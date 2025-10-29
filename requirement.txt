@@ -1,0 +1,23 @@
+# Flask web framework
+Flask==3.0.3
+
+# HTTP client for calling the Grants.gov API
+requests==2.32.3
+
+dotenv
+
+pdfminer.six
+docx2txt
+openpyxl
+xlrd==1.2.0
+
+
+google-genai
+
+
+# Database ORM
+SQLAlchemy>=2.0.0
+psycopg2-binary>=2.9.9
+
+# Optional but highly recommended for JSONB + PostgreSQL integration
+sqlalchemy-utils>=0.41.0

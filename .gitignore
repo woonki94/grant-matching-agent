@@ -1,0 +1,4 @@
+# Project exclude paths
+/venv/
+api.env
+api_key.env
