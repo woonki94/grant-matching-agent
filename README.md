@@ -2,8 +2,9 @@
 Requirements
 
 Install dependencies:
-
+```bash
 pip install -r requirements.txt
+```
 
 requirements.txt should include:
 
@@ -23,28 +24,28 @@ DATABASE_URL = "postgresql+psycopg2://user:password@localhost:5432/grants"
 
 
 	3.	Run the initialization script:
-
+```bash
 ./scripts/init_db.sh
-
+```
 This creates the database and tables.
 
 	4.	Fetch and save grant data:
-
+```bash
 ./scripts/fetch_commit_grant.sh [page_offset] [page_size] [query]
-
+```
 Example:
-
+```bash
 ./scripts/fetch_commit_grant.sh 1 10 "machine learning"
-
+```
 
 	5.	Generate keywords using Gemini:
-
+```bash
 ./scripts/generate_keyword.sh [batch_size] [max_keywords]
-
+```
 Example:
-
+```bash
 ./scripts/generate_keyword.sh 50 25
-
+```
 
 
 API Keys
