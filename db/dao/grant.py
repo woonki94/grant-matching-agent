@@ -1,12 +1,19 @@
-# data/dao.py
 from __future__ import annotations
 from datetime import datetime
 from typing import List
 from sqlalchemy.dialects.postgresql import insert as pg_insert
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session,selectinload
 
-from data.models.models_grant import Opportunity, Attachment
+
+from db.models.grant import Opportunity, Attachment
 from util.extract_content import fetch_and_extract_one
+def _safe_iso(v):
+    if v is None:
+        return None
+    if hasattr(v, "isoformat"):
+        return v.isoformat()
+    return str(v)
+
 
 # ─────────────────────────────────────────────────────────────
 # OPPORTUNITY DAO
@@ -110,12 +117,6 @@ class AttachmentDAO:
         rows: list[dict],
         fetch_content: bool = True,
     ) -> list[int]:
-        """
-        rows: list of dicts with keys:
-          - opportunity_id
-          - file_name
-          - download_path
-        """
 
         ids: list[int] = []
         for r in rows:
@@ -129,3 +130,33 @@ class AttachmentDAO:
             )
             ids.append(att_id)
         return ids
+
+
+class OpportunityReadDAO:
+    @staticmethod
+    def get_summary_and_files(db: Session, opportunity_id: str) -> dict:
+        row = (
+            db.query(Opportunity)
+              .options(selectinload(Opportunity.attachments))
+              .filter(Opportunity.opportunity_id == opportunity_id)
+              .one_or_none()
+        )
+        if not row:
+            return {}
+
+        summary = {
+            "opportunity_id": row.opportunity_id,
+            "opportunity_title": row.opportunity_title,
+            "additional_info_url": row.additional_info_url,
+            "summary_description": row.summary_description,
+        }
+
+        files = [
+            {
+                "file_name": a.file_name,
+                "file_content": a.content,
+            }
+            for a in (row.attachments or [])
+        ]
+
+        return {"opportunityID": row.opportunity_id, "Summary": summary, "additional_files": files}

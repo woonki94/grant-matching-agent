@@ -1,10 +1,7 @@
-# data/models_grant.py
 from sqlalchemy import Column, String, Float, Boolean, Integer, ForeignKey, JSON, Text, DateTime, UniqueConstraint, \
     Index
-from sqlalchemy.orm import declarative_base, relationship
-from datetime import datetime
-
-Base = declarative_base()
+from sqlalchemy.orm import relationship
+from db.base import Base
 
 class Opportunity(Base):
     __tablename__ = "opportunity"
@@ -76,3 +73,4 @@ class Attachment(Base):
 
     # optional: relationship back to Opportunity
     opportunity = relationship("Opportunity", back_populates="attachments")
+

@@ -40,11 +40,11 @@ Example:
 
 	5.	Generate keywords using Gemini:
 ```bash
-./scripts/generate_keyword.sh [batch_size] [max_keywords]
+./scripts/generate_grant_keywords.sh [batch_size] [max_keywords]
 ```
 Example:
 ```bash
-./scripts/generate_keyword.sh 50 25
+./scripts/generate_grant_keywords.sh 50 25
 ```
 
 

@@ -1,9 +1,7 @@
-# data/dao_keywords.py
 from __future__ import annotations
-from typing import List, Dict
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import Session
-from data.models.models_keyword import Keyword
+from db.models.keywords_grant import Keyword
 
 
 class KeywordDAO:

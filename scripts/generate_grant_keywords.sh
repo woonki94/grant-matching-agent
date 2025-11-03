@@ -2,7 +2,7 @@
 # ───────────────────────────────────────────────
 # Run the keyword mining pipeline
 # Usage:
-#   ./scripts/generate_keyword.sh [batch_size] [max_keywords]
+#   ./scripts/generate_grant_keywords.sh [batch_size] [max_keywords]
 # ───────────────────────────────────────────────
 
 set -euo pipefail
@@ -25,4 +25,4 @@ echo
 
 
 # Execute as module so imports always resolve
-python -m services.generate_keywords "$BATCH_SIZE" "$MAX_KEYWORDS"
+python -m services.grant.generate_grant_keywords "$BATCH_SIZE" "$MAX_KEYWORDS"

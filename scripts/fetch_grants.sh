@@ -26,4 +26,4 @@ echo "   Page size   : $PAGE_SIZE"
 echo "   Query       : ${QUERY:-<none>}"
 echo
 
-python -m services.fetch_commit_grant "$PAGE_OFFSET" "$PAGE_SIZE" "$QUERY"
+python -m services.grant.save_grant "$PAGE_OFFSET" "$PAGE_SIZE" "$QUERY"

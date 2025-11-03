@@ -1,9 +1,8 @@
-# data/models_keyword.py
 from __future__ import annotations
-from sqlalchemy import Column, Integer, String, Text, ForeignKey, UniqueConstraint, Index
+from sqlalchemy import Column, Integer, String, ForeignKey, UniqueConstraint, Index
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import relationship
-from data.models.models_grant import Base, Opportunity  # your existing Base + Opportunity
+from db.base import Base
 
 class Keyword(Base):
     __tablename__ = "keywords"

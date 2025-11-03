@@ -1,18 +1,17 @@
 #TODO: Make everything absolute path
-import os
 import sys
 
-from services.grant_service import run_search_pipeline
+from services.grant.call_grant import run_search_pipeline
 from dataclasses import asdict
-from data.db_conn import SessionLocal
-from data.dao.dao_grant import OpportunityDAO, AttachmentDAO
+from db.db_conn import SessionLocal
+from db.dao.grant import OpportunityDAO, AttachmentDAO
 
 
 if __name__ == "__main__":
     # Fetch page 1, 5 results
     page_offset = int(sys.argv[1]) if len(sys.argv) > 1 else 1
-    page_size = int(sys.argv[2]) if len(sys.argv) > 2 else 5
-    query = sys.argv[3] if len(sys.argv) > 3 else None
+    page_size = int(sys.argv[2]) if len(sys.argv) > 2 else 50
+    query = sys.argv[3] if len(sys.argv) > 3 else "Robotics"
 
     response_dto, opps_p, atts_p = run_search_pipeline(page_offset=page_offset, page_size=page_size, q=query)
 

@@ -1,7 +1,6 @@
-# services/keyword_mining_service.py
+# services/generate_grant_keywords.py
 from __future__ import annotations
 
-from keyword import kwlist
 from pathlib import Path
 from typing import List, Dict, Any, Optional
 import json
@@ -12,11 +11,12 @@ import re
 from dotenv import load_dotenv
 from sqlalchemy.orm import Session
 from google import genai
+from db.db_conn import SessionLocal
 
-from data.dao.dao_keywords import KeywordDAO
-from data.dao.dao_read import OpportunityReadDAO
+from db.dao.keywords_grant import KeywordDAO
+from db.dao.grant import OpportunityReadDAO
 
-env_path = Path(__file__).resolve().parents[1] / "api.env"
+env_path = Path(__file__).resolve().parents[2] / "api.env"
 loaded = load_dotenv(dotenv_path=env_path, override=True)
 API_KEY = os.getenv("API_KEY")
 gemini_key = os.getenv("GEMINI_API_KEY")
@@ -81,7 +81,7 @@ def _extract_with_gemini(corpus: str, max_keywords: int) -> List[KeywordCandidat
         that summarize the core research topics of the following grant opportunity.
         
         The section labeled "summary description" provides the grant’s main project summary.
-        The field "additional_info_url" may point to the full grant announcement — if available,
+        The field "additional_info_url" may point to the full grant announcement. If available,
         imagine you can visit it to understand what the grant is doing.
         Under the section [ATTACHMENT], you may find supplementary materials or files
         attached to the opportunity (such as project descriptions, calls, or requirements).
@@ -92,6 +92,9 @@ def _extract_with_gemini(corpus: str, max_keywords: int) -> List[KeywordCandidat
         Each keyword should be a single word or very short phrase (e.g., "genomics", "renewable energy",
         "machine learning", "public health", "data privacy"). Avoid generic or administrative terms
         (e.g., "project", "proposal", "research", "development", "support").
+        
+        Try to keep the keywords in one word, unless it does not deliver clear meaning when separating the words
+        (e.g. reinforcement learning -> reinforcement, learning does not give original meaning)  
         
         Return ONLY valid JSON in exactly this format:
         {{
@@ -124,7 +127,7 @@ def _extract_with_gemini(corpus: str, max_keywords: int) -> List[KeywordCandidat
     data = json.loads(s)
     return data
 
-# ---------- public runner ----------
+
 def mine_keywords_for_one(db: Session, opportunity_id: str, *, max_keywords: int = 30, source_tag: str = "gemini") -> int:
     blob = OpportunityReadDAO.get_summary_and_files(db, opportunity_id)
     summary = blob.get("Summary")
@@ -152,7 +155,7 @@ def mine_keywords_for_one(db: Session, opportunity_id: str, *, max_keywords: int
 
 def mine_keywords_for_all(db: Session, *, batch_size: int = 100, max_keywords: int = 30) -> Dict[str, Any]:
 
-    from data.models.models_grant import Opportunity
+    from db.models.grant import Opportunity
     total = db.query(Opportunity).count()
     done = 0
     written = 0
@@ -180,3 +183,7 @@ def mine_keywords_for_all(db: Session, *, batch_size: int = 100, max_keywords: i
     return {"opportunities_processed": done, "keywords_written": written, "total_opportunities": total}
 
 
+if __name__ == "__main__":
+    with SessionLocal() as sess:
+        report = mine_keywords_for_all(sess, batch_size=50, max_keywords=50)
+        print(report)

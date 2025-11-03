@@ -18,7 +18,7 @@ if [ -f ".env" ]; then
 fi
 
 echo "Initializing database schema..."
-python -m data.init_db   # or python -m data.init_db depending on venv setup
+python -m db.init_db   # or python -m data.init_db depending on venv setup
 echo "Database initialization complete!"
 
 

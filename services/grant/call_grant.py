@@ -9,11 +9,11 @@ from requests.adapters import HTTPAdapter, Retry
 from dotenv import load_dotenv
 
 # Request/Response DTOs (your existing ones)
-from dto.requestDTO import SearchRequest, Pagination, SortOrder, OpportunityStatusFilter
-from dto.responseDTO import PortalSearchResponseDTO, AttachmentDTO
+from dto.grant_request_dto import SearchRequest, Pagination, SortOrder, OpportunityStatusFilter
+from dto.grant_response_dto import PortalSearchResponseDTO, AttachmentDTO
 
 # Persistence DTOs we built earlier
-from dto.persistenceDTO import (
+from dto.grant_dto import (
     OpportunityPersistenceDTO,
     AttachmentPersistenceDTO,
     build_opportunity_persistence_list,
@@ -24,7 +24,7 @@ from dto.persistenceDTO import (
 SIMPLER_SEARCH = "https://api.simpler.grants.gov/v1/opportunities/search"
 SIMPLER_DETAIL = "https://api.simpler.grants.gov/v1/opportunities/"
 
-env_path = Path(__file__).resolve().parents[1] / "api.env"
+env_path = Path(__file__).resolve().parents[2] / "api.env"
 loaded = load_dotenv(dotenv_path=env_path, override=True)
 API_KEY = os.getenv("API_KEY")
 
@@ -134,7 +134,6 @@ def run_search_pipeline(
     response_dto = search_opportunities(req)
     response_dto = enrich_with_attachments(response_dto)
 
-    # Project into Persistence DTOs (flatten nested summary fields, strip HTML)
     opportunities_p: List[OpportunityPersistenceDTO] = build_opportunity_persistence_list(response_dto)
     attachments_p: List[AttachmentPersistenceDTO] = build_attachment_persistence_list(response_dto)
 
