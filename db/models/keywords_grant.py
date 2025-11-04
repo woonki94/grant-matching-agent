@@ -21,7 +21,19 @@ class Keyword(Base):
         unique=True,             # one row per opportunity
     )
 
-    keywords = Column(JSONB, nullable=False, default=list)  # ← JSON array
+    #keywords = Column(JSONB, nullable=False, default=list)  # ← JSON array
+    keywords = Column(
+        JSONB,
+        nullable=False,
+        default=lambda: {
+            "area": "",
+            "discipline": "",
+            "application_domain": [],
+            "research_area": [],
+            "methods": [],
+            "models": [],
+        },
+    )
     raw_json = Column(JSONB)
     source = Column(String, nullable=False, default="gemini")
 

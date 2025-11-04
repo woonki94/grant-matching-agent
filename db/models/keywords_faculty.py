@@ -14,7 +14,19 @@ class FacultyKeyword(Base):
     id = Column(Integer, primary_key=True, autoincrement=True)
     faculty_id = Column(Integer, ForeignKey("faculty.id", ondelete="CASCADE"), nullable=False, unique=True)
 
-    keywords = Column(JSONB, nullable=False, default=list)
+    #keywords = Column(JSONB, nullable=False, default=list)
+    keywords = Column(
+        JSONB,
+        nullable=False,
+        default=lambda: {
+            "area": "",
+            "discipline": "",
+            "application_domain": [],
+            "research_area": [],
+            "methods": [],
+            "models": [],
+        },
+    )
     raw_json = Column(JSONB)
     source = Column(String, nullable=False, default="gemini")
 

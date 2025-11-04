@@ -20,6 +20,8 @@ from db.dao.keywords_faculty import FacultyKeywordDAO
 
 import db.models.faculty as mf
 import db.models.keywords_faculty as mfk
+from util.build_prompt import build_prompt
+from util.format_keywords import _normalize_to_new_schema, _count_total_strings
 
 # ─────────────────────────────────────────────────────────────
 # ENV
@@ -27,6 +29,7 @@ import db.models.keywords_faculty as mfk
 env_path = Path(__file__).resolve().parents[2] / "api.env"
 load_dotenv(dotenv_path=env_path, override=True)
 gemini_key = os.getenv("GEMINI_API_KEY")
+FACULTY_PROMPT_PATH = Path(__file__).resolve().parents[2] / "prompts" / "faculty_keyword_prompt.txt"
 
 
 # ─────────────────────────────────────────────────────────────
@@ -90,32 +93,11 @@ def _extract_with_gemini(corpus: str, max_keywords: int) -> Dict[str, Any]:
         return {"keywords": naive, "raw": {"fallback": True, "items": naive}}
 
     client = genai.Client(api_key=gemini_key)
-    prompt = f"""
-        Extract up to {max_keywords} concise, meaningful research keywords or short phrases
-        that summarize this faculty member's research areas. 
-        
-        Visit research_website_url and links then also see the information there.
-        
-        Avoid generic/administrative terms (e.g., "project", "research", "work").
-        Prefer domain-specific terms (e.g., "reinforcement learning", "humanoid robotics",
-        "power systems stability", "bioprinting", "estimation theory").
-        
-        Try to keep the keywords in one word, unless it does not deliver clear meaning when separating the words
-        (e.g. reinforcement learning -> reinforcement, learning does not give original meaning)  
-        
-        Return ONLY valid JSON in exactly this format:
-        {{
-          "keywords": ["keyword1", "keyword2", "keyword3", ...]
-        }}
+    prompt = build_prompt(FACULTY_PROMPT_PATH, corpus, max_keywords)
 
-        Do not include any explanations outside the JSON.
 
-        Faculty profile content:
-        {corpus}
-    """
-
-    resp = client.models.generate_content(model="gemini-2.5-flash", contents=prompt)
-    text = (resp.text or "{}").strip()
+    response = client.models.generate_content(model="gemini-2.5-flash", contents=prompt)
+    text = (response.text or "{}").strip()
 
     # strip fences if present
     if text.startswith("```"):
@@ -128,7 +110,7 @@ def _extract_with_gemini(corpus: str, max_keywords: int) -> Dict[str, Any]:
         text = m.group(0) if m else "{}"
 
     data = json.loads(text)
-    return {"keywords": data.get("keywords", []) or [], "raw": data}
+    return data
 
 
 # ─────────────────────────────────────────────────────────────
@@ -143,23 +125,25 @@ def mine_keywords_for_one_faculty(db: Session, faculty_id: int, *, max_keywords:
     if not corpus:
         return 0
 
-    out = _extract_with_gemini(corpus, max_keywords=max_keywords)
-    keywords = out.get("keywords") or []
-    raw_json = out.get("raw")
+    items = _extract_with_gemini(corpus, max_keywords=max_keywords)
 
-    if not keywords:
+    structured_keywords = _normalize_to_new_schema(items)
+
+    if (_count_total_strings(structured_keywords) == 0
+            and not structured_keywords.get("area")
+            and not structured_keywords.get("discipline")):
         return 0
 
     FacultyKeywordDAO.upsert_keywords_json(
         db,
         [{
             "faculty_id": fac.id,
-            "keywords": keywords,
-            "raw_json": raw_json,
+            "keywords": structured_keywords,
+            "raw_json": items,
             "source": source_tag if gemini_key else "heuristic",
         }],
     )
-    return len(keywords)
+    return len(structured_keywords)
 
 
 def mine_keywords_for_all_faculty(

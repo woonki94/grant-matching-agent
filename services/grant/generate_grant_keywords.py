@@ -7,6 +7,7 @@ import json
 import os
 import math
 import re
+from pathlib import Path
 
 from dotenv import load_dotenv
 from sqlalchemy.orm import Session
@@ -15,11 +16,15 @@ from db.db_conn import SessionLocal
 
 from db.dao.keywords_grant import KeywordDAO
 from db.dao.grant import OpportunityReadDAO
+from util.build_prompt import build_prompt
+from util.format_keywords import _normalize_to_new_schema, _count_total_strings
 
 env_path = Path(__file__).resolve().parents[2] / "api.env"
 loaded = load_dotenv(dotenv_path=env_path, override=True)
 API_KEY = os.getenv("API_KEY")
 gemini_key = os.getenv("GEMINI_API_KEY")
+
+GRANT_PROMPT_PATH = Path(__file__).resolve().parents[2] / "prompts" / "grant_keyword_prompt.txt"
 
 def _strip_html(s: Optional[str]) -> str:
     if not s:
@@ -76,36 +81,7 @@ def _extract_with_openai(corpus: str, max_keywords: int) -> List[KeywordCandidat
 def _extract_with_gemini(corpus: str, max_keywords: int) -> List[KeywordCandidate]:
 
     client = genai.Client(api_key=gemini_key)
-    prompt = f"""
-        Extract up to {max_keywords} concise, meaningful keywords or short phrases
-        that summarize the core research topics of the following grant opportunity.
-        
-        The section labeled "summary description" provides the grant’s main project summary.
-        The field "additional_info_url" may point to the full grant announcement. If available,
-        imagine you can visit it to understand what the grant is doing.
-        Under the section [ATTACHMENT], you may find supplementary materials or files
-        attached to the opportunity (such as project descriptions, calls, or requirements).
-        
-        Use all this information to identify the central research areas or topics that best
-        represent what the grant is about.
-        
-        Each keyword should be a single word or very short phrase (e.g., "genomics", "renewable energy",
-        "machine learning", "public health", "data privacy"). Avoid generic or administrative terms
-        (e.g., "project", "proposal", "research", "development", "support").
-        
-        Try to keep the keywords in one word, unless it does not deliver clear meaning when separating the words
-        (e.g. reinforcement learning -> reinforcement, learning does not give original meaning)  
-        
-        Return ONLY valid JSON in exactly this format:
-        {{
-          "keywords": ["keyword1", "keyword2", "keyword3", ...]
-        }}
-        
-        Do not include any explanations, comments, or text outside the JSON object.
-        
-        Grant Summary and Materials:
-        {corpus}
-        """
+    prompt = build_prompt(GRANT_PROMPT_PATH, corpus, max_keywords)
     response = client.models.generate_content(
         model="gemini-2.5-flash", contents=prompt
     )
@@ -138,20 +114,23 @@ def mine_keywords_for_one(db: Session, opportunity_id: str, *, max_keywords: int
     corpus = _build_corpus(summary, files)
     items = extract_keywords_via_llm(corpus, max_keywords=max_keywords)
 
-    keywords = items.get("keywords", [])
-    if not keywords:
+    structured_keywords = _normalize_to_new_schema(items)
+
+    if (_count_total_strings(structured_keywords) == 0
+            and not structured_keywords.get("area")
+            and not structured_keywords.get("discipline")):
         return 0
 
     # Store as one row — entire list + raw_json
     row = {
         "opportunity_id": opportunity_id,
-        "keywords": keywords,  # store as JSON array
+        "keywords": structured_keywords,  # store as JSON array
         "raw_json": items,     # keep raw LLM output
         "source": source_tag,
     }
 
     KeywordDAO.upsert_keywords_json(db, [row])
-    return len(keywords)
+    return len(structured_keywords)
 
 def mine_keywords_for_all(db: Session, *, batch_size: int = 100, max_keywords: int = 30) -> Dict[str, Any]:
 

@@ -1,0 +1,33 @@
+You are an information extraction assistant.
+
+Your task is to analyze the following grant opportunity and extract
+structured research-related keywords into the following categories
+(Extract up to {max_keywords} for each categories) :
+
+1. **area** – Broad academic domain (e.g., Engineering, Computer Science, Biology)
+2. **discipline** – Specialized subfield within the area (e.g., Artificial Intelligence, Robotics)
+3. **application_domain** – Real-world or industrial problem area (e.g., Healthcare, Agriculture, Climate Adaptation)
+4. **research_area** – Scientific or technical research topics being studied (e.g., Machine Learning, Computer Vision)
+5. **methods** – Analytical, experimental, or computational techniques (e.g., Regression Analysis, Field Survey, Reinforcement Learning)
+6. **models** – Specific algorithmic, mathematical, or conceptual models (e.g., Transformer, CNN, Random Forest, Bayesian Network)
+
+Guidelines:
+- Use short, meaningful phrases or single words.
+- Avoid administrative or generic terms like "project", "research", "development", "support".
+- If a category has no clear information, leave it empty or use an empty list.
+- Use multi-word phrases **only when necessary** for clarity (e.g., "reinforcement learning").
+- Be concise but informative.
+- Output **only** valid JSON in the format shown below.
+
+Expected JSON format:
+{
+  "area": "string",
+  "discipline": "string",
+  "application_domain": ["string", ...],
+  "research_area": ["string", ...],
+  "methods": ["string", ...],
+  "models": ["string", ...]
+}
+
+Grant Summary and Materials:
+{corpus}
