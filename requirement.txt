@@ -18,6 +18,9 @@ google-genai
 # Database ORM
 SQLAlchemy>=2.0.0
 psycopg2-binary>=2.9.9
+db
 
 # Optional but highly recommended for JSONB + PostgreSQL integration
 sqlalchemy-utils>=0.41.0
+
+openai

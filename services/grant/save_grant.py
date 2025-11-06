@@ -11,7 +11,7 @@ if __name__ == "__main__":
     # Fetch page 1, 5 results
     page_offset = int(sys.argv[1]) if len(sys.argv) > 1 else 1
     page_size = int(sys.argv[2]) if len(sys.argv) > 2 else 5
-    query = sys.argv[3] if len(sys.argv) > 3 else "Robotics"
+    query = sys.argv[3] if len(sys.argv) > 3 else "robotics"
 
     response_dto, opps_p, atts_p = run_search_pipeline(page_offset=page_offset, page_size=page_size, q=query)
 

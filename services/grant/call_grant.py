@@ -9,7 +9,7 @@ from requests.adapters import HTTPAdapter, Retry
 from dotenv import load_dotenv
 
 # Request/Response DTOs (your existing ones)
-from dto.grant_request_dto import SearchRequest, Pagination, SortOrder, OpportunityStatusFilter
+from dto.grant_request_dto import SearchRequest, Pagination, SortOrder, OpportunityStatusFilter, Filters
 from dto.grant_response_dto import PortalSearchResponseDTO, AttachmentDTO
 
 # Persistence DTOs we built earlier
@@ -68,7 +68,9 @@ def build_search_request(
             page_offset=page_offset,
             page_size=page_size,
             sort_order=[SortOrder(order_by=order_by, sort_direction=sort_direction)],
-            opportunity_status=OpportunityStatusFilter(one_of=statuses),
+        ),
+        filters=Filters(
+            opportunity_status=OpportunityStatusFilter(one_of=["forecasted", "posted"])
         ),
         q=q,
     )
@@ -131,6 +133,7 @@ def run_search_pipeline(
         statuses=statuses,
         q=q,
     )
+
     response_dto = search_opportunities(req)
     response_dto = enrich_with_attachments(response_dto)
 

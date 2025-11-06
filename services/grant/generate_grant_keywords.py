@@ -11,7 +11,6 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 from sqlalchemy.orm import Session
-from google import genai
 from db.db_conn import SessionLocal
 
 from db.dao.keywords_grant import KeywordDAO
@@ -19,10 +18,15 @@ from db.dao.grant import OpportunityReadDAO
 from util.build_prompt import build_prompt
 from util.format_keywords import _normalize_to_new_schema, _count_total_strings
 
+from google import genai
+#from openai import OpenAI
+
+
 env_path = Path(__file__).resolve().parents[2] / "api.env"
 loaded = load_dotenv(dotenv_path=env_path, override=True)
 API_KEY = os.getenv("API_KEY")
 gemini_key = os.getenv("GEMINI_API_KEY")
+openai_key = os.getenv("OPENAI_API_KEY")
 
 GRANT_PROMPT_PATH = Path(__file__).resolve().parents[2] / "prompts" / "grant_keyword_prompt.txt"
 
@@ -68,15 +72,17 @@ class KeywordCandidate(Dict[str, Any]):
 def extract_keywords_via_llm(corpus: str, max_keywords: int = 30) -> List[KeywordCandidate]:
     #provider = (os.getenv("KEYWORD_LLM_PROVIDER") or "").lower()  # "openai" | "gemini" | ""
     provider = "gemini"
-
-    #TODO: Try openAI aswell
-    #if provider == "openai":
-    #    return _extract_with_openai(corpus, max_keywords)
+    '''
+    if provider == "openai":
+        return _extract_with_openai(corpus, max_keywords)
+    '''
     if provider == "gemini":
         return _extract_with_gemini(corpus, max_keywords)
 
+
 def _extract_with_openai(corpus: str, max_keywords: int) -> List[KeywordCandidate]:
-    return []
+    return 0
+
 
 def _extract_with_gemini(corpus: str, max_keywords: int) -> List[KeywordCandidate]:
 
@@ -163,6 +169,9 @@ def mine_keywords_for_all(db: Session, *, batch_size: int = 100, max_keywords: i
 
 
 if __name__ == "__main__":
+    print("asdasd")
     with SessionLocal() as sess:
+        print("asdasd2")
         report = mine_keywords_for_all(sess, batch_size=50, max_keywords=50)
+        print("asdasd3")
         print(report)

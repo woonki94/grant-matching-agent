@@ -4,7 +4,7 @@ Your task is to analyze the following grant opportunity and extract
 structured research-related keywords into the following categories
 (Extract up to {max_keywords} for each categories) :
 
-1. **area** – Broad academic domain (e.g., Engineering, Computer Science, Biology)
+1. **area** – Broad academic domain (e.g., Computer Science, Biology)
 2. **discipline** – Specialized subfield within the area (e.g., Artificial Intelligence, Robotics)
 3. **application_domain** – Real-world or industrial problem area (e.g., Healthcare, Agriculture, Climate Adaptation)
 4. **research_area** – Scientific or technical research topics being studied (e.g., Machine Learning, Computer Vision)
