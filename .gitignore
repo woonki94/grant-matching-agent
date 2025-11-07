@@ -2,4 +2,5 @@
 /venv/
 /.venv/
 api.env
-api_key.env
+api_key.env.venv/
+.DS_Store

@@ -24,3 +24,6 @@ db
 sqlalchemy-utils>=0.41.0
 
 openai
+
+beautifulsoup4
+lxml
