@@ -1,0 +1,29 @@
+You are an information extraction assistant.
+
+Extract structured multi-label research keywords from the grant text.
+Return ONLY the following JSON structure:
+
+{
+  "area": ["string", ...],
+  "discipline": ["string", ...],
+  "application_domain": ["string", ...],
+  "research_area": ["string", ...],
+  "methods": ["string", ...],
+  "models": ["string", ...]
+}
+
+Guidelines:
+- Use multiple values for **area** and **discipline** when appropriate.
+- Prioritize fields found in: Title > Purpose/Description > Instrument examples > Funding Activity Category.
+- Convert instruments into techniques for "methods" (mass spectrometer → mass spectrometry, NMR spectrometer → NMR spectroscopy, etc.).
+- "area": broad fields (e.g., Life Sciences, Engineering, Physical Sciences).
+- "discipline": more specific subfields (Biomedical Engineering, Structural Biology, Analytical Chemistry, Biophysics).
+- "application_domain": societal/industrial contexts (e.g., healthcare, clinical diagnostics, core facilities).
+- "research_area": scientific topics enabled by the grant (proteomics, genomics, metabolomics, imaging, structural biology).
+- "methods": experimental/analytical techniques (mass spectrometry, flow cytometry, DNA sequencing, PET/CT imaging).
+- "models": only include if explicitly referenced (transformers, CNNs, Bayesian networks); otherwise return [].
+- Keep phrases short and canonical; no administrative terms.
+- Maximum ~3–10 items per list; de-duplicate.
+
+Extract from this corpus:
+{corpus}

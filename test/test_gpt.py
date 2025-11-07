@@ -1,8 +1,9 @@
 import os
 from pathlib import Path
 
-from dotenv import load_dotenv
 import openai
+from dotenv import load_dotenv
+from openai import OpenAI
 
 
 if __name__ == '__main__':
@@ -11,10 +12,12 @@ if __name__ == '__main__':
     loaded = load_dotenv(dotenv_path=env_path, override=True)
     openai_key = os.getenv("OPENAI_API_KEY")
 
-    client = openai.OpenAI(api_key=openai_key)
+    client = OpenAI(api_key=openai_key)
 
-    print(openai_key)
-    print(client)
+    resp = client.responses.create(
+        model="gpt-5",
+        input="Hello!"
+    )
 
-
+    print(resp.output_text)
 

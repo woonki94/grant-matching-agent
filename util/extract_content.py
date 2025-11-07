@@ -4,6 +4,7 @@ from pathlib import Path
 import io
 import re
 import csv
+import html as html_lib
 import tempfile
 import requests
 
@@ -11,6 +12,8 @@ import requests
 from pdfminer.high_level import extract_text as pdf_extract_text
 import docx2txt
 import openpyxl
+
+from util.html_to_text import _HTMLToText
 
 try:
     import xlrd  # for legacy .xls (use xlrd==1.2.0)
@@ -44,10 +47,24 @@ def infer_ext(filename: str, content_type: Optional[str]) -> str:
     if "spreadsheetml" in ctype or "xlsx" in ctype or "excel" in ctype: return ".xlsx"
     if "ms-excel" in ctype or "xls" in ctype: return ".xls"
     if "csv" in ctype: return ".csv"
+    if "html" in ctype or "htm" in ctype: return ".html"
+
     return ext or ""
 
+def extract_html_bytes(data: bytes) -> str:
+    for enc in ("utf-8", "cp1252", "latin-1"):
+        try:
+            text = data.decode(enc, errors="strict")
+            break
+        except Exception:
+            continue
+    else:
+        text = data.decode("utf-8", errors="ignore")
 
-# --------- extractors from BYTES (docx2txt needs a temp file) ----------
+    parser = _HTMLToText()
+    parser.feed(text)
+    return parser.get_text()
+
 def extract_pdf_bytes(data: bytes) -> str:
     return pdf_extract_text(io.BytesIO(data)) or ""
 
@@ -118,6 +135,8 @@ def extract_text_from_bytes(data: bytes, filename: str, content_type: Optional[s
             return extract_xls_bytes(data), "xls"
         if ext == ".csv":
             return extract_csv_bytes(data), "csv"
+        if ext in (".html", ".htm"):
+            return extract_html_bytes(data), "html"
 
         # Fallback by MIME if no/odd extension
         ctype = (content_type or "").lower()
@@ -131,6 +150,8 @@ def extract_text_from_bytes(data: bytes, filename: str, content_type: Optional[s
             return extract_xls_bytes(data), "xls"
         if "csv" in ctype:
             return extract_csv_bytes(data), "csv"
+        if "html" in ctype or "htm" in ctype or "text/html" in ctype:
+            return extract_html_bytes(data), "html"
 
         # Last-ditch: try pdf → docx
         try:

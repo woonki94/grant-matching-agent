@@ -31,3 +31,7 @@ Expected JSON format:
 
 Grant Summary and Materials:
 {corpus}
+
+{"area": "Biomedical Sciences", "models": [],
+"methods": ["NMR spectroscopy", "X-ray diffraction", "Mass spectrometry", "DNA sequencing", "RNA sequencing", "Protein sequencing", "Flow cytometry", "Electron microscopy", "Light microscopy", "Fluorescence microscopy", "Confocal microscopy", "Biosensing", "High-throughput robotic screening", "Biomedical imaging"],
+"discipline": "Analytical Biochemistry", "research_area": ["Genomics", "Transcriptomics", "Proteomics", "Metabolomics", "Structural Biology", "Single-cell Analysis", "Molecular Imaging", "Cellular Imaging", "High-throughput Screening", "Cytometry", "Bioanalytical Chemistry", "Biophysics"], "application_domain": ["Healthcare", "Precision Medicine", "Drug Discovery", "Clinical Diagnostics", "Cancer Research", "Neuroscience", "Immunology", "Infectious Disease", "Pharmacology", "Toxicology", "Biomarker Discovery", "Stem Cell Research", "Microbiome Research", "Systems Biology"]}

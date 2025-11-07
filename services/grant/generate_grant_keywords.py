@@ -19,7 +19,7 @@ from util.build_prompt import build_prompt
 from util.format_keywords import _normalize_to_new_schema, _count_total_strings
 
 from google import genai
-#from openai import OpenAI
+from openai import OpenAI
 
 
 env_path = Path(__file__).resolve().parents[2] / "api.env"
@@ -28,7 +28,7 @@ API_KEY = os.getenv("API_KEY")
 gemini_key = os.getenv("GEMINI_API_KEY")
 openai_key = os.getenv("OPENAI_API_KEY")
 
-GRANT_PROMPT_PATH = Path(__file__).resolve().parents[2] / "prompts" / "grant_keyword_prompt.txt"
+GRANT_PROMPT_PATH = Path(__file__).resolve().parents[2] / "prompts" / "grant_keyword_prompt_v2.txt"
 
 def _strip_html(s: Optional[str]) -> str:
     if not s:
@@ -64,27 +64,33 @@ def _build_corpus(summary: Dict[str, Any], files: List[Dict[str, str]], max_char
     corpus = "\n\n".join(parts)
     return corpus[:max_chars]
 
-# ---------- LLM adapter (plug your provider here) ----------
-class KeywordCandidate(Dict[str, Any]):
-    # shape: {"keyword": str, "weight": int|None, "category": str|None}
-    pass
 
-def extract_keywords_via_llm(corpus: str, max_keywords: int = 30) -> List[KeywordCandidate]:
+def extract_keywords_via_llm(corpus: str, max_keywords: int = 30) -> Dict[str, Any]:
     #provider = (os.getenv("KEYWORD_LLM_PROVIDER") or "").lower()  # "openai" | "gemini" | ""
-    provider = "gemini"
-    '''
+    provider = "openai"
+
     if provider == "openai":
         return _extract_with_openai(corpus, max_keywords)
-    '''
+
     if provider == "gemini":
         return _extract_with_gemini(corpus, max_keywords)
 
 
-def _extract_with_openai(corpus: str, max_keywords: int) -> List[KeywordCandidate]:
-    return 0
+def _extract_with_openai(corpus: str, max_keywords: int) -> Dict[str, Any]:
+    client = OpenAI(api_key=openai_key)
+    prompt = build_prompt(GRANT_PROMPT_PATH, corpus, max_keywords)
+
+    response = client.responses.create(
+        model="gpt-5",
+        input=prompt
+    )
+    text = response.output_text or "{}"
+    #print(text)
+    data = json.loads(text)
+    return data
 
 
-def _extract_with_gemini(corpus: str, max_keywords: int) -> List[KeywordCandidate]:
+def _extract_with_gemini(corpus: str, max_keywords: int) -> Dict[str, Any]:
 
     client = genai.Client(api_key=gemini_key)
     prompt = build_prompt(GRANT_PROMPT_PATH, corpus, max_keywords)
@@ -169,9 +175,6 @@ def mine_keywords_for_all(db: Session, *, batch_size: int = 100, max_keywords: i
 
 
 if __name__ == "__main__":
-    print("asdasd")
     with SessionLocal() as sess:
-        print("asdasd2")
         report = mine_keywords_for_all(sess, batch_size=50, max_keywords=50)
-        print("asdasd3")
         print(report)

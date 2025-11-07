@@ -10,6 +10,7 @@ import re
 import time
 
 from dotenv import load_dotenv
+from openai import OpenAI
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
@@ -29,6 +30,8 @@ from util.format_keywords import _normalize_to_new_schema, _count_total_strings
 env_path = Path(__file__).resolve().parents[2] / "api.env"
 load_dotenv(dotenv_path=env_path, override=True)
 gemini_key = os.getenv("GEMINI_API_KEY")
+openai_key = os.getenv("OPENAI_API_KEY")
+
 FACULTY_PROMPT_PATH = Path(__file__).resolve().parents[2] / "prompts" / "faculty_keyword_prompt.txt"
 
 
@@ -78,40 +81,55 @@ def _build_corpus_for_faculty(db: Session, fac: mf.Faculty, *, max_chars: int = 
     corpus = "\n\n".join([p for p in parts if p]).strip()
     return corpus[:max_chars]
 
+def extract_keywords_via_llm(corpus: str, max_keywords: int = 30) -> Dict[str, Any]:
+    #provider = (os.getenv("KEYWORD_LLM_PROVIDER") or "").lower()  # "openai" | "gemini" | ""
+    provider = "openai"
 
-# ─────────────────────────────────────────────────────────────
-# LLM adapter (Gemini), JSON-only output
-# ─────────────────────────────────────────────────────────────
-def _extract_with_gemini(corpus: str, max_keywords: int) -> Dict[str, Any]:
-    """
-    Return {"keywords": [...]} and keep raw response in "raw".
-    If key is missing, returns a fallback list from comma splits.
-    """
-    if not gemini_key:
-        naive = [t.strip() for t in re.split(r"[,\n;]", corpus) if t.strip()]
-        naive = list(dict.fromkeys(naive))[:max_keywords]
-        return {"keywords": naive, "raw": {"fallback": True, "items": naive}}
+    if provider == "openai":
+        return _extract_with_openai(corpus, max_keywords)
 
-    client = genai.Client(api_key=gemini_key)
+    if provider == "gemini":
+        return _extract_with_gemini(corpus, max_keywords)
+
+
+def _extract_with_openai(corpus: str, max_keywords: int) -> Dict[str, Any]:
+    client = OpenAI(api_key=openai_key)
     prompt = build_prompt(FACULTY_PROMPT_PATH, corpus, max_keywords)
 
-
-    response = client.models.generate_content(model="gemini-2.5-flash", contents=prompt)
-    text = (response.text or "{}").strip()
-
-    # strip fences if present
-    if text.startswith("```"):
-        text = re.sub(r"^```(?:json)?\s*", "", text)
-        text = re.sub(r"\s*```$", "", text).strip()
-
-    # if not a pure JSON, try first {...}
-    if not text.startswith("{"):
-        m = re.search(r"\{(?:[^{}]|(?R))*\}", text, re.S)
-        text = m.group(0) if m else "{}"
-
+    response = client.responses.create(
+        model="gpt-5",
+        input=prompt
+    )
+    text = response.output_text or "{}"
+    #print(text)
     data = json.loads(text)
     return data
 
+
+def _extract_with_gemini(corpus: str, max_keywords: int) -> Dict[str, Any]:
+
+    client = genai.Client(api_key=gemini_key)
+    prompt = build_prompt(FACULTY_PROMPT_PATH, corpus, max_keywords)
+    response = client.models.generate_content(
+        model="gemini-2.5-flash", contents=prompt
+    )
+
+    #print(response)
+    text = response.text or "{}"
+    s = text.strip()
+
+    if s.startswith("```"):
+        # remove leading ```json or ``` and trailing ```
+        s = re.sub(r"^```(?:json)?\s*", "", s)
+        s = re.sub(r"\s*```$", "", s).strip()
+
+    # If still not a pure JSON object, try to grab the first {...} block
+    if not s.startswith("{"):
+        m = re.search(r"\{(?:[^{}]|(?R))*\}", s, re.S)  # recursive-ish fallback
+        s = m.group(0) if m else "{}"
+
+    data = json.loads(s)
+    return data
 
 # ─────────────────────────────────────────────────────────────
 # Public runners (single + batch)
@@ -125,7 +143,7 @@ def mine_keywords_for_one_faculty(db: Session, faculty_id: int, *, max_keywords:
     if not corpus:
         return 0
 
-    items = _extract_with_gemini(corpus, max_keywords=max_keywords)
+    items = extract_keywords_via_llm(corpus, max_keywords=max_keywords)
 
     structured_keywords = _normalize_to_new_schema(items)
 
