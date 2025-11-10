@@ -19,15 +19,11 @@ class FacultyKeyword(Base):
         JSONB,
         nullable=False,
         default=lambda: {
-            "area": "",
-            "discipline": "",
-            "application_domain": [],
-            "research_area": [],
-            "methods": [],
-            "models": [],
+            "research": {"domain": [], "specialization": []},
+            "application": {"domain": [], "specialization": []},
         },
     )
     raw_json = Column(JSONB)
-    source = Column(String, nullable=False, default="gemini")
+    source = Column(String, nullable=False, default="gpt-5")
 
     faculty = relationship("Faculty", back_populates="keyword")

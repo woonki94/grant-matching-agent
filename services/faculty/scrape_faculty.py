@@ -60,7 +60,7 @@ def crawl(max_pages: int = 50) -> list[str]:
     return all_links
 
 if __name__ == "__main__":
-    links = crawl(max_pages=3)
+    links = crawl(max_pages=0)
 
     for link in links:
         data = parse_profile(link)
