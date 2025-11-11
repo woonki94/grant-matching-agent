@@ -4,3 +4,7 @@
 api.env
 api_key.env
 .DS_Store
+
+# Python cache
+__pycache__/
+*.py[cod]
