@@ -27,3 +27,10 @@ openai
 
 beautifulsoup4
 lxml
+
+
+# For embeddings
+numpy
+scikit-learn
+sentence-transformers
+
