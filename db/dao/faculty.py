@@ -7,6 +7,7 @@ from sqlalchemy import select, delete
 from db.models.faculty import (
     Faculty, FacultyDegree, FacultyExpertise, FacultyResearchGroup, FacultyLink
 )
+from db.models.faculty_publication import FacultyPublication
 # ─────────────────────────────────────────────────────────────
 # FACULTY DAO
 # ─────────────────────────────────────────────────────────────
@@ -57,6 +58,7 @@ class FacultyDAO:
         expertise: List[Dict[str, Any]] | None = None,
         groups: List[Dict[str, Any]] | None = None,
         links: List[Dict[str, Any]] | None = None,
+        publications: List[Dict[str, Any]] | None = None,
         delete_then_insert_children: bool = True,
     ) -> int:
         """
@@ -98,6 +100,15 @@ class FacultyDAO:
                 if links:
                     rows = [{"faculty_id": fac_id, **r} for r in links]
                     FacultyLinkDAO.bulk_upsert(session, rows)
+
+            if publications is not None:
+                session.execute(delete(FacultyPublication).where(FacultyPublication.faculty_id == fac_id))
+                if publications:
+                    rows = [
+                        {"faculty_id": fac_id, **r}
+                        for r in publications
+                    ]
+                    FacultyPublicationDAO.bulk_upsert(session, rows)
 
         return fac_id
 
@@ -190,3 +201,67 @@ class FacultyLinkDAO:
         stmt = pg_insert(FacultyLink).values(rows)
         stmt = stmt.on_conflict_do_nothing(index_elements=["faculty_id", "url"])
         session.execute(stmt)
+
+# ─────────────────────────────────────────────────────────────
+# Publication DAO
+# ─────────────────────────────────────────────────────────────
+class FacultyPublicationDAO:
+    @staticmethod
+    def bulk_upsert(session: Session, rows: List[dict]) -> None:
+        """
+        Upsert publications by (faculty_id, openalex_work_id).
+
+        rows: list of dicts with keys:
+            - faculty_id (int)
+            - openalex_work_id (str)          # REQUIRED for conflict target
+            - title (str)
+            - year (int | None)
+            - abstract (str | None)           [optional]
+            - scholar_author_id (str | None)  [optional]
+        """
+        if not rows:
+            return
+
+        stmt = pg_insert(FacultyPublication).values(rows)
+        stmt = stmt.on_conflict_do_update(
+            index_elements=["faculty_id", "openalex_work_id"],
+            set_={
+                "title": stmt.excluded.title,
+                "year": stmt.excluded.year,
+                "abstract": stmt.excluded.abstract,
+                "scholar_author_id": stmt.excluded.scholar_author_id,
+            },
+        )
+        session.execute(stmt)
+
+    @staticmethod
+    def replace_for_faculty(
+        session: Session,
+        faculty_id: int,
+        rows: List[dict],
+    ) -> None:
+        """
+        Delete all existing publications for a faculty, then insert the given rows.
+
+        rows: dicts WITHOUT faculty_id; this method will inject it.
+              e.g. {
+                "openalex_work_id": "...",
+                "title": "...",
+                "year": 2025,
+                "abstract": "...",
+                "scholar_author_id": "A123..."
+              }
+        """
+        # delete old
+        session.execute(
+            delete(FacultyPublication).where(FacultyPublication.faculty_id == faculty_id)
+        )
+
+        if not rows:
+            return
+
+        payload = [
+            {"faculty_id": faculty_id, **row}
+            for row in rows
+        ]
+        session.execute(pg_insert(FacultyPublication).values(payload))

@@ -162,6 +162,7 @@ class AttachmentPersistenceDTO:
         return AttachmentPersistenceDTO(opportunity_id=opportunity_id, file_name=fn, download_path=dp)
 
 
+#TODO: Put mappers in separate files
 # ========== Convenience mappers for whole search results ==========
 def build_opportunity_persistence_list(search_dto) -> List[OpportunityPersistenceDTO]:
     """
