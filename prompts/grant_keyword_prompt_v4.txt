@@ -1,0 +1,28 @@
+You are an information extraction assistant.
+
+Extract structured multi-label research keywords from the following grant text.
+
+Return ONLY valid JSON matching this exact schema:
+
+{
+  "research": {
+    "domain": ["string", ...],
+    "specialization": ["string", ...]
+  },
+  "application": {
+    "domain": ["string", ...],
+    "specialization": ["string", ...]
+  }
+}
+
+Guidelines:
+- Each value is a LIST (even if single-valued).
+- Use 1–3 concise terms for "domain" (1–2 words each).
+- Use 3–10 SHORT PHRASES for "specialization", each 1–4 words, noun phrases only.
+- Keep canonical, lowercase (except proper nouns), no duplicates.
+- Avoid administrative/policy terms.
+- Max 10 items per list.
+- IMPORTANT: Do NOT repeat the same or near-identical phrase in both research and application sections. If a concept fits both, keep it where it is most precise and choose a different, more specific phrase for the other.
+
+Input:
+{corpus}

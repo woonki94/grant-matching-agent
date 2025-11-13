@@ -1,5 +1,6 @@
 # services/generate_faculty_keywords.py
 from __future__ import annotations
+from util.keyword_cleanup import enforce_caps_and_limits 
 
 from pathlib import Path
 from typing import List, Dict, Any, Optional
@@ -92,6 +93,20 @@ def extract_keywords_via_llm(corpus: str, max_keywords: int = 30) -> Dict[str, A
         return _extract_with_gemini(corpus, max_keywords)
 
 
+# def _extract_with_openai(corpus: str, max_keywords: int) -> Dict[str, Any]:
+#     client = OpenAI(api_key=openai_key)
+#     prompt = build_prompt(FACULTY_PROMPT_PATH, corpus, max_keywords)
+
+#     response = client.responses.create(
+#         model="gpt-5",
+#         input=prompt
+#     )
+#     text = response.output_text or "{}"
+#     #print(text)
+#     data = json.loads(text)
+#     return data
+
+# Added NEW: normalize + Qwen-embedding-based cross-domain de-dup
 def _extract_with_openai(corpus: str, max_keywords: int) -> Dict[str, Any]:
     client = OpenAI(api_key=openai_key)
     prompt = build_prompt(FACULTY_PROMPT_PATH, corpus, max_keywords)
@@ -101,8 +116,10 @@ def _extract_with_openai(corpus: str, max_keywords: int) -> Dict[str, Any]:
         input=prompt
     )
     text = response.output_text or "{}"
-    #print(text)
     data = json.loads(text)
+
+    # NEW: normalize + semantic de-dup (research vs application)
+    data = enforce_caps_and_limits(data, max_items_per_list=10)
     return data
 
 
