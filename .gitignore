@@ -2,5 +2,9 @@
 /venv/
 /.venv/
 api.env
-.venv/
+api_key.env
 .DS_Store
+
+# Python cache
+__pycache__/
+*.py[cod]

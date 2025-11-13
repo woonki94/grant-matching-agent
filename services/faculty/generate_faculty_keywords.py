@@ -1,5 +1,6 @@
 # services/generate_faculty_keywords.py
 from __future__ import annotations
+from util.keyword_cleanup import enforce_caps_and_limits 
 
 from pathlib import Path
 from typing import List, Dict, Any, Optional
@@ -32,7 +33,7 @@ load_dotenv(dotenv_path=env_path, override=True)
 gemini_key = os.getenv("GEMINI_API_KEY")
 openai_key = os.getenv("OPENAI_API_KEY")
 
-FACULTY_PROMPT_PATH = Path(__file__).resolve().parents[2] / "prompts" / "faculty_keyword_prompt.txt"
+FACULTY_PROMPT_PATH = Path(__file__).resolve().parents[2] / "prompts" / "faculty_keyword_prompt_v3.txt"
 
 
 # ─────────────────────────────────────────────────────────────
@@ -125,6 +126,20 @@ def extract_keywords_via_llm(corpus: str, max_keywords: int = 30) -> Dict[str, A
         return _extract_with_gemini(corpus, max_keywords)
 
 
+# def _extract_with_openai(corpus: str, max_keywords: int) -> Dict[str, Any]:
+#     client = OpenAI(api_key=openai_key)
+#     prompt = build_prompt(FACULTY_PROMPT_PATH, corpus, max_keywords)
+
+#     response = client.responses.create(
+#         model="gpt-5",
+#         input=prompt
+#     )
+#     text = response.output_text or "{}"
+#     #print(text)
+#     data = json.loads(text)
+#     return data
+
+# Added NEW: normalize + Qwen-embedding-based cross-domain de-dup
 def _extract_with_openai(corpus: str, max_keywords: int) -> Dict[str, Any]:
     client = OpenAI(api_key=openai_key)
     prompt = build_prompt(FACULTY_PROMPT_PATH, corpus, max_keywords)
@@ -135,8 +150,10 @@ def _extract_with_openai(corpus: str, max_keywords: int) -> Dict[str, Any]:
         input=prompt
     )
     text = response.output_text or "{}"
-    #print(text)
     data = json.loads(text)
+
+    # NEW: normalize + semantic de-dup (research vs application)
+    data = enforce_caps_and_limits(data, max_items_per_list=10)
     return data
 
 
@@ -145,7 +162,7 @@ def _extract_with_gemini(corpus: str, max_keywords: int) -> Dict[str, Any]:
     client = genai.Client(api_key=gemini_key)
     prompt = build_prompt(FACULTY_PROMPT_PATH, corpus, max_keywords)
     response = client.models.generate_content(
-        model="gemini-2.5-flash", contents=prompt
+        model="gemini-2.5-pro", contents=prompt
     )
 
     #print(response)
@@ -168,7 +185,7 @@ def _extract_with_gemini(corpus: str, max_keywords: int) -> Dict[str, Any]:
 # ─────────────────────────────────────────────────────────────
 # Public runners (single + batch)
 # ─────────────────────────────────────────────────────────────
-def mine_keywords_for_one_faculty(db: Session, faculty_id: int, *, max_keywords: int = 30, source_tag: str = "gemini") -> int:
+def mine_keywords_for_one_faculty(db: Session, faculty_id: int, *, max_keywords: int = 30, source_tag: str = "gpt-5") -> int:
     fac = db.get(mf.Faculty, faculty_id)
     if not fac:
         return 0
@@ -178,8 +195,9 @@ def mine_keywords_for_one_faculty(db: Session, faculty_id: int, *, max_keywords:
         return 0
 
     items = extract_keywords_via_llm(corpus, max_keywords=max_keywords)
-
+    #print(items)
     structured_keywords = _normalize_to_new_schema(items)
+    #print(structured_keywords)
 
     if (_count_total_strings(structured_keywords) == 0
             and not structured_keywords.get("area")
@@ -203,7 +221,7 @@ def mine_keywords_for_all_faculty(
     *,
     batch_size: int = 100,
     max_keywords: int = 50,
-    only_missing: bool = True,
+    only_missing: bool = False,
     sleep_s: float = 0.25,
 ) -> Dict[str, Any]:
     """
