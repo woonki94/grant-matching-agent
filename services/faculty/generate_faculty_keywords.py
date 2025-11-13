@@ -79,6 +79,39 @@ def _build_corpus_for_faculty(db: Session, fac: mf.Faculty, *, max_chars: int = 
     if rg_names:
         parts.append("Research Groups: " + ", ".join(sorted(set(n.strip() for n in rg_names if n))))
 
+    # ---------------------------------------------------------
+    # Publications (
+    # ---------------------------------------------------------
+    pubs = db.execute(
+        select(
+            mf.FacultyPublication.year,
+            mf.FacultyPublication.title,
+            mf.FacultyPublication.abstract
+        ).where(mf.FacultyPublication.faculty_id == fac.id)
+        .order_by(mf.FacultyPublication.year.desc())
+    ).all()
+
+    if pubs:
+        pub_lines = ["Research:\n"]
+        for year, title, abstract in pubs:
+            if not title:
+                continue
+
+            line = []
+
+            if year:
+                line.append(f"{year} — {title}")
+            else:
+                line.append(title)
+
+            if abstract:
+                line.append(abstract.strip())
+
+            pub_lines.append("\n".join(line) + "\n")
+
+        parts.append("\n".join(pub_lines).strip())
+
+
     corpus = "\n\n".join([p for p in parts if p]).strip()
     return corpus[:max_chars]
 
@@ -110,6 +143,7 @@ def extract_keywords_via_llm(corpus: str, max_keywords: int = 30) -> Dict[str, A
 def _extract_with_openai(corpus: str, max_keywords: int) -> Dict[str, Any]:
     client = OpenAI(api_key=openai_key)
     prompt = build_prompt(FACULTY_PROMPT_PATH, corpus, max_keywords)
+    #print(prompt)
 
     response = client.responses.create(
         model="gpt-5",

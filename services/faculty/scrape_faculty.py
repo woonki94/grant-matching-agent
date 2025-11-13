@@ -4,7 +4,7 @@ from bs4 import BeautifulSoup
 import db.models.keywords_faculty  # defines FacultyKeyword
 import db.models.faculty           # defines Faculty
 from services.faculty.scrape_individual_faculty import parse_profile
-from services.faculty.save_faculty import save_profile_dict
+from services.faculty.save_faculty import save_profile_dict, enrich_faculty_publications
 
 #TODO: PUT links on the separate config file
 BASE = "https://engineering.oregonstate.edu"
@@ -63,5 +63,18 @@ if __name__ == "__main__":
     links = crawl(max_pages=0)
 
     for link in links:
-        data = parse_profile(link)
-        fid = save_profile_dict(data)
+        try:
+            profile = parse_profile(link)
+            faculty_id = save_profile_dict(profile)
+
+            # skip publications if name is missing
+            if not profile.get("name"):
+                print(f"[SKIP PUBS] No name for {link}")
+                continue
+
+            num_pubs = enrich_faculty_publications(faculty_id)
+            print(f"[OK] {profile.get('name')} (id={faculty_id}) -> {num_pubs} pubs")
+
+        except Exception as e:
+            # Don't let one bad profile kill the whole run
+            print(f"[ERROR] link={link} error={e}")
