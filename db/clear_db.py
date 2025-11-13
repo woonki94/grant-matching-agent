@@ -13,7 +13,7 @@ if __package__ is None or __package__ == "":
 from db.base import Base
 from db.db_conn import engine
 
-# Import ALL model modules so their tables register on Base
+# Import models so Base.metadata knows them
 from db.models.keywords_grant import Keyword
 from db.models.keywords_faculty import FacultyKeyword
 from db.models.faculty_publication import FacultyPublication
@@ -21,19 +21,28 @@ from db.models.faculty_publication import FacultyPublication
 from db.models.grant import Opportunity
 from db.models.faculty import Faculty
 
+from sqlalchemy import text
+
 # ───────────────────────────────────────────────
-# Initialize DB
+# Clear All Tables
 # ───────────────────────────────────────────────
-def init_database() -> None:
-    print("Creating database tables (if not exist)...")
-    print("Models loaded tables:", list(Base.metadata.tables.keys()))
+def clear_all_data() -> None:
+    with engine.connect() as conn:
+        trans = conn.begin()
+        try:
+            print("Clearing all data from tables...")
+            # Disable foreign key constraints
+            conn.execute(text("SET session_replication_role = 'replica';"))
+            for table in reversed(Base.metadata.sorted_tables):
+                print(f"Deleting from {table.name}...")
+                conn.execute(table.delete())
+            # Re-enable constraints
+            conn.execute(text("SET session_replication_role = 'origin';"))
+            trans.commit()
+            print("All data cleared successfully.")
+        except Exception as e:
+            trans.rollback()
+            print("Error clearing data:", e)
 
-    Base.metadata.create_all(engine)
-
-    print("All tables ready.")
-
-#TODO: Automate Database creation
 if __name__ == "__main__":
-    print("Known models:", sorted(k for k in Base.registry._class_registry.keys()
-                                  if isinstance(k, str)))
-    init_database()
+    clear_all_data()

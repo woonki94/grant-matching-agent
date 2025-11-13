@@ -1,5 +1,8 @@
 import os
 import sys
+from sqlalchemy import text
+
+from db.init_db import init_database
 
 # ───────────────────────────────────────────────
 # Ensure project root on sys.path
@@ -13,7 +16,7 @@ if __package__ is None or __package__ == "":
 from db.base import Base
 from db.db_conn import engine
 
-# Import ALL model modules so their tables register on Base
+# Import models so they register with Base
 from db.models.keywords_grant import Keyword
 from db.models.keywords_faculty import FacultyKeyword
 from db.models.faculty_publication import FacultyPublication
@@ -21,19 +24,34 @@ from db.models.faculty_publication import FacultyPublication
 from db.models.grant import Opportunity
 from db.models.faculty import Faculty
 
+
 # ───────────────────────────────────────────────
-# Initialize DB
+# Drop All Tables
 # ───────────────────────────────────────────────
-def init_database() -> None:
-    print("Creating database tables (if not exist)...")
-    print("Models loaded tables:", list(Base.metadata.tables.keys()))
+def drop_database(confirm: bool = True) -> None:
+    """Drop all tables from the database."""
+    if confirm:
+        ans = input(
+            "This will DROP ALL TABLES in the current database. Continue? (y/N): "
+        ).strip().lower()
+        if ans != "y":
+            print("Aborted.")
+            return
 
-    Base.metadata.create_all(engine)
+    print("Dropping all tables...")
 
-    print("All tables ready.")
+    with engine.connect() as conn:
+        # Disable foreign key checks (Postgres-safe)
+        conn.execute(text("SET session_replication_role = 'replica';"))
 
-#TODO: Automate Database creation
+        # Drop all tables
+        Base.metadata.drop_all(bind=engine)
+
+        # Re-enable constraints
+        conn.execute(text("SET session_replication_role = 'origin';"))
+        print("All tables dropped successfully.")
+
+
 if __name__ == "__main__":
-    print("Known models:", sorted(k for k in Base.registry._class_registry.keys()
-                                  if isinstance(k, str)))
+    drop_database()
     init_database()

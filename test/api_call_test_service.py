@@ -11,7 +11,7 @@ from dto.grant_response_dto import PortalSearchResponseDTO, AttachmentDTO  # ←
 SIMPLER_API = "https://api.simpler.grants.gov/v1/opportunities/search"
 DETAIL_API_BASE = "https://api.simpler.grants.gov/v1/opportunities/"
 
-load_dotenv(dotenv_path="api_key.env")
+load_dotenv(dotenv_path="api.env")
 API_KEY = os.getenv("SIMPLER_API_KEY")
 
 def _session() -> requests.Session:
