@@ -2,6 +2,7 @@ from sqlalchemy import (
     Column, String, Integer, Text, JSON, ForeignKey,
     UniqueConstraint, Index
 )
+from db.models.faculty_publication import FacultyPublication
 from sqlalchemy.orm import relationship
 from db.base import Base
 
@@ -65,6 +66,12 @@ class Faculty(Base):
         "FacultyKeyword",
         back_populates="faculty",
         uselist=False,
+        cascade="all, delete-orphan",
+        passive_deletes=True,
+    )
+    publications = relationship(
+        "FacultyPublication",
+        back_populates="faculty",
         cascade="all, delete-orphan",
         passive_deletes=True,
     )

@@ -5,8 +5,10 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from db.db_conn import engine
 from db.dao.faculty import (
-    FacultyDAO
+    FacultyDAO, FacultyPublicationDAO
 )
+from db.models.faculty import Faculty
+from services.faculty.call_publication_faculty import fetch_faculty_publications_from_openalex
 
 SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
 
@@ -72,3 +74,41 @@ def save_profile_dict(profile: Dict[str, Any]) -> int:
         session.commit()
         return faculty_id
 
+def enrich_faculty_publications(faculty_id: int) -> int:
+    """
+    Fetch OpenAlex publications for a faculty and upsert into faculty_publication.
+    Returns number of publications upserted.
+    """
+    with SessionLocal() as session:
+        faculty = session.query(Faculty).filter(Faculty.id == faculty_id).first()
+        if not faculty:
+            raise ValueError(f"Faculty id {faculty_id} not found")
+
+        # if all OSU:
+        university = "Oregon State University"
+
+        author_id, dtos = fetch_faculty_publications_from_openalex(
+            faculty_id=faculty.id,
+            full_name=faculty.name,
+            university=university,
+            per_page=10,
+            max_pages=1,
+        )
+
+        if not author_id or not dtos:
+            return 0
+
+        rows = [
+            {
+                "faculty_id": dto.faculty_id,
+                "title": dto.title,
+                "year": dto.year,
+                "abstract": dto.abstract,
+                "scholar_author_id": dto.scholar_author_id,
+            }
+            for dto in dtos
+        ]
+
+        FacultyPublicationDAO.replace_for_faculty(session, faculty.id, rows)
+        session.commit()
+        return len(rows)
