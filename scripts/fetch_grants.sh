@@ -18,12 +18,14 @@ fi
 
 PAGE_OFFSET=${1:-1}
 PAGE_SIZE=${2:-5}
-QUERY=${3:-""}   # optional text search term
+MAX_PAGE=${3:-10}
+QUERY=${4:-""}   # optional text search term
 
 echo " Running fetch_commit_grant.py ..."
 echo "   Page offset : $PAGE_OFFSET"
 echo "   Page size   : $PAGE_SIZE"
+echo "   Page size   : $MAX_PAGE"
 echo "   Query       : ${QUERY:-<none>}"
 echo
 
-python -m services.grant.save_grant "$PAGE_OFFSET" "$PAGE_SIZE" "$QUERY"
+python -m services.grant.save_grant "$PAGE_OFFSET" "$PAGE_SIZE" "$MAX_PAGE" "$QUERY"

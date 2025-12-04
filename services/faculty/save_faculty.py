@@ -91,8 +91,6 @@ def enrich_faculty_publications(faculty_id: int) -> int:
             faculty_id=faculty.id,
             full_name=faculty.name,
             university=university,
-            per_page=10,
-            max_pages=1,
         )
 
         if not author_id or not dtos:

@@ -18,7 +18,7 @@ def fetch(url: str) -> BeautifulSoup:
 
 def extract_faculty_links(soup: BeautifulSoup) -> list[str]:
     out = []
-    for a in soup.select("h2.fw-bolder.text-break a[href^='/people/']"):
+    for a in soup.select("div.coe-brand-people-card a[href^='/people/']"):
         href = a.get("href")
         if href and href.startswith("/people/"):
             out.append(urljoin(BASE, href))
@@ -60,7 +60,7 @@ def crawl(max_pages: int = 50) -> list[str]:
     return all_links
 
 if __name__ == "__main__":
-    links = crawl(max_pages=0)
+    links = crawl(max_pages=15)
 
     for link in links:
         try:
