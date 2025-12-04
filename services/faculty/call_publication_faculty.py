@@ -1,3 +1,5 @@
+from datetime import datetime
+
 import requests
 from typing import Optional, Dict, Any, List
 from dto.faculty_publication_dto import FacultyPublicationPersistenceDTO
@@ -94,9 +96,11 @@ def get_author_works_with_abstracts(
     per_page: int = 50,
     max_pages: int = 1,
     sort_order: str = "publication_year:desc",
+    min_year: int | None = None,
 ) -> List[Dict[str, Any]]:
     """
     Fetches works for a given OpenAlex author id ordered by date (newest first).
+    If min_year is provided, only returns works with publication_year >= min_year.
     """
     all_works: List[Dict[str, Any]] = []
     url = f"{OPENALEX_BASE}/works"
@@ -104,9 +108,19 @@ def get_author_works_with_abstracts(
     page_cursor = "*"
     pages_fetched = 0
 
+    # Build filter string
+    filters = [f"authorships.author.id:{author_id}"]
+
+    if min_year is not None:
+        current_year = datetime.now().year
+        # Range: publication_year:min_year-current_year
+        filters.append(f"publication_year:{min_year}-{current_year}")
+
+    filter_str = ",".join(filters)
+
     while pages_fetched < max_pages:
         params = {
-            "filter": f"authorships.author.id:{author_id}",
+            "filter": filter_str,
             "per-page": per_page,
             "cursor": page_cursor,
             "sort": sort_order,
@@ -180,6 +194,8 @@ def fetch_faculty_publications_from_openalex(
     university: str,
     per_page: int = 50,
     max_pages: int = 1,
+    years_back: int = 5,
+
 ) -> tuple[Optional[str], List[FacultyPublicationPersistenceDTO]]:
     """
     End-to-end helper:
@@ -201,12 +217,17 @@ def fetch_faculty_publications_from_openalex(
         return None, []
 
     author_id = author["id"]
+    min_year = None
+    if years_back is not None:
+        current_year = datetime.now().year
+        min_year = current_year - (years_back - 1)
 
     works = get_author_works_with_abstracts(
         author_id=author_id,
         per_page=per_page,
         max_pages=max_pages,
         sort_order="publication_year:desc",
+        min_year=min_year,
     )
 
     dtos = build_publication_dtos_from_openalex_works(
