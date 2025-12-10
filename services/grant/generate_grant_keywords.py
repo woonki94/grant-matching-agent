@@ -30,7 +30,7 @@ API_KEY = os.getenv("API_KEY")
 gemini_key = os.getenv("GEMINI_API_KEY")
 openai_key = os.getenv("OPENAI_API_KEY")
 
-GRANT_PROMPT_PATH = Path(__file__).resolve().parents[2] / "prompts" / "grant_keyword_prompt_v4.txt"
+GRANT_PROMPT_PATH = Path(__file__).resolve().parents[2] / "prompts" / "grant_keyword_prompt_v3.txt"
 
 def _strip_html(s: Optional[str]) -> str:
     if not s:

@@ -1,0 +1,24 @@
+You are writing a justification to explain to a faculty member why a specific grant is a good fit for them.
+
+### Grant Information
+Title: {grant_title}
+Agency: {grant_agency}
+
+Grant Domains: {grant_domains}
+Grant Specializations: {grant_specializations}
+
+### Faculty Research
+Faculty Domains: {faculty_domains}
+Faculty Specializations: {faculty_specializations}
+
+### Task
+Write 3–4 sentences explaining why this faculty member is relevant for this grant.
+Base the explanation on overlaps in research areas, methods, or application domains.
+Do NOT mention algorithms, embeddings, cosine similarity, scores, or that this was machine-generated.
+
+Return ONLY the justification text.
+
+
+
+
+

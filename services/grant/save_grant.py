@@ -8,7 +8,7 @@ from db.dao.grant import OpportunityDAO, AttachmentDAO
 
 #TODO: Parallel fetching with async, Progress bar would look better
 if __name__ == "__main__":
-    # Fetch page 1, 5 results
+
     page_offset = int(sys.argv[1]) if len(sys.argv) > 1 else 1
     page_size = int(sys.argv[2]) if len(sys.argv) > 2 else 50
     max_page =  int(sys.argv[3]) if len(sys.argv) > 3 else 10
@@ -41,3 +41,5 @@ if __name__ == "__main__":
                                                                 fetch_content=True)
             sess.commit()
             print(f"Stored page {p} ({len(opps_p)} opportunities).")
+
+

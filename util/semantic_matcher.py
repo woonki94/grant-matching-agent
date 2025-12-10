@@ -23,7 +23,7 @@ def flatten_keywords(kw: Dict[str, Dict[str, List[str]]]) -> List[str]:
 def rank_faculty_to_grant(
     faculty_keywords: Dict,
     grant_keywords: Dict,
-    top_k_pairs: int = 20
+    top_k_pairs: int = 10
 ) -> List[Tuple[str, str, float]]:
     f_terms = flatten_keywords(faculty_keywords)
     g_terms = flatten_keywords(grant_keywords)

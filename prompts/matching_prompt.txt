@@ -1,0 +1,21 @@
+You are evaluating whether a faculty member’s research matches a grant.
+
+Grant Domains: {grant_domains}
+Grant Specializations: {grant_specs}
+
+Faculty Domains: {fac_domains}
+Faculty Specializations: {fac_specs}
+
+Initial Semantic Similarity Score (domains only): {domain_score}
+
+Task:
+1. Evaluate whether the domains conceptually align.
+2. Evaluate whether the faculty’s specializations meaningfully relate to the grant’s specializations.
+3. Provide a refined relevance score between 0 and 1.
+4. Be concise; 3–4 sentences.
+
+Respond in JSON:
+{
+  "score": <float>,
+  "reason": "<short explanation>"
+}
