@@ -32,6 +32,6 @@ echo "   Max keywords : $MAX_KEYWORDS"
 echo
 
 # call the actual module in your repo
-python -m services.faculty.generate_faculty_keywords "$BATCH_SIZE" "$MAX_KEYWORDS"
+python -m services.faculty.generate_keywords "$BATCH_SIZE" "$MAX_KEYWORDS"
 
-echo "Faculty keyword generation complete ✅"
+echo "Faculty keyword generation complete"

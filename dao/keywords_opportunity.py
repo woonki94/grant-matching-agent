@@ -1,7 +1,7 @@
 from __future__ import annotations
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import Session
-from db.models.keywords_grant import Keyword
+from db.models.keywords_opportunity import Keyword
 
 
 class KeywordDAO:
@@ -18,3 +18,19 @@ class KeywordDAO:
         )
         db.execute(stmt)
         db.commit()
+
+    @staticmethod
+    def get_by_opportunity_id(db: Session, opportunity_id: str):
+        """
+        Returns the Keyword row for this opportunity_id, or None if not found.
+
+        Example:
+            row = KeywordDAO.get_by_opportunity_id(db, "DE-FOA-0003141")
+            if row:
+                print(row.keywords)
+        """
+        return (
+            db.query(Keyword)
+            .filter(Keyword.opportunity_id == opportunity_id)
+            .one_or_none()
+        )

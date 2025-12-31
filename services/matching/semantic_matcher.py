@@ -34,7 +34,7 @@ def rank_pairs(faculty_kw: Dict, grant_kw: Dict, top_k_pairs: int = 20) -> List[
 
 def score_faculty_vs_grant(faculty_kw: Dict, grant_kw: Dict, agg: str = "max") -> float:
     """
-    Aggregate a single similarity score for (faculty, grant).
+    Aggregate a single similarity score for (faculty, opportunity).
     agg = 'max' (best term-to-term similarity) or 'mean_top5' (average of top-5).
     """
     f_terms = _flatten(faculty_kw)
@@ -46,7 +46,7 @@ def score_faculty_vs_grant(faculty_kw: Dict, grant_kw: Dict, agg: str = "max") -
     G = embed_texts(g_terms)
     S = cosine_sim_matrix(F, G)  # (len(f_terms), len(g_terms))
 
-    # per-faculty-term best match against grant terms
+    # per-faculty-term best match against opportunity terms
     best_per_f_term = S.max(axis=1) if S.size else np.zeros((len(f_terms),), dtype=np.float32)
 
     if agg == "max":

@@ -1,10 +1,21 @@
 from datetime import datetime
-
 import requests
 from typing import Optional, Dict, Any, List
-from dto.faculty_publication_dto import FacultyPublicationPersistenceDTO
+from sqlalchemy.orm import Session, sessionmaker
 
-OPENALEX_BASE = "https://api.openalex.org"
+from config import settings
+from db.db_conn import engine
+
+
+from dto.faculty_dto import FacultyPublicationPersistenceDTO
+from db.models.faculty import Faculty
+from dao.faculty import (
+   FacultyPublicationDAO
+)
+
+SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
+
+OPENALEX_BASE = settings.openalex_base_url
 
 
 def _get(url: str, params: dict | None = None) -> dict:
@@ -237,4 +248,44 @@ def fetch_faculty_publications_from_openalex(
     )
 
     return author_id, dtos
+
+
+def enrich_faculty_publications(faculty_id: int, years_back: int) -> int:
+    """
+    Fetch OpenAlex publications for a faculty and upsert into faculty_publication.
+    Returns number of publications upserted.
+    """
+    with SessionLocal() as session:
+        faculty = session.query(Faculty).filter(Faculty.id == faculty_id).first()
+        if not faculty:
+            raise ValueError(f"Faculty id {faculty_id} not found")
+
+        # if all OSU:
+        #TODO: hard coded, not good
+        university = "Oregon State University"
+
+        author_id, dtos = fetch_faculty_publications_from_openalex(
+            faculty_id=faculty.id,
+            full_name=faculty.name,
+            university=university,
+            years_back= years_back,
+        )
+
+        if not author_id or not dtos:
+            return 0
+
+        rows = [
+            {
+                "faculty_id": dto.faculty_id,
+                "title": dto.title,
+                "year": dto.year,
+                "abstract": dto.abstract,
+                "scholar_author_id": dto.scholar_author_id,
+            }
+            for dto in dtos
+        ]
+
+        FacultyPublicationDAO.replace_for_faculty(session, faculty.id, rows)
+        session.commit()
+        return len(rows)
 

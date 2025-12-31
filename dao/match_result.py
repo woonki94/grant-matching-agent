@@ -12,9 +12,6 @@ class MatchResultDAO:
         llm_score: float,
         reason: str
     ):
-        """
-        Insert or update a single match result.
-        """
 
         existing = (
             db.query(MatchResult)

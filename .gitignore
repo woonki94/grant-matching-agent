@@ -1,8 +1,8 @@
 # Project exclude paths
 /venv/
 /.venv/
+.env
 api.env
-api_key.env
 .DS_Store
 
 # Python cache

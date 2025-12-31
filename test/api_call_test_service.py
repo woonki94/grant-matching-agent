@@ -5,8 +5,8 @@ import requests
 from requests.adapters import HTTPAdapter, Retry
 from dotenv import load_dotenv
 #TODO: Make everything absolute path
-from dto.grant_request_dto import SearchRequest, Pagination, SortOrder, OpportunityStatusFilter
-from dto.grant_response_dto import PortalSearchResponseDTO, AttachmentDTO  # ← import new DTO
+from dto.opportunity_request_dto import SearchRequest, Pagination, SortOrder, OpportunityStatusFilter
+from dto.opportunity_response_dto import PortalSearchResponseDTO, AttachmentDTO  # ← import new DTO
 
 SIMPLER_API = "https://api.simpler.grants.gov/v1/opportunities/search"
 DETAIL_API_BASE = "https://api.simpler.grants.gov/v1/opportunities/"

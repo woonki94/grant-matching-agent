@@ -5,7 +5,7 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import Session,selectinload
 
 
-from db.models.grant import Opportunity, Attachment
+from db.models.opportunity import Opportunity, Attachment
 from util.extract_content import fetch_and_extract_one
 def _safe_iso(v):
     if v is None:

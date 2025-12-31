@@ -17,8 +17,8 @@ from sentence_transformers import SentenceTransformer
 from db.db_conn import SessionLocal
 import db.models.faculty as mf
 import db.models.keywords_faculty as mfk
-import db.models.grant as mg
-import db.models.keywords_grant as mgk
+import db.models.opportunity as mg
+import db.models.keywords_opportunity as mgk
 
 # ─────────────────────────────────────────────────────────────
 # ENV
@@ -69,7 +69,7 @@ def _cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
 # ─────────────────────────────────────────────────────────────
 def match_grants_to_faculty(db: Session, *, batch_size: int = 20, top_k: int = 5) -> List[Dict[str, Any]]:
     
-    #Computes top-K matching faculty for each grant in the batch.
+    #Computes top-K matching faculty for each opportunity in the batch.
    
     # Load grants & their keywords
     grants_query = (
@@ -99,7 +99,7 @@ def match_grants_to_faculty(db: Session, *, batch_size: int = 20, top_k: int = 5
 
     results: List[Dict[str, Any]] = []
 
-    # Compute top-K matches for each grant
+    # Compute top-K matches for each opportunity
     for gid, title, gkw in grants:
         gtext = _flatten_keywords(gkw or {})
         gemb = _get_embedding_with_openai(gtext)

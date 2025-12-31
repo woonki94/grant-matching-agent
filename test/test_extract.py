@@ -155,7 +155,7 @@ def extract_text_from_file(path: Path) -> Tuple[str, str]:
 # ---------- CLI ----------
 def main():
     p = argparse.ArgumentParser(
-        description="Download grant attachments (pdf/docx/xlsx/xls/csv) and extract text."
+        description="Download opportunity attachments (pdf/docx/xlsx/xls/csv) and extract text."
     )
     p.add_argument("--out", default="downloads", help="Download directory (default: downloads)")
     p.add_argument("--txtout", default="extracted", help="Extracted text output dir (default: extracted)")

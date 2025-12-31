@@ -17,12 +17,11 @@ from db.base import Base
 from db.db_conn import engine
 
 # Import models so they register with Base
-from db.models.keywords_grant import Keyword
+from db.models.keywords_opportunity import Keyword
 from db.models.keywords_faculty import FacultyKeyword
-from db.models.faculty_publication import FacultyPublication
 from db.models.match_result import MatchResult
 
-from db.models.grant import Opportunity
+from db.models.opportunity import Opportunity
 from db.models.faculty import Faculty
 
 

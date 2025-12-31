@@ -1,5 +1,6 @@
-# services/generate_faculty_keywords.py
 from __future__ import annotations
+
+from config import OPENAI_MODEL, OPENAI_API_KEY
 from util.keyword_cleanup import enforce_caps_and_limits 
 
 from pathlib import Path
@@ -18,23 +19,15 @@ from sqlalchemy.orm import Session
 
 from google import genai
 from db.db_conn import SessionLocal
-from db.dao.keywords_faculty import FacultyKeywordDAO
+from dao.keywords_faculty import FacultyKeywordDAO
 
 import db.models.faculty as mf
 import db.models.keywords_faculty as mfk
 from util.build_prompt import build_prompt
 from util.format_keywords import _normalize_to_new_schema, _count_total_strings
 
-# ─────────────────────────────────────────────────────────────
-# ENV
-# ─────────────────────────────────────────────────────────────
-env_path = Path(__file__).resolve().parents[2] / "api.env"
-load_dotenv(dotenv_path=env_path, override=True)
-gemini_key = os.getenv("GEMINI_API_KEY")
-openai_key = os.getenv("OPENAI_API_KEY")
 
 FACULTY_PROMPT_PATH = Path(__file__).resolve().parents[2] / "prompts" / "faculty_keyword_prompt_v3.txt"
-
 
 # ─────────────────────────────────────────────────────────────
 # Helpers
@@ -116,37 +109,12 @@ def _build_corpus_for_faculty(db: Session, fac: mf.Faculty, *, max_chars: int = 
     return corpus[:max_chars]
 
 def extract_keywords_via_llm(corpus: str, max_keywords: int = 30) -> Dict[str, Any]:
-    #provider = (os.getenv("KEYWORD_LLM_PROVIDER") or "").lower()  # "openai" | "gemini" | ""
-    provider = "openai"
-
-    if provider == "openai":
-        return _extract_with_openai(corpus, max_keywords)
-
-    if provider == "gemini":
-        return _extract_with_gemini(corpus, max_keywords)
-
-
-# def _extract_with_openai(corpus: str, max_keywords: int) -> Dict[str, Any]:
-#     client = OpenAI(api_key=openai_key)
-#     prompt = build_prompt(FACULTY_PROMPT_PATH, corpus, max_keywords)
-
-#     response = client.responses.create(
-#         model="gpt-5",
-#         input=prompt
-#     )
-#     text = response.output_text or "{}"
-#     #print(text)
-#     data = json.loads(text)
-#     return data
-
-# Added NEW: normalize + Qwen-embedding-based cross-domain de-dup
-def _extract_with_openai(corpus: str, max_keywords: int) -> Dict[str, Any]:
-    client = OpenAI(api_key=openai_key)
+    client = OpenAI(api_key=OPENAI_API_KEY)
     prompt = build_prompt(FACULTY_PROMPT_PATH, corpus, max_keywords)
-    #print(prompt)
+    # print(prompt)
 
     response = client.responses.create(
-        model="gpt-5",
+        model=OPENAI_MODEL,
         input=prompt
     )
     text = response.output_text or "{}"
@@ -157,35 +125,10 @@ def _extract_with_openai(corpus: str, max_keywords: int) -> Dict[str, Any]:
     return data
 
 
-def _extract_with_gemini(corpus: str, max_keywords: int) -> Dict[str, Any]:
-
-    client = genai.Client(api_key=gemini_key)
-    prompt = build_prompt(FACULTY_PROMPT_PATH, corpus, max_keywords)
-    response = client.models.generate_content(
-        model="gemini-2.5-pro", contents=prompt
-    )
-
-    #print(response)
-    text = response.text or "{}"
-    s = text.strip()
-
-    if s.startswith("```"):
-        # remove leading ```json or ``` and trailing ```
-        s = re.sub(r"^```(?:json)?\s*", "", s)
-        s = re.sub(r"\s*```$", "", s).strip()
-
-    # If still not a pure JSON object, try to grab the first {...} block
-    if not s.startswith("{"):
-        m = re.search(r"\{(?:[^{}]|(?R))*\}", s, re.S)  # recursive-ish fallback
-        s = m.group(0) if m else "{}"
-
-    data = json.loads(s)
-    return data
-
 # ─────────────────────────────────────────────────────────────
 # Public runners (single + batch)
 # ─────────────────────────────────────────────────────────────
-def mine_keywords_for_one_faculty(db: Session, faculty_id: int, *, max_keywords: int = 30, source_tag: str = "gpt-5") -> int:
+def mine_keywords_for_one_faculty(db: Session, faculty_id: int, *, max_keywords: int = 30, source_tag: str ) -> int:
     fac = db.get(mf.Faculty, faculty_id)
     if not fac:
         return 0
@@ -210,7 +153,7 @@ def mine_keywords_for_one_faculty(db: Session, faculty_id: int, *, max_keywords:
             "faculty_id": fac.id,
             "keywords": structured_keywords,
             "raw_json": items,
-            "source": source_tag if gemini_key else "heuristic",
+            "source": source_tag,
         }],
     )
     return len(structured_keywords)
@@ -250,7 +193,7 @@ def mine_keywords_for_all_faculty(
         chunk = ids[page * batch_size : (page + 1) * batch_size]
         for fid in chunk:
             try:
-                c = mine_keywords_for_one_faculty(db, fid, max_keywords=max_keywords)
+                c = mine_keywords_for_one_faculty(db, fid, max_keywords=max_keywords, source_tag=OPENAI_MODEL)
                 written += c
             except Exception as e:
                 print(f"[faculty_keyword_mining] faculty_id={fid}: ERROR {e}")

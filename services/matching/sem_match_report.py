@@ -26,9 +26,9 @@ from db.db_conn import SessionLocal
 
 # 👇 Import ALL models that are referenced by relationships so SQLAlchemy sees them
 # If your models package already imports them in db/models/__init__.py, these three imports are enough:
-from db.models.keywords_grant import Keyword as GrantKeyword
+from db.models.keywords_opportunity import Keyword as GrantKeyword
 from db.models.keywords_faculty import FacultyKeyword as FacKeyword
-from db.models.grant import Opportunity
+from db.models.opportunity import Opportunity
 from db.models.faculty import Faculty
 
 from services.matching.semantic_matcher import score_faculty_vs_grant, rank_pairs
@@ -83,17 +83,17 @@ def load_faculty_kw_all(db: Session) -> List[Tuple[int, Dict]]:
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--grant-id", required=True)
+    ap.add_argument("--opportunity-id", required=True)
     ap.add_argument("--top", type=int, default=15)
     ap.add_argument("--agg", choices=["max", "mean_top5"], default="max",
-                    help="Aggregation for faculty↔grant score: "
+                    help="Aggregation for faculty↔opportunity score: "
                          "'max' (best single term) or 'mean_top5' (avg of top 5 matches)")
     args = ap.parse_args()
 
     with SessionLocal() as db:
         g_kw = load_grant_kw(db, args.grant_id)
         if not g_kw:
-            print(f"No keywords found for grant '{args.grant_id}'. "
+            print(f"No keywords found for opportunity '{args.grant_id}'. "
                   f"Run the grant keyword extractor first.")
             return
 
@@ -102,7 +102,7 @@ def main():
             print("No faculty keywords found. Run the faculty keyword extractor first.")
             return
 
-        # Score all faculty against the grant
+        # Score all faculty against the opportunity
         scored: List[Tuple[int, float, float]] = []
         for fid, f_kw in fac_rows:
             sem = score_faculty_vs_grant(f_kw, g_kw, agg=args.agg)

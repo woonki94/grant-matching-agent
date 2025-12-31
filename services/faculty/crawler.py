@@ -1,15 +1,28 @@
+from __future__ import annotations
+
 import requests
 from urllib.parse import urljoin
 from bs4 import BeautifulSoup
 import db.models.keywords_faculty  # defines FacultyKeyword
 import db.models.faculty           # defines Faculty
-from services.faculty.scrape_individual_faculty import parse_profile
-from services.faculty.save_faculty import save_profile_dict, enrich_faculty_publications
+from config import settings
+from services.faculty.profile_parser import parse_profile
 
-#TODO: PUT links on the separate config file
-BASE = "https://engineering.oregonstate.edu"
-LIST_PATH = "/people"
-HEADERS = {"User-Agent": "Mozilla/5.0 (+faculty-link-scraper; OSU project)"}
+from typing import Dict, Any, List
+from sqlalchemy.orm import Session, sessionmaker
+
+from db.db_conn import engine
+from dao.faculty import (
+    FacultyDAO, FacultyPublicationDAO
+)
+from dto.faculty_dto import build_faculty_bundle
+
+
+SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
+
+BASE = settings.osu_eng_base_url
+LIST_PATH = settings.osu_eng_list_path
+HEADERS = {"User-Agent": settings.scraper_user_agent}
 
 def fetch(url: str) -> BeautifulSoup:
     r = requests.get(url, headers=HEADERS, timeout=20)
@@ -59,22 +72,19 @@ def crawl(max_pages: int = 50) -> list[str]:
     print(f"\nTotal unique faculty profiles: {len(all_links)}")
     return all_links
 
-if __name__ == "__main__":
-    links = crawl(max_pages=15)
 
-    for link in links:
-        try:
-            profile = parse_profile(link)
-            faculty_id = save_profile_dict(profile)
 
-            # skip publications if name is missing
-            if not profile.get("name"):
-                print(f"[SKIP PUBS] No name for {link}")
-                continue
+def save_profile_dict(profile: Dict[str, Any]) -> int:
+    if not profile.get("source_url"):
+        raise ValueError("profile must include source_url")
 
-            num_pubs = enrich_faculty_publications(faculty_id)
-            print(f"[OK] {profile.get('name')} (id={faculty_id}) -> {num_pubs} pubs")
+    bundle = build_faculty_bundle(profile)
 
-        except Exception as e:
-            # Don't let one bad profile kill the whole run
-            print(f"[ERROR] link={link} error={e}")
+    with SessionLocal() as session:
+        faculty_id = FacultyDAO.upsert_one_bundle(
+            session,
+            **bundle.to_dao_args(),
+            delete_then_insert_children=True,
+        )
+        session.commit()
+        return faculty_id

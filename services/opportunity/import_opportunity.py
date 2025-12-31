@@ -1,14 +1,16 @@
-#TODO: Make everything absolute path
 import sys
+from pathlib import Path
 
-from services.grant.call_grant import run_search_pipeline
+PROJECT_ROOT = Path(__file__).resolve().parents[2]  # .../root
+sys.path.insert(0, str(PROJECT_ROOT))
+
+from services.opportunity.call_opportunity import run_search_pipeline
 from dataclasses import asdict
 from db.db_conn import SessionLocal
-from db.dao.grant import OpportunityDAO, AttachmentDAO
+from dao.opportunity import OpportunityDAO, AttachmentDAO
 
 #TODO: Parallel fetching with async, Progress bar would look better
-if __name__ == "__main__":
-
+def main():
     page_offset = int(sys.argv[1]) if len(sys.argv) > 1 else 1
     page_size = int(sys.argv[2]) if len(sys.argv) > 2 else 50
     max_page =  int(sys.argv[3]) if len(sys.argv) > 3 else 10
@@ -43,3 +45,5 @@ if __name__ == "__main__":
             print(f"Stored page {p} ({len(opps_p)} opportunities).")
 
 
+if __name__ == "__main__":
+    main()

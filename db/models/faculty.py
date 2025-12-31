@@ -2,7 +2,6 @@ from sqlalchemy import (
     Column, String, Integer, Text, JSON, ForeignKey,
     UniqueConstraint, Index
 )
-from db.models.faculty_publication import FacultyPublication
 from sqlalchemy.orm import relationship
 from db.base import Base
 
@@ -135,3 +134,34 @@ class FacultyLink(Base):
     url = Column(String(1024), nullable=False)
 
     faculty = relationship("Faculty", back_populates="links")
+
+
+
+class FacultyPublication(Base):
+    __tablename__ = "faculty_publication"
+    __table_args__ = (
+        UniqueConstraint(
+            "faculty_id",
+            "openalex_work_id",
+            name="ux_faculty_publication_unique_work",
+        ),
+        Index("ix_faculty_publication_faculty", "faculty_id"),
+        Index("ix_faculty_publication_year", "year"),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+
+    faculty_id = Column(
+        Integer,
+        ForeignKey("faculty.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+
+    openalex_work_id = Column(String(255), nullable=True)
+    scholar_author_id = Column(String(255))
+
+    title = Column(Text, nullable=False)
+    abstract = Column(Text)
+    year = Column(Integer)
+
+    faculty = relationship("Faculty", back_populates="publications")

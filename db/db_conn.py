@@ -4,7 +4,7 @@ import os
 
 # Example: postgresql+psycopg://user:pass@host:port/dbname
 DATABASE_URL = "postgresql+psycopg2://{user}:{pwd}@{host}:{port}/{db}".format(
-    user=os.getenv("PGUSER", "postgres"),
+    user=os.getenv("PGUSER", "kimwoonki"),
     pwd=os.getenv("PGPASSWORD", ""),
     host=os.getenv("PGHOST", "127.0.0.1"),
     port=os.getenv("PGPORT", "5432"),

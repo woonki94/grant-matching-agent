@@ -6,6 +6,8 @@ from openai import OpenAI, APIError, RateLimitError, APITimeoutError
 from dotenv import load_dotenv
 from pathlib import Path
 
+from config import OPENROUTER_API_KEY, QWEN_MODEL
+
 DEFAULT_OR_BASE = "https://openrouter.ai/api/v1"
 
 def _load_env():
@@ -17,11 +19,10 @@ def _load_env():
 
 def _get_openrouter_client() -> OpenAI:
     _load_env()
-    key = os.getenv("OPENROUTER_API_KEY")
     base = os.getenv("OPENROUTER_BASE_URL", DEFAULT_OR_BASE).rstrip("/")
-    if not key:
+    if not OPENROUTER_API_KEY:
         raise RuntimeError("OPENROUTER_API_KEY not set (api.env).")
-    client = OpenAI(api_key=key, base_url=base)
+    client = OpenAI(api_key=OPENROUTER_API_KEY, base_url=base)
     # sanity check – but no over-strict equality
     base_url_str = str(getattr(client, "base_url", "")).lower().rstrip("/")
     if "openrouter.ai" not in base_url_str:
@@ -31,7 +32,7 @@ def _get_openrouter_client() -> OpenAI:
 def _get_model() -> str:
     _load_env()
     # allow either name; keep QWEN_EMBED_MODEL for backward compat
-    model = (os.getenv("QWEN_EMBED_MODEL") or os.getenv("EMBED_MODEL") or "").strip()
+    model = QWEN_MODEL
     if not model:
         raise RuntimeError(
             "No embedding model configured. Set QWEN_EMBED_MODEL or EMBED_MODEL "

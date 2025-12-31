@@ -8,26 +8,21 @@ import requests
 from requests.adapters import HTTPAdapter, Retry
 from dotenv import load_dotenv
 
-# Request/Response DTOs (your existing ones)
-from dto.grant_request_dto import SearchRequest, Pagination, SortOrder, OpportunityStatusFilter, Filters
-from dto.grant_response_dto import PortalSearchResponseDTO, AttachmentDTO
+from config import settings, Grant_API_KEY
+# Request/Response DTOs
+from dto.opportunity_request_dto import SearchRequest, Pagination, SortOrder, OpportunityStatusFilter, Filters
+from dto.opportunity_response_dto import PortalSearchResponseDTO, AttachmentDTO
 
-# Persistence DTOs we built earlier
-from dto.grant_dto import (
+# Persistence DTOs
+from dto.opportunity_dto import (
     OpportunityPersistenceDTO,
     AttachmentPersistenceDTO,
     build_opportunity_persistence_list,
     build_attachment_persistence_list,
 )
 
-#TODO: put links in hidden config file
-SIMPLER_SEARCH = "https://api.simpler.grants.gov/v1/opportunities/search"
-SIMPLER_DETAIL = "https://api.simpler.grants.gov/v1/opportunities/"
-
-env_path = Path(__file__).resolve().parents[2] / "api.env"
-loaded = load_dotenv(dotenv_path=env_path, override=True)
-API_KEY = os.getenv("API_KEY")
-
+SIMPLER_SEARCH = settings.simpler_search_url
+SIMPLER_DETAIL = settings.simpler_detail_base_url
 
 # ─────────────────────────────────────────────────────────────
 # HTTP helpers
@@ -45,9 +40,9 @@ def _session() -> requests.Session:
     return s
 
 def _auth_headers() -> Dict[str, str]:
-    if not API_KEY:
+    if not Grant_API_KEY:
         raise RuntimeError("Missing SIMPLER_API_KEY (set in api_key.env or env)")
-    return {"x-api-key": API_KEY}
+    return {"x-api-key": Grant_API_KEY}
 
 
 # ─────────────────────────────────────────────────────────────

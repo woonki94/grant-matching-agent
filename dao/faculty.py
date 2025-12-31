@@ -5,9 +5,8 @@ from sqlalchemy.orm import Session
 from sqlalchemy import select, delete
 
 from db.models.faculty import (
-    Faculty, FacultyDegree, FacultyExpertise, FacultyResearchGroup, FacultyLink
+    Faculty, FacultyDegree, FacultyExpertise, FacultyResearchGroup, FacultyLink, FacultyPublication
 )
-from db.models.faculty_publication import FacultyPublication
 # ─────────────────────────────────────────────────────────────
 # FACULTY DAO
 # ─────────────────────────────────────────────────────────────

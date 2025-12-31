@@ -5,17 +5,14 @@ from pathlib import Path
 from openai import OpenAI
 from sqlalchemy.orm import Session
 
+from config import OPENAI_API_KEY, OPENAI_MODEL
 from db.db_conn import SessionLocal
 from db.models.match_result import MatchResult
-from db.models.grant import Opportunity   # for grant titles, agency, etc.
-from db.models.keywords_grant import Keyword as GrantKeyword
+from db.models.opportunity import Opportunity   # for opportunity titles, agency, etc.
+from db.models.keywords_opportunity import Keyword as GrantKeyword
 from db.models.keywords_faculty import FacultyKeyword
 
 from services.matching.hybrid_matcher import extract_domains, extract_specializations
-
-# Load API Key
-client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-
 
 # ================================================================
 #   1. Query DB: Get all matched grants for a given faculty
@@ -46,8 +43,8 @@ def load_prompt(name: str) -> str:
 def build_justification_prompt(db, grant, faculty_obj, match):
     """
     Loads justification template and fills:
-    - grant title + agency
-    - grant keywords (domain/specialization)
+    - opportunity title + agency
+    - opportunity keywords (domain/specialization)
     - faculty keywords (domain/specialization)
     """
 
@@ -95,6 +92,8 @@ def build_justification_prompt(db, grant, faculty_obj, match):
         grant_specializations=grant_specs,
         faculty_domains=faculty_domains,
         faculty_specializations=faculty_specs,
+        domain_score=f"{match.domain_score:.3f}",
+        llm_score=f"{match.llm_score:.3f}",
     )
 
     return filled.strip()
@@ -104,8 +103,9 @@ def build_justification_prompt(db, grant, faculty_obj, match):
 #   3. Ask GPT to generate justification
 # ================================================================
 def generate_justification(prompt: str) -> str:
+    client = OpenAI(api_key=OPENAI_API_KEY)
     resp = client.responses.create(
-        model="gpt-5",
+        model=OPENAI_MODEL,
         input=prompt
     )
     return resp.output_text.strip()

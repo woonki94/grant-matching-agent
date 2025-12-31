@@ -18,7 +18,7 @@ class MatchResult(Base):
     grant = relationship("Opportunity", backref="match_results")
     faculty = relationship("Faculty", backref="match_results")
 
-    # OPTIONAL: enforce uniqueness per (grant, faculty)
+    # OPTIONAL: enforce uniqueness per (opportunity, faculty)
     __table_args__ = (
         # Create unique constraint to avoid duplicates
         {'sqlite_autoincrement': True},

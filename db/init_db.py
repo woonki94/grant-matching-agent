@@ -14,13 +14,7 @@ from db.base import Base
 from db.db_conn import engine
 
 # Import ALL model modules so their tables register on Base
-from db.models.keywords_grant import Keyword
-from db.models.keywords_faculty import FacultyKeyword
-from db.models.faculty_publication import FacultyPublication
-from db.models.match_result import MatchResult
-
-from db.models.grant import Opportunity
-from db.models.faculty import Faculty
+import db.models
 
 # ───────────────────────────────────────────────
 # Initialize DB

@@ -9,22 +9,19 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Dict, List, Tuple
 import json
-import numpy as np
 import os
 
 from dotenv import load_dotenv
 from sqlalchemy.orm import Session
-from db.models.keywords_grant import Keyword as GrantKeyword
+
+from config import OPENAI_MODEL, OPENAI_API_KEY
+from db.models.keywords_opportunity import Keyword as GrantKeyword
 from db.models.keywords_faculty import FacultyKeyword
 from db.db_conn import SessionLocal
-from services.matching.sem_match_report import load_grant_kw, load_faculty_kw_all
 from util.qwen_embeddings import embed_texts, cosine_sim_matrix
 from openai import OpenAI
-from db.dao.match_result import MatchResultDAO
+from dao.match_result import MatchResultDAO
 
-env_path = Path(__file__).resolve().parents[2] / "api.env"
-loaded = load_dotenv(dotenv_path=env_path, override=True)
-openai_key = os.getenv("OPENAI_API_KEY")
 
 
 # -----------------------------------------------------------
@@ -65,7 +62,7 @@ def rank_by_domains_only(
     if not g_domains:
         return []
 
-    # Embed grant domains ONCE
+    # Embed opportunity domains ONCE
     G = embed_texts(g_domains)
 
     faculty_scores = []
@@ -122,7 +119,7 @@ Respond ONLY in JSON using this exact schema:
 
 def gpt_rerank_single(f_id: int, f_kw: Dict, g_kw: Dict, domain_score: float) -> Dict:
 
-    client = OpenAI(api_key=openai_key)
+    client = OpenAI(api_key=OPENAI_API_KEY)
 
     fac_dom = extract_domains(f_kw)
     fac_spec = extract_specializations(f_kw)
@@ -141,7 +138,7 @@ def gpt_rerank_single(f_id: int, f_kw: Dict, g_kw: Dict, domain_score: float) ->
 
     # --- FIXED: Correct OpenAI API usage ---
     resp = client.responses.create(
-        model="gpt-4.1",  # gpt-5 not generally available unless you have access
+        model=OPENAI_MODEL,
         input=prompt,
     )
 
@@ -308,7 +305,56 @@ def run_matching_for_partial_grants(num_grant=5, num_faculty=10):
     print("\nDone. Results saved to DB")
     return all_results
 
+
+def run_matching_for_one_faculty(faculty_id: int, top_k_per_grant: int = 10):
+    all_results = {}
+
+    with SessionLocal() as db:
+        # Load all grants
+        all_grants = load_all_grant_keywords(db)
+        print(f"Loaded {len(all_grants)} grants")
+
+        # Load this specific faculty's keywords
+        faculty_rows = load_all_faculty_keywords(db)
+        faculty_dict = {fid: kw for fid, kw in faculty_rows}
+
+        if faculty_id not in faculty_dict:
+            raise ValueError(f"Faculty {faculty_id} has no keyword entry.")
+
+        # Wrap it into the format match_grant_to_faculty expects
+        single_faculty_row = [(faculty_id, faculty_dict[faculty_id])]
+
+        print(f"Running match for Faculty {faculty_id}")
+
+        for grant_id, grant_kw in all_grants:
+            print(f"\n=== Matching Faculty {faculty_id} with Grant {grant_id} ===")
+
+            # Run the matching (only 1 faculty)
+            result = match_grant_to_faculty(
+                faculty_rows=single_faculty_row,
+                grant_kw=grant_kw,
+                top_k=10
+            )
+            all_results[grant_id] = result
+
+            # Extract row
+            final_list = result.get("final_reranked_results", [])
+            if final_list:
+                row = final_list[0]   # only one faculty
+                MatchResultDAO.save_match_result(
+                    db=db,
+                    grant_id=grant_id,
+                    faculty_id=faculty_id,
+                    domain_score=row["domain_score"],
+                    llm_score=row["llm_score"],
+                    reason=row["reason"]
+                )
+
+        print("\nDone. Results saved to DB for this faculty.")
+        return all_results
+
 if __name__ == "__main__":
     #print(run_matching_for_all_grants())
 
-    print(run_matching_for_partial_grants())
+    #print(run_matching_for_partial_grants())
+    print(run_matching_for_one_faculty(13))
