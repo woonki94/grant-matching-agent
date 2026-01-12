@@ -1,0 +1,164 @@
+import logging
+
+from sqlalchemy.orm import Session
+from sqlalchemy.dialects.postgresql import insert as pg_insert
+from sqlalchemy.orm import selectinload
+
+from typing import List, Dict, Any, Iterator
+
+from db.models import Faculty
+from db.models.faculty import FacultyAdditionalInfo, FacultyPublication, FacultyKeyword
+from dto.faculty_dto import FacultyDTO, FacultyAdditionalInfoDTO, FacultyPublicationDTO
+
+from logging_setup import setup_logging
+
+logger = logging.getLogger(__name__)
+setup_logging()
+
+FACULTY_COLS = {
+    "source_url",
+    "name",
+    "email",
+    "phone",
+    "position",
+    "organization",
+    "organizations",
+    "address",
+    "biography",
+    "degrees",
+    "expertise",
+}
+
+
+class FacultyDAO:
+    def __init__(self, session: Session):
+        self.session = session
+
+    def upsert_faculty(self, dto: FacultyDTO) -> Faculty:
+        obj = (
+            self.session.query(Faculty)
+            .filter(Faculty.email == dto.email)
+            .one_or_none()
+        )
+
+        if obj is None:
+            obj = Faculty(email=dto.email)
+            self.session.add(obj)
+
+        data: Dict[str, Any] = dto.model_dump(include=FACULTY_COLS, exclude_unset=True)
+
+        for k, v in data.items():
+            setattr(obj, k, v)
+
+        return obj
+
+    def upsert_additional_info(self, faculty_id: int, items: List[FacultyAdditionalInfoDTO]) -> int:
+        count = 0
+        for info in items:
+            obj = (
+                self.session.query(FacultyAdditionalInfo)
+                .filter(
+                    FacultyAdditionalInfo.faculty_id == faculty_id,
+                    FacultyAdditionalInfo.additional_info_url == info.additional_info_url,
+                )
+                .one_or_none()
+            )
+
+            if obj is None:
+                obj = FacultyAdditionalInfo(
+                    faculty_id=faculty_id,
+                    additional_info_url=info.additional_info_url,
+                    extract_status=info.extract_status or "pending",
+                )
+                self.session.add(obj)
+            else:
+                # optional: keep status/content as-is; update URL is usually unnecessary
+                obj.additional_info_url = info.additional_info_url
+
+            count += 1
+
+        return count
+
+    def upsert_publications(self, faculty_id: int, items: List[FacultyPublicationDTO]) -> int:
+        count = 0
+
+        for pub in items:
+            # skip bad rows early
+            if not pub.openalex_work_id or not pub.title:
+                continue
+
+            obj = (
+                self.session.query(FacultyPublication)
+                .filter(
+                    FacultyPublication.faculty_id == faculty_id,
+                    FacultyPublication.openalex_work_id == pub.openalex_work_id,
+                )
+                .one_or_none()
+            )
+
+            if obj is None:
+                obj = FacultyPublication(
+                    faculty_id=faculty_id,
+                    openalex_work_id=pub.openalex_work_id,
+                )
+                self.session.add(obj)
+
+            # update fields (insert or update)
+            obj.scholar_author_id = pub.scholar_author_id
+            obj.title = pub.title
+            obj.abstract = pub.abstract
+            obj.year = pub.year
+
+            count += 1
+
+        return count
+
+    def read_all_faculty_ids(self) -> List[int]:
+        return [fid for (fid,) in self.session.query(Faculty.faculty_id).all()]
+
+    def read_faculty_with_relations(self, faculty_id: int) -> Faculty | None:
+        return (
+            self.session.query(Faculty)
+            .options(
+                selectinload(Faculty.additional_info),
+                selectinload(Faculty.publications),
+                selectinload(Faculty.keyword),
+            )
+            .filter(Faculty.faculty_id == faculty_id)
+            .one_or_none()
+        )
+
+    def iter_faculty_with_relations(self, batch_size: int = 200) -> Iterator[Faculty]:
+        q = (
+            self.session.query(Faculty)
+            .options(
+                selectinload(Faculty.additional_info),
+                selectinload(Faculty.publications),
+                selectinload(Faculty.keyword),
+            )
+            .yield_per(batch_size)
+        )
+        for fac in q:
+            yield fac
+
+    def upsert_keywords_json(self, rows: List[Dict[str, Any]]) -> int:
+        """
+        Bulk upsert FacultyKeyword rows by faculty_id.
+        Does NOT commit (caller commits).
+        Returns number of rows provided.
+        """
+        if not rows:
+            return 0
+
+        stmt = pg_insert(FacultyKeyword).values(rows)
+        stmt = stmt.on_conflict_do_update(
+            index_elements=[FacultyKeyword.faculty_id],
+            set_={
+                "keywords": stmt.excluded.keywords,
+                "raw_json": stmt.excluded.raw_json,
+                "source": stmt.excluded.source,
+            },
+        )
+
+        self.session.execute(stmt)
+        return len(rows)
