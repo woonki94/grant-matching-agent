@@ -1,10 +1,10 @@
 # Project exclude paths
 /venv/
-/.venv/
 .env
-api.env
 .DS_Store
 
 # Python cache
 __pycache__/
 *.py[cod]
+
+/data/extracted_text
