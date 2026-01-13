@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from pgvector.sqlalchemy import Vector
 from sqlalchemy import (
     Column,
     String,
@@ -15,6 +16,8 @@ from sqlalchemy import (
 from sqlalchemy.orm import relationship
 from sqlalchemy.dialects.postgresql import JSONB
 from db.base import Base
+
+EMBED_DIM = 4096
 
 
 class Opportunity(Base):
@@ -64,6 +67,14 @@ class Opportunity(Base):
 
     keyword = relationship(
         "OpportunityKeyword",
+        back_populates="opportunity",
+        uselist=False,
+        cascade="all, delete-orphan",
+        passive_deletes=True,
+    )
+
+    keyword_embedding = relationship(
+        "OpportunityKeywordEmbedding",
         back_populates="opportunity",
         uselist=False,
         cascade="all, delete-orphan",
@@ -167,3 +178,24 @@ class OpportunityKeyword(Base):
     source = Column(String, nullable=False, default="gpt-5")
 
     opportunity = relationship("Opportunity", back_populates="keyword")
+
+
+class OpportunityKeywordEmbedding(Base):
+    __tablename__ = "opportunity_keyword_embedding"
+    __table_args__ = (
+        UniqueConstraint("opportunity_id", name="ux_opportunity_keyword_embedding_opp"),
+        Index("ix_opportunity_keyword_embedding_model", "model"),
+    )
+
+    opportunity_id = Column(
+        String,
+        ForeignKey("opportunity.opportunity_id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+
+    model = Column(String(128), nullable=False)
+
+    research_domain_vec = Column(Vector(EMBED_DIM), nullable=True)      # adjust dim
+    application_domain_vec = Column(Vector(EMBED_DIM), nullable=True)   # adjust dim
+
+    opportunity = relationship("Opportunity", back_populates="keyword_embedding")

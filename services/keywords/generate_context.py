@@ -24,15 +24,12 @@ def opportunity_to_prompt_payload(opp: Opportunity,) -> Dict[str, Any]:
         ),
     }
 
-
 def faculty_to_keyword_context(fac: Faculty) -> dict:
-
     pubs = sorted(
         fac.publications or [],
         key=lambda p: (p.year or 0),
         reverse=True
     )
-
     return {
         "name": fac.name,
         "position": fac.position,

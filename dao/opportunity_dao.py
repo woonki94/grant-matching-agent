@@ -6,7 +6,8 @@ from sqlalchemy.orm import Session
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import selectinload
 
-from db.models.opportunity import Opportunity, OpportunityAttachment, OpportunityAdditionalInfo, OpportunityKeyword
+from db.models.opportunity import Opportunity, OpportunityAttachment, OpportunityAdditionalInfo, OpportunityKeyword, \
+    OpportunityKeywordEmbedding
 from dto.opportunity_dto import OpportunityDTO, OpportunityAttachmentDTO, OpportunityAdditionalInfoDTO
 
 
@@ -128,6 +129,20 @@ class OpportunityDAO:
         for opp in q:
             yield opp
 
+    def read_opportunities_by_ids_with_relations(self, ids: list[str]) -> list[Opportunity]:
+        if not ids:
+            return []
+        return (
+            self.session.query(Opportunity)
+            .options(
+                selectinload(Opportunity.additional_info),
+                selectinload(Opportunity.attachments),
+                selectinload(Opportunity.keyword),
+            )
+            .filter(Opportunity.opportunity_id.in_(ids))
+            .all()
+        )
+
     def upsert_keywords_json(self, rows: List[Dict[str, Any]]) -> int:
         """
         Bulk upsert OpportunityKeyword rows by opportunity_id (or opportunity_id FK).
@@ -149,3 +164,31 @@ class OpportunityDAO:
 
         self.session.execute(stmt)
         return len(rows)
+
+    def iter_opportunities_with_keywords(self):
+        return (
+            self.session.query(Opportunity)
+            .options(selectinload(Opportunity.keyword))
+            .yield_per(200)
+        )
+
+
+    def upsert_keyword_embedding(self, row: dict) -> None:
+        """
+        row = {
+          faculty_id: int,
+          model: str,
+          research_domain_vec: list[float] | None,
+          application_domain_vec: list[float] | None
+        }
+        """
+        stmt = pg_insert(OpportunityKeywordEmbedding).values([row])
+        stmt = stmt.on_conflict_do_update(
+            index_elements=["opportunity_id"],
+            set_={
+                "model": stmt.excluded.model,
+                "research_domain_vec": stmt.excluded.research_domain_vec,
+                "application_domain_vec": stmt.excluded.application_domain_vec,
+            },
+        )
+        self.session.execute(stmt)

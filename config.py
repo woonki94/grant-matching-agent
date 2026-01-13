@@ -19,6 +19,8 @@ class Settings(BaseSettings):
     # =========================
     qwen_embed_model: str
 
+
+    openrouter_base_url: str =  "https://openrouter.ai/api/v1"
     openrouter_api_key: str
 
     # =========================

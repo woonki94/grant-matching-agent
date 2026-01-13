@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from pgvector.sqlalchemy import Vector
 from sqlalchemy import (
     Column,
     String,
@@ -14,6 +15,8 @@ from sqlalchemy.orm import relationship
 from sqlalchemy.dialects.postgresql import JSONB
 
 from db.base import Base
+
+EMBED_DIM = 4096
 
 
 class Faculty(Base):
@@ -62,6 +65,14 @@ class Faculty(Base):
 
     keyword = relationship(
         "FacultyKeyword",
+        back_populates="faculty",
+        uselist=False,
+        cascade="all, delete-orphan",
+        passive_deletes=True,
+    )
+
+    keyword_embedding = relationship(
+        "FacultyKeywordEmbedding",
         back_populates="faculty",
         uselist=False,
         cascade="all, delete-orphan",
@@ -165,3 +176,26 @@ class FacultyKeyword(Base):
     source = Column(String, nullable=False, default="gpt-5")
 
     faculty = relationship("Faculty", back_populates="keyword")
+
+
+class FacultyKeywordEmbedding(Base):
+    __tablename__ = "faculty_keyword_embedding"
+    __table_args__ = (
+        UniqueConstraint("faculty_id", name="ux_faculty_keyword_embedding_faculty"),
+        Index("ix_faculty_keyword_embedding_model", "model"),
+    )
+
+    faculty_id = Column(
+        Integer,
+        ForeignKey("faculty.faculty_id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+
+    # which embedding model produced these vectors
+    model = Column(String(128), nullable=False)
+
+    # domain-only embeddings (you decided to keep it simple)
+    research_domain_vec = Column(Vector(EMBED_DIM), nullable=True)      # adjust dim
+    application_domain_vec = Column(Vector(EMBED_DIM), nullable=True)   # adjust dim
+
+    faculty = relationship("Faculty", back_populates="keyword_embedding")

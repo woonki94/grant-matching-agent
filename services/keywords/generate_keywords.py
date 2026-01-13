@@ -1,44 +1,35 @@
 from __future__ import annotations
 
+import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from config import settings, OPENAI_MODEL, OPENAI_API_KEY
+PROJECT_ROOT = Path(__file__).resolve().parents[2]  # .../root
+sys.path.insert(0, str(PROJECT_ROOT))
+
+from services.prompts.keyword_prompts import (
+    FACULTY_CANDIDATE_PROMPT,
+    FACULTY_KEYWORDS_PROMPT,
+    OPP_CANDIDATE_PROMPT,
+    OPP_KEYWORDS_PROMPT
+)
+from utils.qwen_embedder import embed_domain_bucket, extract_domains
+
+
+from config import settings, OPENAI_MODEL, OPENAI_API_KEY, QWEN_MODEL
 from dao.faculty_dao import FacultyDAO
 from dao.opportunity_dao import OpportunityDAO
 from db.db_conn import SessionLocal
 from db.models import Faculty
-from llm_schemas.keywords import KeywordsOut, CandidatesOut
+from dto.llm_response_dto import KeywordsOut, CandidatesOut
 from services.keywords.generate_context import faculty_to_keyword_context, opportunity_to_prompt_payload
-from utils.content_extractor import load_extracted_content
+from utils.content_compressor import cap_extracted_blocks
 
 
 import json
 from langchain_core.prompts import ChatPromptTemplate
 from typing import Tuple
 from langchain_openai import ChatOpenAI
-
-
-
-FACULTY_CANDIDATE_PROMPT = ChatPromptTemplate.from_messages([
-    ("system", "Extract concise candidate keyword phrases from the faculty context..."),
-    ("human", "Context (JSON):\n{context_json}")
-])
-
-FACULTY_KEYWORDS_PROMPT = ChatPromptTemplate.from_messages([
-    ("system", "Generate research/application keywords for faculty using ONLY context..."),
-    ("human", "Context (JSON):\n{context_json}\n\nCandidate phrases:\n{candidates}")
-])
-
-OPP_CANDIDATE_PROMPT = ChatPromptTemplate.from_messages([
-    ("system", "Extract concise candidate keyword phrases from the funding opportunity context..."),
-    ("human", "Context (JSON):\n{context_json}")
-])
-
-OPP_KEYWORDS_PROMPT = ChatPromptTemplate.from_messages([
-    ("system", "Generate research/application keywords for a funding opportunity using ONLY context..."),
-    ("human", "Context (JSON):\n{context_json}\n\nCandidate phrases:\n{candidates}")
-])
 
 def build_keyword_chain(candidate_prompt: ChatPromptTemplate, keywords_prompt: ChatPromptTemplate):
     llm = ChatOpenAI(model=OPENAI_MODEL, temperature=0, api_key=OPENAI_API_KEY)
@@ -49,6 +40,14 @@ def build_keyword_chain(candidate_prompt: ChatPromptTemplate, keywords_prompt: C
 
 def generate_keywords(obj, *, context_builder, candidates_chain, keywords_chain) -> Tuple[dict, dict]:
     context = context_builder(obj)
+
+    if "attachments_extracted" in context:
+        context["attachments_extracted"] = cap_extracted_blocks(
+            context["attachments_extracted"],
+            max_total_chars=18_000,
+            max_per_doc_chars=2_000,
+        )
+
     context_json = json.dumps(context, ensure_ascii=False)
 
     cand_out: CandidatesOut = candidates_chain.invoke({"context_json": context_json})
@@ -61,49 +60,107 @@ def generate_keywords(obj, *, context_builder, candidates_chain, keywords_chain)
 
     return kw_out.model_dump(), {"context_used": context, "candidates": candidates}
 
+if __name__ == "__main__":
+    import argparse
 
-if __name__ == '__main__':
-    faculty_cand_chain, faculty_kw_chain = build_keyword_chain(FACULTY_CANDIDATE_PROMPT, FACULTY_KEYWORDS_PROMPT)
-    opp_cand_chain, opp_kw_chain = build_keyword_chain(OPP_CANDIDATE_PROMPT, OPP_KEYWORDS_PROMPT)
+    parser = argparse.ArgumentParser(description="Generate keywords for faculty/opportunities")
+    parser.add_argument("--limit", type=int, default=0, help="Max number of records to process (0 = no limit)")
+    parser.add_argument("--faculty-only", action="store_true", help="Only generate faculty keywords")
+    parser.add_argument("--opp-only", action="store_true", help="Only generate opportunity keywords")
+
+    args = parser.parse_args()
+
+    # If both flags set, treat as "do both" (or you can error out)
+    run_faculty = not args.opp_only
+    run_opp = not args.faculty_only
+
+    faculty_cand_chain, faculty_kw_chain = build_keyword_chain(
+        FACULTY_CANDIDATE_PROMPT, FACULTY_KEYWORDS_PROMPT
+    )
+    opp_cand_chain, opp_kw_chain = build_keyword_chain(
+        OPP_CANDIDATE_PROMPT, OPP_KEYWORDS_PROMPT
+    )
+
+    def _apply_limit(iterable):
+        if args.limit and args.limit > 0:
+            # assumes iterable is a generator; slice manually
+            count = 0
+            for x in iterable:
+                yield x
+                count += 1
+                if count >= args.limit:
+                    break
+        else:
+            yield from iterable
 
     with SessionLocal() as sess:
         fac_dao = FacultyDAO(sess)
         opp_dao = OpportunityDAO(sess)
 
-        for fac in fac_dao.iter_faculty_with_relations():
-            faculty_keywords, faculty_keywords_raw = generate_keywords(
-                fac,
-                context_builder=faculty_to_keyword_context,
-                candidates_chain=faculty_cand_chain,
-                keywords_chain=faculty_kw_chain,
-            )
+        if run_faculty:
+            for fac in _apply_limit(fac_dao.iter_faculty_with_relations()):
+                faculty_keywords, faculty_keywords_raw = generate_keywords(
+                    fac,
+                    context_builder=faculty_to_keyword_context,
+                    candidates_chain=faculty_cand_chain,
+                    keywords_chain=faculty_kw_chain,
+                )
 
-            fac_rows = [{
-                "faculty_id": fac.faculty_id,
-                "keywords": faculty_keywords,
-                "raw_json": faculty_keywords_raw,
-                "source": OPENAI_MODEL,
-            }]
+                # 1) upsert keywords
+                fac_dao.upsert_keywords_json([{
+                    "faculty_id": fac.faculty_id,
+                    "keywords": faculty_keywords,
+                    "raw_json": faculty_keywords_raw,
+                    "source": OPENAI_MODEL,
+                }])
 
-            fac_dao.upsert_keywords_json(fac_rows)
-        sess.commit()
+                # 2) embed domains from freshly-generated keywords
+                r_domains, a_domains = extract_domains(faculty_keywords)
 
-        for opp in opp_dao.iter_opportunities_with_relations():
-            opportunity_keywords, opportunity_keywords_raw = generate_keywords(
-                opp,
-                context_builder=opportunity_to_prompt_payload,
-                candidates_chain=opp_cand_chain,
-                keywords_chain=opp_kw_chain,
-            )
-            opp_rows = [{
-                "opportunity_id": opp.opportunity_id,
-                "keywords": opportunity_keywords,
-                "raw_json": opportunity_keywords_raw,
-                "source": OPENAI_MODEL,
-            }]
+                r_vec = embed_domain_bucket(r_domains)  # List[float] | None
+                a_vec = embed_domain_bucket(a_domains)
 
-            opp_dao.upsert_keywords_json(opp_rows)
-        sess.commit()
+                # upsert embedding row (only if at least one exists)
+                if r_vec is not None or a_vec is not None:
+                    fac_dao.upsert_keyword_embedding({
+                        "faculty_id": fac.faculty_id,
+                        "model": QWEN_MODEL,
+                        "research_domain_vec": r_vec,
+                        "application_domain_vec": a_vec,
+                    })
+
+            sess.commit()
+
+        if run_opp:
+            for opp in _apply_limit(opp_dao.iter_opportunities_with_relations()):
+                opportunity_keywords, opportunity_keywords_raw = generate_keywords(
+                    opp,
+                    context_builder=opportunity_to_prompt_payload,
+                    candidates_chain=opp_cand_chain,
+                    keywords_chain=opp_kw_chain,
+                )
+
+                opp_dao.upsert_keywords_json([{
+                    "opportunity_id": opp.opportunity_id,
+                    "keywords": opportunity_keywords,
+                    "raw_json": opportunity_keywords_raw,
+                    "source": OPENAI_MODEL,
+                }])
+
+                r_domains, a_domains = extract_domains(opportunity_keywords)
+
+                r_vec = embed_domain_bucket(r_domains)
+                a_vec = embed_domain_bucket(a_domains)
+
+                if r_vec is not None or a_vec is not None:
+                    opp_dao.upsert_keyword_embedding({
+                        "opportunity_id": opp.opportunity_id,
+                        "model": QWEN_MODEL,
+                        "research_domain_vec": r_vec,
+                        "application_domain_vec": a_vec,
+                    })
+
+            sess.commit()
 
 
 

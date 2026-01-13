@@ -7,7 +7,7 @@ from sqlalchemy.orm import selectinload
 from typing import List, Dict, Any, Iterator
 
 from db.models import Faculty
-from db.models.faculty import FacultyAdditionalInfo, FacultyPublication, FacultyKeyword
+from db.models.faculty import FacultyAdditionalInfo, FacultyPublication, FacultyKeyword, FacultyKeywordEmbedding
 from dto.faculty_dto import FacultyDTO, FacultyAdditionalInfoDTO, FacultyPublicationDTO
 
 from logging_setup import setup_logging
@@ -113,22 +113,7 @@ class FacultyDAO:
 
         return count
 
-    def read_all_faculty_ids(self) -> List[int]:
-        return [fid for (fid,) in self.session.query(Faculty.faculty_id).all()]
-
-    def read_faculty_with_relations(self, faculty_id: int) -> Faculty | None:
-        return (
-            self.session.query(Faculty)
-            .options(
-                selectinload(Faculty.additional_info),
-                selectinload(Faculty.publications),
-                selectinload(Faculty.keyword),
-            )
-            .filter(Faculty.faculty_id == faculty_id)
-            .one_or_none()
-        )
-
-    def iter_faculty_with_relations(self, batch_size: int = 200) -> Iterator[Faculty]:
+    def iter_faculty_with_relations(self, batch_size: int = 200, stream=True) -> Iterator[Faculty]:
         q = (
             self.session.query(Faculty)
             .options(
@@ -136,10 +121,13 @@ class FacultyDAO:
                 selectinload(Faculty.publications),
                 selectinload(Faculty.keyword),
             )
-            .yield_per(batch_size)
         )
-        for fac in q:
-            yield fac
+
+        if stream:
+            q = q.yield_per(batch_size)
+
+        return q.all() if not stream else q
+
 
     def upsert_keywords_json(self, rows: List[Dict[str, Any]]) -> int:
         """
@@ -162,3 +150,30 @@ class FacultyDAO:
 
         self.session.execute(stmt)
         return len(rows)
+
+    def iter_faculty_with_keywords(self):
+        return (
+            self.session.query(Faculty)
+            .options(selectinload(Faculty.keyword))
+            .yield_per(200)
+        )
+
+    def upsert_keyword_embedding(self, row: dict) -> None:
+        """
+        row = {
+          faculty_id: int,
+          model: str,
+          research_domain_vec: list[float] | None,
+          application_domain_vec: list[float] | None
+        }
+        """
+        stmt = pg_insert(FacultyKeywordEmbedding).values([row])
+        stmt = stmt.on_conflict_do_update(
+            index_elements=["faculty_id"],
+            set_={
+                "model": stmt.excluded.model,
+                "research_domain_vec": stmt.excluded.research_domain_vec,
+                "application_domain_vec": stmt.excluded.application_domain_vec,
+            },
+        )
+        self.session.execute(stmt)

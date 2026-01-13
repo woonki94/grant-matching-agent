@@ -1,6 +1,8 @@
 import os
 import sys
 
+from sqlalchemy import text
+
 # ───────────────────────────────────────────────
 # Ensure project root on sys.path
 # ───────────────────────────────────────────────
@@ -22,8 +24,12 @@ import db.models
 def init_database() -> None:
     print("Creating database tables (if not exist)...")
     print("Models loaded tables:", list(Base.metadata.tables.keys()))
+    with engine.begin() as conn:
+        conn.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))
 
     Base.metadata.create_all(engine)
+
+
 
     print("All tables ready.")
 
