@@ -11,7 +11,7 @@ FACULTY_RECS_PROMPT = ChatPromptTemplate.from_messages([
      "- llm_score matters more than domain_score when interpreting fit.\n"
      "\n"
      "QUALITATIVE LABELS (based on llm_score; use ONE label per opportunity in your bullets):\n"
-     "- llm_score < 0.30: 'sucks' (weak fit)\n"
+     "- llm_score < 0.30: 'mismatch' (weak fit)\n"
      "- 0.30–0.49: 'bad' (mostly mismatch)\n"
      "- 0.50–0.69: 'good' (reasonable fit)\n"
      "- 0.70–0.84: 'great' (strong fit)\n"

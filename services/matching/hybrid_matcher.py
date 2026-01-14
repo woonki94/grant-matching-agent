@@ -1,4 +1,10 @@
 from __future__ import annotations
+import sys
+from pathlib import Path
+
+PROJECT_ROOT = Path(__file__).resolve().parents[2]  # .../root
+sys.path.insert(0, str(PROJECT_ROOT))
+
 import json
 import argparse
 from sqlalchemy import text
@@ -9,7 +15,7 @@ from db.db_conn import SessionLocal
 from dao.faculty_dao import FacultyDAO
 from dao.opportunity_dao import OpportunityDAO
 from dao.match_dao import MatchDAO
-from services.keywords.generate_context import faculty_to_keyword_context, opportunity_to_prompt_payload
+from services.keywords.generate_context import faculty_to_keyword_context, opportunity_to_keyword_context
 from services.prompts.matching_prompt import MATCH_PROMPT
 from utils.content_compressor import cap_extracted_blocks, cap_fac, cap_opp
 from dto.llm_response_dto import LLMMatchOut  # make this
@@ -36,8 +42,9 @@ def main(k: int, min_domain: float, limit_faculty: int):
             cand = [(oid, s) for (oid, s) in cand if s >= min_domain]
             if not cand:
                 continue
-
-            fac_ctx = cap_fac(faculty_to_keyword_context(fac))
+            #TODO: necessary to pass all the context?? both for fac and opp
+            #fac_ctx = cap_fac(faculty_to_keyword_context(fac))
+            fac_ctx = {"name": fac.name, "keywords": (fac.keyword.keywords if fac.keyword else {})}
             fac_json = json.dumps(fac_ctx, ensure_ascii=False)
 
             # Stage 2: LLM score only the filtered candidates
@@ -51,12 +58,14 @@ def main(k: int, min_domain: float, limit_faculty: int):
                 if opp is None:
                     continue
 
-                opp_ctx = cap_opp(opportunity_to_prompt_payload(opp))
+                #opp_ctx = cap_opp(opportunity_to_keyword_context(opp))
+                opp_ctx = {"opportunity_id": opp.opportunity_id,
+                           "keywords": (opp.keyword.keywords if opp.keyword else {})}
                 opp_json = json.dumps(opp_ctx, ensure_ascii=False)
 
                 scored: LLMMatchOut = chain.invoke({
-                    "faculty_json": fac_json,
-                    "opp_json": opp_json,
+                    "faculty_kw_json": fac_json,
+                    "opp_kw_json": opp_json,
                 })
 
                 out_rows.append({

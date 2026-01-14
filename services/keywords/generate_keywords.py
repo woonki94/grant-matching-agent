@@ -22,7 +22,7 @@ from dao.opportunity_dao import OpportunityDAO
 from db.db_conn import SessionLocal
 from db.models import Faculty
 from dto.llm_response_dto import KeywordsOut, CandidatesOut
-from services.keywords.generate_context import faculty_to_keyword_context, opportunity_to_prompt_payload
+from services.keywords.generate_context import faculty_to_keyword_context, opportunity_to_keyword_context
 from utils.content_compressor import cap_extracted_blocks
 
 
@@ -135,7 +135,7 @@ if __name__ == "__main__":
             for opp in _apply_limit(opp_dao.iter_opportunities_with_relations()):
                 opportunity_keywords, opportunity_keywords_raw = generate_keywords(
                     opp,
-                    context_builder=opportunity_to_prompt_payload,
+                    context_builder=opportunity_to_keyword_context,
                     candidates_chain=opp_cand_chain,
                     keywords_chain=opp_kw_chain,
                 )

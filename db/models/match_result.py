@@ -10,6 +10,7 @@ class MatchResult(Base):
 
     id = Column(Integer, primary_key=True, autoincrement=True)
 
+    #TODO: grant_id -> opportunity_id
     grant_id = Column(
         String,
         ForeignKey("opportunity.opportunity_id", ondelete="CASCADE"),

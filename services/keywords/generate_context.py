@@ -4,7 +4,7 @@ from db.models import Faculty, Opportunity
 from utils.content_extractor import load_extracted_content
 
 
-def opportunity_to_prompt_payload(opp: Opportunity,) -> Dict[str, Any]:
+def opportunity_to_keyword_context(opp: Opportunity,) -> Dict[str, Any]:
     return {
         "opportunity_title": opp.opportunity_title,
         "agency_name": opp.agency_name,

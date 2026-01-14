@@ -25,7 +25,7 @@ from db.models.faculty import Faculty
 from dao.opportunity_dao import OpportunityDAO
 from services.keywords.generate_context import (
     faculty_to_keyword_context,
-    opportunity_to_prompt_payload,
+    opportunity_to_keyword_context,
 )
 from utils.content_compressor import cap_extracted_blocks, cap_fac, cap_opp
 
@@ -125,7 +125,7 @@ def main(email: str, k: int) -> None:
             opp = opp_map.get(oid)
             if not opp:
                 continue
-            ctx = cap_opp(opportunity_to_prompt_payload(opp))
+            ctx = cap_opp(opportunity_to_keyword_context(opp))
             scores = score_map.get(oid, {"domain_score": None, "llm_score": None})
 
             opp_payloads.append({

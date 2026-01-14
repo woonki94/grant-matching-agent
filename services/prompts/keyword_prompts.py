@@ -1,82 +1,97 @@
 from langchain_core.prompts import ChatPromptTemplate
 
+
+
 FACULTY_CANDIDATE_PROMPT = ChatPromptTemplate.from_messages([
     ("system",
-     "You extract candidate keyword phrases from faculty context for later structuring.\n"
+     "You extract candidate keyword phrases from faculty context for later structuring.\n\n"
      "Rules:\n"
      "- Use ONLY the provided context.\n"
      "- Return a single JSON object with key `candidates` = list[str].\n"
      "- Include TWO kinds of candidates:\n"
-     "  (A) AREA terms: 1–3 words, broad fields/areas that define the work (e.g., 'heat transfer', 'robotics').\n"
-     "  (B) SPECIALIZATION statements: 8–25 words, detailed phrases capturing methods/problems/systems (can be sentence-like).\n"
-     "- Prefer technical phrases over generic admin words.\n"
+     "  (A) AREA terms: 1–3 words, broad research fields or domains.\n"
+     "  (B) SPECIALIZATION statements: 8–25 words describing expertise, methods, systems, or problems the faculty works on.\n"
+     "- SPECIALIZATION phrases must describe capabilities the faculty HOLDS.\n"
+     "- Write phrases neutrally (no 'seeks', 'needs', 'requires').\n"
+     "- Prefer technical and research content; avoid administrative language.\n"
      "- Lowercase unless proper nouns.\n"
      "- Deduplicate.\n"
-     "- Keep to ~30–80 candidates total."),
+     "- Target ~30–80 candidates total."
+    ),
     ("human", "Context (JSON):\n{context_json}")
 ])
 
 OPP_CANDIDATE_PROMPT = ChatPromptTemplate.from_messages([
     ("system",
-     "You extract candidate keyword phrases from a funding opportunity context for later structuring.\n"
+     "You extract candidate keyword phrases from a funding opportunity context for later structuring.\n\n"
      "Rules:\n"
      "- Use ONLY the provided context.\n"
      "- Return a single JSON object with key `candidates` = list[str].\n"
      "- Include TWO kinds of candidates:\n"
-     "  (A) AREA terms: 1–3 words, broad research areas the opportunity targets.\n"
-     "  (B) SPECIALIZATION statements: 8–25 words, detailed phrases describing goals, methods, constraints, or targeted problems.\n"
-     "- Prefer domain terms and technical content; avoid application paperwork language.\n"
+     "  (A) AREA terms: 1–3 words, broad research or technical areas targeted.\n"
+     "  (B) SPECIALIZATION statements: 8–25 words describing capabilities, methods, or expertise the project expects investigators to have.\n"
+     "- SPECIALIZATION phrases must describe what the grant NEEDS faculty to have.\n"
+     "- Write phrases factually (do not include submission or administrative language).\n"
      "- Lowercase unless proper nouns.\n"
      "- Deduplicate.\n"
-     "- Keep to ~30–80 candidates total."),
+     "- Target ~30–80 candidates total."
+    ),
     ("human", "Context (JSON):\n{context_json}")
 ])
 
 FACULTY_KEYWORDS_PROMPT = ChatPromptTemplate.from_messages([
     ("system",
-     "You generate structured keywords from faculty context.\n"
-     "Output must match the schema:\n"
-     "{{\"research\": {{\"domain\": [], \"specialization\": []}}, "
-     "\"application\": {{\"domain\": [], \"specialization\": []}}}}\n"
+     "You generate structured keywords from faculty context.\n\n"
+     "Output must match this JSON schema:\n"
+     "{{\n"
+     "  \"research\": {{\"domain\": [], \"specialization\": []}},\n"
+     "  \"application\": {{\"domain\": [], \"specialization\": []}}\n"
+     "}}\n\n"
      "Definitions:\n"
-     "- domain (AREA): 1–3 words that define the work area/field. Keep short and general.\n"
-     "- specialization (SPEC): 8–25 words, detailed keyword statements describing methods/problems/systems; may be sentence-like.\n\n"
+     "- domain: 1–3 words, broad fields defining the faculty’s work.\n"
+     "- specialization: 8–25 words describing expertise, methods, or systems the faculty HAS.\n\n"
      "Rules:\n"
-     "- Use ONLY the provided context + candidate phrases.\n"
+     "- Use ONLY the provided context and candidate phrases.\n"
      "- Do NOT invent new topics.\n"
-     "- Lowercase except proper nouns.\n"
+     "- Lowercase unless proper nouns.\n"
      "- Deduplicate.\n"
-     "- research.domain: 3–8 items\n"
-     "- research.specialization: 3–10 items\n"
-     "- application.domain: 2–6 items (sectors/contexts)\n"
-     "- application.specialization: 2–8 items (detailed applied statements)\n"
-     "- If unsure, leave lists shorter rather than guessing.\n"
-     "- Avoid admin terms: 'grant', 'university', 'department', 'proposal'."),
+     "- research.domain: 4–10 items\n"
+     "- research.specialization: 5–15 items\n"
+     "- application.domain: 4–10 items\n"
+     "- application.specialization: 5–15 items\n"
+     "- Avoid administrative or institutional language."
+    ),
     ("human",
      "Context (JSON):\n{context_json}\n\n"
-     "Candidate phrases:\n{candidates}")
+     "Candidate phrases:\n{candidates}"
+    )
 ])
+
 
 OPP_KEYWORDS_PROMPT = ChatPromptTemplate.from_messages([
     ("system",
-     "You generate structured keywords from a funding opportunity context.\n"
-     "Output must match the schema:\n"
-      "{{\"research\": {{\"domain\": [], \"specialization\": []}}, "
-     "\"application\": {{\"domain\": [], \"specialization\": []}}}}\n"
+     "You generate structured keywords from a funding opportunity context.\n\n"
+     "Output must match this JSON schema:\n"
+     "{{\n"
+     "  \"research\": {{\"domain\": [], \"specialization\": []}},\n"
+     "  \"application\": {{\"domain\": [], \"specialization\": []}}\n"
+     "}}\n\n"
      "Definitions:\n"
-     "- domain (AREA): 1–3 words that define the research areas targeted.\n"
-     "- specialization (SPEC): 8–25 words, detailed keyword statements capturing scope, methods, constraints, or targeted problems.\n\n"
+     "- domain: 1–3 words, broad research or technical areas.\n"
+     "- specialization: 8–25 words describing expertise, methods, or capabilities the project EXPECTS investigators to have.\n\n"
      "Rules:\n"
-     "- Use ONLY the provided context + candidate phrases.\n"
-     "- Do NOT invent requirements.\n"
-     "- Lowercase except proper nouns.\n"
+     "- Use ONLY the provided context and candidate phrases.\n"
+     "- Do NOT invent requirements not present in the text.\n"
+     "- Lowercase unless proper nouns.\n"
      "- Deduplicate.\n"
-     "- research.domain: 3–10 items\n"
-     "- research.specialization: 3–12 items\n"
-     "- application.domain: 2–8 items (sectors/beneficiaries)\n"
-     "- application.specialization: 2–10 items (detailed applied statements)\n"
-     "- Avoid generic funding language ('submit', 'eligibility', 'deadline') unless it encodes a real technical constraint."),
+     "- research.domain: 4–10 items\n"
+     "- research.specialization: 5–15 items\n"
+     "- application.domain: 4–10 items\n"
+     "- application.specialization: 5–15 items\n"
+     "- Avoid generic submission or eligibility language."
+    ),
     ("human",
      "Context (JSON):\n{context_json}\n\n"
-     "Candidate phrases:\n{candidates}")
+     "Candidate phrases:\n{candidates}"
+    )
 ])
