@@ -2,6 +2,7 @@ from sqlalchemy import (
     Column, Float, String, Integer, ForeignKey,
     UniqueConstraint, Index
 )
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import relationship
 from db.base import Base
 
@@ -30,6 +31,10 @@ class MatchResult(Base):
 
     # One-sentence, brief explanation (log-level)
     reason = Column(String(256), nullable=False)
+
+    covered = Column(JSONB, nullable=False, default=list)  # ["topic1", "topic2", ...]
+    missing = Column(JSONB, nullable=False, default=list)  # ["topicX", ...]
+    evidence = Column(JSONB, nullable=False, default=dict)  # {"grant_kw": ["faculty_kw", ...]}
 
     grant = relationship("Opportunity", backref="match_results")
     faculty = relationship("Faculty", backref="match_results")

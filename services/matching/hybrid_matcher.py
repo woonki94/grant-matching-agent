@@ -63,10 +63,35 @@ def main(k: int, min_domain: float, limit_faculty: int):
                            "keywords": (opp.keyword.keywords if opp.keyword else {})}
                 opp_json = json.dumps(opp_ctx, ensure_ascii=False)
 
+                kw = opp.keyword.keywords or {}
+
+                app_specs = (kw.get("application") or {}).get("specialization") or []
+                res_specs = (kw.get("research") or {}).get("specialization") or []
+
+                requirements_indexed = {
+                    "application": {str(i): t for i, t in enumerate(app_specs)},
+                    "research": {str(i): t for i, t in enumerate(res_specs)},
+                }
+
+                requirements_indexed_json = json.dumps(requirements_indexed, ensure_ascii=False)
+
                 scored: LLMMatchOut = chain.invoke({
                     "faculty_kw_json": fac_json,
-                    "opp_kw_json": opp_json,
+                    "requirements_indexed": requirements_indexed_json,
                 })
+
+                def group_by_section(items):
+                    out = {"application": [], "research": []}
+                    for it in items or []:
+                        out[it.section].append(int(it.idx))
+                    # stable dedupe
+                    for k in out:
+                        seen = set()
+                        out[k] = [x for x in out[k] if not (x in seen or seen.add(x))]
+                    return out
+
+                covered_grouped = group_by_section(scored.covered)
+                missing_grouped = group_by_section(scored.missing)
 
                 out_rows.append({
                     "grant_id": opp_id,
@@ -74,8 +99,12 @@ def main(k: int, min_domain: float, limit_faculty: int):
                     "domain_score": float(domain_sim),
                     "llm_score": float(scored.llm_score),
                     "reason": scored.reason.strip(),
+                    "covered": covered_grouped,   # JSONB object
+                    "missing": missing_grouped,   # JSONB object
+                    #"evidence": getattr(scored, "evidence", {}) or {},
                 })
 
+            print(out_rows)
             match_dao.upsert_matches(out_rows)
             batch += 1
             if batch % 30 == 0:
@@ -84,8 +113,8 @@ def main(k: int, min_domain: float, limit_faculty: int):
 
 if __name__ == "__main__":
     p = argparse.ArgumentParser()
-    p.add_argument("--k", type=int, default=5)
+    p.add_argument("--k", type=int, default=10)
     p.add_argument("--min-domain", type=float, default=0.30)
-    p.add_argument("--limit-faculty", type=int, default=0)
+    p.add_argument("--limit-faculty", type=int, default=10)
     args = p.parse_args()
     main(k=args.k, min_domain=args.min_domain, limit_faculty=args.limit_faculty)

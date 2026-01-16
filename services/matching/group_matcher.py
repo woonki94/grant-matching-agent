@@ -6,6 +6,8 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parents[2]  # .../root
 sys.path.insert(0, str(PROJECT_ROOT))
 
+from services.matching.group_matcher_max_flow_v2 import min_cost_team_select, min_cost_team_select_multi
+
 import argparse
 import json
 import re
@@ -185,8 +187,9 @@ def main(opportunity_id: str, team_size: int = 3, limit_faculty: int = 200):
 
         needs = [n.model_dump() for n in needs_out.needs]
         coverage = build_coverage_matrix(faculty_rows, needs)
-
+        print(coverage)
         faculty_ids = [r[0] for r in faculty_rows]
+
         selected_ids, covered_ids, missing_ids = greedy_team_select(
             faculty_ids=faculty_ids,
             needs=needs,
@@ -194,6 +197,14 @@ def main(opportunity_id: str, team_size: int = 3, limit_faculty: int = 200):
             team_size=needs_out.suggested_team_size if team_size == 0 else team_size,
         )
 
+        for n in needs_out.needs:
+            mh = " (must)" if n.must_have else ""
+            print(f"  - {n.need_id}: {n.label}{mh}  [w={n.weight}]")
+
+        print(selected_ids)
+        print(covered_ids),
+        print(missing_ids)
+    
         selected_rows = [r for r in faculty_rows if r[0] in set(selected_ids)]
 
         print("\n" + "=" * 90)
@@ -213,10 +224,12 @@ def main(opportunity_id: str, team_size: int = 3, limit_faculty: int = 200):
         print("  missing:", missing_ids)
         print("=" * 90 + "\n")
 
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--opportunity-id", required=True)
-    parser.add_argument("--team-size", type=int, default=3, help="0 = use LLM suggested size")
+    #TODO: determine teamsize by the funded amount
+    parser.add_argument("--team-size", type=int, default=4, help="0 = use LLM suggested size")
     parser.add_argument("--limit-faculty", type=int, default=200)
     args = parser.parse_args()
     main(args.opportunity_id, team_size=args.team_size, limit_faculty=args.limit_faculty)

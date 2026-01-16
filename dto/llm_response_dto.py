@@ -1,6 +1,6 @@
 # dto/llm_outputs.py
 from __future__ import annotations
-from typing import List, Optional, Literal
+from typing import List, Optional, Literal, Dict
 from pydantic import BaseModel, Field
 
 
@@ -26,9 +26,17 @@ class KeywordsOut(BaseModel):
 # Matching / scoring
 # ───────────────────────────────────────────────
 
+class CoveredItem(BaseModel):
+    section: Literal["application", "research"]
+    idx: int
+
 class LLMMatchOut(BaseModel):
-    llm_score: float = Field(ge=0.0, le=1.0)
-    reason: str = Field(min_length=1, max_length=256)
+    llm_score: float = Field(..., ge=0.0, le=1.0)
+    #TODO: DO we really need short reasoning here?
+    reason: str
+
+    covered: List[CoveredItem] = Field(default_factory=list)
+    missing: List[CoveredItem] = Field(default_factory=list)
 
 
 # ───────────────────────────────────────────────
@@ -52,6 +60,9 @@ class FacultyRecsOut(BaseModel):
 
 NeedKind = Literal["research_domain", "method", "application", "compliance"]
 
+# ───────────────────────────────────────────────
+# For group matcher
+# ───────────────────────────────────────────────
 class Need(BaseModel):
     need_id: str
     label: str
@@ -71,7 +82,7 @@ class TeamMember(BaseModel):
     faculty_id: int
     name: str | None = None
     email: str | None = None
-    role: str | None = None  # optional label like "methods lead"
+    role: str | None = None
 
 class TeamMatchOut(BaseModel):
     opportunity_id: str

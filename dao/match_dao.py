@@ -41,6 +41,9 @@ class MatchDAO:
                 "domain_score": stmt.excluded.domain_score,
                 "llm_score": stmt.excluded.llm_score,
                 "reason": stmt.excluded.reason,
+                "covered": stmt.excluded.covered,
+                "missing": stmt.excluded.missing,
+                #"evidence": stmt.excluded.evidence,
             },
         )
         self.session.execute(stmt)
@@ -62,3 +65,14 @@ class MatchDAO:
             .limit(k)
         )
         return [(gid, float(d), float(l)) for (gid, d, l) in q.all()]
+
+    def list_matches_for_opportunity(self, opportunity_id: str, limit: int = 200):
+        q = text("""
+            SELECT faculty_id, domain_score, llm_score, covered, missing
+            FROM match_results
+            WHERE grant_id = :oid
+            ORDER BY llm_score DESC, domain_score DESC
+            LIMIT :lim
+        """)
+        rows = self.session.execute(q, {"oid": opportunity_id, "lim": limit}).mappings().all()
+        return [dict(r) for r in rows]
