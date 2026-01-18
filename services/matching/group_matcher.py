@@ -6,7 +6,6 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parents[2]  # .../root
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from services.matching.group_matcher_max_flow_v2 import min_cost_team_select, min_cost_team_select_multi
 
 import argparse
 import json

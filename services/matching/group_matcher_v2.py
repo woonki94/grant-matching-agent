@@ -171,7 +171,7 @@ if __name__ == "__main__":
 
         print("Selected:", selected_ids)
 
-        print("\nFaculty to newly covered needs (contribution):")
+        print("\nFaculty covered needs:")
         for fid in selected_ids:
             m = faculty_need_map.get(fid, {})
             print(f"  Faculty {fid}:")
