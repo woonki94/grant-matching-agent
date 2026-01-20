@@ -40,25 +40,31 @@ def extract_faculty_links(soup: BeautifulSoup) -> list[str]:
             unique.append(u)
     return unique
 
-def crawl(max_pages: int = 50) -> list[str]:
-    all_links = []
+def crawl(max_pages: int = 50, max_links: int = 0) -> list[str]:
+    seen: set[str] = set()
+    out: list[str] = []
 
-    # Page 0: base without page number
-    url = f"{BASE}{LIST_PATH}"
-    soup = fetch(url)
-    links = extract_faculty_links(soup)
-    all_links.extend(links)
+    def add_batch(links: list[str]) -> None:
+        nonlocal out
+        for link in links:
+            if link in seen:
+                continue
+            seen.add(link)
+            if 0 < max_links <= len(out):
+                continue  # keep crawling pages, but don't store more
+            out.append(link)
+
+    # Page 0
+    soup = fetch(f"{BASE}{LIST_PATH}")
+    add_batch(extract_faculty_links(soup))
 
     # Pages 1..max_pages
     for p in range(1, max_pages + 1):
-        url = f"{BASE}{LIST_PATH}?page={p}"
-        soup = fetch(url)
+        soup = fetch(f"{BASE}{LIST_PATH}?page={p}")
         links = extract_faculty_links(soup)
         if not links:
             break
-        all_links.extend(links)
+        add_batch(links)
 
-    # Final de-dupe
-    all_links = list(dict.fromkeys(all_links))
-    return all_links
+    return out
 

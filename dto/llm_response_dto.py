@@ -1,6 +1,6 @@
 # dto/llm_outputs.py
 from __future__ import annotations
-from typing import List, Optional, Literal, Dict
+from typing import List, Optional, Literal, Dict, Union
 from pydantic import BaseModel, Field
 
 
@@ -22,21 +22,33 @@ class KeywordsOut(BaseModel):
     application: KeywordBucket = Field(default_factory=KeywordBucket)
 
 
+class KeywordItem(BaseModel):
+    t: str
+    w: float = Field(1.0, ge=0.0, le=1.0)
+
+class WeightedSpecsOut(BaseModel):
+    research: List[KeywordItem] = Field(default_factory=list)
+    application: List[KeywordItem] = Field(default_factory=list)
+
+
 # ───────────────────────────────────────────────
 # Matching / scoring
 # ───────────────────────────────────────────────
 
-class CoveredItem(BaseModel):
+class MissingItem(BaseModel):
     section: Literal["application", "research"]
     idx: int
 
+class ScoredCoveredItem(BaseModel):
+    section: Literal["application", "research"]
+    idx: int
+    c: float = Field(..., ge=0.0, le=1.0)
+
 class LLMMatchOut(BaseModel):
     llm_score: float = Field(..., ge=0.0, le=1.0)
-    #TODO: DO we really need short reasoning here?
-    reason: str
-
-    covered: List[CoveredItem] = Field(default_factory=list)
-    missing: List[CoveredItem] = Field(default_factory=list)
+    reason: Optional[str] = None
+    covered: List[ScoredCoveredItem] = Field(default_factory=list)
+    missing: List[MissingItem] = Field(default_factory=list)
 
 
 # ───────────────────────────────────────────────

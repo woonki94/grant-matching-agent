@@ -24,25 +24,43 @@ MATCH_PROMPT = ChatPromptTemplate.from_messages([
 
      "Rules:\n"
      "- Use ONLY the provided faculty keywords and REQUIREMENTS_INDEXED.\n"
-     "- reason: EXACTLY one sentence, <= 10 words, concrete, mention 1–2 overlapping capabilities.\n"
+     "- reason: EXACTLY one sentence, <= 10 words, mention 1–2 overlapping capabilities.\n"
      "- Do NOT mention embeddings, cosine similarity, tokens, or prompting.\n\n"
 
      "Coverage output requirements (MUST follow exactly):\n"
      "- REQUIREMENTS_INDEXED is a JSON object with keys: 'application' and 'research'.\n"
-     "- Each section maps string indices to requirement text, e.g. {{\"0\": \"...\", \"1\": \"...\"}}.\n"
-     "- You MUST output two lists: 'covered' and 'missing'. Each element must be:\n"
-     "  {{\"section\": \"application\"|\"research\", \"idx\": <int>}}.\n"
+     "- Each section maps string indices to requirement text, e.g. {{\"0\": \"...\", \"1\": \"...\"}}.\n\n"
+
+     "- You MUST output TWO fields: covered and missing.\n"
+     "- covered is a list of objects with keys: section, idx, c.\n"
+     "- missing is a list of objects with keys: section, idx.\n\n"
+
+     "- covered item format:\n"
+     "  {{\"section\": \"application\"|\"research\", \"idx\": <int>, \"c\": <float 0..1>}}.\n"
+     "- missing item format:\n"
+     "  {{\"section\": \"application\"|\"research\", \"idx\": <int>}}.\n\n"
+
      "- idx is 0-based and must exist in the corresponding section.\n"
-     "- Do NOT output requirement text in covered/missing — only section + idx.\n"
-     "- No duplicates. Do not put the same (section, idx) in both lists.\n"
+     "- c is coverage strength:\n"
+     "  - 0.90–1.00: direct match (same capability)\n"
+     "  - 0.70–0.89: strong match (closely aligned)\n"
+     "  - 0.40–0.69: partial match (some overlap)\n"
+     "  - below 0.40: treat as missing\n\n"
+
+     "- Do NOT output requirement text in covered/missing.\n"
+     "- No duplicates.\n"
+     "- Do not put the same (section, idx) in both lists.\n"
      "- Be conservative: if unsure, put it in missing.\n\n"
+
      "Completeness constraint (IMPORTANT):\n"
-     "- For EACH section ('application' and 'research'), you must classify EVERY index that appears\n"
-     "  in REQUIREMENTS_INDEXED[section] into exactly one of covered or missing.\n"
-     "  (i.e., covered ∪ missing = all indices, and covered ∩ missing = ∅, per section).\n"
+     "- For EACH section ('application' and 'research'), classify EVERY index in REQUIREMENTS_INDEXED[section]\n"
+     "  into exactly one of covered or missing.\n"
+     "  (covered ∪ missing = all indices, covered ∩ missing = ∅, per section).\n\n"
 
      "Final self-check:\n"
-     "- Validate every (section, idx) exists in REQUIREMENTS_INDEXED before responding."
+     "- Every (section, idx) exists in REQUIREMENTS_INDEXED.\n"
+     "- Every covered item includes c.\n"
+     "- Every missing item does NOT include c.\n"
     ),
     ("human",
      "FACULTY KEYWORDS (JSON):\n{faculty_kw_json}\n\n"

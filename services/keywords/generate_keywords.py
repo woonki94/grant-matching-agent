@@ -11,7 +11,7 @@ from services.prompts.keyword_prompts import (
     FACULTY_CANDIDATE_PROMPT,
     FACULTY_KEYWORDS_PROMPT,
     OPP_CANDIDATE_PROMPT,
-    OPP_KEYWORDS_PROMPT
+    OPP_KEYWORDS_PROMPT, OPP_SPECIALIZATION_WEIGHT_PROMPT, FACULTY_SPECIALIZATION_WEIGHT_PROMPT
 )
 from utils.qwen_embedder import embed_domain_bucket, extract_domains
 
@@ -21,7 +21,7 @@ from dao.faculty_dao import FacultyDAO
 from dao.opportunity_dao import OpportunityDAO
 from db.db_conn import SessionLocal
 from db.models import Faculty
-from dto.llm_response_dto import KeywordsOut, CandidatesOut
+from dto.llm_response_dto import KeywordsOut, CandidatesOut, WeightedSpecsOut
 from services.keywords.generate_context import faculty_to_keyword_context, opportunity_to_keyword_context
 from utils.content_compressor import cap_extracted_blocks
 
@@ -31,14 +31,51 @@ from langchain_core.prompts import ChatPromptTemplate
 from typing import Tuple
 from langchain_openai import ChatOpenAI
 
-def build_keyword_chain(candidate_prompt: ChatPromptTemplate, keywords_prompt: ChatPromptTemplate):
+
+def build_keyword_chain(
+    candidate_prompt: ChatPromptTemplate,
+    keywords_prompt: ChatPromptTemplate,
+    weight_prompt: ChatPromptTemplate,
+):
     llm = ChatOpenAI(model=OPENAI_MODEL, temperature=0, api_key=OPENAI_API_KEY)
 
     candidates_chain = candidate_prompt | llm.with_structured_output(CandidatesOut)
     keywords_chain = keywords_prompt | llm.with_structured_output(KeywordsOut)
-    return candidates_chain, keywords_chain
+    weight_chain = weight_prompt | llm.with_structured_output(WeightedSpecsOut)
 
-def generate_keywords(obj, *, context_builder, candidates_chain, keywords_chain) -> Tuple[dict, dict]:
+    return candidates_chain, keywords_chain, weight_chain
+
+
+def _apply_weighted_specializations(*, keywords: dict, weighted: WeightedSpecsOut) -> dict:
+    """
+    Keeps domains unchanged (List[str]).
+    Replaces specialization lists (List[str]) with List[{"t": str, "w": float}].
+    """
+    out = dict(keywords)
+    out["research"] = dict(out.get("research") or {})
+    out["application"] = dict(out.get("application") or {})
+
+    out["research"]["specialization"] = [x.model_dump() for x in (weighted.research or [])]
+    out["application"]["specialization"] = [x.model_dump() for x in (weighted.application or [])]
+    return out
+
+
+def generate_keywords(
+    obj,
+    *,
+    context_builder,
+    candidates_chain,
+    keywords_chain,
+    weight_chain,
+) -> Tuple[dict, dict]:
+    """
+    3-step pipeline:
+      1) context -> candidates
+      2) context + candidates -> structured keywords (domains + specialization strings)
+      3) context + specialization lists -> weighted specialization objects
+    Returns:
+      (keywords_weighted_json, raw_debug_json)
+    """
     context = context_builder(obj)
 
     if "attachments_extracted" in context:
@@ -50,15 +87,41 @@ def generate_keywords(obj, *, context_builder, candidates_chain, keywords_chain)
 
     context_json = json.dumps(context, ensure_ascii=False)
 
+    # Step 1: candidates
     cand_out: CandidatesOut = candidates_chain.invoke({"context_json": context_json})
-    candidates = cand_out.candidates[:50]
+    candidates = (cand_out.candidates or [])[:50]
 
+    # Step 2: structured keywords (specialization as strings)
     kw_out: KeywordsOut = keywords_chain.invoke({
         "context_json": context_json,
         "candidates": "\n".join(f"- {c}" for c in candidates),
     })
+    kw_dict = kw_out.model_dump()
 
-    return kw_out.model_dump(), {"context_used": context, "candidates": candidates}
+    # Step 3: weight specializations (faculty expertise OR opp requirement criticality)
+    spec_in = {
+        "research": (kw_dict.get("research") or {}).get("specialization") or [],
+        "application": (kw_dict.get("application") or {}).get("specialization") or [],
+    }
+    weighted_out: WeightedSpecsOut = weight_chain.invoke({
+        "context_json": context_json,
+        "spec_json": json.dumps(spec_in, ensure_ascii=False),
+    })
+
+    kw_weighted = _apply_weighted_specializations(keywords=kw_dict, weighted=weighted_out)
+
+    raw_debug = {
+        "context_used": context,
+        "candidates": candidates,
+        "keywords_unweighted": kw_dict,          # helpful for debugging
+        "specializations_input": spec_in,        # what was weighted
+        "weighted_specializations": {
+            "research": [x.model_dump() for x in weighted_out.research],
+            "application": [x.model_dump() for x in weighted_out.application],
+        },
+    }
+
+    return kw_weighted, raw_debug
 
 if __name__ == "__main__":
     import argparse
@@ -74,11 +137,16 @@ if __name__ == "__main__":
     run_faculty = not args.opp_only
     run_opp = not args.faculty_only
 
-    faculty_cand_chain, faculty_kw_chain = build_keyword_chain(
-        FACULTY_CANDIDATE_PROMPT, FACULTY_KEYWORDS_PROMPT
+    faculty_cand_chain, faculty_kw_chain, faculty_w_chain = build_keyword_chain(
+        FACULTY_CANDIDATE_PROMPT,
+        FACULTY_KEYWORDS_PROMPT,
+        FACULTY_SPECIALIZATION_WEIGHT_PROMPT,
     )
-    opp_cand_chain, opp_kw_chain = build_keyword_chain(
-        OPP_CANDIDATE_PROMPT, OPP_KEYWORDS_PROMPT
+
+    opp_cand_chain, opp_kw_chain, opp_w_chain = build_keyword_chain(
+        OPP_CANDIDATE_PROMPT,
+        OPP_KEYWORDS_PROMPT,
+        OPP_SPECIALIZATION_WEIGHT_PROMPT,
     )
 
     def _apply_limit(iterable):
@@ -104,6 +172,7 @@ if __name__ == "__main__":
                     context_builder=faculty_to_keyword_context,
                     candidates_chain=faculty_cand_chain,
                     keywords_chain=faculty_kw_chain,
+                    weight_chain=faculty_w_chain
                 )
 
                 # 1) upsert keywords
@@ -138,6 +207,7 @@ if __name__ == "__main__":
                     context_builder=opportunity_to_keyword_context,
                     candidates_chain=opp_cand_chain,
                     keywords_chain=opp_kw_chain,
+                    weight_chain=opp_w_chain,
                 )
 
                 opp_dao.upsert_keywords_json([{

@@ -32,7 +32,7 @@ CONTENT_BASE_DIR = settings.extracted_content_path
 LINK_SUB_DIR = settings.faculty_additional_link_path
 UNIV_NAME = settings.university_name
 
-def import_faculty(max_pages, years_back) -> None:
+def import_faculty(max_pages,max_faculty, years_back) -> None:
 
     # 0) Ensure base dir exists
     CONTENT_BASE_DIR.mkdir(parents=True, exist_ok=True)
@@ -44,7 +44,7 @@ def import_faculty(max_pages, years_back) -> None:
         years_back,
     )
 
-    links = crawl(max_pages=max_pages)
+    links = crawl(max_pages=max_pages, max_links=max_faculty)
     logger.info("[1/3 FETCH] Completed (%d links)", len(links))
 
     # 2) Upsert faculty + additional_info + publications
@@ -104,9 +104,18 @@ if __name__ == "__main__":
         help="How many years back to fetch publications from OpenAlex",
     )
 
+    #for debugging purpose
+    parser.add_argument(
+        "--max-faculty",
+        type=int,
+        default=0,
+        help="Maximum number of faculty links to crawl (0 = no limit)",
+    )
+
     args = parser.parse_args()
 
     import_faculty(
         max_pages=args.max_pages,
         years_back=args.years_back,
+        max_faculty=args.max_faculty,
     )

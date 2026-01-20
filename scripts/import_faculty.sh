@@ -3,12 +3,13 @@
 # Run the faculty import + publication enrichment pipeline
 #
 # Usage:
-#   ./scripts/import_faculty.sh [max_pages] [years_back]
+#   ./scripts/import_faculty.sh [max_pages] [years_back] [max_faculty]
 #
 # Examples:
 #   ./scripts/import_faculty.sh
 #   ./scripts/import_faculty.sh 1
 #   ./scripts/import_faculty.sh 3 10
+#   ./scripts/import_faculty.sh 3 10 50
 # ───────────────────────────────────────────────
 
 set -euo pipefail
@@ -29,14 +30,18 @@ fi
 
 MAX_PAGES="${1:-0}"
 YEARS_BACK="${2:-5}"
+MAX_FACULTY="${3:-0}"
+
 
 echo "Running faculty import pipeline..."
 echo "  Max pages        : $MAX_PAGES"
 echo "  Publications back: $YEARS_BACK years"
+echo "  Max faculty links: $MAX_FACULTY"
 echo
 
 PYTHON_FILE="$PROJECT_ROOT/services/faculty/import_faculty.py"
 
 python "$PYTHON_FILE" \
   --max-pages "$MAX_PAGES" \
-  --years-back "$YEARS_BACK"
+  --years-back "$YEARS_BACK" \
+  --max-faculty "$MAX_FACULTY"

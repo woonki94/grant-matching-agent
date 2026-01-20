@@ -18,8 +18,33 @@ from dao.match_dao import MatchDAO
 from services.keywords.generate_context import faculty_to_keyword_context, opportunity_to_keyword_context
 from services.prompts.matching_prompt import MATCH_PROMPT
 from utils.content_compressor import cap_extracted_blocks, cap_fac, cap_opp
-from dto.llm_response_dto import LLMMatchOut  # make this
+from dto.llm_response_dto import LLMMatchOut, ScoredCoveredItem, MissingItem  # make this
 
+from utils.keyword_accessor import (
+    keywords_for_matching,
+    requirements_indexed,
+)
+
+def covered_to_grouped(items: list[ScoredCoveredItem]):
+    out = {"application": {}, "research": {}}
+    for it in items or []:
+        sec = it.section
+        idx = str(int(it.idx))
+        c = float(it.c)
+        # if duplicate idx appears, keep the max confidence
+        prev = out[sec].get(idx)
+        out[sec][idx] = c if prev is None else max(prev, c)
+    return out
+
+def missing_to_grouped(items: list[MissingItem]):
+    out = {"application": [], "research": []}
+    for it in items or []:
+        out[it.section].append(int(it.idx))
+    # stable dedupe
+    for sec in out:
+        seen = set()
+        out[sec] = [x for x in out[sec] if not (x in seen or seen.add(x))]
+    return out
 
 def main(k: int, min_domain: float, limit_faculty: int):
     llm = ChatOpenAI(model=OPENAI_MODEL, temperature=0, api_key=OPENAI_API_KEY)
@@ -36,18 +61,14 @@ def main(k: int, min_domain: float, limit_faculty: int):
 
         batch = 0
         for fac in faculty_iter:
-            # Stage 1: candidates by cosine similarity (top-K)
             cand = match_dao.topk_opps_for_faculty(faculty_id=fac.faculty_id, k=k)
-            # threshold filter
             cand = [(oid, s) for (oid, s) in cand if s >= min_domain]
             if not cand:
                 continue
-            #TODO: necessary to pass all the context?? both for fac and opp
-            #fac_ctx = cap_fac(faculty_to_keyword_context(fac))
-            fac_ctx = {"name": fac.name, "keywords": (fac.keyword.keywords if fac.keyword else {})}
-            fac_json = json.dumps(fac_ctx, ensure_ascii=False)
 
-            # Stage 2: LLM score only the filtered candidates
+            fac_kw = keywords_for_matching(getattr(fac.keyword, "keywords", {}) or {})
+            fac_json = json.dumps(fac_kw, ensure_ascii=False)
+
             opp_ids = [opp_id for opp_id, _ in cand]
             opps = opp_dao.read_opportunities_by_ids_with_relations(opp_ids)
             opp_map = {o.opportunity_id: o for o in opps}
@@ -55,43 +76,21 @@ def main(k: int, min_domain: float, limit_faculty: int):
             out_rows = []
             for opp_id, domain_sim in cand:
                 opp = opp_map.get(opp_id)
-                if opp is None:
+                if not opp:
                     continue
 
-                #opp_ctx = cap_opp(opportunity_to_keyword_context(opp))
-                opp_ctx = {"opportunity_id": opp.opportunity_id,
-                           "keywords": (opp.keyword.keywords if opp.keyword else {})}
-                opp_json = json.dumps(opp_ctx, ensure_ascii=False)
-
-                kw = opp.keyword.keywords or {}
-
-                app_specs = (kw.get("application") or {}).get("specialization") or []
-                res_specs = (kw.get("research") or {}).get("specialization") or []
-
-                requirements_indexed = {
-                    "application": {str(i): t for i, t in enumerate(app_specs)},
-                    "research": {str(i): t for i, t in enumerate(res_specs)},
-                }
-
-                requirements_indexed_json = json.dumps(requirements_indexed, ensure_ascii=False)
+                # Build indexed requirements from normalized (string-only) keywords
+                opp_kw = keywords_for_matching(getattr(opp.keyword, "keywords", {}) or {})
+                req_idx = requirements_indexed(opp_kw)
+                opp_req_idx_json = json.dumps(req_idx, ensure_ascii=False)
 
                 scored: LLMMatchOut = chain.invoke({
                     "faculty_kw_json": fac_json,
-                    "requirements_indexed": requirements_indexed_json,
+                    "requirements_indexed": opp_req_idx_json,
                 })
 
-                def group_by_section(items):
-                    out = {"application": [], "research": []}
-                    for it in items or []:
-                        out[it.section].append(int(it.idx))
-                    # stable dedupe
-                    for k in out:
-                        seen = set()
-                        out[k] = [x for x in out[k] if not (x in seen or seen.add(x))]
-                    return out
-
-                covered_grouped = group_by_section(scored.covered)
-                missing_grouped = group_by_section(scored.missing)
+                covered_grouped = covered_to_grouped(scored.covered)
+                missing_grouped = missing_to_grouped(scored.missing)
 
                 out_rows.append({
                     "grant_id": opp_id,
@@ -99,16 +98,17 @@ def main(k: int, min_domain: float, limit_faculty: int):
                     "domain_score": float(domain_sim),
                     "llm_score": float(scored.llm_score),
                     "reason": scored.reason.strip(),
-                    "covered": covered_grouped,   # JSONB object
-                    "missing": missing_grouped,   # JSONB object
-                    #"evidence": getattr(scored, "evidence", {}) or {},
+                    "covered": covered_grouped,
+                    "missing": missing_grouped,
                 })
 
-            print(out_rows)
-            match_dao.upsert_matches(out_rows)
+            if out_rows:
+                match_dao.upsert_matches(out_rows)
+
             batch += 1
             if batch % 30 == 0:
                 sess.commit()
+
         sess.commit()
 
 if __name__ == "__main__":
