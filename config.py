@@ -52,7 +52,7 @@ class Settings(BaseSettings):
     # =========================
     # Opportunity Extracted Content saved path
     # =========================
-    extracted_content_path: Path = Path("/Users/kimwoonki/Desktop/OSU/Fall2025/Capstone/GrantFetcher_v2/data/extracted_text")
+    extracted_content_path: Path = Path("/home/ec2-user/grant-matching-agent/data/extracted_text")
     opportunity_attachment_path: Path = Path("opportunities/attachments")
     opportunity_additional_link_path: Path = Path("opportunities/additional_links")
 
