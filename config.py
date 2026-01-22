@@ -5,7 +5,8 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 from pathlib import Path
 BASE_DIR = Path(__file__).resolve().parent
 
-from llm.client import LLMChatClient, LLMConfig  # adjust path if different
+from client.llm_client import LLMChatClient, LLMConfig  # adjust path if different
+from client.embedding_client import EmbeddingClient,EmbeddingConfig
 
 
 class Settings(BaseSettings):
@@ -22,7 +23,6 @@ class Settings(BaseSettings):
     bedrock_model_id: str | None = None
     aws_profile: str | None = None
 
-
     # =========================
     # LLM Provider
     # =========================
@@ -33,6 +33,17 @@ class Settings(BaseSettings):
     # Qwen
     # =========================
     qwen_embed_model: str
+
+    # =========================
+    # Embeddings (Bedrock)
+    # =========================
+    bedrock_embed_model_id: str | None = None
+
+    # =========================
+    # Embedding Provider
+    # =========================
+    embedding_provider: Literal["qwen", "bedrock"] = "bedrock"
+    embed_dim: int = 4096 if embedding_provider == "qwen" else 1024
 
 
     openrouter_base_url: str =  "https://openrouter.ai/api/v1"
@@ -116,5 +127,21 @@ def get_llm_client() -> LLMChatClient:
             aws_region=settings.aws_region,
             bedrock_model_id=settings.bedrock_model_id,
             aws_profile=settings.aws_profile,
+        )
+    )
+
+@lru_cache(maxsize=1)
+def get_embedding_client() -> EmbeddingClient:
+    return EmbeddingClient(
+        EmbeddingConfig(
+            provider=settings.embedding_provider,
+            # Bedrock
+            aws_region=settings.aws_region,
+            aws_profile=settings.aws_profile,
+            bedrock_embed_model_id=settings.bedrock_embed_model_id,
+            # OpenRouter(Qwen)
+            openrouter_api_key=settings.openrouter_api_key,
+            openrouter_base_url=settings.openrouter_base_url,
+            openrouter_embed_model=settings.qwen_embed_model,
         )
     )

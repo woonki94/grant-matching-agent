@@ -15,8 +15,9 @@ from sqlalchemy.orm import relationship
 from sqlalchemy.dialects.postgresql import JSONB
 
 from db.base import Base
+from config import settings
 
-EMBED_DIM = 4096
+EMBED_DIM = settings.embed_dim
 
 
 class Faculty(Base):
