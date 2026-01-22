@@ -17,7 +17,9 @@ from sqlalchemy.orm import relationship
 from sqlalchemy.dialects.postgresql import JSONB
 from db.base import Base
 
-EMBED_DIM = 4096
+from config import settings
+
+EMBED_DIM = settings.embed_dim
 
 
 class Opportunity(Base):

@@ -30,6 +30,8 @@ import json
 from langchain_core.prompts import ChatPromptTemplate
 from typing import Tuple
 from langchain_openai import ChatOpenAI
+from config import get_llm_client
+
 
 
 def build_keyword_chain(
@@ -37,7 +39,7 @@ def build_keyword_chain(
     keywords_prompt: ChatPromptTemplate,
     weight_prompt: ChatPromptTemplate,
 ):
-    llm = ChatOpenAI(model=OPENAI_MODEL, temperature=0, api_key=OPENAI_API_KEY)
+    llm = get_llm_client().build()
 
     candidates_chain = candidate_prompt | llm.with_structured_output(CandidatesOut)
     keywords_chain = keywords_prompt | llm.with_structured_output(KeywordsOut)

@@ -1,9 +1,12 @@
-from typing import Final
+from typing import Final,Literal
+from functools import lru_cache
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from pathlib import Path
 BASE_DIR = Path(__file__).resolve().parent
-#TODO: print-> log
+
+from client.llm_client import LLMChatClient, LLMConfig  # adjust path if different
+from client.embedding_client import EmbeddingClient,EmbeddingConfig
 
 
 class Settings(BaseSettings):
@@ -13,11 +16,34 @@ class Settings(BaseSettings):
     openai_model: str
     openai_api_key: str
 
+    # =========================
+    # Claude (Bedrock)
+    # =========================
+    aws_region: str = "us-east-1"
+    bedrock_model_id: str | None = None
+    aws_profile: str | None = None
+
+    # =========================
+    # LLM Provider
+    # =========================
+    llm_provider: Literal["openai", "bedrock"] = "bedrock"
+    llm_temperature: float = 0.0
 
     # =========================
     # Qwen
     # =========================
     qwen_embed_model: str
+
+    # =========================
+    # Embeddings (Bedrock)
+    # =========================
+    bedrock_embed_model_id: str | None = None
+
+    # =========================
+    # Embedding Provider
+    # =========================
+    embedding_provider: Literal["qwen", "bedrock"] = "bedrock"
+    embed_dim: int = 4096 if embedding_provider == "qwen" else 1024
 
 
     openrouter_base_url: str =  "https://openrouter.ai/api/v1"
@@ -52,7 +78,7 @@ class Settings(BaseSettings):
     # =========================
     # Opportunity Extracted Content saved path
     # =========================
-    extracted_content_path: Path = Path("/Users/kimwoonki/Desktop/OSU/Fall2025/Capstone/GrantFetcher_v2/data/extracted_text")
+    extracted_content_path: Path = Path("/home/ec2-user/grant-matching-agent/data/extracted_text")
     opportunity_attachment_path: Path = Path("opportunities/attachments")
     opportunity_additional_link_path: Path = Path("opportunities/additional_links")
 
@@ -89,3 +115,33 @@ OPENAI_MODEL: Final[str] = settings.openai_model
 Grant_API_KEY: Final[str] = settings.grant_api_key
 OPENROUTER_API_KEY : Final[str] = settings.openrouter_api_key
 QWEN_MODEL: Final[str] = settings.qwen_embed_model
+
+@lru_cache(maxsize=1)
+def get_llm_client() -> LLMChatClient:
+    return LLMChatClient(
+        LLMConfig(
+            provider=settings.llm_provider,
+            temperature=settings.llm_temperature,
+            openai_model=settings.openai_model,
+            openai_api_key=settings.openai_api_key,
+            aws_region=settings.aws_region,
+            bedrock_model_id=settings.bedrock_model_id,
+            aws_profile=settings.aws_profile,
+        )
+    )
+
+@lru_cache(maxsize=1)
+def get_embedding_client() -> EmbeddingClient:
+    return EmbeddingClient(
+        EmbeddingConfig(
+            provider=settings.embedding_provider,
+            # Bedrock
+            aws_region=settings.aws_region,
+            aws_profile=settings.aws_profile,
+            bedrock_embed_model_id=settings.bedrock_embed_model_id,
+            # OpenRouter(Qwen)
+            openrouter_api_key=settings.openrouter_api_key,
+            openrouter_base_url=settings.openrouter_base_url,
+            openrouter_embed_model=settings.qwen_embed_model,
+        )
+    )
