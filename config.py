@@ -1,6 +1,7 @@
 from typing import Final,Literal
 from functools import lru_cache
 
+from pydantic import computed_field, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from pathlib import Path
 BASE_DIR = Path(__file__).resolve().parent
@@ -11,43 +12,21 @@ from client.embedding_client import EmbeddingClient,EmbeddingConfig
 
 class Settings(BaseSettings):
     # =========================
-    # OpenAI
+    # Postgres Settings
     # =========================
-    openai_model: str
-    openai_api_key: str
+    pguser: str
+    pgpassword: str
+    pghost: str
+    pgport: int = 5432
+    pgdatabase: str
 
-    # =========================
-    # Claude (Bedrock)
-    # =========================
-    aws_region: str = "us-east-1"
-    bedrock_model_id: str | None = None
-    aws_profile: str | None = None
-
-    # =========================
-    # LLM Provider
-    # =========================
-    llm_provider: Literal["openai", "bedrock"] = "bedrock"
-    llm_temperature: float = 0.0
-
-    # =========================
-    # Qwen
-    # =========================
-    qwen_embed_model: str
-
-    # =========================
-    # Embeddings (Bedrock)
-    # =========================
-    bedrock_embed_model_id: str | None = None
-
-    # =========================
-    # Embedding Provider
-    # =========================
-    embedding_provider: Literal["qwen", "bedrock"] = "bedrock"
-    embed_dim: int = 4096 if embedding_provider == "qwen" else 1024
-
-
-    openrouter_base_url: str =  "https://openrouter.ai/api/v1"
-    openrouter_api_key: str
+    @computed_field
+    @property
+    def database_url(self) -> str:
+        return (
+            f"postgresql+psycopg2://{self.pguser}:{self.pgpassword}"
+            f"@{self.pghost}:{self.pgport}/{self.pgdatabase}"
+        )
 
     # =========================
     # Grant.gov
@@ -61,7 +40,59 @@ class Settings(BaseSettings):
     # =========================
     openalex_base_url: str = "https://api.openalex.org"
 
+    # =========================
+    # LLM+EMBEDDING Provider
+    # =========================
+    llm_provider: Literal["openai", "bedrock"]
+    embedding_provider: Literal["openrouter", "bedrock"]
 
+
+    # =========================
+    # OpenAI
+    # =========================
+    openai_model: str
+    openai_api_key: str
+
+    # =========================
+    # Qwen
+    # =========================
+    qwen_embed_model: str
+    openrouter_base_url: str
+    openrouter_api_key: str
+
+    #AWS
+    aws_region: str = "us-east-1"
+    aws_profile: str | None = None
+    # =========================
+    # Claude (Bedrock)
+    # =========================
+    bedrock_model_id: str | None = None
+    # =========================
+    # Embeddings (Bedrock)
+    # =========================
+    bedrock_embed_model_id: str | None = None
+
+    # =========================
+    # LLM config
+    # =========================
+    llm_temperature: float = 0.0
+
+    @computed_field
+    @property
+    def embed_dim(self) -> int:
+        return 4096 if self.embedding_provider == "openrouter" else 1024
+
+    # =========================
+    # Opportunity Extracted Content saved path
+    # =========================
+    extracted_content_path: Path
+    opportunity_attachment_path: Path
+    opportunity_additional_link_path: Path
+
+    # =========================
+    # Faculty Extracted Content saved path
+    # =========================
+    faculty_additional_link_path: Path
 
 
     # =========================
@@ -74,18 +105,6 @@ class Settings(BaseSettings):
         "Mozilla/5.0 (+faculty-link-scraper; OSU project)"
     )
 
-
-    # =========================
-    # Opportunity Extracted Content saved path
-    # =========================
-    extracted_content_path: Path = Path("/home/ec2-user/grant-matching-agent/data/extracted_text")
-    opportunity_attachment_path: Path = Path("opportunities/attachments")
-    opportunity_additional_link_path: Path = Path("opportunities/additional_links")
-
-    # =========================
-    # Faculty Extracted Content saved path
-    # =========================
-    faculty_additional_link_path: Path = Path("faculty/additional_links")
 
     # =========================
     # University Name(needed for publication extraction)
