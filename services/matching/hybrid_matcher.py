@@ -19,6 +19,7 @@ from services.keywords.generate_context import faculty_to_keyword_context, oppor
 from services.prompts.matching_prompt import MATCH_PROMPT
 from utils.content_compressor import cap_extracted_blocks, cap_fac, cap_opp
 from dto.llm_response_dto import LLMMatchOut, ScoredCoveredItem, MissingItem  # make this
+from config import get_llm_client
 
 from utils.keyword_accessor import (
     keywords_for_matching,
@@ -47,7 +48,7 @@ def missing_to_grouped(items: list[MissingItem]):
     return out
 
 def main(k: int, min_domain: float, limit_faculty: int):
-    llm = ChatOpenAI(model=OPENAI_MODEL, temperature=0, api_key=OPENAI_API_KEY)
+    llm = get_llm_client().build()
     chain = MATCH_PROMPT | llm.with_structured_output(LLMMatchOut)
 
     with SessionLocal() as sess:

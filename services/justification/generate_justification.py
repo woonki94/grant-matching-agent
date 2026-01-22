@@ -32,6 +32,7 @@ from utils.content_compressor import cap_extracted_blocks, cap_fac, cap_opp
 from langchain_openai import ChatOpenAI
 from langchain_core.prompts import ChatPromptTemplate
 from pydantic import BaseModel, Field
+from config import get_llm_client
 
 def llm_label(llm_score: float) -> str:
     if llm_score < 0.30:
@@ -77,7 +78,7 @@ def print_faculty_recs(out, email: str, *, width: int = 92, show_full_id: bool =
         print("-" * width)
 
 def main(email: str, k: int) -> None:
-    llm = ChatOpenAI(model=OPENAI_MODEL, temperature=0, api_key=OPENAI_API_KEY)
+    llm = get_llm_client().build()
     chain = FACULTY_RECS_PROMPT | llm.with_structured_output(FacultyRecsOut)
 
     with SessionLocal() as sess:

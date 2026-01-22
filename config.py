@@ -1,9 +1,11 @@
-from typing import Final
+from typing import Final,Literal
+from functools import lru_cache
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from pathlib import Path
 BASE_DIR = Path(__file__).resolve().parent
-#TODO: print-> log
+
+from llm.client import LLMChatClient, LLMConfig  # adjust path if different
 
 
 class Settings(BaseSettings):
@@ -13,6 +15,19 @@ class Settings(BaseSettings):
     openai_model: str
     openai_api_key: str
 
+    # =========================
+    # Claude (Bedrock)
+    # =========================
+    aws_region: str = "us-east-1"
+    bedrock_model_id: str | None = None
+    aws_profile: str | None = None
+
+
+    # =========================
+    # LLM Provider
+    # =========================
+    llm_provider: Literal["openai", "bedrock"] = "bedrock"
+    llm_temperature: float = 0.0
 
     # =========================
     # Qwen
@@ -89,3 +104,17 @@ OPENAI_MODEL: Final[str] = settings.openai_model
 Grant_API_KEY: Final[str] = settings.grant_api_key
 OPENROUTER_API_KEY : Final[str] = settings.openrouter_api_key
 QWEN_MODEL: Final[str] = settings.qwen_embed_model
+
+@lru_cache(maxsize=1)
+def get_llm_client() -> LLMChatClient:
+    return LLMChatClient(
+        LLMConfig(
+            provider=settings.llm_provider,
+            temperature=settings.llm_temperature,
+            openai_model=settings.openai_model,
+            openai_api_key=settings.openai_api_key,
+            aws_region=settings.aws_region,
+            bedrock_model_id=settings.bedrock_model_id,
+            aws_profile=settings.aws_profile,
+        )
+    )
