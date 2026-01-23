@@ -6,7 +6,7 @@ from typing import Dict, List, Tuple
 from db.db_conn import SessionLocal
 from dao.match_dao import MatchDAO
 from dao.opportunity_dao import OpportunityDAO
-from utils.keyword_accessor import keywords_for_matching
+from utils.keyword_accessor import keywords_for_matching, extract_specializations
 
 
 def solve_team_milp_soft_coverage(
@@ -166,19 +166,17 @@ def build_milp_inputs_for_opportunity(
 
     # --- requirement universe + weights ---
     kw_raw = getattr(opp.keyword, "keywords", {}) or {}
-    w = requirement_weights_from_raw(kw_raw)
+    spec_items = extract_specializations(kw_raw)
 
-    kw_text = keywords_for_matching(kw_raw)  # may strip weights; fine
-    req_text_indexed = requirements_indexed_text_only(kw_text)
+    # Requirement index universe is just positions in the list
+    I_app = list(range(len(spec_items["application"])))
+    I_res = list(range(len(spec_items["research"])))
 
-    I_app = sorted(int(k) for k in (req_text_indexed.get("application") or {}).keys())
-    I_res = sorted(int(k) for k in (req_text_indexed.get("research") or {}).keys())
-
-    # safety: fill missing weights with 1.0 (if any mismatch)
-    for i in I_app:
-        w["application"].setdefault(i, 1.0)
-    for i in I_res:
-        w["research"].setdefault(i, 1.0)
+    # Weights indexed by position
+    w: Dict[str, Dict[int, float]] = {"application": {}, "research": {}}
+    for sec, I_sec in (("application", I_app), ("research", I_res)):
+        for i in I_sec:
+            w[sec][i] = float(spec_items[sec][i].get("w", 1.0))
 
     # --- match rows => F + c ---
     match_rows = match_dao.list_matches_for_opportunity(opportunity_id, limit=limit_rows)

@@ -13,7 +13,7 @@ from services.prompts.keyword_prompts import (
     OPP_CANDIDATE_PROMPT,
     OPP_KEYWORDS_PROMPT, OPP_SPECIALIZATION_WEIGHT_PROMPT, FACULTY_SPECIALIZATION_WEIGHT_PROMPT
 )
-from utils.qwen_embedder import embed_domain_bucket, extract_domains
+from utils.embedder import embed_domain_bucket, extract_domains
 
 
 from config import settings, OPENAI_MODEL, OPENAI_API_KEY, QWEN_MODEL
