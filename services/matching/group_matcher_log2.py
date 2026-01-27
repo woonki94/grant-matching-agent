@@ -168,7 +168,7 @@ if __name__ == "__main__":
     opp_id = "60b8b017-30ec-4f31-a160-f00b7ee384e7"
     print_weighted_coverage_for_first_faculty(
         opp_id,
-        faculty_id=41,   # None => first faculty in match rows
+        faculty_id=45,   # None => first faculty in match rows
         limit_rows=500,
         top_n=50,
     )

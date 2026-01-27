@@ -101,3 +101,13 @@ class TeamMatchOut(BaseModel):
     selected: List[TeamMember] = Field(default_factory=list)
     covered_need_ids: List[str] = Field(default_factory=list)
     missing_need_ids: List[str] = Field(default_factory=list)
+
+#
+class PairPenalty(BaseModel):
+    f: int = Field(..., description="Faculty id")
+    g: int = Field(..., description="Faculty id")
+    p: float = Field(..., ge=0, description="Penalty magnitude in score units")
+    why: Optional[str] = Field(None, description="Short reason")
+
+class PairPenaltiesOut(BaseModel):
+    pair_penalties: List[PairPenalty] = Field(default_factory=list)

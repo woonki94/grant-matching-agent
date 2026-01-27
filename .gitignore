@@ -10,3 +10,5 @@ __pycache__/
 /data/extracted_text
 
 /logs
+
+/archive
