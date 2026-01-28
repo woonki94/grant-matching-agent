@@ -129,6 +129,15 @@ class OpportunityDAO:
         for opp in q:
             yield opp
 
+    def iter_opportunity_ids(self, batch_size: int = 500) -> Iterator[str]:
+        # Only pull the PK; no joins, no relations
+        q = (
+            self.session.query(Opportunity.opportunity_id)
+            .yield_per(batch_size)
+        )
+        for (oid,) in q:
+            yield oid
+
     def read_opportunities_by_ids_with_relations(self, ids: list[str]) -> list[Opportunity]:
         if not ids:
             return []

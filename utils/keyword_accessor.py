@@ -1,3 +1,6 @@
+from typing import Dict
+
+
 def extract_specializations(kw: dict) -> dict:
     """
     Returns:
@@ -51,6 +54,19 @@ def requirements_indexed(kw: dict) -> dict:
         for i, s in enumerate(specs[sec]):
             out[sec][str(i)] = s["t"]
 
+    return out
+
+def build_req_text_indexed(opp_keywords_raw: dict) -> Dict[str, Dict[int, str]]:
+    """
+    req_text[sec][idx] = specialization text
+    Must match indexing used to create match_rows['covered'].
+    """
+    kw_text = keywords_for_matching(opp_keywords_raw)
+    out: Dict[str, Dict[int, str]] = {"application": {}, "research": {}}
+    for sec in ("application", "research"):
+        specs = ((kw_text.get(sec) or {}).get("specialization") or [])
+        for i, s in enumerate(specs):
+            out[sec][i] = str(s)
     return out
 
 

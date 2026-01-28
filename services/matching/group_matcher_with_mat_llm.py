@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import json
+import math
 
 from config import get_llm_client
+from dao.group_match_dao import GroupMatchDAO
 from dao.opportunity_dao import OpportunityDAO
 from db.db_conn import SessionLocal
 from dto.llm_response_dto import PairPenaltiesOut
@@ -13,36 +15,78 @@ from typing import Dict, List, Tuple, Any
 from typing import Dict, List, Tuple, Any, Optional
 
 from services.prompts.group_match_prompt import REDUNDANCY_PAIR_PENALTY_PROMPT
-from utils.keyword_accessor import keywords_for_matching
+from utils.keyword_accessor import keywords_for_matching, build_req_text_indexed
 
-
-def get_redundancy_penalty_chain():
-    llm = get_llm_client().build()
-    return REDUNDANCY_PAIR_PENALTY_PROMPT | llm.with_structured_output(PairPenaltiesOut)
-
-
-def llm_pair_penalty_fn(report: Dict[str, Any]) -> List[Dict[str, Any]]:
+def redundancy_penalty_fn_full(
+    *,
+    candidate_fids: List[int],
+    I_app: List[int],
+    I_res: List[int],
+    w: Dict[str, Dict[int, float]],
+    c: Dict[int, Dict[str, Dict[int, float]]],
+    alpha: Dict[str, float],
+    k: float = 0.5,              # exponential tilt strength
+) -> List[Dict[str, Any]]:
     """
-    report: the compact team report dict
-    returns: [{"f": int, "g": int, "p": float}, ...]
+    Deterministic pairwise redundancy penalty (importance-aware), without normalization.
+
+    Assumptions:
+      - weights w[sec][i] are present for all i in I_sec
+      - weights lie in [0,1]
+      - coverage c_{f,sec,i} lies in [0,1]
+
+    Penalty:
+      p_fg = sum_sec alpha_sec * sum_i exp(-k * w_sec,i) * min(c_f, c_g)
+
+    Raises ValueError if any required weight is missing.
     """
-    chain = get_redundancy_penalty_chain()
 
-    out: PairPenaltiesOut = chain.invoke({
-        "report_json": json.dumps(report, ensure_ascii=False)
-    })
+    if k < 0:
+        raise ValueError(f"k must be >= 0. Got {k}")
 
-    pairs = []
-    for pp in (out.pair_penalties or []):
-        f = int(pp.f)
-        g = int(pp.g)
-        if f == g:
-            continue
-        p = float(pp.p)
-        if p <= 0:
-            continue
-        pairs.append({"f": f, "g": g, "p": p})
+    def cf(fid: int, sec: str, i: int) -> float:
+        return float((((c.get(fid) or {}).get(sec) or {}).get(i, 0.0)))
+
+    def wf(sec: str, i: int) -> float:
+        if sec not in w:
+            raise ValueError(f"Missing weight section: '{sec}'")
+        sec_w = w[sec]
+        if i not in sec_w:
+            raise ValueError(f"Missing weight for section '{sec}', index: {i}")
+        val = float(sec_w[i])
+        # optional strict range check (uncomment if you want hard enforcement)
+        # if not (0.0 <= val <= 1.0):
+        #     raise ValueError(f"Weight out of [0,1] for section '{sec}', index {i}: {val}")
+        return val
+
+    F = [int(x) for x in candidate_fids]
+    pairs: List[Dict[str, Any]] = []
+
+    aa = float(alpha.get("application", 1.0))
+    rr = float(alpha.get("research", 1.0))
+
+    for a_i in range(len(F)):
+        for a_j in range(a_i + 1, len(F)):
+            f, g = F[a_i], F[a_j]
+            p_fg = 0.0
+
+            # application
+            for i in I_app:
+                w_i = wf("application", i)
+                m = math.exp(-k * w_i)
+                p_fg += aa * m * min(cf(f, "application", i), cf(g, "application", i))
+
+            # research
+            for i in I_res:
+                w_i = wf("research", i)
+                m = math.exp(-k * w_i)
+                p_fg += rr * m * min(cf(f, "research", i), cf(g, "research", i))
+
+            if p_fg > 0:
+                pairs.append({"f": f, "g": g, "p": round(p_fg, 6)})
+
     return pairs
+
 
 def compute_base_scores(
     *,
@@ -62,119 +106,43 @@ def compute_base_scores(
     for fid in F:
         s = 0.0
         s += float(alpha.get("application", 1.0)) * sum(wf("application", i) * cf(fid, "application", i) for i in I_app)
-        s += float(alpha.get("research", 1.0))     * sum(wf("research", i)     * cf(fid, "research", i)     for i in I_res)
+        s += float(alpha.get("research", 1.0))  * sum(wf("research", i)     * cf(fid, "research", i)     for i in I_res)
         scores[fid] = s
     return scores
 
 
-def top_hits_for_faculty(
-    fid: int,
-    *,
-    I_app: List[int],
-    I_res: List[int],
-    w: Dict[str, Dict[int, float]],
-    c: Dict[int, Dict[str, Dict[int, float]]],
-    alpha: Dict[str, float],
-    top_m: int = 8,
-    c_min: float = 0.15,
-) -> List[Dict[str, Any]]:
-    rows = []
-    for sec, I in (("application", I_app), ("research", I_res)):
-        a = float(alpha.get(sec, 1.0))
-        sec_c = (c.get(fid) or {}).get(sec) or {}
-        for i in I:
-            cc = float(sec_c.get(i, 0.0))
-            if cc < c_min:
-                continue
-            ww = float((w.get(sec) or {}).get(i, 1.0))
-            contrib = a * ww * cc
-            rows.append((contrib, sec, i, ww, cc))
-    rows.sort(reverse=True, key=lambda x: x[0])
-    out = [{"sec": sec, "idx": i, "w": ww, "c": cc} for _, sec, i, ww, cc in rows[:top_m]]
-    return out
-
-
-def build_team_report(
-    *,
-    candidate_fids: List[int],
-    base_scores: Dict[int, float],
-    team_current: List[int],
-    req_text: Dict[str, Dict[int, str]],
-    w: Dict[str, Dict[int, float]],
-    c: Dict[int, Dict[str, Dict[int, float]]],
-    I_app: List[int],
-    I_res: List[int],
-    alpha: Dict[str, float],
-    K: int,
-    top_m: int = 8,
-) -> Dict[str, Any]:
-    # grant requirements payload (only those indices that exist in req_text)
-    def req_list(sec: str) -> List[Dict[str, Any]]:
-        items = []
-        for i, text in (req_text.get(sec) or {}).items():
-            items.append({"idx": int(i), "text": str(text), "w": float((w.get(sec) or {}).get(int(i), 1.0))})
-        # sort by weight desc
-        items.sort(key=lambda d: d["w"], reverse=True)
-        return items
-
-    candidates = []
-    for fid in candidate_fids:
-        candidates.append({
-            "fid": int(fid),
-            "base_score": float(base_scores.get(fid, 0.0)),
-            "top_hits": top_hits_for_faculty(
-                fid,
-                I_app=I_app, I_res=I_res, w=w, c=c, alpha=alpha,
-                top_m=top_m,
-            )
-        })
-
-    # sort candidates by base score descending
-    candidates.sort(key=lambda d: d["base_score"], reverse=True)
-
-    return {
-        "grant": {"requirements": {"application": req_list("application"), "research": req_list("research")}},
-        "candidates": candidates,
-        "team_current": [int(x) for x in team_current],
-        "settings": {"K": int(K)}
-    }
-
-def redundancy_overlap_mass(
+def team_redundancy_from_pair_penalties(
     team: List[int],
+    pair_penalties: List[Dict[str, Any]],
     *,
-    I_app: List[int],
-    I_res: List[int],
-    w: Dict[str, Dict[int, float]],
-    c: Dict[int, Dict[str, Dict[int, float]]],
-    alpha: Dict[str, float],
+    average: bool = True,
 ) -> float:
-    # average pair overlap mass
-    import itertools
+    team_set = set(int(x) for x in team)
 
-    def wf(sec, i): return float((w.get(sec) or {}).get(i, 1.0))
-    def cf(fid, sec, i): return float((((c.get(fid) or {}).get(sec) or {}).get(i, 0.0)))
+    # normalize pair map
+    pmap: Dict[tuple[int, int], float] = {}
+    for it in pair_penalties:
+        f, g = int(it["f"]), int(it["g"])
+        if f == g:
+            continue
+        if f > g:
+            f, g = g, f
+        pmap[(f, g)] = max(float(it["p"]), pmap.get((f, g), 0.0))
 
-    secs = ("application", "research")
-    I = {"application": I_app, "research": I_res}
+    # sum penalties inside team
+    s = 0.0
+    cnt = 0
+    team_list = sorted(team_set)
+    for i in range(len(team_list)):
+        for j in range(i + 1, len(team_list)):
+            key = (team_list[i], team_list[j])
+            if key in pmap:
+                s += pmap[key]
+            cnt += 1
 
-    pairs = list(itertools.combinations(team, 2))
-    if not pairs:
-        return 0.0
-
-    total = 0.0
-    for f, g in pairs:
-        ov = 0.0
-        for sec in secs:
-            a = float(alpha.get(sec, 1.0))
-            for i in I[sec]:
-                ov += a * wf(sec, i) * min(cf(f, sec, i), cf(g, sec, i))
-        total += ov
-
-    return total / len(pairs)
-
-def is_excellent(team: List[int], *, red_score: float, red_max: float = 1.5) -> bool:
-    return red_score <= red_max
-
+    if not average:
+        return s
+    return s / cnt if cnt else 0.0
 
 def solve_team_with_pair_penalties_milp(
     *,
@@ -242,205 +210,250 @@ def solve_team_with_pair_penalties_milp(
 
     return {"selected": selected, "objective": obj, "status": pulp.LpStatus.get(prob.status)}
 
-def iterate_team_selection_with_llm_redundancy(
+
+def quality_gate(
     *,
-    F_all: List[int],
+    team: List[int],
     I_app: List[int],
     I_res: List[int],
     w: Dict[str, Dict[int, float]],
     c: Dict[int, Dict[str, Dict[int, float]]],
-    req_text: Dict[str, Dict[int, str]],
-    K: int,
     alpha: Dict[str, float],
-    topN: int = 20,
-    lam_grid: List[float] = [0.0, 0.5, 1.0, 2.0, 4.0],
-    max_iter: int = 3,
-    red_max: float = 1.5,
-    llm_pair_penalty_fn=None,  # function(report)->pair_penalties list
-) -> Dict[str, Any]:
-    # 1) base scores for all faculty
-    base_scores = compute_base_scores(F=F_all, I_app=I_app, I_res=I_res, w=w, c=c, alpha=alpha)
+    # thresholds (start low, tune later)
+    min_cov: float = 0.25,
+    breadth_tau: float = 0.25,
+    min_breadth: float = 0.25,
+    critical_w: float = 0.90,
+    critical_tau: float = 0.60,
+    min_critical_hit: float = 0.35,
+) -> Tuple[bool, Dict[str, float]]:
 
-    # 2) shortlist topN
-    cand_sorted = sorted(F_all, key=lambda fid: base_scores.get(fid, 0.0), reverse=True)
-    candidates = cand_sorted[:topN]
+    def team_max(sec: str, idx: int) -> float:
+        best = 0.0
+        for fid in team:
+            best = max(best, float((((c.get(fid) or {}).get(sec) or {}).get(idx, 0.0))))
+        return best
 
-    # baseline team (topK by base score)
-    team_current = candidates[:K]
+    def sec_metrics(sec: str, I: List[int]) -> Dict[str, float]:
+        if not I:
+            return {"cov": 0.0, "breadth": 0.0, "critical_hit": 1.0}
 
-    last = None
-    for it in range(max_iter):
-        # Build report and ask LLM for pair penalties
-        report = build_team_report(
-            candidate_fids=candidates,
-            base_scores=base_scores,
-            team_current=team_current,
-            req_text=req_text,
-            w=w, c=c,
-            I_app=I_app, I_res=I_res,
-            alpha=alpha,
-            K=K,
-        )
+        weights = [float((w.get(sec) or {}).get(i, 1.0)) for i in I]
+        denom = sum(weights) if sum(weights) > 0 else 1.0
 
-        if llm_pair_penalty_fn is None:
-            pair_penalties = []  # fallback: no penalties
-        else:
-            pair_penalties = llm_pair_penalty_fn(report)
+        cov_num = 0.0
+        hit = 0
+        crit = 0
+        crit_hit = 0
 
-        # Sweep lambda grid and pick first "excellent" (or best objective)
-        best = None
-        for lam in lam_grid:
-            sol = solve_team_with_pair_penalties_milp(
-                candidate_fids=candidates,
-                base_scores=base_scores,
-                pair_penalties=pair_penalties,
-                K=K,
-                lam=lam,
-                solver_name="cbc",
-                msg=False,
-            )
-            team = sol["selected"]
+        for i in I:
+            wi = float((w.get(sec) or {}).get(i, 1.0))
+            mx = team_max(sec, i)
 
-            sol_pack = {
-                "iter": it,
-                "lambda": lam,
-                "team": team,
-                "objective": sol["objective"],
-                "status": sol["status"],
-                "redundancy": red,
-                "pair_penalties_used": len(pair_penalties),
-            }
+            cov_num += wi * mx
+            if mx >= breadth_tau:
+                hit += 1
 
-            # store best by objective if no excellent
-            if best is None or sol_pack["objective"] > best["objective"]:
-                best = sol_pack
+            if wi >= critical_w:
+                crit += 1
+                if mx >= critical_tau:
+                    crit_hit += 1
 
-            if is_excellent(team, red_score=red, red_max=red_max):
-                return {"ok": True, "result": sol_pack, "report": report}
+        cov = cov_num / denom
+        breadth = hit / len(I)
+        critical_hit = (crit_hit / crit) if crit else 1.0
 
-        # if none excellent, move to best found and iterate again (LLM sees updated team)
-        last = best
-        team_current = best["team"]
+        return {"cov": cov, "breadth": breadth, "critical_hit": critical_hit}
 
-    return {"ok": False, "best": last}
+    app = sec_metrics("application", I_app)
+    res = sec_metrics("research", I_res)
 
-def build_req_text_indexed(opp_keywords_raw: dict) -> Dict[str, Dict[int, str]]:
-    """
-    req_text[sec][idx] = specialization text
-    Must match indexing used to create match_rows['covered'].
-    """
-    kw_text = keywords_for_matching(opp_keywords_raw)
-    out: Dict[str, Dict[int, str]] = {"application": {}, "research": {}}
-    for sec in ("application", "research"):
-        specs = ((kw_text.get(sec) or {}).get("specialization") or [])
-        for i, s in enumerate(specs):
-            out[sec][i] = str(s)
-    return out
+    a_app = float(alpha.get("application", 1.0))
+    a_res = float(alpha.get("research", 1.0))
+    a_sum = (a_app + a_res) if (a_app + a_res) > 0 else 1.0
 
+    cov_total = (a_app * app["cov"] + a_res * res["cov"]) / a_sum
+    breadth_total = (a_app * app["breadth"] + a_res * res["breadth"]) / a_sum
+    critical_total = (a_app * app["critical_hit"] + a_res * res["critical_hit"]) / a_sum
 
-def debug_team_objective_breakdown(team, base_scores, pair_penalties, lam):
-    # normalize pairs
-    pmap = {}
-    for it in pair_penalties:
-        f, g = int(it["f"]), int(it["g"])
-        if f == g:
-            continue
-        if f > g:
-            f, g = g, f
-        pmap[(f, g)] = max(float(it["p"]), pmap.get((f, g), 0.0))
-
-    base = sum(float(base_scores.get(fid, 0.0)) for fid in team)
-
-    pairs_in_team = []
-    penalty = 0.0
-    team_set = set(team)
-    for (f, g), p in pmap.items():
-        if f in team_set and g in team_set:
-            pairs_in_team.append((f, g, p))
-            penalty += p
-
-    obj = base - lam * penalty
-
-    print("\n--- objective breakdown ---")
-    print("team:", team)
-    print("base:", base)
-    print("penalized_pairs_in_team:", pairs_in_team)
-    print("penalty_sum:", penalty)
-    print("lambda:", lam)
-    print("base - lambda*penalty:", obj)
-
-if __name__ == '__main__':
-    opp_id = "60b8b017-30ec-4f31-a160-f00b7ee384e7"
-    K = 3
-    topN = 20
-    lam_grid = [0.0, 0.5, 1.0, 2.0, 4.0]
-
-    alpha = {"application": 1.0, "research": 0.5}
-
-    with SessionLocal() as sess:
-        # --- load opp keywords for req_text ---
-        opp = OpportunityDAO(sess).read_opportunities_by_ids_with_relations([opp_id])[0]
-        kw_raw = getattr(opp.keyword, "keywords", {}) or {}
-        req_text = build_req_text_indexed(kw_raw)
-
-        # --- get F,I,w,c from your existing builder (ensure index alignment!) ---
-        F, I_app, I_res, w, c = build_milp_inputs_for_opportunity(
-            sess=sess,
-            opportunity_id=opp_id,
-            limit_rows=500,
-        )
-
-    # --- base scores + shortlist ---
-    base_scores = compute_base_scores(F=F, I_app=I_app, I_res=I_res, w=w, c=c, alpha=alpha)
-    candidates = sorted(F, key=lambda fid: base_scores.get(fid, 0.0), reverse=True)[:topN]
-    team_current = candidates[:K]  # baseline team
-
-    # --- build report + call LLM once (redundancy only) ---
-    report = build_team_report(
-        candidate_fids=candidates,
-        base_scores=base_scores,
-        team_current=team_current,
-        req_text=req_text,
-        w=w, c=c,
-        I_app=I_app, I_res=I_res,
-        alpha=alpha,
-        K=K,
-        top_m=8,
+    ok = (
+        cov_total >= min_cov
+        and breadth_total >= min_breadth
+        and critical_total >= min_critical_hit
     )
 
-    pair_penalties = llm_pair_penalty_fn(report)
-    print("\nLLM pair penalties:")
-    print(json.dumps(pair_penalties, indent=2))
+    return ok, {
+        "cov_total": cov_total,
+        "breadth_total": breadth_total,
+        "critical_hit_total": critical_total,
+        "cov_app": app["cov"], "cov_res": res["cov"],
+        "breadth_app": app["breadth"], "breadth_res": res["breadth"],
+        "critical_hit_app": app["critical_hit"], "critical_hit_res": res["critical_hit"],
+    }
 
-    # --- sweep lambda, solve MILP, pick best by (objective) or by redundancy threshold ---
-    best = None
-    for lam in lam_grid:
-        sol = solve_team_with_pair_penalties_milp(
-            candidate_fids=candidates,
-            base_scores=base_scores,
-            pair_penalties=pair_penalties,
-            K=K,
-            lam=lam,
-            solver_name="cbc",
-            msg=False,
+def run_group_match_for_all_opps(
+    *,
+    K: int = 4,
+    topN: int = 20,
+    lam_grid: List[float] = [0.0, 0.5, 1.0, 2.0, 4.0],
+    alpha: Dict[str, float] = {"application": 1.0, "research": 1.0},
+    limit_rows: int = 500,
+    batch_size: int = 200,
+    commit_every: int = 25,
+):
+    """
+    Runs group matching for all opportunities that have keywords.
+    Saves one group_match_results row per (opp_id, lambda).
+    """
+
+    with SessionLocal() as sess:
+        opp_dao = OpportunityDAO(sess)
+        g_dao = GroupMatchDAO(sess)
+
+        processed = 0
+        saved = 0
+
+        print(
+            f"[GROUP-MATCH] start | K={K}, topN={topN}, "
+            f"lambdas={lam_grid}, alpha={alpha}"
         )
 
-        team = sol["selected"]
-        red = redundancy_overlap_mass(team, I_app=I_app, I_res=I_res, w=w, c=c, alpha=alpha)
+        for idx, opp in enumerate(
+            opp_dao.iter_opportunities_with_keywords()
+        ):
+            opp_id = opp.opportunity_id
+            kw_raw = (opp.keyword.keywords if opp.keyword else {}) or {}
 
-        row = {
-            "lambda": lam,
-            "status": sol["status"],
-            "objective": sol["objective"],
-            "team": team,
-            "redundancy": red,
-        }
-        print("\n", json.dumps(row, indent=2))
+            print(f"\n[{idx:05d}] opportunity={opp_id}")
 
-        if best is None or row["objective"] > best["objective"]:
-            best = row
+            # --- build requirement text ---
+            req_text = build_req_text_indexed(kw_raw)
+            if not req_text["application"] and not req_text["research"]:
+                print("  ↳ skipped (no requirements)")
+                continue
 
-    print("\nBEST:")
-    print(json.dumps(best, indent=2))
+            # --- build inputs ---
+            F, I_app, I_res, w, c = build_milp_inputs_for_opportunity(
+                sess=sess,
+                opportunity_id=opp_id,
+                limit_rows=limit_rows,
+            )
+            if not F:
+                print("  ↳ skipped (no faculty candidates)")
+                continue
 
-    debug_team_objective_breakdown(team, base_scores, pair_penalties, lam)
+            # --- base scores + shortlist ---
+            base_scores = compute_base_scores(
+                F=F,
+                I_app=I_app,
+                I_res=I_res,
+                w=w,
+                c=c,
+                alpha=alpha,
+            )
+            candidates = sorted(
+                F, key=lambda fid: base_scores.get(fid, 0.0), reverse=True
+            )[:topN]
+
+            if len(candidates) < K:
+                print(f"  ↳ skipped (only {len(candidates)} candidates)")
+                continue
+
+            pair_penalties = redundancy_penalty_fn_full(
+                candidate_fids=candidates,
+                I_app=I_app,
+                I_res=I_res,
+                w=w,
+                c=c,
+                alpha=alpha,
+            )
+
+            print(f"  penalties={len(pair_penalties)} pairs")
+            print(pair_penalties)
+            # --- sweep lambda ---
+            for lam in lam_grid:
+                sol = solve_team_with_pair_penalties_milp(
+                    candidate_fids=candidates,
+                    base_scores=base_scores,
+                    pair_penalties=pair_penalties,
+                    K=K,
+                    lam=lam,
+                    solver_name="cbc",
+                    msg=False,
+                )
+
+                team = sol["selected"]
+                red = team_redundancy_from_pair_penalties(
+                    team, pair_penalties, average=True
+                )
+
+                ok, qm = quality_gate(
+                    team=team,
+                    I_app=I_app,
+                    I_res=I_res,
+                    w=w,
+                    c=c,
+                    alpha=alpha,
+                    # tweak later; start loose
+                    min_cov=0.25,
+                    breadth_tau=0.25,
+                    min_breadth=0.25,
+                    critical_w=0.90,
+                    critical_tau=0.60,
+                    min_critical_hit=0.35,
+                )
+
+                if not ok:
+                    print(f"    ↳ SKIP save (quality gate failed): {qm}")
+                    continue
+
+                db_row = {
+                    "grant_id": opp_id,
+                    "lambda": float(lam),
+                    "k": int(K),
+                    "top_n": int(topN),
+                    "alpha": alpha,
+                    "objective": float(sol.get("objective") or 0.0),
+                    "redundancy": float(red),
+                    "status": sol.get("status"),
+                    "meta": {
+                        "algo": "pair_penalty_milp",
+                        "penalty_source": "deterministic_overlap",
+                        "lambda_grid": lam_grid,
+                        "quality": qm,
+                    },
+                }
+
+                g_dao.save_group_run(db_row, team)
+                saved += 1
+
+                print(
+                    f"    λ={lam:<4} team={team} "
+                    f"obj={db_row['objective']:.3f} "
+                    f"red={db_row['redundancy']:.3f}"
+                )
+
+            processed += 1
+
+            # --- periodic commit ---
+            if processed % commit_every == 0:
+                sess.commit()
+                print(
+                    f"[GROUP-MATCH] committed "
+                    f"(processed={processed}, saved={saved})"
+                )
+
+        sess.commit()
+        print(
+            f"\n[GROUP-MATCH] DONE "
+            f"(processed={processed}, saved={saved})"
+        )
+
+if __name__ == '__main__':
+    K = 4
+    topN = 20
+    lam_grid = [0.0, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0]
+
+    alpha = {"application": 1.0, "research": 1.0}
+
+    run_group_match_for_all_opps(K=K, topN=topN, lam_grid=lam_grid, alpha=alpha)
