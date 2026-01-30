@@ -111,3 +111,19 @@ class PairPenalty(BaseModel):
 
 class PairPenaltiesOut(BaseModel):
     pair_penalties: List[PairPenalty] = Field(default_factory=list)
+
+
+class MemberRoleOut(BaseModel):
+    faculty_id: int
+    role: str = Field(..., description="Short label like 'AI/ML lead', 'Education/Outreach lead', etc.")
+    why: str = Field(..., description="1-2 sentences describing their unique contribution")
+
+class CoverageOut(BaseModel):
+    strong: List[str] = Field(default_factory=list)
+    partial: List[str] = Field(default_factory=list)
+    missing: List[str] = Field(default_factory=list)
+
+class GroupJustificationOut(BaseModel):
+    one_paragraph: str
+    member_roles: List[MemberRoleOut] = Field(default_factory=list)
+    coverage: CoverageOut = Field(default_factory=CoverageOut)
