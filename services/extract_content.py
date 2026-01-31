@@ -4,12 +4,16 @@ import hashlib
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, Optional, Type
+import os
+import boto3
+from botocore.exceptions import ClientError
 
 from config import settings
 from db.db_conn import SessionLocal
 from dao.content_extraction_dao import ContentExtractionDAO
 from db.models.opportunity import OpportunityAttachment, OpportunityAdditionalInfo
 from utils.content_extractor import fetch_and_extract_one
+from utils.extracted_content_store import put_text
 
 def short_hash(value: str, length: int = 20) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()[:length]
@@ -32,8 +36,11 @@ def run_extraction_pipeline(
     done = 0
     failed = 0
 
-    out_dir = base_dir / subdir
-    out_dir.mkdir(parents=True, exist_ok=True)
+    bucket = os.getenv("EXTRACTED_CONTENT_BUCKET", "grant-matcher")
+    prefix = os.getenv("EXTRACTED_CONTENT_PREFIX", "extracted-context-opportunities").strip("/")
+
+    s3 = boto3.client("s3", region_name=os.getenv("AWS_REGION", "us-west-2"))
+
 
     with SessionLocal() as sess:
         dao = ContentExtractionDAO(sess)
@@ -69,12 +76,21 @@ def run_extraction_pipeline(
                 detected_type = result.get("detected_type") or "unknown"
 
                 hash_part = short_hash(url)
-                text_path = out_dir / f"{item.id}__{hash_part}.txt"
-                text_path.write_text(text, encoding="utf-8", errors="ignore")
+
+                # Store under: s3://grant-matcher/extracted-context-opportunities/<subdir>/<id>__<hash>.txt
+                s3_key = f"{prefix}/{subdir}/{item.id}__{hash_part}.txt"
+
+                s3.put_object(
+                    Bucket=bucket,
+                    Key=s3_key,
+                    Body=text.encode("utf-8", errors="ignore"),
+                    ContentType="text/plain; charset=utf-8",
+                )
 
                 updates.append({
                     "id": item.id,
-                    "content_path": str(text_path),
+                    # store either the key OR full s3:// url; key is usually better
+                    "content_path": s3_key,
                     "detected_type": detected_type,
                     "content_char_count": len(text),
                     "extracted_at": extracted_at,

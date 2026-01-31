@@ -1,12 +1,17 @@
 from __future__ import annotations
 from typing import List, Optional, Tuple, Dict, Any
-from pathlib import Path
+
 import io
 import re
 import csv
 import html as html_lib
 import tempfile
 import requests
+
+import os
+import boto3
+from botocore.exceptions import ClientError
+from pathlib import Path
 
 # keep your chosen stack
 from pdfminer.high_level import extract_text as pdf_extract_text
@@ -257,7 +262,7 @@ def fetch_and_extract_one(
             "status_code": None,
             "error": f"request_error: {ex}",
         }
-
+    
 
 def load_extracted_content(
     rows: List[Any],
@@ -266,10 +271,55 @@ def load_extracted_content(
 ) -> List[Dict[str, Any]]:
     """
     Generic loader for extracted content from DB rows.
-    Works for attachments, additional_info, faculty links, etc.
+    S3-backed version.
+
+    Expects r.content_path to be either:
+      - S3 key (recommended): "extracted-context-opportunities/<subdir>/<file>.txt"
+      - or full S3 URL: "s3://grant-matcher/extracted-context-opportunities/<subdir>/<file>.txt"
+      - or (optional fallback) a local filesystem path (if you still have old rows)
     """
     out: List[Dict[str, Any]] = []
-    total = 0
+
+    bucket = os.getenv("EXTRACTED_CONTENT_BUCKET", "grant-matcher").strip()
+    prefix = os.getenv("EXTRACTED_CONTENT_PREFIX", "extracted-context-opportunities").strip().strip("/")
+    region = os.getenv("AWS_REGION", "us-west-2").strip()
+
+    s3 = boto3.client("s3", region_name=region)
+
+    def _normalize_to_s3_key(content_path: str) -> Optional[str]:
+        """
+        Normalize DB content_path to an S3 key.
+        Supports:
+          - "s3://bucket/prefix/..."
+          - "prefix/..." (already a key)
+          - "filename.txt" (will be prefixed)
+        """
+        if not content_path:
+            return None
+
+        cp = content_path.strip()
+
+        # Full S3 URL: s3://bucket/key
+        if cp.startswith("s3://"):
+            # strip "s3://"
+            rest = cp[5:]
+            # rest = "bucket/key..."
+            parts = rest.split("/", 1)
+            if len(parts) != 2:
+                return None
+            url_bucket, key = parts[0], parts[1]
+            # If URL bucket doesn't match env bucket, still try using URL bucket
+            # (but here we only return key; bucket handled outside)
+            return key
+
+        # Already a key that includes prefix
+        if prefix and cp.startswith(prefix + "/"):
+            return cp
+
+        # If it's a bare key (no prefix), attach prefix
+        if prefix:
+            return f"{prefix}/{cp.lstrip('/')}"
+        return cp.lstrip("/")
 
     for r in rows or []:
         if getattr(r, "extract_status", None) != "done":
@@ -278,10 +328,38 @@ def load_extracted_content(
             continue
 
         content_path = getattr(r, "content_path", None)
-        p = Path(content_path)
+        if not content_path:
+            continue
 
+        # Decide bucket/key
+        cp = str(content_path).strip()
+        use_bucket = bucket
+        key = None
+
+        # If content_path is a full s3:// URL, parse bucket from it too
+        if cp.startswith("s3://"):
+            rest = cp[5:]
+            parts = rest.split("/", 1)
+            if len(parts) != 2:
+                continue
+            use_bucket, _key = parts[0], parts[1]
+            key = _key
+        else:
+            key = _normalize_to_s3_key(cp)
+
+        if not key:
+            continue
+
+        # Fetch from S3
         try:
-            text = p.read_text(encoding="utf-8", errors="ignore")
+            resp = s3.get_object(Bucket=use_bucket, Key=key)
+            text = resp["Body"].read().decode("utf-8", errors="ignore")
+        except ClientError as e:
+            code = e.response.get("Error", {}).get("Code")
+            if code in ("NoSuchKey", "404"):
+                continue
+            # other errors (AccessDenied, etc.) should be visible
+            raise
         except Exception:
             continue
 
@@ -300,6 +378,7 @@ def load_extracted_content(
         out.append(item)
 
     return out
+
 
 def fetch_and_extract_batch(urls: List[str]) -> List[dict]:
     s = requests.Session()

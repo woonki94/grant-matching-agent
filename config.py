@@ -61,7 +61,7 @@ class Settings(BaseSettings):
     openrouter_api_key: str
 
     #AWS
-    aws_region: str = "us-east-1"
+    aws_region: str = "us-east-2"
     aws_profile: str | None = None
     # =========================
     # Claude (Bedrock)
