@@ -117,11 +117,11 @@ class Settings(BaseSettings):
     log_level: str = "INFO"
     log_dir: Path = Path(BASE_DIR) / "logs"
 
-
     model_config = SettingsConfigDict(
         env_file=BASE_DIR/".env",
-        case_sensitive=False
-    )
+        case_sensitive=False,
+        extra="ignore",
+)
 
 settings = Settings()
 
