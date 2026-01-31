@@ -1,59 +1,89 @@
-# Flask web framework
-Flask==3.0.3
+############################################
+# Core web + API
+############################################
 
-# HTTP client for calling the Grants.gov API
+Flask==3.0.3
 requests==2.32.3
 
-dotenv~=0.9.9
+############################################
+# Environment variables
+############################################
+
+# NOTE: Prefer python-dotenv (most common + maintained)
+#dotenv~=0.9.9            # (Unnecessary if using python-dotenv)
+python-dotenv~=1.2.1
+
+############################################
+# File / document parsing
+############################################
 
 pdfminer.six
 docx2txt~=0.9
 openpyxl~=3.1.5
 xlrd==1.2.0
-
-
-google-genai
-
-
-# Database ORM
-SQLAlchemy>=2.0.0
-psycopg2-binary>=2.9.9
-db~=0.1.1
-
-# Optional but highly recommended for JSONB + PostgreSQL integration
-sqlalchemy-utils>=0.41.0
-
-openai~=2.7.1
-
+pypdf~=6.5.0
+readability-lxml~=0.8.4.1
 beautifulsoup4~=4.14.2
 lxml
 
+############################################
+# Database ORM + PostgreSQL
+############################################
 
-# For embeddings
+SQLAlchemy>=2.0.0
+psycopg2-binary>=2.9.9
+
+# NOTE: This package name "db" is usually not required in SQLAlchemy apps.
+# Uncomment only if you know you explicitly use it.
+#db~=0.1.1
+
+sqlalchemy-utils>=0.41.0
+pgvector~=0.4.2
+
+############################################
+# LLM / Agent Frameworks
+############################################
+
+# EC2 uses AWS Bedrock only
+langchain-core~=1.2.7
+langchain-aws~=1.2.1
+
+# OpenAI / Gemini are used only on LOCAL machine not on EC2
+#openai~=2.7.1
+#google-genai
+
+# If your local machine uses LangChain OpenAI integrations, uncomment this locally:
+#langchain-openai~=1.1.7
+
+############################################
+# Embeddings / ML (LOCAL ONLY)
+############################################
+
+# WARNING: sentence-transformers pulls torch, which may pull CUDA wheels on Linux.
+# Keep commented on EC2 unless you explicitly want local embedding models there.
 numpy~=2.3.4
 scikit-learn
-sentence-transformers~=5.1.2
+#sentence-transformers~=5.1.2
 
+############################################
+# General utilities / data
+############################################
 
-python-dotenv~=1.2.1
 protobuf~=5.29.5
 pydantic-settings~=2.12.0
-
-readability-lxml~=0.8.4.1
-pypdf~=6.5.0
 pydantic~=2.12.3
 tqdm~=4.67.1
 
-boto3~=1.42.32
-langchain-core~=1.2.7
-langchain-openai~=1.1.7
-langchain-aws~=1.2.1
-
-pgvector~=0.4.2
-networkx~=3.5
-
 pandas~=3.0.0
 tabulate~=0.9.0
+networkx~=3.5
 
+############################################
+# AWS SDK
+############################################
+
+# boto3 is enough; it installs a compatible botocore automatically.
 boto3~=1.42.32
-botocore~=1.42.38
+
+# Usually unnecessary to pin separately unless you have a specific reason
+#botocore~=1.42.38
