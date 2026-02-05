@@ -158,10 +158,10 @@ Grant_API_KEY: Final[str] = settings.grant_api_key
 
 
 @lru_cache(maxsize=1)
+@lru_cache(maxsize=1)
 def get_llm_client() -> LLMChatClient:
     return LLMChatClient(
         LLMConfig(
-            provider="bedrock",
             temperature=settings.llm_temperature,
             aws_region=settings.aws_region,
             aws_profile=settings.aws_profile,
@@ -170,11 +170,11 @@ def get_llm_client() -> LLMChatClient:
     )
 
 
+
 @lru_cache(maxsize=1)
 def get_embedding_client() -> EmbeddingClient:
     return EmbeddingClient(
         EmbeddingConfig(
-            provider="bedrock",
             aws_region=settings.aws_region,
             aws_profile=settings.aws_profile,
             bedrock_embed_model_id=settings.bedrock_embed_model_id,
