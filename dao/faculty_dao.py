@@ -197,3 +197,17 @@ class FacultyDAO:
             "keywords": kw,
         }
 
+    def get_faculty_id_by_email(self, email: str) -> Optional[int]:
+        """
+        Return faculty_id for the given email, or None if not found.
+        """
+
+        row = (
+            self.session
+            .query(Faculty.faculty_id)
+            .filter(Faculty.email == email)
+            .one_or_none()
+        )
+
+        return row.faculty_id if row else None
+
