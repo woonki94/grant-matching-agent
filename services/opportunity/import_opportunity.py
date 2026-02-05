@@ -1,7 +1,7 @@
 import sys
 from pathlib import Path
 
-PROJECT_ROOT = Path(__file__).resolve().parents[2]  # .../root
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(PROJECT_ROOT))
 
 import argparse
@@ -47,12 +47,11 @@ def import_opportunity(page_size: int, query: str | None) -> None:
     # -------------------------
     # 3) Extract (Local or S3)
     # -------------------------
-    backend = settings.extracted_content_backend
+    backend = (settings.extracted_content_backend or "local").lower().strip()
 
-    # IMPORTANT: use clean, stable subdir *names* for S3 keys
-    # (Avoid passing local filesystem paths like "data/opportunity_attachments" unless you want those in S3 keys.)
-    ATT_SUBDIR = "opportunity_attachments"
-    LINK_SUBDIR = "opportunity_additional_links"
+    # Keep S3 keys stable + clean
+    att_subdir = "opportunity_attachments"
+    link_subdir = "opportunity_additional_links"
 
     if backend == "local":
         if settings.extracted_content_path is None:
@@ -66,7 +65,7 @@ def import_opportunity(page_size: int, query: str | None) -> None:
         stats = run_extraction_pipeline(
             model=OpportunityAttachment,
             base_dir=base_dir,
-            subdir=ATT_SUBDIR,
+            subdir=att_subdir,
             url_getter=lambda a: a.file_download_path,
             backend="local",
         )
@@ -75,68 +74,56 @@ def import_opportunity(page_size: int, query: str | None) -> None:
         stats = run_extraction_pipeline(
             model=OpportunityAdditionalInfo,
             base_dir=base_dir,
-            subdir=LINK_SUBDIR,
+            subdir=link_subdir,
             url_getter=lambda a: a.additional_info_url,
             backend="local",
         )
         logger.info("[3/3 EXTRACT:LINKS] Completed %s", stats)
 
-    elif backend == "s3":
+        return
+
+    if backend == "s3":
         if not settings.extracted_content_bucket:
             raise RuntimeError(
                 "EXTRACTED_CONTENT_BUCKET must be set when EXTRACTED_CONTENT_BACKEND=s3"
             )
 
-        stats = run_extraction_pipeline(
-            model=OpportunityAttachment,
-            base_dir=None,
-            subdir=ATT_SUBDIR,
-            url_getter=lambda a: a.file_download_path,
+        common = dict(
             backend="s3",
+            base_dir=None,
             s3_bucket=settings.extracted_content_bucket,
             s3_prefix=settings.extracted_content_prefix,
             aws_region=settings.aws_region,
             aws_profile=settings.aws_profile,
+        )
+
+        stats = run_extraction_pipeline(
+            model=OpportunityAttachment,
+            subdir=att_subdir,
+            url_getter=lambda a: a.file_download_path,
+            **common,
         )
         logger.info("[3/3 EXTRACT:ATTACHMENTS] Completed %s", stats)
 
         stats = run_extraction_pipeline(
             model=OpportunityAdditionalInfo,
-            base_dir=None,
-            subdir=LINK_SUBDIR,
+            subdir=link_subdir,
             url_getter=lambda a: a.additional_info_url,
-            backend="s3",
-            s3_bucket=settings.extracted_content_bucket,
-            s3_prefix=settings.extracted_content_prefix,
-            aws_region=settings.aws_region,
-            aws_profile=settings.aws_profile,
+            **common,
         )
         logger.info("[3/3 EXTRACT:LINKS] Completed %s", stats)
 
-    else:
-        raise RuntimeError(f"Unsupported EXTRACTED_CONTENT_BACKEND={backend}")
+        return
+
+    raise RuntimeError(f"Unsupported EXTRACTED_CONTENT_BACKEND={backend}")
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Import opportunities pipeline")
 
-    parser.add_argument(
-        "--page-size",
-        type=int,
-        default=100,
-        help="Number of opportunities to fetch",
-    )
-
-    parser.add_argument(
-        "--query",
-        type=str,
-        default=None,
-        help="Search query string",
-    )
+    parser.add_argument("--page-size", type=int, default=100)
+    parser.add_argument("--query", type=str, default=None)
 
     args = parser.parse_args()
 
-    import_opportunity(
-        page_size=args.page_size,
-        query=args.query,
-    )
+    import_opportunity(page_size=args.page_size, query=args.query)

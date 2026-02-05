@@ -4,13 +4,17 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Final, Literal, Optional
 
-from pydantic import computed_field
+from pydantic import computed_field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-from client.llm_client import LLMChatClient, LLMConfig  # adjust path if different
+from client.llm_client import LLMChatClient, LLMConfig
 from client.embedding_client import EmbeddingClient, EmbeddingConfig
 
 BASE_DIR = Path(__file__).resolve().parent
+
+LLMProvider = Literal["bedrock"]
+EmbeddingProvider = Literal["bedrock"]
+ExtractedBackend = Literal["local", "s3"]
 
 
 class Settings(BaseSettings):
@@ -44,86 +48,65 @@ class Settings(BaseSettings):
     openalex_base_url: str = "https://api.openalex.org"
 
     # =========================
-    # LLM+EMBEDDING Provider
+    # Providers (Bedrock only)
     # =========================
-    llm_provider: Literal["openai", "bedrock"]
-    embedding_provider: Literal["openrouter", "bedrock"]
+    llm_provider: LLMProvider = "bedrock"
+    embedding_provider: EmbeddingProvider = "bedrock"
+
+    @field_validator("llm_provider", mode="before")
+    @classmethod
+    def _normalize_llm_provider(cls, v):
+        # allow "Bedrock" / "BEDROCK"
+        if v is None:
+            return "bedrock"
+        return str(v).strip().lower()
+
+    @field_validator("embedding_provider", mode="before")
+    @classmethod
+    def _normalize_embedding_provider(cls, v):
+        if v is None:
+            return "bedrock"
+        return str(v).strip().lower()
 
     # =========================
-    # OpenAI
-    # =========================
-    openai_model: str
-    openai_api_key: str
-
-    # =========================
-    # Qwen (OpenRouter)
-    # =========================
-    qwen_embed_model: str
-    openrouter_base_url: str
-    openrouter_api_key: str
-
-    # =========================
-    # AWS
+    # AWS / Bedrock
     # =========================
     aws_region: str = "us-east-2"
     aws_profile: Optional[str] = None
 
-    # =========================
-    # Claude (Bedrock)
-    # =========================
-    bedrock_model_id: Optional[str] = None
-
-    # =========================
-    # Embeddings (Bedrock)
-    # =========================
-    bedrock_embed_model_id: Optional[str] = None
+    # Required for Bedrock usage
+    bedrock_model_id: str
+    bedrock_embed_model_id: str
 
     # =========================
     # LLM config
     # =========================
     llm_temperature: float = 0.0
 
+    # Keep if your code expects it; tune per embedding model if needed.
     @computed_field
     @property
     def embed_dim(self) -> int:
-        return 4096 if self.embedding_provider == "openrouter" else 1024
+        return 1024
 
     # =========================
-    # Extracted Content Storage
+    # Extracted Content Storage (Local or S3)
     # =========================
-    # Env you provided:
-    #   EXTRACTED_CONTENT_BACKEND=s3
-    #   EXTRACTED_CONTENT_BUCKET=grant-matcher
-    #   EXTRACTED_CONTENT_PREFIX=extracted-context-opportunities
-    #   AWS_REGION=us-east-2
-    extracted_content_backend: Literal["local", "s3"] = "local"
-
-    # Local backend (only used if backend=local)
-    extracted_content_path: Optional[Path] = None
-
-    # S3 backend (required if backend=s3)
-    extracted_content_bucket: Optional[str] = None
+    extracted_content_backend: ExtractedBackend = "local"
+    extracted_content_path: Optional[Path] = None  # local
+    extracted_content_bucket: Optional[str] = None  # s3
     extracted_content_prefix: str = ""
 
-    @computed_field
-    @property
-    def extracted_content_enabled(self) -> bool:
-        """
-        Convenience flag: True when extraction storage is configured enough to write.
-        """
-        if self.extracted_content_backend == "local":
-            return self.extracted_content_path is not None
-        if self.extracted_content_backend == "s3":
-            return bool(self.extracted_content_bucket)
-        return False
+    @field_validator("extracted_content_backend", mode="before")
+    @classmethod
+    def _normalize_extracted_backend(cls, v):
+        if v is None:
+            return "local"
+        return str(v).strip().lower()
 
     @computed_field
     @property
     def extracted_content_s3_uri(self) -> Optional[str]:
-        """
-        Convenience URI for logging/debugging.
-        Returns None unless backend=s3 and bucket is set.
-        """
         if self.extracted_content_backend != "s3" or not self.extracted_content_bucket:
             return None
         prefix = (self.extracted_content_prefix or "").strip("/")
@@ -133,24 +116,11 @@ class Settings(BaseSettings):
             else f"s3://{self.extracted_content_bucket}"
         )
 
-    # NOTE:
-    # We intentionally DO NOT mkdir anything here.
-    # Any code that previously did:
-    #   CONTENT_BASE_DIR = settings.extracted_content_path
-    #   CONTENT_BASE_DIR.mkdir(...)
-    # must be updated to:
-    #   if settings.extracted_content_backend == "local": mkdir(...)
-    #   if "s3": do NOT mkdir.
-
     # =========================
     # Pipeline local scratch paths (safe defaults)
     # =========================
-    # If your pipeline temporarily downloads files before uploading to S3,
-    # these defaults avoid Settings validation errors.
     opportunity_attachment_path: Path = BASE_DIR / "data" / "opportunity_attachments"
-    opportunity_additional_link_path: Path = (
-        BASE_DIR / "data" / "opportunity_additional_links"
-    )
+    opportunity_additional_link_path: Path = BASE_DIR / "data" / "opportunity_additional_links"
     faculty_additional_link_path: Path = BASE_DIR / "data" / "faculty_additional_links"
 
     # =========================
@@ -162,7 +132,7 @@ class Settings(BaseSettings):
     scraper_user_agent: str = "Mozilla/5.0 (+faculty-link-scraper; OSU project)"
 
     # =========================
-    # University Name (needed for publication extraction)
+    # University Name
     # =========================
     university_name: str = "Oregon State University"
 
@@ -184,25 +154,18 @@ settings = Settings()
 # =========================
 # Frequently used aliases: Constant
 # =========================
-OPENAI_API_KEY: Final[str] = settings.openai_api_key
-OPENAI_MODEL: Final[str] = settings.openai_model
-
 Grant_API_KEY: Final[str] = settings.grant_api_key
-OPENROUTER_API_KEY: Final[str] = settings.openrouter_api_key
-QWEN_MODEL: Final[str] = settings.qwen_embed_model
 
 
 @lru_cache(maxsize=1)
 def get_llm_client() -> LLMChatClient:
     return LLMChatClient(
         LLMConfig(
-            provider=settings.llm_provider,
+            provider="bedrock",
             temperature=settings.llm_temperature,
-            openai_model=settings.openai_model,
-            openai_api_key=settings.openai_api_key,
             aws_region=settings.aws_region,
-            bedrock_model_id=settings.bedrock_model_id,
             aws_profile=settings.aws_profile,
+            bedrock_model_id=settings.bedrock_model_id,
         )
     )
 
@@ -211,14 +174,9 @@ def get_llm_client() -> LLMChatClient:
 def get_embedding_client() -> EmbeddingClient:
     return EmbeddingClient(
         EmbeddingConfig(
-            provider=settings.embedding_provider,
-            # Bedrock
+            provider="bedrock",
             aws_region=settings.aws_region,
             aws_profile=settings.aws_profile,
             bedrock_embed_model_id=settings.bedrock_embed_model_id,
-            # OpenRouter(Qwen)
-            openrouter_api_key=settings.openrouter_api_key,
-            openrouter_base_url=settings.openrouter_base_url,
-            openrouter_embed_model=settings.qwen_embed_model,
         )
     )

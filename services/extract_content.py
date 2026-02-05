@@ -1,15 +1,15 @@
 from __future__ import annotations
 
 import hashlib
-import os
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, Optional, Type
 
 import boto3
 
-from db.db_conn import SessionLocal
+from config import settings
 from dao.content_extraction_dao import ContentExtractionDAO
+from db.db_conn import SessionLocal
 from utils.content_extractor import fetch_and_extract_one
 
 
@@ -18,7 +18,6 @@ def short_hash(value: str, length: int = 20) -> str:
 
 
 def _safe_subdir(subdir: str) -> str:
-    # Make sure we don't accidentally create double slashes in S3 keys
     return str(subdir).strip("/").replace("\\", "/")
 
 
@@ -29,24 +28,17 @@ def run_extraction_pipeline(
     subdir: str,
     url_getter: Callable[[Any], str],
     batch_size: int = 200,
-    # ✅ New: backend config
     backend: str = "local",  # "local" or "s3"
+    # Optional overrides (if not passed, uses config settings)
     s3_bucket: Optional[str] = None,
-    s3_prefix: str = "",
+    s3_prefix: Optional[str] = None,
     aws_region: Optional[str] = None,
     aws_profile: Optional[str] = None,
 ) -> Dict[str, int]:
     """
-    Generic pipeline for any DB model with:
-      id, extract_status, extract_error, extracted_at, content_path, detected_type, content_char_count
-
-    Local backend:
-      Writes: <base_dir>/<subdir>/<id>__<hash>.txt
-      Stores content_path as relative path (same convention as you choose; here we store the full local path string)
-
-    S3 backend:
-      Writes: s3://<bucket>/<prefix>/<subdir>/<id>__<hash>.txt
-      Stores content_path as the S3 key (recommended).
+    Extracts text for pending DB rows and stores it either:
+      - Local: <base_dir>/<subdir>/<id>__<hash>.txt
+      - S3:    s3://<bucket>/<prefix>/<subdir>/<id>__<hash>.txt  (stores the S3 key in DB)
     """
 
     backend = (backend or "local").lower().strip()
@@ -55,33 +47,37 @@ def run_extraction_pipeline(
 
     subdir = _safe_subdir(subdir)
 
-    # Resolve S3 parameters (prefer explicit args; fallback to env vars for safety)
+    # -------------------------
+    # Backend setup
+    # -------------------------
+    s3_client = None
+    bucket = None
+    prefix = ""
+
     if backend == "s3":
-        bucket = s3_bucket or os.getenv("EXTRACTED_CONTENT_BUCKET")
+        bucket = s3_bucket or settings.extracted_content_bucket
         if not bucket:
             raise RuntimeError(
-                "S3 backend requires EXTRACTED_CONTENT_BUCKET (or s3_bucket arg)."
+                "S3 backend requires extracted_content_bucket (EXTRACTED_CONTENT_BUCKET)."
             )
 
-        prefix = (s3_prefix or os.getenv("EXTRACTED_CONTENT_PREFIX", "")).strip("/")
-        region = aws_region or os.getenv("AWS_REGION") or os.getenv("AWS_DEFAULT_REGION")
+        prefix = (s3_prefix if s3_prefix is not None else settings.extracted_content_prefix or "").strip("/")
 
-        if aws_profile:
-            session = boto3.Session(profile_name=aws_profile, region_name=region)
-        else:
-            session = boto3.Session(region_name=region)
+        region = aws_region or settings.aws_region
+        profile = aws_profile or settings.aws_profile
 
-        s3 = session.client("s3")
+        session = boto3.Session(profile_name=profile, region_name=region) if profile else boto3.Session(region_name=region)
+        s3_client = session.client("s3")
 
     else:
-        # Local backend requires a base_dir
         if base_dir is None:
-            raise RuntimeError(
-                "Local backend requires base_dir (EXTRACTED_CONTENT_PATH)."
-            )
+            raise RuntimeError("Local backend requires base_dir (EXTRACTED_CONTENT_PATH).")
         base_dir = Path(base_dir)
         (base_dir / subdir).mkdir(parents=True, exist_ok=True)
 
+    # -------------------------
+    # Process pending items
+    # -------------------------
     processed = 0
     done = 0
     failed = 0
@@ -122,28 +118,22 @@ def run_extraction_pipeline(
 
                 detected_type = result.get("detected_type") or "unknown"
                 hash_part = short_hash(url)
-
                 filename = f"{item.id}__{hash_part}.txt"
 
                 if backend == "s3":
-                    # Store under: s3://<bucket>/<prefix>/<subdir>/<id>__<hash>.txt
-                    if prefix:
-                        s3_key = f"{prefix}/{subdir}/{filename}"
-                    else:
-                        s3_key = f"{subdir}/{filename}"
+                    # Build key: <prefix>/<subdir>/<filename>
+                    key = f"{prefix}/{subdir}/{filename}" if prefix else f"{subdir}/{filename}"
 
-                    s3.put_object(
-                        Bucket=bucket,  # type: ignore[name-defined]
-                        Key=s3_key,
+                    s3_client.put_object(  # type: ignore[union-attr]
+                        Bucket=bucket,  # type: ignore[arg-type]
+                        Key=key,
                         Body=text.encode("utf-8", errors="ignore"),
                         ContentType="text/plain; charset=utf-8",
                     )
-
-                    content_path = s3_key  # store key in DB (recommended)
+                    content_path = key  # store S3 key in DB
 
                 else:
-                    # Local: <base_dir>/<subdir>/<id>__<hash>.txt
-                    out_path = (base_dir / subdir / filename)  # type: ignore[operator]
+                    out_path = base_dir / subdir / filename  # type: ignore[operator]
                     out_path.write_text(text, encoding="utf-8", errors="ignore")
                     content_path = str(out_path)
 
@@ -158,7 +148,6 @@ def run_extraction_pipeline(
                         "extract_error": None,
                     }
                 )
-
                 processed += 1
                 done += 1
 
