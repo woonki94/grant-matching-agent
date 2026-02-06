@@ -400,7 +400,7 @@ def run_justifications_from_group_results_agentic(
 
 
 if __name__ == "__main__":
-    email = "AbbasiB@oregonstate.edu"
+    email = "mark.clements@oregonstate.edu"
     print(
         run_justifications_from_group_results_agentic(
             faculty_email=email,
