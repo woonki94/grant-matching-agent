@@ -4,7 +4,7 @@ from sqlalchemy.orm import Session
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import selectinload
 
-from typing import List, Dict, Any, Iterator
+from typing import List, Dict, Any, Iterator, Optional
 
 from db.models import Faculty
 from db.models.faculty import FacultyAdditionalInfo, FacultyPublication, FacultyKeyword, FacultyKeywordEmbedding
@@ -177,3 +177,37 @@ class FacultyDAO:
             },
         )
         self.session.execute(stmt)
+
+    def get_faculty_keyword_context(self, faculty_id: int) -> Optional[Dict[str, Any]]:
+        fac = (
+            self.session.query(Faculty)
+            .options(selectinload(Faculty.keyword))
+            .filter(Faculty.faculty_id == int(faculty_id))
+            .one_or_none()
+        )
+        if not fac:
+            return None
+
+        kw = (fac.keyword.keywords if fac.keyword else {}) or {}
+
+        return {
+            "faculty_id": fac.faculty_id,
+            "name": getattr(fac, "name", None),
+            "email": getattr(fac, "email", None),
+            "keywords": kw,
+        }
+
+    def get_faculty_id_by_email(self, email: str) -> Optional[int]:
+        """
+        Return faculty_id for the given email, or None if not found.
+        """
+
+        row = (
+            self.session
+            .query(Faculty.faculty_id)
+            .filter(Faculty.email == email)
+            .one_or_none()
+        )
+
+        return row.faculty_id if row else None
+

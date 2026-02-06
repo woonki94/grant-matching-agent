@@ -1,6 +1,6 @@
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Tuple, Optional
 
-from sqlalchemy import text
+from sqlalchemy import text, desc
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import Session
 from db.models.match_result import MatchResult  # wherever you put it
@@ -76,3 +76,41 @@ class MatchDAO:
         """)
         rows = self.session.execute(q, {"oid": opportunity_id, "lim": limit}).mappings().all()
         return [dict(r) for r in rows]
+
+    def get_grant_ids_for_faculty(
+            self,
+            *,
+            faculty_id: int,
+            min_domain_score: Optional[float] = None,
+            min_llm_score: Optional[float] = None,
+            limit: Optional[int] = None,
+            order_by: str = "llm",  # "llm" | "domain"
+    ) -> List[str]:
+        """
+        Return a list of grant_ids matched to a faculty.
+
+        This is intended as a Stage-1 / Stage-2 filter before
+        running expensive group matching.
+        """
+
+        q = (
+            self.session
+            .query(MatchResult.grant_id)
+            .filter(MatchResult.faculty_id == faculty_id)
+        )
+
+        if min_domain_score is not None:
+            q = q.filter(MatchResult.domain_score >= min_domain_score)
+
+        if min_llm_score is not None:
+            q = q.filter(MatchResult.llm_score >= min_llm_score)
+
+        if order_by == "llm":
+            q = q.order_by(desc(MatchResult.llm_score))
+        elif order_by == "domain":
+            q = q.order_by(desc(MatchResult.domain_score))
+
+        if limit is not None:
+            q = q.limit(limit)
+
+        return [row.grant_id for row in q.all()]

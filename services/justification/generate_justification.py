@@ -85,7 +85,7 @@ def main(email: str, k: int) -> None:
         opp_dao = OpportunityDAO(sess)
         match_dao = MatchDAO(sess)
 
-        # 1) Fetch faculty by email (+ relations, since your context builder uses them)
+        # TODO: Make a DAO
         fac = (
             sess.query(Faculty)
             .options(

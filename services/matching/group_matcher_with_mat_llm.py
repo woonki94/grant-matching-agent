@@ -25,7 +25,7 @@ def redundancy_penalty_fn_full(
     w: Dict[str, Dict[int, float]],
     c: Dict[int, Dict[str, Dict[int, float]]],
     alpha: Dict[str, float],
-    k: float = 0.5,              # exponential tilt strength
+    k: float = 5,              # exponential tilt strength
 ) -> List[Dict[str, Any]]:
     """
     Deterministic pairwise redundancy penalty (importance-aware), without normalization.
@@ -73,13 +73,15 @@ def redundancy_penalty_fn_full(
             # application
             for i in I_app:
                 w_i = wf("application", i)
-                m = math.exp(-k * w_i)
+                #m = math.exp(-k * w_i)
+                m = 1.0 / (1.0 + k * w_i)
                 p_fg += aa * m * min(cf(f, "application", i), cf(g, "application", i))
 
             # research
             for i in I_res:
                 w_i = wf("research", i)
-                m = math.exp(-k * w_i)
+                #m = math.exp(-k * w_i)
+                m = 1.0 / (1.0 + k * w_i)
                 p_fg += rr * m * min(cf(f, "research", i), cf(g, "research", i))
 
             if p_fg > 0:
@@ -353,7 +355,7 @@ def run_group_match_for_all_opps(
             )
             candidates = sorted(
                 F, key=lambda fid: base_scores.get(fid, 0.0), reverse=True
-            )[:topN]
+            )
 
             if len(candidates) < K:
                 print(f"  ↳ skipped (only {len(candidates)} candidates)")

@@ -1,43 +1,48 @@
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional
-from sqlalchemy.orm import Session
-from sqlalchemy import text
-from sqlalchemy.dialects.postgresql import insert as pg_insert
+from typing import List
 
-from db.models.group_match_result import GroupMatchResult, GroupMember  # adjust import path to yours
+from numpy import integer
+from sqlalchemy.orm import Session
+
+from sqlalchemy.dialects.postgresql import insert as pg_insert
+from db.models.group_match_result import GroupMatchResult
 
 
 class GroupMatchDAO:
     def __init__(self, session: Session):
         self.session = session
 
-    def save_group_run(self, row: Dict[str, Any], team: List[int]) -> int:
-        # --- upsert group_match_results ---
-        stmt = pg_insert(GroupMatchResult).values(row)
-        stmt = stmt.on_conflict_do_update(
-            index_elements=["grant_id", "lambda", "k", "top_n"],
-            set_={
-                "alpha": stmt.excluded.alpha,
-                "objective": stmt.excluded.objective,
-                "redundancy": stmt.excluded.redundancy,
-                "status": stmt.excluded.status,
-                "meta": stmt.excluded.meta,
-            },
-        ).returning(GroupMatchResult.id)
+    def upsert(
+        self,
+        *,
+        grant_id: str,
+        faculty_ids: List[int],
+        team_size: int,
+        final_coverage: float,
+    ) -> GroupMatchResult:
 
-        group_id = int(self.session.execute(stmt).scalar_one())
+        faculty_ids = sorted(faculty_ids)
 
-        # --- replace members (delete then insert) ---
-        self.session.query(GroupMember).filter(GroupMember.group_id == group_id).delete(
-            synchronize_session=False
+        stmt = (
+            pg_insert(GroupMatchResult)
+            .values(
+                grant_id=grant_id,
+                faculty_ids=faculty_ids,
+                team_size=team_size,
+                final_coverage=final_coverage,
+            )
+            .on_conflict_do_update(
+                constraint="ux_group_grant_faculty_ids",
+                set_={
+                    # fields you want to update on conflict
+                    "team_size": team_size,
+                    "final_coverage": final_coverage,
+                },
+            )
+            .returning(GroupMatchResult)
         )
 
-        if team:
-            member_rows = [
-                {"group_id": group_id, "faculty_id": int(fid), "rank_in_group": int(i)}
-                for i, fid in enumerate(team)
-            ]
-            self.session.execute(pg_insert(GroupMember).values(member_rows))
-
-        return group_id
+        result = self.session.execute(stmt)
+        obj = result.scalar_one()
+        return obj

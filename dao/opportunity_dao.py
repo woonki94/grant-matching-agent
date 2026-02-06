@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-from typing import List, Dict, Any, Iterator
+from typing import List, Dict, Any, Iterator, Optional
 from sqlalchemy.orm import Session
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import selectinload
@@ -201,3 +201,23 @@ class OpportunityDAO:
             },
         )
         self.session.execute(stmt)
+
+    def get_opportunity_context(self, opportunity_id: str) -> Optional[Dict[str, Any]]:
+        opp = (
+            self.session.query(Opportunity)
+            .options(selectinload(Opportunity.keyword))
+            .filter(Opportunity.opportunity_id == opportunity_id)
+            .one_or_none()
+        )
+        if not opp:
+            return None
+
+        kw = (opp.keyword.keywords if opp.keyword else {}) or {}
+
+        return {
+            "opportunity_id": opp.opportunity_id,
+            "title": getattr(opp, "opportunity_title", None),
+            "agency": getattr(opp, "agency_name", None),
+            "summary": getattr(opp, "summary_description", None),
+            "keywords": kw,  # your JSON keyword schema
+        }
