@@ -255,6 +255,11 @@ def generate_keywords(
     )
     kw_dict = kw_out.model_dump()
 
+    for k in ("research", "application"):
+        if isinstance(kw_dict.get(k), str):
+            kw_dict[k] = json.loads(kw_dict[k])
+
+
     # Step 3: weight specializations
     spec_in = {
         "research": (kw_dict.get("research") or {}).get("specialization") or [],
@@ -328,7 +333,7 @@ if __name__ == "__main__":
         embed_model = settings.bedrock_embed_model_id
 
         if run_faculty:
-            for fac in _apply_limit(fac_dao.iter_faculty_with_relations()):
+            for fac in _apply_limit(fac_dao.iter_faculty_missing_keywords()):
                 faculty_keywords, faculty_keywords_raw = generate_keywords(
                     fac,
                     context_builder=faculty_to_keyword_context,
@@ -365,7 +370,7 @@ if __name__ == "__main__":
             sess.commit()
 
         if run_opp:
-            for opp in _apply_limit(opp_dao.iter_opportunities_with_relations()):
+            for opp in _apply_limit(opp_dao.iter_opportunity_missing_keywords()):
                 opportunity_keywords, opportunity_keywords_raw = generate_keywords(
                     opp,
                     context_builder=opportunity_to_keyword_context,

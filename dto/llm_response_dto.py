@@ -1,8 +1,8 @@
 # dto/llm_outputs.py
 from __future__ import annotations
 from typing import List, Optional, Literal, Dict, Union
-from pydantic import BaseModel, Field
-
+from pydantic import BaseModel, Field, field_validator
+import json
 
 # ───────────────────────────────────────────────
 # Keyword extraction
@@ -20,7 +20,33 @@ class KeywordBucket(BaseModel):
 class KeywordsOut(BaseModel):
     research: KeywordBucket = Field(default_factory=KeywordBucket)
     application: KeywordBucket = Field(default_factory=KeywordBucket)
+    
+    @field_validator("research", "application", mode="before")
+    @classmethod
+    def _coerce_bucket(cls, v):
+        if not isinstance(v, str):
+            return v
 
+        s = v.strip()
+
+        # Remove ```json fences if present
+        if s.startswith("```"):
+            s = s.strip("`").strip()
+            if s.lower().startswith("json"):
+                s = s[4:].strip()
+
+        # Find the first '{' and parse the first JSON object only
+        i = s.find("{")
+        if i == -1:
+            return v
+
+        s2 = s[i:]
+        dec = json.JSONDecoder()
+        try:
+            obj, end = dec.raw_decode(s2)  # parses first JSON object, ignores trailing junk
+            return obj
+        except Exception:
+            return v
 
 class KeywordItem(BaseModel):
     t: str

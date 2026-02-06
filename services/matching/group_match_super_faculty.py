@@ -142,7 +142,7 @@ def run_group_match(
 if __name__ == "__main__":
 
     team_size = 3
-    email = 'AbbasiB@oregonstate.edu'
+    email = 'mark.clements@oregonstate.edu'
 
     ret = run_group_match(team_size=team_size, faculty_email=email)
 
