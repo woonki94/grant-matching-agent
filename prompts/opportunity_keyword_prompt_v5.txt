@@ -1,0 +1,119 @@
+You are an information extraction assistant.
+
+Task:
+Extract structured, multi-label keywords from the grant text in {corpus}.
+Focus on the scientific research areas and the real-world application context.
+Ignore administrative/policy sections unless they clearly indicate a research or application area.
+
+Return ONLY valid JSON matching this exact schema:
+
+{
+  "research": {
+    "domain": ["string", ...],
+    "specialization": ["string", ...]
+  },
+  "application": {
+    "domain": ["string", ...],
+    "specialization": ["string", ...]
+  }
+}
+
+FIELD DEFINITIONS (match schema)
+
+- research.domain:
+  1–3 broad scientific fields (1–2 words each).
+  Examples: "robotics", "statistics", "biology", "materials science", "computer science".
+
+- research.specialization:
+  3–10 specific research topics or methods as short noun phrases (2–6 words each).
+  Good: "safe reinforcement learning", "diffusion models", "time-series imputation", "bipedal locomotion"
+  Bad: "ai", "machine learning", "data science", "optimization" (too generic unless qualified)
+
+- application.domain:
+  1–3 broad sectors or impact areas (1–2 words each).
+  Examples: "healthcare", "agriculture", "climate", "education", "energy", "transportation", "cybersecurity".
+
+- application.specialization:
+  3–10 specific applied problem areas as short noun phrases (2–6 words each).
+  Good: "clinical risk prediction", "wildfire risk modeling", "grid outage recovery", "precision crop monitoring"
+  Bad: "societal impact", "sustainability", "innovation" (too vague)
+
+GLOBAL RULES
+
+- Every field MUST be a JSON list.
+- Max 10 items per list.
+- No duplicates or near-duplicates.
+- No full sentences; noun phrases only; no leading verbs.
+- Lowercase by default; keep common acronyms uppercase (NLP, HCI, IoT, GIS, NSF, NIH, NASA).
+- Diversity rule: within each specialization list, avoid multiple items that represent the same concept with minor modifiers (e.g., many “biosensor” variants). Prefer distinct techniques or problems.
+- Selection rule: If more than 6 valid specialization candidates exist in a list, keep the most central 6–8 items; discard peripheral ones and technically specific items; discard the rest.
+- Family de-duplication rule: Do not include multiple items that differ only by subtype within the same technical family (e.g., cell-free vs cell-based biosensors). Keep the single most informative representative.
+- AI/ML specificity rule:
+  If using AI/ML terms, they must be qualified with a specific method or task
+  (e.g., "bayesian optimization for sensor design",
+         "supervised classification for sensor specificity").
+  Do NOT output vague phrases such as "ai-assisted", "ai-enabled", or "ml-based" alone.
+- Research specificity rule:
+  Prefer research.specialization phrases that combine a method or approach with a concrete component, signal, or task (method + object), rather than standalone broad biology or engineering topics.
+- Application specificity rule:
+  Prefer application.specialization phrases that reflect distinct real-world tasks.
+  Avoid near-duplicates such as “surveillance” vs “monitoring”.
+
+GENERIC / POLICY REJECTION (IMPORTANT)
+
+Do NOT include:
+- policy or boilerplate language:
+  "transformative", "broad participation", "innovation", "societal benefit", "interdisciplinary"
+- administrative or compliance terms:
+  "eligibility", "budget", "reporting", "review criteria", "funding opportunity", "submission"
+- umbrella technical terms without qualifiers:
+  "ai", "machine learning", "deep learning", "optimization", "modeling", "simulation"
+  (Only keep if specialized, e.g., "bayesian optimization", "deep reinforcement learning")
+
+RESEARCH vs APPLICATION SEPARATION (IMPORTANT)
+
+- research.* = methods, models, techniques, or scientific advances.
+- application.* = real-world context: sector + applied task.
+- Do NOT repeat the same or near-identical phrase across research and application lists.
+  If a concept fits both, keep it where it is most precise and make the other side more specific.
+
+HIGH-SIGNAL EXTRACTION HINTS
+
+Prefer phrases near:
+"research areas", "aims", "objectives", "intellectual merit",
+"technical approach", "methods", "prior work".
+
+Use attachment content if present, but still follow all rejection and selection rules.
+
+Input
+
+{corpus}
+
+⸻
+
+Example Output (for testing)
+
+{
+  "research": {
+    "domain": ["robotics", "artificial intelligence"],
+    "specialization": [
+      "vision-language representation learning for robotic manipulation",
+      "tactile perception models for force-aware grasp control",
+      "sensor fusion algorithms for navigation in partially observable environments",
+      "reinforcement learning for compliant manipulation control",
+      "sampling-based motion planning in cluttered workspaces",
+      "active perception strategies for object pose estimation"
+    ]
+  },
+  "application": {
+    "domain": ["agriculture"],
+    "specialization": [
+      "precision harvesting of delicate crops in outdoor environments",
+      "robot operation under dense foliage and variable lighting",
+      "damage-minimizing produce handling during automated picking",
+      "deployment of mobile manipulators in commercial farming settings",
+      "reduction of manual labor through robotic harvesting systems",
+      "scalable automation workflows for specialty crop production"
+    ]
+  }
+}

@@ -1,0 +1,37 @@
+{
+  "opportunity_id": "c08bbf7a-563b-4af4-a79b-b1cb7bdd71ad",
+  "title": "Rehabilitation Engineering Research Centers (RERC) Program: RERC on AI-Driven Assistive and Rehabilitation Technologies",
+  "team_size": 3,
+  "selected_faculty": [
+    {
+      "id": 24,
+      "name": "Tracy Arras"
+    },
+    {
+      "id": 25,
+      "name": "Scott Ashford"
+    },
+    {
+      "id": 34,
+      "name": "Ravi Balasubramanian"
+    }
+  ],
+  "objective": 1.5,
+  "covered_keywords": [
+    {
+      "keyword": "artificial intelligence",
+      "weight": 0.5,
+      "coverage": 1.0
+    },
+    {
+      "keyword": "biomedical engineering",
+      "weight": 0.5,
+      "coverage": 1.0
+    },
+    {
+      "keyword": "healthcare",
+      "weight": 0.5,
+      "coverage": 1.0
+    }
+  ]
+}

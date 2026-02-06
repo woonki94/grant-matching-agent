@@ -1,0 +1,47 @@
+{
+  "opportunity_id": "b39b2236-74f2-466c-875e-8a226a78968c",
+  "title": "Mind, Machine and Motor Nexus",
+  "team_size": 3,
+  "selected_faculty": [
+    {
+      "id": 16,
+      "name": "Janet Amador"
+    },
+    {
+      "id": 33,
+      "name": "Yong Bakos"
+    },
+    {
+      "id": 34,
+      "name": "Ravi Balasubramanian"
+    }
+  ],
+  "objective": 2.5,
+  "covered_keywords": [
+    {
+      "keyword": "robotics",
+      "weight": 0.5,
+      "coverage": 1.0
+    },
+    {
+      "keyword": "human-computer interaction",
+      "weight": 0.5,
+      "coverage": 1.0
+    },
+    {
+      "keyword": "artificial intelligence",
+      "weight": 0.5,
+      "coverage": 1.0
+    },
+    {
+      "keyword": "healthcare",
+      "weight": 0.5,
+      "coverage": 1.0
+    },
+    {
+      "keyword": "workplace",
+      "weight": 0.5,
+      "coverage": 1.0
+    }
+  ]
+}

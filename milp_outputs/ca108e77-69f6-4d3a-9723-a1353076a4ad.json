@@ -1,0 +1,47 @@
+{
+  "opportunity_id": "ca108e77-69f6-4d3a-9723-a1353076a4ad",
+  "title": "Advancing Bioinformatics, Translational Bioinformatics and Computational Biology Research (R01 Clinical Trial Optional)",
+  "team_size": 3,
+  "selected_faculty": [
+    {
+      "id": 13,
+      "name": "Tim Alcon"
+    },
+    {
+      "id": 28,
+      "name": "Meghna Babbar-Sebens"
+    },
+    {
+      "id": 37,
+      "name": "John Barber"
+    }
+  ],
+  "objective": 2.5,
+  "covered_keywords": [
+    {
+      "keyword": "bioinformatics",
+      "weight": 0.5,
+      "coverage": 1.0
+    },
+    {
+      "keyword": "computational biology",
+      "weight": 0.5,
+      "coverage": 1.0
+    },
+    {
+      "keyword": "machine learning",
+      "weight": 0.5,
+      "coverage": 1.0
+    },
+    {
+      "keyword": "healthcare",
+      "weight": 0.5,
+      "coverage": 1.0
+    },
+    {
+      "keyword": "public health",
+      "weight": 0.5,
+      "coverage": 1.0
+    }
+  ]
+}

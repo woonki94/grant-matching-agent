@@ -1,0 +1,42 @@
+{
+  "opportunity_id": "131fabad-5506-431b-b87a-e564f1d8dcc4",
+  "title": "Research Grants in Clinical Informatics (R01 Clinical Trial Optional)",
+  "team_size": 3,
+  "selected_faculty": [
+    {
+      "id": 6,
+      "name": "(missing name)"
+    },
+    {
+      "id": 12,
+      "name": "Lance Albertson"
+    },
+    {
+      "id": 16,
+      "name": "Janet Amador"
+    }
+  ],
+  "objective": 2.0,
+  "covered_keywords": [
+    {
+      "keyword": "machine learning",
+      "weight": 0.5,
+      "coverage": 1.0
+    },
+    {
+      "keyword": "data science",
+      "weight": 0.5,
+      "coverage": 1.0
+    },
+    {
+      "keyword": "healthcare",
+      "weight": 0.5,
+      "coverage": 1.0
+    },
+    {
+      "keyword": "public health",
+      "weight": 0.5,
+      "coverage": 1.0
+    }
+  ]
+}

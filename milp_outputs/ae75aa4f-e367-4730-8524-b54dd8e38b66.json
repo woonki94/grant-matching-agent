@@ -1,0 +1,37 @@
+{
+  "opportunity_id": "ae75aa4f-e367-4730-8524-b54dd8e38b66",
+  "title": "New Generation of Glucose Control Technologies Incorporating AI/ML Tools/Strategies",
+  "team_size": 3,
+  "selected_faculty": [
+    {
+      "id": 26,
+      "name": "Nick AuYeung"
+    },
+    {
+      "id": 27,
+      "name": "Mohammad Azizian"
+    },
+    {
+      "id": 34,
+      "name": "Ravi Balasubramanian"
+    }
+  ],
+  "objective": 1.5,
+  "covered_keywords": [
+    {
+      "keyword": "biomedical engineering",
+      "weight": 0.5,
+      "coverage": 1.0
+    },
+    {
+      "keyword": "machine learning",
+      "weight": 0.5,
+      "coverage": 1.0
+    },
+    {
+      "keyword": "healthcare",
+      "weight": 0.5,
+      "coverage": 1.0
+    }
+  ]
+}

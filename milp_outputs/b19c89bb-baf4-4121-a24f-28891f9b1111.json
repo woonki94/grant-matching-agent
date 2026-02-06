@@ -1,0 +1,42 @@
+{
+  "opportunity_id": "b19c89bb-baf4-4121-a24f-28891f9b1111",
+  "title": "Novel Approaches to Advance Precision Aging and Cognitive Health",
+  "team_size": 3,
+  "selected_faculty": [
+    {
+      "id": 12,
+      "name": "Lance Albertson"
+    },
+    {
+      "id": 16,
+      "name": "Janet Amador"
+    },
+    {
+      "id": 17,
+      "name": "Tejasvi Anand"
+    }
+  ],
+  "objective": 2.0,
+  "covered_keywords": [
+    {
+      "keyword": "machine learning",
+      "weight": 0.5,
+      "coverage": 1.0
+    },
+    {
+      "keyword": "healthcare",
+      "weight": 0.5,
+      "coverage": 1.0
+    },
+    {
+      "keyword": "public health",
+      "weight": 0.5,
+      "coverage": 1.0
+    },
+    {
+      "keyword": "aging",
+      "weight": 0.5,
+      "coverage": 1.0
+    }
+  ]
+}

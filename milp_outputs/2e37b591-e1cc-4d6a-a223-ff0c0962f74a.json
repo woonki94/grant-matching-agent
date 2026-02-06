@@ -1,0 +1,42 @@
+{
+  "opportunity_id": "2e37b591-e1cc-4d6a-a223-ff0c0962f74a",
+  "title": "Illuminating AD/ADRD Genome to Enable Precision Genomic Medicine",
+  "team_size": 3,
+  "selected_faculty": [
+    {
+      "id": 13,
+      "name": "Tim Alcon"
+    },
+    {
+      "id": 34,
+      "name": "Ravi Balasubramanian"
+    },
+    {
+      "id": 37,
+      "name": "John Barber"
+    }
+  ],
+  "objective": 2.0,
+  "covered_keywords": [
+    {
+      "keyword": "neuroscience",
+      "weight": 0.5,
+      "coverage": 1.0
+    },
+    {
+      "keyword": "bioinformatics",
+      "weight": 0.5,
+      "coverage": 1.0
+    },
+    {
+      "keyword": "healthcare",
+      "weight": 0.5,
+      "coverage": 1.0
+    },
+    {
+      "keyword": "pharmaceuticals",
+      "weight": 0.5,
+      "coverage": 1.0
+    }
+  ]
+}

@@ -1,0 +1,37 @@
+{
+  "opportunity_id": "25d22ed0-f1fe-4c46-a5b6-0ab60a464f00",
+  "title": "Collaboratory to Advance Mathematics Education and Learning (CAMEL) for K-12",
+  "team_size": 3,
+  "selected_faculty": [
+    {
+      "id": 11,
+      "name": "Muge Albayrak"
+    },
+    {
+      "id": 24,
+      "name": "Tracy Arras"
+    },
+    {
+      "id": 30,
+      "name": "Mike Bailey"
+    }
+  ],
+  "objective": 1.5,
+  "covered_keywords": [
+    {
+      "keyword": "education",
+      "weight": 0.5,
+      "coverage": 1.0
+    },
+    {
+      "keyword": "machine learning",
+      "weight": 0.5,
+      "coverage": 1.0
+    },
+    {
+      "keyword": "stem",
+      "weight": 0.5,
+      "coverage": 1.0
+    }
+  ]
+}

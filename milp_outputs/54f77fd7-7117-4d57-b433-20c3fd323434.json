@@ -1,0 +1,42 @@
+{
+  "opportunity_id": "54f77fd7-7117-4d57-b433-20c3fd323434",
+  "title": "Interdisciplinary Research to Understand the Complex Biology of Resilience to Alzheimer\u2019s and Related Dementias Disease Risk",
+  "team_size": 3,
+  "selected_faculty": [
+    {
+      "id": 2,
+      "name": "Bahman Abbasi"
+    },
+    {
+      "id": 34,
+      "name": "Ravi Balasubramanian"
+    },
+    {
+      "id": 37,
+      "name": "John Barber"
+    }
+  ],
+  "objective": 2.0,
+  "covered_keywords": [
+    {
+      "keyword": "neuroscience",
+      "weight": 0.5,
+      "coverage": 1.0
+    },
+    {
+      "keyword": "machine learning",
+      "weight": 0.5,
+      "coverage": 1.0
+    },
+    {
+      "keyword": "healthcare",
+      "weight": 0.5,
+      "coverage": 1.0
+    },
+    {
+      "keyword": "aging",
+      "weight": 0.5,
+      "coverage": 1.0
+    }
+  ]
+}
