@@ -1,7 +1,13 @@
+import sys
+from pathlib import Path
 from typing import Dict, List, final
 
 from typing import Dict, List, Tuple
 from itertools import combinations
+
+
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(PROJECT_ROOT))
 
 from dao.faculty_dao import FacultyDAO
 from dao.group_match_dao import GroupMatchDAO

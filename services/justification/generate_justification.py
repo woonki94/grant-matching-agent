@@ -19,7 +19,6 @@ from services.prompts.justification_prompts import FACULTY_RECS_PROMPT
 
 
 
-from config import OPENAI_MODEL, OPENAI_API_KEY
 from db.db_conn import SessionLocal
 from db.models.faculty import Faculty
 from dao.opportunity_dao import OpportunityDAO
