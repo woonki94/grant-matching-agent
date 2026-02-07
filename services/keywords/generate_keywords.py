@@ -9,6 +9,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 import json
 import logging
+import re
 
 import boto3
 from botocore.exceptions import ClientError
@@ -34,6 +35,23 @@ from services.prompts.keyword_prompts import (
 from utils.content_compressor import cap_extracted_blocks
 
 logger = logging.getLogger(__name__)
+
+# -----------------------------
+# Postgres JSONB safety:
+# Remove NUL (\x00) and other control chars that Postgres rejects in text/jsonb.
+# -----------------------------
+_CTRL_RE = re.compile(r"[\x00-\x08\x0B\x0C\x0E-\x1F]")
+
+
+def sanitize_for_postgres(obj: Any) -> Any:
+    if isinstance(obj, str):
+        obj = obj.replace("\x00", "")
+        return _CTRL_RE.sub("", obj)
+    if isinstance(obj, list):
+        return [sanitize_for_postgres(x) for x in obj]
+    if isinstance(obj, dict):
+        return {k: sanitize_for_postgres(v) for k, v in obj.items()}
+    return obj
 
 
 # -----------------------------
@@ -137,11 +155,11 @@ def _refresh_extracted_blocks_from_s3(context: dict, obj: Any) -> dict:
     This function ensures the extracted blocks come from S3 using content_path keys.
     Works for:
       - Opportunity: attachments_extracted, additional_info_extracted
-      - Faculty: additional_link_extracted / additional_info_extracted (depending on your context keys)
+      - Faculty: additional_links_extracted / additional_info_extracted (depending on your context keys)
     """
     out = dict(context)
 
-    # Opportunity convention (your earlier context builder code)
+    # Opportunity convention
     if hasattr(obj, "attachments") and "attachments_extracted" in out:
         out["attachments_extracted"] = _load_extracted_content_s3(
             getattr(obj, "attachments") or [],
@@ -157,7 +175,6 @@ def _refresh_extracted_blocks_from_s3(context: dict, obj: Any) -> dict:
         )
 
     # Faculty conventions (depending on your schema/context)
-    # If your faculty context uses "additional_links_extracted" key, handle it:
     if hasattr(obj, "additional_info") and "additional_links_extracted" in out:
         out["additional_links_extracted"] = _load_extracted_content_s3(
             getattr(obj, "additional_info") or [],
@@ -195,7 +212,6 @@ def _apply_weighted_specializations(*, keywords: dict, weighted: WeightedSpecsOu
 def _extract_domains_from_keywords(kw: dict) -> Tuple[List[str], List[str]]:
     """
     Returns (research_domains, application_domains) from your KeywordsOut structure.
-    Adjust if your schema differs.
     """
     r = (kw.get("research") or {}).get("domain") or []
     a = (kw.get("application") or {}).get("domain") or []
@@ -229,7 +245,6 @@ def generate_keywords(
     context = context_builder(obj)
 
     # Force extracted blocks to come from S3 (content_path keys)
-    # (works for both faculties & opportunities as long as content_path is stored)
     context = _refresh_extracted_blocks_from_s3(context, obj)
 
     # Cap huge extracted blobs (especially attachments)
@@ -239,6 +254,9 @@ def generate_keywords(
             max_total_chars=18_000,
             max_per_doc_chars=2_000,
         )
+
+    # Sanitize context before serializing / sending to LLM (safe + avoids hidden NULs)
+    context = sanitize_for_postgres(context)
 
     context_json = json.dumps(context, ensure_ascii=False)
 
@@ -258,7 +276,6 @@ def generate_keywords(
     for k in ("research", "application"):
         if isinstance(kw_dict.get(k), str):
             kw_dict[k] = json.loads(kw_dict[k])
-
 
     # Step 3: weight specializations
     spec_in = {
@@ -284,6 +301,10 @@ def generate_keywords(
             "application": [x.model_dump() for x in weighted_out.application],
         },
     }
+
+    # Final sanitization for Postgres JSONB safety
+    kw_weighted = sanitize_for_postgres(kw_weighted)
+    raw_debug = sanitize_for_postgres(raw_debug)
 
     return kw_weighted, raw_debug
 
@@ -328,7 +349,6 @@ if __name__ == "__main__":
         fac_dao = FacultyDAO(sess)
         opp_dao = OpportunityDAO(sess)
 
-        # Use Bedrock model id as source string
         source_model = settings.bedrock_model_id
         embed_model = settings.bedrock_embed_model_id
 
@@ -341,6 +361,10 @@ if __name__ == "__main__":
                     keywords_chain=faculty_kw_chain,
                     weight_chain=faculty_w_chain,
                 )
+
+                # Extra safety (in case dao serializes differently)
+                faculty_keywords = sanitize_for_postgres(faculty_keywords)
+                faculty_keywords_raw = sanitize_for_postgres(faculty_keywords_raw)
 
                 fac_dao.upsert_keywords_json(
                     [
@@ -378,6 +402,10 @@ if __name__ == "__main__":
                     keywords_chain=opp_kw_chain,
                     weight_chain=opp_w_chain,
                 )
+
+                # Extra safety (in case dao serializes differently)
+                opportunity_keywords = sanitize_for_postgres(opportunity_keywords)
+                opportunity_keywords_raw = sanitize_for_postgres(opportunity_keywords_raw)
 
                 opp_dao.upsert_keywords_json(
                     [

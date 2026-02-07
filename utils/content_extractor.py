@@ -12,7 +12,7 @@ from pathlib import Path
 import boto3
 from botocore.exceptions import ClientError
 
-# local extraction libs
+# extraction libs (no local storage; docx uses temp only)
 from pdfminer.high_level import extract_text as pdf_extract_text
 import docx2txt
 import openpyxl
@@ -165,7 +165,7 @@ def extract_text_from_bytes(data: bytes, filename: str, content_type: Optional[s
         if "spreadsheetml" in ctype or "xlsx" in ctype or "excel" in ctype:
             return extract_xlsx_bytes(data), "xlsx"
         if "ms-excel" in ctype or "xls" in ctype:
-            return extract_xls_bytes(data), "xls"
+            return extract_xlsx_bytes(data), "xls"
         if "csv" in ctype:
             return extract_csv_bytes(data), "csv"
         if "html" in ctype or "htm" in ctype or "text/html" in ctype:
@@ -287,46 +287,45 @@ def load_extracted_content(
     Loader for extracted content from DB rows.
 
     Expects r.content_path to be either:
-      - S3 key (recommended): "<prefix>/<subdir>/<file>.txt"
+      - S3 key: "<prefix>/<subdir>/<file>.txt"
       - or full S3 URL: "s3://bucket/<prefix>/<subdir>/<file>.txt"
-      - (optional) a local filesystem path (if you still have old rows)
+
+    This function does NOT try to attach prefixes automatically.
+    Prefix selection is handled when writing (import/extraction pipeline),
+    and the DB should store the full key (or full s3:// URI).
     """
     out: List[Dict[str, Any]] = []
 
-    bucket = (settings.extracted_content_bucket or "").strip()
-    prefix = (settings.extracted_content_prefix or "").strip().strip("/")
+    bucket_default = (settings.extracted_content_bucket or "").strip()
+    if not bucket_default:
+        return out
+
     region = (settings.aws_region or "").strip()
     profile = settings.aws_profile
 
-    if not bucket:
-        # No bucket configured -> nothing to load
-        return out
-
-    session = boto3.Session(profile_name=profile, region_name=region) if profile else boto3.Session(region_name=region)
+    session = (
+        boto3.Session(profile_name=profile, region_name=region)
+        if profile
+        else boto3.Session(region_name=region)
+    )
     s3 = session.client("s3")
 
-    def _normalize_to_s3_key(content_path: str) -> Optional[str]:
-        if not content_path:
+    def _parse_bucket_key(content_path: str) -> Optional[Tuple[str, str]]:
+        cp = (content_path or "").strip()
+        if not cp:
             return None
-        cp = content_path.strip()
 
-        # Full S3 URL: s3://bucket/key
         if cp.startswith("s3://"):
             rest = cp[5:]
             parts = rest.split("/", 1)
             if len(parts) != 2:
                 return None
-            _url_bucket, key = parts[0], parts[1]
-            return key
+            b, k = parts[0].strip(), parts[1].lstrip("/")
+            if not b or not k:
+                return None
+            return b, k
 
-        # Already a key that includes prefix
-        if prefix and cp.startswith(prefix + "/"):
-            return cp
-
-        # If it's a bare key (no prefix), attach prefix
-        if prefix:
-            return f"{prefix}/{cp.lstrip('/')}"
-        return cp.lstrip("/")
+        return bucket_default, cp.lstrip("/")
 
     for r in rows or []:
         if getattr(r, "extract_status", None) != "done":
@@ -338,26 +337,14 @@ def load_extracted_content(
         if not content_path:
             continue
 
-        cp = str(content_path).strip()
-        use_bucket = bucket
-        key = None
-
-        # If content_path is a full s3:// URL, parse bucket+key from it
-        if cp.startswith("s3://"):
-            rest = cp[5:]
-            parts = rest.split("/", 1)
-            if len(parts) != 2:
-                continue
-            use_bucket, key = parts[0], parts[1]
-        else:
-            key = _normalize_to_s3_key(cp)
-
-        if not key:
+        parsed = _parse_bucket_key(str(content_path))
+        if not parsed:
             continue
+        use_bucket, key = parsed
 
         try:
             resp = s3.get_object(Bucket=use_bucket, Key=key)
-            text = resp["Body"].read().decode("utf-8", errors="ignore")
+            text = resp["Body"].read().decode("utf-8", errors="ignore").strip()
         except ClientError as e:
             code = e.response.get("Error", {}).get("Code")
             if code in ("NoSuchKey", "404"):
@@ -366,7 +353,6 @@ def load_extracted_content(
         except Exception:
             continue
 
-        text = text.strip()
         if not text:
             continue
 

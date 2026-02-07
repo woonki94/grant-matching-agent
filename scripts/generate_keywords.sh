@@ -20,12 +20,12 @@ echo "Running keyword generation pipeline..."
 echo "  Mode  : $MODE"
 echo "  Limit : ${LIMIT:-none}"
 echo
-echo "  LLM_PROVIDER              : ${LLM_PROVIDER:-}"
-echo "  EMBEDDING_PROVIDER        : ${EMBEDDING_PROVIDER:-}"
-echo "  AWS_REGION                : ${AWS_REGION:-}"
-echo "  EXTRACTED_CONTENT_BACKEND : ${EXTRACTED_CONTENT_BACKEND:-}"
-echo "  EXTRACTED_CONTENT_BUCKET  : ${EXTRACTED_CONTENT_BUCKET:-}"
-echo "  EXTRACTED_CONTENT_PREFIX  : ${EXTRACTED_CONTENT_PREFIX:-}"
+echo "  LLM_PROVIDER                         : ${LLM_PROVIDER:-}"
+echo "  EMBEDDING_PROVIDER                   : ${EMBEDDING_PROVIDER:-}"
+echo "  AWS_REGION                           : ${AWS_REGION:-}"
+echo "  EXTRACTED_CONTENT_BUCKET             : ${EXTRACTED_CONTENT_BUCKET:-}"
+echo "  EXTRACTED_CONTENT_PREFIX_OPPORTUNITY : ${EXTRACTED_CONTENT_PREFIX_OPPORTUNITY:-}"
+echo "  EXTRACTED_CONTENT_PREFIX_FACULTY     : ${EXTRACTED_CONTENT_PREFIX_FACULTY:-}"
 echo
 
 PYTHON_FILE="$PROJECT_ROOT/services/keywords/generate_keywords.py"

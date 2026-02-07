@@ -45,77 +45,39 @@ def import_opportunity(page_size: int, query: str | None) -> None:
     logger.info("[2/3 UPSERT] Completed")
 
     # -------------------------
-    # 3) Extract (Local or S3)
+    # 3) Extract (S3 ONLY)
     # -------------------------
-    backend = (settings.extracted_content_backend or "local").lower().strip()
+    if not settings.extracted_content_bucket:
+        raise RuntimeError("EXTRACTED_CONTENT_BUCKET must be set")
 
     # Keep S3 keys stable + clean
     att_subdir = "opportunity_attachments"
     link_subdir = "opportunity_additional_links"
 
-    if backend == "local":
-        if settings.extracted_content_path is None:
-            raise RuntimeError(
-                "EXTRACTED_CONTENT_PATH must be set when EXTRACTED_CONTENT_BACKEND=local"
-            )
+    common = dict(
+        backend="s3",
+        base_dir=None,
+        s3_bucket=settings.extracted_content_bucket,
+        s3_prefix=settings.extracted_content_prefix_opportunity,
+        aws_region=settings.aws_region,
+        aws_profile=settings.aws_profile,
+    )
 
-        base_dir = settings.extracted_content_path
-        base_dir.mkdir(parents=True, exist_ok=True)
+    stats = run_extraction_pipeline(
+        model=OpportunityAttachment,
+        subdir=att_subdir,
+        url_getter=lambda a: a.file_download_path,
+        **common,
+    )
+    logger.info("[3/3 EXTRACT:ATTACHMENTS] Completed %s", stats)
 
-        stats = run_extraction_pipeline(
-            model=OpportunityAttachment,
-            base_dir=base_dir,
-            subdir=att_subdir,
-            url_getter=lambda a: a.file_download_path,
-            backend="local",
-        )
-        logger.info("[3/3 EXTRACT:ATTACHMENTS] Completed %s", stats)
-
-        stats = run_extraction_pipeline(
-            model=OpportunityAdditionalInfo,
-            base_dir=base_dir,
-            subdir=link_subdir,
-            url_getter=lambda a: a.additional_info_url,
-            backend="local",
-        )
-        logger.info("[3/3 EXTRACT:LINKS] Completed %s", stats)
-
-        return
-
-    if backend == "s3":
-        if not settings.extracted_content_bucket:
-            raise RuntimeError(
-                "EXTRACTED_CONTENT_BUCKET must be set when EXTRACTED_CONTENT_BACKEND=s3"
-            )
-
-        common = dict(
-            backend="s3",
-            base_dir=None,
-            s3_bucket=settings.extracted_content_bucket,
-            s3_prefix=settings.extracted_content_prefix,
-            aws_region=settings.aws_region,
-            aws_profile=settings.aws_profile,
-        )
-
-        stats = run_extraction_pipeline(
-            model=OpportunityAttachment,
-            subdir=att_subdir,
-            url_getter=lambda a: a.file_download_path,
-            **common,
-        )
-        logger.info("[3/3 EXTRACT:ATTACHMENTS] Completed %s", stats)
-
-        stats = run_extraction_pipeline(
-            model=OpportunityAdditionalInfo,
-            subdir=link_subdir,
-            url_getter=lambda a: a.additional_info_url,
-            **common,
-        )
-        logger.info("[3/3 EXTRACT:LINKS] Completed %s", stats)
-
-        return
-
-    raise RuntimeError(f"Unsupported EXTRACTED_CONTENT_BACKEND={backend}")
+    stats = run_extraction_pipeline(
+        model=OpportunityAdditionalInfo,
+        subdir=link_subdir,
+        url_getter=lambda a: a.additional_info_url,
+        **common,
+    )
+    logger.info("[3/3 EXTRACT:LINKS] Completed %s", stats)
 
 
 if __name__ == "__main__":

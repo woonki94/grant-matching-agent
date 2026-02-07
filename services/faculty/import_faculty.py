@@ -22,7 +22,6 @@ from services.faculty.faculty_page_crawler import crawl
 from services.faculty.profile_parser import parse_profile
 from utils.publication_enricher import get_publication_dtos_for_faculty
 
-
 logger = logging.getLogger("import_faculty")
 setup_logging()
 
@@ -63,7 +62,7 @@ def import_faculty(max_pages: int, max_faculty: int, years_back: int) -> None:
                         dto.additional_info,
                     )
 
-                    author_id, pubs = get_publication_dtos_for_faculty(
+                    _author_id, pubs = get_publication_dtos_for_faculty(
                         full_name=faculty.name,
                         university=UNIV_NAME,
                         years_back=years_back,
@@ -78,54 +77,25 @@ def import_faculty(max_pages: int, max_faculty: int, years_back: int) -> None:
     logger.info("[2/3 UPSERT] Completed")
 
     # -------------------------
-    # 3) Extract content from additional links (Local or S3)
+    # 3) Extract content from additional links (S3 ONLY)
     # -------------------------
-    backend = (settings.extracted_content_backend or "local").lower().strip()
+    if not settings.extracted_content_bucket:
+        raise RuntimeError("EXTRACTED_CONTENT_BUCKET must be set")
 
-    # You requested:
-    #   EXTRACTED_CONTENT_PREFIX=extracted-context-faculties
-    #   link_subdir="faculties_additional_links"
+    # Writes to:
+    # s3://<bucket>/<EXTRACTED_CONTENT_PREFIX_FACULTY>/faculties_additional_links/<id>__<hash>.txt
     LINK_SUBDIR = "faculties_additional_links"
 
-    if backend == "local":
-        if settings.extracted_content_path is None:
-            raise RuntimeError(
-                "EXTRACTED_CONTENT_PATH must be set when EXTRACTED_CONTENT_BACKEND=local"
-            )
-        base_dir = settings.extracted_content_path
-        base_dir.mkdir(parents=True, exist_ok=True)
-
-        stats = run_extraction_pipeline(
-            model=FacultyAdditionalInfo,
-            base_dir=base_dir,
-            subdir=LINK_SUBDIR,
-            url_getter=lambda a: a.additional_info_url,
-            backend="local",
-        )
-        logger.info("[3/3 EXTRACT:LINKS] Completed %s", stats)
-        return
-
-    if backend == "s3":
-        if not settings.extracted_content_bucket:
-            raise RuntimeError(
-                "EXTRACTED_CONTENT_BUCKET must be set when EXTRACTED_CONTENT_BACKEND=s3"
-            )
-
-        stats = run_extraction_pipeline(
-            model=FacultyAdditionalInfo,
-            base_dir=None,
-            subdir=LINK_SUBDIR,
-            url_getter=lambda a: a.additional_info_url,
-            backend="s3",
-            s3_bucket=settings.extracted_content_bucket,
-            s3_prefix=settings.extracted_content_prefix,  # set this to extracted-context-faculties in .env
-            aws_region=settings.aws_region,
-            aws_profile=settings.aws_profile,
-        )
-        logger.info("[3/3 EXTRACT:LINKS] Completed %s", stats)
-        return
-
-    raise RuntimeError(f"Unsupported EXTRACTED_CONTENT_BACKEND={backend}")
+    stats = run_extraction_pipeline(
+        model=FacultyAdditionalInfo,
+        subdir=LINK_SUBDIR,
+        url_getter=lambda a: a.additional_info_url,
+        s3_bucket=settings.extracted_content_bucket,
+        s3_prefix=settings.extracted_content_prefix_faculty,
+        aws_region=settings.aws_region,
+        aws_profile=settings.aws_profile,
+    )
+    logger.info("[3/3 EXTRACT:LINKS] Completed %s", stats)
 
 
 if __name__ == "__main__":
