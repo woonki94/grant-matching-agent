@@ -19,7 +19,6 @@ from services.prompts.justification_prompts import FACULTY_RECS_PROMPT
 
 
 
-from config import OPENAI_MODEL, OPENAI_API_KEY
 from db.db_conn import SessionLocal
 from db.models.faculty import Faculty
 from dao.opportunity_dao import OpportunityDAO
@@ -85,7 +84,7 @@ def main(email: str, k: int) -> None:
         opp_dao = OpportunityDAO(sess)
         match_dao = MatchDAO(sess)
 
-        # 1) Fetch faculty by email (+ relations, since your context builder uses them)
+        # TODO: Make a DAO
         fac = (
             sess.query(Faculty)
             .options(

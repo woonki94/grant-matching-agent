@@ -14,7 +14,6 @@ BASE_DIR = Path(__file__).resolve().parent
 
 LLMProvider = Literal["bedrock"]
 EmbeddingProvider = Literal["bedrock"]
-ExtractedBackend = Literal["local", "s3"]
 
 
 class Settings(BaseSettings):
@@ -56,7 +55,6 @@ class Settings(BaseSettings):
     @field_validator("llm_provider", mode="before")
     @classmethod
     def _normalize_llm_provider(cls, v):
-        # allow "Bedrock" / "BEDROCK"
         if v is None:
             return "bedrock"
         return str(v).strip().lower()
@@ -90,26 +88,26 @@ class Settings(BaseSettings):
         return 1024
 
     # =========================
-    # Extracted Content Storage (Local or S3)
+    # Extracted Content Storage (S3 ONLY)
     # =========================
-    extracted_content_backend: ExtractedBackend = "local"
-    extracted_content_path: Optional[Path] = None  # local
-    extracted_content_bucket: Optional[str] = None  # s3
-    extracted_content_prefix: str = ""
-
-    @field_validator("extracted_content_backend", mode="before")
-    @classmethod
-    def _normalize_extracted_backend(cls, v):
-        if v is None:
-            return "local"
-        return str(v).strip().lower()
+    extracted_content_bucket: str  # REQUIRED
+    extracted_content_prefix_opportunity: str = ""
+    extracted_content_prefix_faculty: str = ""
 
     @computed_field
     @property
-    def extracted_content_s3_uri(self) -> Optional[str]:
-        if self.extracted_content_backend != "s3" or not self.extracted_content_bucket:
-            return None
-        prefix = (self.extracted_content_prefix or "").strip("/")
+    def extracted_content_s3_uri_opportunity(self) -> str:
+        prefix = (self.extracted_content_prefix_opportunity or "").strip("/")
+        return (
+            f"s3://{self.extracted_content_bucket}/{prefix}"
+            if prefix
+            else f"s3://{self.extracted_content_bucket}"
+        )
+
+    @computed_field
+    @property
+    def extracted_content_s3_uri_faculty(self) -> str:
+        prefix = (self.extracted_content_prefix_faculty or "").strip("/")
         return (
             f"s3://{self.extracted_content_bucket}/{prefix}"
             if prefix
@@ -118,6 +116,7 @@ class Settings(BaseSettings):
 
     # =========================
     # Pipeline local scratch paths (safe defaults)
+    # (These are NOT extracted-content storage; they’re local temp paths.)
     # =========================
     opportunity_attachment_path: Path = BASE_DIR / "data" / "opportunity_attachments"
     opportunity_additional_link_path: Path = BASE_DIR / "data" / "opportunity_additional_links"
@@ -158,7 +157,6 @@ Grant_API_KEY: Final[str] = settings.grant_api_key
 
 
 @lru_cache(maxsize=1)
-@lru_cache(maxsize=1)
 def get_llm_client() -> LLMChatClient:
     return LLMChatClient(
         LLMConfig(
@@ -168,7 +166,6 @@ def get_llm_client() -> LLMChatClient:
             bedrock_model_id=settings.bedrock_model_id,
         )
     )
-
 
 
 @lru_cache(maxsize=1)
