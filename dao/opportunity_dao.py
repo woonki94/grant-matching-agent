@@ -221,3 +221,21 @@ class OpportunityDAO:
             "summary": getattr(opp, "summary_description", None),
             "keywords": kw,  # your JSON keyword schema
         }
+
+
+
+
+
+    def iter_opportunity_missing_keywords(self, batch_size: int = 200) -> Iterator[Opportunity]:
+        q = (
+            self.session.query(Opportunity)
+            .outerjoin(OpportunityKeyword, OpportunityKeyword.opportunity_id == Opportunity.opportunity_id)
+            .options(
+                selectinload(Opportunity.additional_info),
+                selectinload(Opportunity.attachments),
+                selectinload(Opportunity.keyword),
+            )
+            .filter(OpportunityKeyword.opportunity_id.is_(None))  # only missing keywords
+            .yield_per(batch_size)
+        )
+        yield from q

@@ -1,56 +1,43 @@
-# llm_client.py
+# client/llm_client.py  (Bedrock-only)
 from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Optional
 
 import boto3
-from langchain_openai import ChatOpenAI
 from langchain_aws import ChatBedrock
 
 
 @dataclass(frozen=True)
 class LLMConfig:
-    provider: str  # "openai" | "bedrock"
+    # Bedrock only
     temperature: float = 0.0
-
-    # OpenAI
-    openai_model: Optional[str] = None
-    openai_api_key: Optional[str] = None
-
-    # Bedrock
     aws_region: Optional[str] = None
-    bedrock_model_id: Optional[str] = None
     aws_profile: Optional[str] = None
+    bedrock_model_id: str = ""  # required
 
 
 class LLMChatClient:
     def __init__(self, config: LLMConfig):
         self.config = config
 
-    def build(self):
-        provider = (self.config.provider or "").lower().strip()
+    def build(self) -> ChatBedrock:
+        if not self.config.bedrock_model_id:
+            raise ValueError("bedrock_model_id is required for Bedrock LLM")
 
-        if provider == "openai":
-            return ChatOpenAI(
-                model=self.config.openai_model,
-                api_key=self.config.openai_api_key,
-                temperature=self.config.temperature,
+        session = (
+            boto3.Session(
+                profile_name=self.config.aws_profile,
+                region_name=self.config.aws_region,
             )
+            if self.config.aws_profile
+            else boto3.Session(region_name=self.config.aws_region)
+        )
 
-        if provider == "bedrock":
-            session = (
-                boto3.Session(profile_name=self.config.aws_profile, region_name=self.config.aws_region)
-                if self.config.aws_profile
-                else boto3.Session(region_name=self.config.aws_region)
-            )
+        bedrock_runtime = session.client("bedrock-runtime")
 
-            bedrock_runtime = session.client("bedrock-runtime")
-
-            return ChatBedrock(
-                model_id=self.config.bedrock_model_id,
-                client=bedrock_runtime,
-                model_kwargs={"temperature": self.config.temperature},
-            )
-
-        raise ValueError(f"Unknown provider: {self.config.provider!r}")
+        return ChatBedrock(
+            model_id=self.config.bedrock_model_id,
+            client=bedrock_runtime,
+            model_kwargs={"temperature": self.config.temperature},
+        )

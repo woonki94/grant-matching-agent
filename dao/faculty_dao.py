@@ -211,3 +211,25 @@ class FacultyDAO:
 
         return row.faculty_id if row else None
 
+
+    def iter_faculty_missing_keywords(
+        self,
+        batch_size: int = 200,
+        stream: bool = True,
+    ) -> Iterator[Faculty]:
+
+        q = (
+            self.session.query(Faculty)
+            .outerjoin(FacultyKeyword, FacultyKeyword.faculty_id == Faculty.faculty_id)
+            .options(
+                selectinload(Faculty.additional_info),
+                selectinload(Faculty.publications),
+                selectinload(Faculty.keyword),
+            )
+            .filter(FacultyKeyword.faculty_id.is_(None))  # only missing keywords
+        )
+
+        if stream:
+            q = q.yield_per(batch_size)
+
+        return q if stream else q.all()

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import sys
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 import json
 import time
@@ -9,6 +11,9 @@ from pydantic import BaseModel, Field
 
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
+
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(PROJECT_ROOT))
 
 from config import get_llm_client
 from dao.opportunity_dao import OpportunityDAO
@@ -394,13 +399,41 @@ def run_justifications_from_group_results_agentic(
         return json.dumps(results, indent=2, ensure_ascii=False)
 
 
+
 if __name__ == "__main__":
-    email = "AbbasiB@oregonstate.edu"
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Run justification agent")
+    parser.add_argument(
+        "--email",
+        required=True,
+        help="Faculty email (e.g. abbasiB@oregonstate.edu)",
+    )
+    parser.add_argument(
+        "--team-size",
+        type=int,
+        default=3,
+        help="Number of agents in the team (default: 3)",
+    )
+    parser.add_argument(
+        "--limit-rows",
+        type=int,
+        default=200,
+        help="Max number of rows to process",
+    )
+    parser.add_argument(
+        "--include-trace",
+        action="store_true",
+        help="Include agent trace output",
+    )
+
+    args = parser.parse_args()
+
     print(
         run_justifications_from_group_results_agentic(
-            faculty_email=email,
-            team_size=3,
-            limit_rows=200,
-            include_trace=False,
+            faculty_email=args.email,
+            team_size=args.team_size,
+            limit_rows=args.limit_rows,
+            include_trace=args.include_trace,
         )
     )
