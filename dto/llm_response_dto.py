@@ -153,3 +153,11 @@ class GroupJustificationOut(BaseModel):
     one_paragraph: str
     member_roles: List[MemberRoleOut] = Field(default_factory=list)
     coverage: CoverageOut = Field(default_factory=CoverageOut)
+
+
+# ───────────────────────────────────────────────
+# Candidate team selection
+# ───────────────────────────────────────────────
+class TeamCandidateSelectionOut(BaseModel):
+    selected_candidate_indices: List[int] = Field(default_factory=list)
+    reason: Optional[str] = None
