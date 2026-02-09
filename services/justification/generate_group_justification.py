@@ -350,6 +350,16 @@ def _fallback_user_format(results: List[Dict[str, Any]]) -> str:
     return "\n".join(lines).strip()
 
 
+def _write_markdown_report(markdown_text: str, output_path: Optional[str] = None) -> Path:
+    if output_path:
+        out = Path(output_path).expanduser()
+    else:
+        out = PROJECT_ROOT / "outputs" / "justification_reports" / f"group_justification_{int(time.time())}.md"
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(markdown_text, encoding="utf-8")
+    return out
+
+
 
 def run_justifications_from_group_results_agentic(
     *,
@@ -536,7 +546,13 @@ if __name__ == "__main__":
     parser.add_argument(
         "--opp-id",
         type=str,
-        help="Max number of rows to process",
+        help="Single target opportunity id",
+    )
+    parser.add_argument(
+        "--out-md",
+        type=str,
+        default=None,
+        help="Output markdown file path (default: auto-generated under outputs/justification_reports)",
     )
     parser.add_argument(
         "--include-trace",
@@ -546,12 +562,14 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
 
+    rendered = run_justifications_from_group_results_agentic(
+        faculty_emails=args.email,
+        team_size=args.team_size,
+        opp_ids=[args.opp_id] if args.opp_id else None,
+        limit_rows=args.limit_rows,
+        include_trace=args.include_trace,
+    )
+    out_path = _write_markdown_report(rendered, args.out_md)
     print(
-        run_justifications_from_group_results_agentic(
-            faculty_emails=args.email,
-            team_size=args.team_size,
-            limit_rows=args.limit_rows,
-            opp_ids=["60b8b017-30ec-4f31-a160-f00b7ee384e7"],
-            include_trace=args.include_trace,
-        )
+        f"Saved markdown report to: {out_path}"
     )
