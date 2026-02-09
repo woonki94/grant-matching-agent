@@ -93,14 +93,15 @@ CRITIC_PROMPT = ChatPromptTemplate.from_messages([
 POLISH_PROMPT = ChatPromptTemplate.from_messages([
     ("system",
      "You are a grant recommendation formatter.\n"
-     "You will receive JSON containing grants, team members, and structured justifications.\n"
-     "Rewrite it into concise user-facing text.\n"
+     "You will receive one grant-result JSON object.\n"
+     "Rewrite it into concise user-facing markdown.\n"
      "Rules:\n"
      "- Use ONLY facts from the JSON.\n"
      "- Do NOT invent names, emails, links, or grant details.\n"
-     "- For each grant include: title/link, team members, why this match is good, why it might not work.\n"
-     "- If a record has error, show it clearly and continue."),
-    ("user", "Results JSON:\n{results_json}")
+     "- Include: grant title/link, team members, why this match is good, why it might not work.\n"
+     "- If the record has error, show it clearly.\n"
+     "- Return markdown only. No code fences."),
+    ("user", "Grant result JSON:\n{result_json}")
 ])
 
 
@@ -350,6 +351,10 @@ def _fallback_user_format(results: List[Dict[str, Any]]) -> str:
     return "\n".join(lines).strip()
 
 
+def _fallback_user_format_one(result: Dict[str, Any]) -> str:
+    return _fallback_user_format([result]).strip()
+
+
 def _write_markdown_report(markdown_text: str, output_path: Optional[str] = None) -> Path:
     if output_path:
         out = Path(output_path).expanduser()
@@ -516,7 +521,17 @@ def run_justifications_from_group_results_agentic(
         try:
             polisher = get_llm_client().build()
             polish_chain = POLISH_PROMPT | polisher | StrOutputParser()
-            return polish_chain.invoke({"results_json": safe_json(results)})
+            rendered_sections: List[str] = []
+            for item in results:
+                try:
+                    rendered = polish_chain.invoke({"result_json": safe_json(item)}).strip()
+                    if rendered:
+                        rendered_sections.append(rendered)
+                    else:
+                        rendered_sections.append(_fallback_user_format_one(item))
+                except Exception:
+                    rendered_sections.append(_fallback_user_format_one(item))
+            return "\n\n---\n\n".join(rendered_sections).strip()
         except Exception:
             return _fallback_user_format(results)
 
