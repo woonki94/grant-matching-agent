@@ -90,6 +90,19 @@ CRITIC_PROMPT = ChatPromptTemplate.from_messages([
      "Return CriticVerdict.")
 ])
 
+POLISH_PROMPT = ChatPromptTemplate.from_messages([
+    ("system",
+     "You are a grant recommendation formatter.\n"
+     "You will receive JSON containing grants, team members, and structured justifications.\n"
+     "Rewrite it into concise user-facing text.\n"
+     "Rules:\n"
+     "- Use ONLY facts from the JSON.\n"
+     "- Do NOT invent names, emails, links, or grant details.\n"
+     "- For each grant include: title/link, team members, why this match is good, why it might not work.\n"
+     "- If a record has error, show it clearly and continue."),
+    ("user", "Results JSON:\n{results_json}")
+])
+
 
 # -------------------------
 # Context building utilities
@@ -294,26 +307,102 @@ class JustificationEngine:
         return justification, trace
 
 
+def _fallback_user_format(results: List[Dict[str, Any]]) -> str:
+    lines: List[str] = []
+    for r in results:
+        title = r.get("grant_title") or r.get("grant_id")
+        lines.append(f"Grant: {title}")
+        lines.append(f"Link: {r.get('grant_link')}")
+
+        if r.get("error"):
+            lines.append(f"Result: ERROR - {r['error']}")
+            lines.append("")
+            continue
+
+        lines.append("Team:")
+        for m in r.get("team_members", []):
+            lines.append(f"- {m.get('faculty_name')} ({m.get('faculty_email')})")
+
+        just = r.get("justification", {}) or {}
+        lines.append("Why this is a good match:")
+        one_paragraph = (just.get("one_paragraph") or "").strip()
+        if one_paragraph:
+            lines.append(f"- {one_paragraph}")
+
+        coverage = just.get("coverage", {}) or {}
+        strong = coverage.get("strong", []) or []
+        partial = coverage.get("partial", []) or []
+        for item in strong:
+            lines.append(f"- Strong coverage: {item}")
+        for item in partial:
+            lines.append(f"- Partial coverage: {item}")
+
+        lines.append("Why this might not work:")
+        missing = coverage.get("missing", []) or []
+        if missing:
+            for item in missing:
+                lines.append(f"- Missing coverage risk: {item}")
+        else:
+            lines.append("- No explicit missing coverage was flagged.")
+
+        lines.append("")
+
+    return "\n".join(lines).strip()
+
+
 
 def run_justifications_from_group_results_agentic(
     *,
-    faculty_email: str,
+    faculty_emails: str,
     team_size: int,
+    opp_ids: Optional[List[str]] = None,
     limit_rows: int = 500,
     include_trace: bool = False,
 ) -> str:
+    def _expand_group_results(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """
+        Normalize run_group_match outputs into flat rows:
+        {opp_id, team, final_coverage, score}
+        Supports both grouped output (selected_teams per opp) and legacy flat rows.
+        """
+        expanded: List[Dict[str, Any]] = []
+        for r in rows:
+            if "selected_teams" in r:
+                opp_id = r.get("opp_id") or r.get("grant_id")
+                for cand in r.get("selected_teams") or []:
+                    expanded.append(
+                        {
+                            "opp_id": opp_id,
+                            "team": cand.get("team"),
+                            "final_coverage": cand.get("final_coverage"),
+                            "score": cand.get("score"),
+                        }
+                    )
+            else:
+                expanded.append(
+                    {
+                        "opp_id": r.get("opp_id") or r.get("grant_id"),
+                        "team": r.get("team"),
+                        "final_coverage": r.get("final_coverage"),
+                        "score": r.get("score"),
+                    }
+                )
+        return expanded
+
     with SessionLocal() as sess:
         odao = OpportunityDAO(sess)
         fdao = FacultyDAO(sess)
         engine = JustificationEngine(odao=odao, fdao=fdao)
 
         group_results = run_group_match(
-            faculty_email=faculty_email,
+            faculty_emails=[faculty_emails],
             team_size=team_size,
             limit_rows=limit_rows,
+            opp_ids=opp_ids,
         )
-        if not group_results:
-            raise ValueError(f"No group matches found for {faculty_email}")
+        normalized_rows = _expand_group_results(group_results)
+        if not normalized_rows:
+            raise ValueError(f"No group matches found for {faculty_emails}")
 
         # Caches
         opp_cache: Dict[str, Dict[str, Any]] = {}
@@ -321,7 +410,7 @@ def run_justifications_from_group_results_agentic(
 
         results: List[Dict[str, Any]] = []
 
-        for idx, r in enumerate(group_results):
+        for idx, r in enumerate(normalized_rows):
             opp_id = r["opp_id"]
             team: List[int] = r["team"]
             coverage = r.get("final_coverage")
@@ -335,6 +424,8 @@ def run_justifications_from_group_results_agentic(
                 results.append({
                     "index": idx,
                     "grant_id": opp_id,
+                    "grant_title": None,
+                    "grant_link": f"https://simpler.grants.gov/opportunity/{opp_id}",
                     "team": team,
                     "error": "Opportunity not found",
                 })
@@ -352,6 +443,8 @@ def run_justifications_from_group_results_agentic(
                 results.append({
                     "index": idx,
                     "grant_id": opp_id,
+                    "grant_title": opp_ctx.get("title") or opp_ctx.get("opportunity_title"),
+                    "grant_link": f"https://simpler.grants.gov/opportunity/{opp_id}",
                     "team": team,
                     "error": "No faculty contexts found for team",
                 })
@@ -380,7 +473,19 @@ def run_justifications_from_group_results_agentic(
                 out = {
                     "index": idx,
                     "grant_id": opp_id,
+                    "grant_title": opp_ctx.get("title") or opp_ctx.get("opportunity_title"),
+                    "grant_link": f"https://simpler.grants.gov/opportunity/{opp_id}",
                     "team": team,
+                    "team_members": [
+                        {
+                            "faculty_id": f.get("faculty_id") or f.get("id"),
+                            "faculty_name": f.get("name"),
+                            "faculty_email": f.get("email"),
+                        }
+                        for f in fac_ctxs
+                    ],
+                    "score": r.get("score"),
+                    "final_coverage": coverage,
                     "justification": justification.model_dump(),
                 }
                 if include_trace:
@@ -392,11 +497,18 @@ def run_justifications_from_group_results_agentic(
                 results.append({
                     "index": idx,
                     "grant_id": opp_id,
+                    "grant_title": opp_ctx.get("title") or opp_ctx.get("opportunity_title"),
+                    "grant_link": f"https://simpler.grants.gov/opportunity/{opp_id}",
                     "team": team,
                     "error": f"{type(e).__name__}: {e}",
                 })
 
-        return json.dumps(results, indent=2, ensure_ascii=False)
+        try:
+            polisher = get_llm_client().build()
+            polish_chain = POLISH_PROMPT | polisher | StrOutputParser()
+            return polish_chain.invoke({"results_json": safe_json(results)})
+        except Exception:
+            return _fallback_user_format(results)
 
 
 
@@ -412,13 +524,18 @@ if __name__ == "__main__":
     parser.add_argument(
         "--team-size",
         type=int,
-        default=3,
+        default=2,
         help="Number of agents in the team (default: 3)",
     )
     parser.add_argument(
         "--limit-rows",
         type=int,
         default=200,
+        help="Max number of rows to process",
+    )
+    parser.add_argument(
+        "--opp-id",
+        type=str,
         help="Max number of rows to process",
     )
     parser.add_argument(
@@ -431,9 +548,10 @@ if __name__ == "__main__":
 
     print(
         run_justifications_from_group_results_agentic(
-            faculty_email=args.email,
+            faculty_emails=args.email,
             team_size=args.team_size,
             limit_rows=args.limit_rows,
+            opp_ids=["60b8b017-30ec-4f31-a160-f00b7ee384e7"],
             include_trace=args.include_trace,
         )
     )

@@ -71,17 +71,53 @@ def run_group_match(
     faculty_emails: List[str],
     team_size: int = 3,
     limit_rows: int = 500,
-    num_candidates: int = 1,
+    num_candidates: int = 10,
     opp_ids: Optional[List[str]] = None,
     use_llm_selection: bool = False,
     desired_team_count: int = 1,
+    group_by_opp: bool = True,
 ):
+    def _attach_member_coverages(
+        candidates: List[Dict[str, object]],
+        coverage_map: Dict[int, Dict[str, Dict[int, float]]],
+    ) -> List[Dict[str, object]]:
+        out: List[Dict[str, object]] = []
+        for cand in candidates:
+            team_ids = list(cand["team"])
+            out.append(
+                {
+                    **cand,
+                    "member_coverages": {
+                        int(fid): coverage_map.get(int(fid), {"application": {}, "research": {}})
+                        for fid in team_ids
+                    },
+                }
+            )
+        return out
+
+    def _normalize_candidates(
+        selection,
+        requirements: Dict[str, Dict[int, float]],
+    ) -> List[Dict[str, object]]:
+        if isinstance(selection, tuple):
+            team, final_coverage = selection
+            score = 0.0
+            for sec, sec_cov in final_coverage.items():
+                for idx, cov in sec_cov.items():
+                    score += float(requirements.get(sec, {}).get(idx, 0.0)) * float(cov)
+            return [{"team": team, "final_coverage": final_coverage, "score": score}]
+        return selection
+
     with SessionLocal() as sess:
         match_dao = MatchDAO(sess)
         fac_dao = FacultyDAO(sess)
 
         if not faculty_emails:
             raise ValueError("At least one faculty email is required.")
+        if desired_team_count < 1:
+            raise ValueError("desired_team_count must be >= 1")
+        if num_candidates < 1:
+            raise ValueError("num_candidates must be >= 1")
 
         # Deduplicate while preserving order.
         unique_emails = list(dict.fromkeys(faculty_emails))
@@ -90,7 +126,7 @@ def run_group_match(
 
         target_opp_ids = opp_ids if opp_ids else match_dao.get_grant_ids_for_faculty(faculty_id=anchor_fac_id)
 
-        results = []
+        flat_results = []
         for opp_id in target_opp_ids:
             f, _i_app, _i_res, w, c = build_inputs_for_opportunity(
                 sess=sess,
@@ -101,69 +137,80 @@ def run_group_match(
                 print("  ↳ skipped (no faculty candidates)")
                 continue
 
+            # Ensure all required faculty can be forced into the team even when
+            # they are missing from match rows for this opportunity.
+            missing_required = [fid for fid in fac_ids if fid not in f]
+            if missing_required:
+                for fid in missing_required:
+                    f.append(fid)
+                    c[fid] = {
+                        "application": {i: 0.0 for i in w.get("application", {}).keys()},
+                        "research": {i: 0.0 for i in w.get("research", {}).keys()},
+                    }
+                f = sorted(set(f))
+
+            # Always output desired_team_count teams.
+            # num_candidates is treated as candidate-pool size only when LLM is enabled.
+            candidate_pool_size = max(num_candidates, desired_team_count) if use_llm_selection else desired_team_count
+
             selection = team_selection_super_faculty(
                 cand_faculty_ids=f,
                 requirements=w,
                 coverage=c,
                 K=team_size,
                 required_faculty_ids=fac_ids,
-                num_candidates=num_candidates,
+                num_candidates=candidate_pool_size,
+            )
+            candidates = _normalize_candidates(selection, w)
+            llm_selection = None
+
+            if use_llm_selection:
+                llm_selection = select_candidate_teams_with_llm(
+                    opportunity_id=opp_id,
+                    desired_team_count=desired_team_count,
+                    candidates=_attach_member_coverages(candidates, c),
+                    requirement_weights=w,
+                )
+                selected_candidates = llm_selection["selected_candidates"]
+            else:
+                selected_candidates = candidates[:desired_team_count]
+
+            # Return one row per selected team.
+            for cand in selected_candidates[:desired_team_count]:
+                flat_results.append(
+                    {
+                        "opp_id": opp_id,  # compatibility alias
+                        "team": cand["team"],
+                        "final_coverage": cand["final_coverage"],
+                        "score": cand["score"],
+                    }
+                )
+
+        if not group_by_opp:
+            return flat_results
+
+        grouped: Dict[str, Dict[str, object]] = {}
+        for row in flat_results:
+            oid = row["opp_id"]
+            if oid not in grouped:
+                grouped[oid] = {
+                    "opp_id": oid,
+                    "selected_teams": [],
+                }
+            grouped[oid]["selected_teams"].append(
+                {
+                    "team": row["team"],
+                    "final_coverage": row["final_coverage"],
+                    "score": row["score"],
+                }
             )
 
-            if num_candidates == 1:
-                team, final_coverage = selection
-                results.append(
-                    {
-                        "opp_id": opp_id,
-                        "team": team,
-                        "final_coverage": final_coverage,
-                    }
-                )
-            else:
-                candidates = selection
-                llm_selection = None
-                selected_candidates = candidates
-                if use_llm_selection:
-                    llm_candidates = []
-                    for cand in candidates:
-                        team_ids = list(cand["team"])
-                        llm_candidates.append(
-                            {
-                                **cand,
-                                "member_coverages": {
-                                    int(fid): c.get(int(fid), {"application": {}, "research": {}})
-                                    for fid in team_ids
-                                },
-                            }
-                        )
-                    llm_selection = select_candidate_teams_with_llm(
-                        opportunity_id=opp_id,
-                        desired_team_count=desired_team_count,
-                        candidates=llm_candidates,
-                        requirement_weights=w,
-                    )
-
-                    selected_candidates = llm_selection["selected_candidates"]
-
-                top = selected_candidates[0]
-                results.append(
-                    {
-                        "opp_id": opp_id,
-                        "team": top["team"],
-                        "final_coverage": top["final_coverage"],
-                        "score": top["score"],
-                        "candidates": candidates,
-                        "selected_teams": selected_candidates,
-                        "llm_selection": llm_selection,
-                    }
-                )
-
-        return results
+        return list(grouped.values())
 
 
 if __name__ == "__main__":
-    team_size = 3
-    email_list = ["houssam.abbas@oregonstate.edu","AbbasiB@oregonstate.edu"]
+    team_size = 4
+    email_list = ["AbbasiB@oregonstate.edu"]
     wished_grant = "60b8b017-30ec-4f31-a160-f00b7ee384e7"
-    ret = run_group_match(team_size=team_size, faculty_emails=email_list, opp_ids=[wished_grant], num_candidates=10, use_llm_selection = True, desired_team_count=1)
+    ret = run_group_match(team_size=team_size, faculty_emails=email_list, num_candidates=10, use_llm_selection = False, desired_team_count=2)
     print(ret)

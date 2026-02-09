@@ -85,8 +85,12 @@ def _fake_build_inputs_for_opportunity(*, sess, opportunity_id: str, limit_rows:
     return f, i_app, i_res, w, c
 
 
-def _team_list(rows):
-    return [r["team"] for r in rows]
+def _teams_by_opp(rows):
+    out = {}
+    for r in rows:
+        oid = r["opp_id"]
+        out.setdefault(oid, []).append(r["team"])
+    return out
 
 
 def main():
@@ -107,6 +111,7 @@ def main():
             opp_ids=opp_ids,
             use_llm_selection=False,
             desired_team_count=desired_team_count,
+            group_by_opp=False,
         )
         llm_based = run_group_match(
             faculty_emails=faculty_emails,
@@ -115,17 +120,19 @@ def main():
             opp_ids=opp_ids,
             use_llm_selection=True,
             desired_team_count=desired_team_count,
+            group_by_opp=False,
         )
 
     print("Synthetic comparison using run_group_match (deterministic vs LLM).\n")
-    for det, llm in zip(deterministic, llm_based):
-        opp_id = det["opp_id"]
-        det_top = _team_list(det["selected_teams"][:desired_team_count])
-        llm_top = _team_list(llm["selected_teams"])
+    det_map = _teams_by_opp(deterministic)
+    llm_map = _teams_by_opp(llm_based)
+
+    for opp_id in opp_ids:
+        det_top = det_map.get(opp_id, [])
+        llm_top = llm_map.get(opp_id, [])
         print(f"Opportunity: {opp_id}")
         print(f"  Deterministic top-{desired_team_count}: {det_top}")
         print(f"  LLM selected top-{desired_team_count}: {llm_top}")
-        print(f"  LLM reason: {None if llm['llm_selection'] is None else llm['llm_selection'].get('reason')}")
         print(f"  Different? {det_top != llm_top}\n")
 
 
