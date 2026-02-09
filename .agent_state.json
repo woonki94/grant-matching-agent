@@ -1,0 +1,135 @@
+{
+  "messages": [
+    {
+      "role": "user",
+      "content": "I’m a professor at Oregon State University working in scientific visualization, high-performance computer graphics, geometric modeling, and computer-aided design.  I’m looking for relevant external research grants that align with my work. Please find and rank suitable opportunities.\n"
+    }
+  ],
+  "slots": {},
+  "research_areas": [
+    "scientific visualization",
+    "high-performance computer graphics",
+    "geometric modeling",
+    "computer-aided design"
+  ],
+  "institution": "Oregon State University",
+  "user_role": "professor",
+  "query_submitted": true,
+  "last_tool_result": {
+    "query_text": "scientific visualization high-performance computer graphics geometric modeling computer-aided design",
+    "results": [
+      {
+        "opportunity_id": "67d97081-2134-43c3-8257-14a67f20222c",
+        "title": "Building Sustainable Software Tools for Open Science (R03 Clinical Trial Not Allowed)",
+        "agency": "National Institutes of Health",
+        "category": "discretionary",
+        "status": "forecasted",
+        "domain_score": 0.25839753398910004,
+        "llm_score": 0.35,
+        "reason": "Graphics optimization and performance scalability overlap; software engineering expertise limited."
+      },
+      {
+        "opportunity_id": "11efd047-3fa4-4de3-843f-79fda61924ba",
+        "title": "Pilot Program to Increase Research Capacity at  Historically Black Colleges and Universities and Other Minority-Serving Institutions",
+        "agency": "Dept of the Army -- Materiel Command",
+        "category": "discretionary",
+        "status": "posted",
+        "domain_score": 0.22650250792503357,
+        "llm_score": 0.32,
+        "reason": "Graphics expertise supports technology transfer; visualization research advances faculty capability."
+      },
+      {
+        "opportunity_id": "60b8b017-30ec-4f31-a160-f00b7ee384e7",
+        "title": "Carderock BAA",
+        "agency": "NSWC - Carderock - N00167",
+        "category": "discretionary",
+        "status": "posted",
+        "domain_score": 0.2929133176803589,
+        "llm_score": 0.28,
+        "reason": "3D modeling and CAD tools overlap minimally with naval hydrodynamics and marine engineering requirements."
+      },
+      {
+        "opportunity_id": "db2370bb-df90-4845-890a-7d25963d44ef",
+        "title": "BRAIN Initiative: Brain-Behavior Quantification and Synchronization – Transformative Research on Behavior at the Organismal Level",
+        "agency": "National Institutes of Health",
+        "category": "discretionary",
+        "status": "forecasted",
+        "domain_score": 0.23393619060516357,
+        "llm_score": 0.28,
+        "reason": "Faculty expertise in visualization and graphics lacks neuroscience, signal processing, and behavioral recording capabilities."
+      },
+      {
+        "opportunity_id": "4c7d870d-04a6-4636-a613-edd1a6dececa",
+        "title": "ROSES25: B.2 Heliophysics Foundational Research",
+        "agency": "NASA Headquarters",
+        "category": "discretionary",
+        "status": "posted",
+        "domain_score": 0.1946259836031231,
+        "llm_score": 0.28,
+        "reason": "Graphics expertise lacks heliophysics domain; minimal application requirement coverage."
+      },
+      {
+        "opportunity_id": "ecbe2890-046d-4963-bbd0-2125d4f3e7bd",
+        "title": "National Centers for Cryo-electron Tomography (cryoET) (R24 -Clinical Trial Not Allowed)",
+        "agency": "National Institutes of Health",
+        "category": "discretionary",
+        "status": "posted",
+        "domain_score": 0.35180099585044433,
+        "llm_score": 0.15,
+        "reason": "Faculty expertise in visualization and 3D reconstruction lacks cryo-electron tomography domain knowledge."
+      },
+      {
+        "opportunity_id": "d81a40ea-48d5-4f1d-80f6-830e3dab76e6",
+        "title": "Cooperative Agreement for affiliated Partner with the Californian Cooperative Ecosystem Studies Unit",
+        "agency": "Geological Survey",
+        "category": "discretionary",
+        "status": "posted",
+        "domain_score": 0.28554568972911354,
+        "llm_score": 0.15,
+        "reason": "Faculty expertise in computer graphics and visualization lacks coastal ecosystem and wetland ecology knowledge."
+      },
+      {
+        "opportunity_id": "d1aa3067-5978-40bd-a18a-a8c219bdcee2",
+        "title": "Physical Oceanography",
+        "agency": "U.S. National Science Foundation",
+        "category": "discretionary",
+        "status": "posted",
+        "domain_score": 0.242610187219359,
+        "llm_score": 0.15,
+        "reason": "Faculty expertise in graphics and visualization lacks oceanographic domain knowledge."
+      },
+      {
+        "opportunity_id": "2dac0aa9-d6f2-4b26-a56e-3dfd2bd1ac3a",
+        "title": "ROSES25: B.6 Heliophysics Technology and Instrument Development for Science",
+        "agency": "NASA Headquarters",
+        "category": "discretionary",
+        "status": "posted",
+        "domain_score": 0.2306251972913742,
+        "llm_score": 0.15,
+        "reason": "Faculty expertise in graphics and visualization lacks space instrumentation and plasma diagnostics capabilities."
+      },
+      {
+        "opportunity_id": "a55926dd-83b8-4e51-801e-384852d46065",
+        "title": "National Resource Network for the Study of Human Auditory and Vestibular Disorders",
+        "agency": "National Institutes of Health",
+        "category": "discretionary",
+        "status": "forecasted",
+        "domain_score": 0.2285627288482951,
+        "llm_score": 0.15,
+        "reason": "Faculty expertise in graphics and visualization lacks human tissue preparation and biomedical research capabilities."
+      }
+    ],
+    "meta": {
+      "top_k": 10,
+      "filters": {
+        "agency": null,
+        "category": null,
+        "status": null,
+        "user_urls": []
+      }
+    }
+  },
+  "search_completed": true,
+  "results_presented": true,
+  "recommendation_provided": true
+}
