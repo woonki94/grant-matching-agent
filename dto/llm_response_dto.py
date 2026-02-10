@@ -138,7 +138,9 @@ class PairPenalty(BaseModel):
 class PairPenaltiesOut(BaseModel):
     pair_penalties: List[PairPenalty] = Field(default_factory=list)
 
-
+# ───────────────────────────────────────────────
+# Group justification
+# ───────────────────────────────────────────────
 class MemberRoleOut(BaseModel):
     faculty_id: int
     role: str = Field(..., description="Short label like 'AI/ML lead', 'Education/Outreach lead', etc.")
@@ -149,10 +151,49 @@ class CoverageOut(BaseModel):
     partial: List[str] = Field(default_factory=list)
     missing: List[str] = Field(default_factory=list)
 
+class MemberStrengthOut(BaseModel):
+    faculty_id: int
+    bullets: List[str] = Field(default_factory=list)
+
+class TeamRoleOut(BaseModel):
+    member_roles: List[MemberRoleOut] = Field(default_factory=list)
+
+class WhyWorkingOut(BaseModel):
+    summary: str = ""
+    member_strengths: List[MemberStrengthOut] = Field(default_factory=list)
+    strong: List[str] = Field(default_factory=list)
+    partial: List[str] = Field(default_factory=list)
+
+class WhyNotWorkingOut(BaseModel):
+    why_not_working: List[str] = Field(default_factory=list)
+    missing: List[str] = Field(default_factory=list)
+
+class RecommendationOut(BaseModel):
+    match_quality: Literal["good", "moderate", "bad"] = "moderate"
+    recommendation: str = ""
+
+
 class GroupJustificationOut(BaseModel):
+    match_quality: Literal["good", "moderate", "bad"] = "moderate"
     one_paragraph: str
     member_roles: List[MemberRoleOut] = Field(default_factory=list)
     coverage: CoverageOut = Field(default_factory=CoverageOut)
+    member_strengths: List[MemberStrengthOut] = Field(default_factory=list)
+    why_not_working: List[str] = Field(default_factory=list)
+    recommendation: str = ""
+
+class PlannerRequest(BaseModel):
+    opp_fields: List[str] = Field(default_factory=list, description="Additional opportunity fields to fetch if available.")
+    faculty_fields: List[str] = Field(default_factory=list, description="Additional faculty fields to fetch if available.")
+    ask_for_more_faculty: bool = Field(default=False, description="Whether writer needs richer faculty context than keywords.")
+    ask_for_more_opp: bool = Field(default=False, description="Whether writer needs richer opportunity context than summary/keywords.")
+    focus_points: List[str] = Field(default_factory=list, description="Key angles to emphasize in justification.")
+
+
+class CriticVerdict(BaseModel):
+    ok: bool = Field(..., description="True if justification is acceptable and grounded.")
+    issues: List[str] = Field(default_factory=list, description="Problems found: vagueness, missing grounding, etc.")
+    request_more: PlannerRequest = Field(default_factory=PlannerRequest, description="If not ok, what more to fetch.")
 
 
 # ───────────────────────────────────────────────

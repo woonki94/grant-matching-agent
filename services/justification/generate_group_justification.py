@@ -7,11 +7,6 @@ from typing import Any, Dict, List, Optional, Tuple
 import json
 import time
 
-from pydantic import BaseModel, Field
-
-from langchain_core.prompts import ChatPromptTemplate
-from langchain_core.output_parsers import StrOutputParser
-
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(PROJECT_ROOT))
 
@@ -19,90 +14,20 @@ from config import get_llm_client
 from dao.opportunity_dao import OpportunityDAO
 from dao.faculty_dao import FacultyDAO
 from db.db_conn import SessionLocal
-from dto.llm_response_dto import GroupJustificationOut
+from dto.llm_response_dto import (
+    GroupJustificationOut,
+    TeamRoleOut,
+    WhyWorkingOut,
+    WhyNotWorkingOut,
+    RecommendationOut,
+)
 from services.matching.group_match_super_faculty import run_group_match
-
-
-# -------------------------
-# Structured models (Planner/Critic)
-# -------------------------
-
-class PlannerRequest(BaseModel):
-    """What extra info the LLM wants before writing the justification."""
-    opp_fields: List[str] = Field(default_factory=list, description="Additional opportunity fields to fetch if available.")
-    faculty_fields: List[str] = Field(default_factory=list, description="Additional faculty fields to fetch if available.")
-    ask_for_more_faculty: bool = Field(default=False, description="Whether writer needs richer faculty context than keywords.")
-    ask_for_more_opp: bool = Field(default=False, description="Whether writer needs richer opportunity context than summary/keywords.")
-    focus_points: List[str] = Field(default_factory=list, description="Key angles to emphasize in justification.")
-
-
-class CriticVerdict(BaseModel):
-    """Critic either approves or requests more info and a rewrite."""
-    ok: bool = Field(..., description="True if justification is acceptable and grounded.")
-    issues: List[str] = Field(default_factory=list, description="Problems found: vagueness, missing grounding, etc.")
-    request_more: PlannerRequest = Field(default_factory=PlannerRequest, description="If not ok, what more to fetch.")
-
-
-# -------------------------
-# Prompts
-# -------------------------
-
-PLANNER_PROMPT = ChatPromptTemplate.from_messages([
-    ("system",
-     "You are a grant-team match planning agent. Your job is to decide what information is missing "
-     "to write a specific, grounded justification. "
-     "You must be conservative: only ask for fields that would materially improve specificity."),
-    ("user",
-     "Given this draft context JSON:\n{input_json}\n\n"
-     "Return a PlannerRequest specifying what extra fields would help. "
-     "If current info is sufficient, return empty lists and false flags, but still include 2-6 focus_points.")
-])
-
-WRITER_PROMPT = ChatPromptTemplate.from_messages([
-    ("system",
-     "You write concise, high-specificity grant-team match justifications.\n"
-     "Grounding rules:\n"
-     "- Use ONLY facts present in the provided JSON context.\n"
-     "- Do NOT invent publications, awards, institutions, methods, or outcomes.\n"
-     "- If a needed detail is missing, speak generally and acknowledge uncertainty.\n"
-     "- Prefer concrete mappings between grant keywords/aims and each faculty member's keywords.\n"
-     "Output must match the GroupJustificationOut schema exactly."),
-    ("user",
-     "Context JSON:\n{input_json}\n\n"
-     "Task:\n"
-     "Write a justification that explains why this team matches the grant. "
-     "Use coverage and keywords to justify complementarity and reduce redundancy. "
-     "Include 1-3 actionable suggestions to improve fit (e.g., add skill X, clarify aim Y) if appropriate.")
-])
-
-CRITIC_PROMPT = ChatPromptTemplate.from_messages([
-    ("system",
-     "You are a strict reviewer. Check the justification for:\n"
-     "- Grounding: any claims not supported by the provided context JSON\n"
-     "- Specificity: too generic or templated\n"
-     "- Coverage: does it explain team complementarity relative to grant keywords?\n"
-     "- Actionability: are recommendations concrete?\n"
-     "If problems exist, set ok=false and request more data via PlannerRequest.\n"
-     "If it is solid, ok=true."),
-    ("user",
-     "Context JSON:\n{context_json}\n\n"
-     "Justification JSON (already structured):\n{justification_json}\n\n"
-     "Return CriticVerdict.")
-])
-
-POLISH_PROMPT = ChatPromptTemplate.from_messages([
-    ("system",
-     "You are a grant recommendation formatter.\n"
-     "You will receive one grant-result JSON object.\n"
-     "Rewrite it into concise user-facing markdown.\n"
-     "Rules:\n"
-     "- Use ONLY facts from the JSON.\n"
-     "- Do NOT invent names, emails, links, or grant details.\n"
-     "- Include: grant title/link, team members, why this match is good, why it might not work.\n"
-     "- If the record has error, show it clearly.\n"
-     "- Return markdown only. No code fences."),
-    ("user", "Grant result JSON:\n{result_json}")
-])
+from services.prompts.group_match_prompt import (
+    TEAM_ROLE_DECIDER_PROMPT,
+    WHY_WORKING_DECIDER_PROMPT,
+    WHY_NOT_WORKING_DECIDER_PROMPT,
+    RECOMMENDER_PROMPT,
+)
 
 
 # -------------------------
@@ -145,36 +70,51 @@ def build_base_payload(
 def safe_json(obj: Any) -> str:
     return json.dumps(obj, ensure_ascii=False, indent=2)
 
+def extract_requirement_specs(opp_ctx: Dict[str, Any]) -> Dict[str, Dict[int, Dict[str, Any]]]:
+    """
+    Extract requirement text/weight by section/index from opportunity keyword payload.
+    """
+    out: Dict[str, Dict[int, Dict[str, Any]]] = {"application": {}, "research": {}}
+    kw = (opp_ctx.get("keywords") or {}) if isinstance(opp_ctx, dict) else {}
+
+    for sec in ("application", "research"):
+        sec_obj = kw.get(sec) if isinstance(kw, dict) else None
+        if not isinstance(sec_obj, dict):
+            continue
+        specs = sec_obj.get("specialization")
+        if not isinstance(specs, list):
+            continue
+        for i, item in enumerate(specs):
+            if not isinstance(item, dict):
+                continue
+            out[sec][i] = {
+                "text": str(item.get("t") or f"{sec} requirement {i}"),
+                "weight": float(item.get("w") or 0.0),
+            }
+    return out
+
 
 # -------------------------
 # Provider-agnostic LLM chain builder
 # -------------------------
 
 @dataclass
-class LLMs:
-    planner: Any
+class GroupJustificationLLMs:
     writer: Any
-    critic: Any
 
 
-def build_llms() -> LLMs:
+def build_llms() -> GroupJustificationLLMs:
     """
     Uses your existing get_llm_client().build().
     For best results:
-      - planner: lower temp
       - writer: moderate temp
-      - critic: low temp
     If your builder supports params, set them there; otherwise it's fine as-is.
     """
     base = get_llm_client().build()
     # If your client supports .bind(temperature=...), uncomment and tune:
-    # planner = base.bind(temperature=0.2)
-    # writer  = base.bind(temperature=0.5)
-    # critic  = base.bind(temperature=0.1)
-    planner = base
+    # writer = base.bind(temperature=0.4)
     writer = base
-    critic = base
-    return LLMs(planner=planner, writer=writer, critic=critic)
+    return GroupJustificationLLMs(writer=writer)
 
 
 # -------------------------
@@ -220,9 +160,10 @@ class JustificationEngine:
         self.fdao = fdao
         self.llms = build_llms()
 
-        self.planner_chain = PLANNER_PROMPT | self.llms.planner.with_structured_output(PlannerRequest)
-        self.writer_chain = WRITER_PROMPT | self.llms.writer.with_structured_output(GroupJustificationOut)
-        self.critic_chain = CRITIC_PROMPT | self.llms.critic.with_structured_output(CriticVerdict)
+        self.team_role_chain = TEAM_ROLE_DECIDER_PROMPT | self.llms.writer.with_structured_output(TeamRoleOut)
+        self.why_working_chain = WHY_WORKING_DECIDER_PROMPT | self.llms.writer.with_structured_output(WhyWorkingOut)
+        self.why_not_working_chain = WHY_NOT_WORKING_DECIDER_PROMPT | self.llms.writer.with_structured_output(WhyNotWorkingOut)
+        self.recommender_chain = RECOMMENDER_PROMPT | self.llms.writer.with_structured_output(RecommendationOut)
 
     def run_one(
         self,
@@ -231,7 +172,6 @@ class JustificationEngine:
         fac_ctxs: List[Dict[str, Any]],
         coverage: Any,
         group_meta: Optional[Dict[str, Any]] = None,
-        max_rewrite_rounds: int = 1,
         trace: Optional[Dict[str, Any]] = None,
     ) -> Tuple[GroupJustificationOut, Dict[str, Any]]:
         """
@@ -239,8 +179,7 @@ class JustificationEngine:
         trace includes planner/critic outputs and the final context used.
         """
         trace = trace or {}
-        trace.setdefault("planner", None)
-        trace.setdefault("critic", [])
+        trace.setdefault("steps", {})
         trace.setdefault("context_versions", [])
 
         # Build initial context
@@ -252,108 +191,269 @@ class JustificationEngine:
         )
         trace["context_versions"].append(json.loads(safe_json(context)))
 
-        # 1) Plan
-        plan: PlannerRequest = self.planner_chain.invoke({"input_json": safe_json(context)})
-        trace["planner"] = json.loads(plan.model_dump_json())
+        split_input = {
+            "grant": context.get("grant"),
+            "team": context.get("team"),
+            "coverage": context.get("coverage"),
+            "requirements": extract_requirement_specs(opp_ctx),
+        }
+        try:
+            team_roles = self.team_role_chain.invoke({"input_json": safe_json(split_input)})
+            trace["steps"]["team_roles"] = team_roles.model_dump()
 
-        # 2) Deterministic research/enrichment based on plan
-        if plan.ask_for_more_opp or plan.opp_fields:
-            opp_ctx = enrich_opportunity_context(self.odao, opp_ctx, plan.opp_fields)
-        if plan.ask_for_more_faculty or plan.faculty_fields:
-            fac_ctxs = [enrich_faculty_context(self.fdao, f, plan.faculty_fields) for f in fac_ctxs]
+            why_working = self.why_working_chain.invoke({"input_json": safe_json(split_input)})
+            trace["steps"]["why_working"] = why_working.model_dump()
 
-        # Rebuild context after enrichment
-        context = build_base_payload(
-            opp_ctx=opp_ctx,
-            fac_ctxs=fac_ctxs,
-            coverage=coverage,
-            group_meta=group_meta,
-        )
-        # Include focus points explicitly for writer (helps a lot)
-        context["focus_points"] = plan.focus_points
-        trace["context_versions"].append(json.loads(safe_json(context)))
+            why_not = self.why_not_working_chain.invoke({"input_json": safe_json(split_input)})
+            trace["steps"]["why_not_working"] = why_not.model_dump()
 
-        # 3) Write + (optional) Critic + rewrite
-        justification: GroupJustificationOut = self.writer_chain.invoke({"input_json": safe_json(context)})
+            rec_input = {
+                **split_input,
+                "team_roles": team_roles.model_dump(),
+                "why_working": why_working.model_dump(),
+                "why_not_working": why_not.model_dump(),
+            }
+            recommendation = self.recommender_chain.invoke({"input_json": safe_json(rec_input)})
+            trace["steps"]["recommendation"] = recommendation.model_dump()
 
-        for _ in range(max_rewrite_rounds + 1):
-            verdict: CriticVerdict = self.critic_chain.invoke({
-                "context_json": safe_json(context),
-                "justification_json": safe_json(justification.model_dump()),
-            })
-            trace["critic"].append(json.loads(verdict.model_dump_json()))
-
-            if verdict.ok:
-                return justification, trace
-
-            # If critic requests more info, enrich and rewrite once
-            req = verdict.request_more
-            if req.ask_for_more_opp or req.opp_fields:
-                opp_ctx = enrich_opportunity_context(self.odao, opp_ctx, req.opp_fields)
-            if req.ask_for_more_faculty or req.faculty_fields:
-                fac_ctxs = [enrich_faculty_context(self.fdao, f, req.faculty_fields) for f in fac_ctxs]
-
-            context = build_base_payload(
-                opp_ctx=opp_ctx,
-                fac_ctxs=fac_ctxs,
-                coverage=coverage,
-                group_meta=group_meta,
+            justification = GroupJustificationOut(
+                match_quality=recommendation.match_quality,
+                one_paragraph=why_working.summary or "",
+                member_roles=team_roles.member_roles,
+                coverage={
+                    "strong": why_working.strong,
+                    "partial": why_working.partial,
+                    "missing": why_not.missing,
+                },
+                member_strengths=why_working.member_strengths,
+                why_not_working=why_not.why_not_working,
+                recommendation=recommendation.recommendation,
             )
-            context["focus_points"] = (req.focus_points or context.get("focus_points") or [])
-            trace["context_versions"].append(json.loads(safe_json(context)))
+            return justification, trace
+        except Exception:
+            fallback_roles = []
+            for tm in context.get("team", []) or []:
+                fid = tm.get("faculty_id")
+                if isinstance(fid, int):
+                    fallback_roles.append(
+                        {
+                            "faculty_id": fid,
+                            "role": "Contributor",
+                            "why": "Insufficient LLM output; role inferred as general contributor.",
+                        }
+                    )
+            justification = GroupJustificationOut(
+                match_quality="moderate",
+                one_paragraph="Insufficient model output to generate a complete structured justification.",
+                member_roles=fallback_roles,
+                coverage={"strong": [], "partial": [], "missing": []},
+                member_strengths=[],
+                why_not_working=["Structured writer stages failed; verify model/service health and rerun."],
+                recommendation="Review this result manually and rerun generation.",
+            )
+            return justification, trace
 
-            justification = self.writer_chain.invoke({"input_json": safe_json(context)})
 
-        # If still not ok, return best attempt + trace (don’t fail the whole batch)
-        return justification, trace
+def _render_markdown_report(results: List[Dict[str, Any]]) -> str:
+    def _quality_from_item(item: Dict[str, Any]) -> str:
+        just = item.get("justification") or {}
+        q = (just.get("match_quality") or "").strip().lower()
+        if q in {"good", "moderate", "bad"}:
+            return q
+        score = item.get("score")
+        if isinstance(score, (int, float)):
+            if score >= 70.0:
+                return "good"
+            if score >= 40.0:
+                return "moderate"
+        return "bad"
 
+    def _heading_pair(quality: str) -> Tuple[str, str]:
+        if quality == "good":
+            return "## Why This Is a Good Match", "## Why It Might Not Work"
+        if quality == "moderate":
+            return "## Why This Match Might Work", "## Why This Match Likely Won't Work"
+        return "## ⚠️ Critical Mismatch Alert", "## Why This Match Doesn't Work"
 
-def _fallback_user_format(results: List[Dict[str, Any]]) -> str:
+    def _deterministic_gap_items(item: Dict[str, Any]) -> List[str]:
+        gap_rows: List[Tuple[float, str]] = []
+        final_cov = item.get("final_coverage") or {}
+        req_specs = item.get("requirement_specs") or {}
+
+        for sec in ("application", "research"):
+            sec_cov = final_cov.get(sec) if isinstance(final_cov, dict) else {}
+            if not isinstance(sec_cov, dict):
+                continue
+            sec_specs = req_specs.get(sec) if isinstance(req_specs, dict) else {}
+            for k, v in sec_cov.items():
+                try:
+                    idx = int(k)
+                    cov = float(v)
+                except Exception:
+                    continue
+                if cov > 0.05:
+                    continue
+                spec = sec_specs.get(idx) if isinstance(sec_specs, dict) else None
+                if isinstance(spec, dict):
+                    txt = str(spec.get("text") or f"{sec} requirement {idx}")
+                    w = float(spec.get("weight") or 0.0)
+                    gap_rows.append((w, f"{sec}[{idx}] {txt} (w={w:.2f}) has coverage {cov:.2f}"))
+                else:
+                    gap_rows.append((0.0, f"{sec}[{idx}] has coverage {cov:.2f}"))
+
+        gap_rows.sort(key=lambda x: x[0], reverse=True)
+        return [row[1] for row in gap_rows[:8]]
+
+    def _format_strength_bullet(text: str) -> str:
+        s = (text or "").strip()
+        if not s:
+            return s
+        if ":" in s:
+            return s
+        if " - " in s:
+            left, right = s.split(" - ", 1)
+            return f"{left.strip()}: {right.strip()}"
+        return f"Grant requirement alignment: {s}"
+
     lines: List[str] = []
     for r in results:
         title = r.get("grant_title") or r.get("grant_id")
-        lines.append(f"Grant: {title}")
-        lines.append(f"Link: {r.get('grant_link')}")
+        lines.append(f"# {title}")
+        lines.append("")
+        lines.append(f"**Grant Link:** {r.get('grant_link')}")
+        score = r.get("score")
+        lines.append(f"**Match Score:** {score}/100" if score is not None else "**Match Score:** N/A/100")
+        lines.append("")
+        lines.append("---")
+        lines.append("")
 
         if r.get("error"):
-            lines.append(f"Result: ERROR - {r['error']}")
+            lines.append("## ⚠️ Processing Error")
+            lines.append("")
+            lines.append(r["error"])
+            lines.append("")
+            lines.append("## Recommendation")
+            lines.append("Review this opportunity manually or rerun justification generation.")
             lines.append("")
             continue
 
-        lines.append("Team:")
-        for m in r.get("team_members", []):
-            lines.append(f"- {m.get('faculty_name')} ({m.get('faculty_email')})")
-
+        quality = _quality_from_item(r)
+        positive_heading, risk_heading = _heading_pair(quality)
         just = r.get("justification", {}) or {}
-        lines.append("Why this is a good match:")
-        one_paragraph = (just.get("one_paragraph") or "").strip()
-        if one_paragraph:
-            lines.append(f"- {one_paragraph}")
+        role_by_faculty: Dict[int, str] = {}
+        for mr in just.get("member_roles", []) or []:
+            try:
+                fid = int(mr.get("faculty_id"))
+            except Exception:
+                continue
+            role_txt = str(mr.get("role") or "").strip()
+            if role_txt:
+                role_by_faculty[fid] = role_txt
 
+        lines.append("## Team")
+        lines.append("")
+        for m in r.get("team_members", []):
+            name = m.get("faculty_name") or f"Faculty {m.get('faculty_id')}"
+            email = m.get("faculty_email")
+            fid = m.get("faculty_id")
+            role = role_by_faculty.get(int(fid), "Contributor") if isinstance(fid, int) else "Contributor"
+            if email:
+                lines.append(f"- **{name}** ({email}) — {role}")
+            else:
+                lines.append(f"- **{name}** — {role}")
+        lines.append("")
+        lines.append("---")
+        lines.append("")
+
+        lines.append(positive_heading)
+        lines.append("")
+        strengths = just.get("member_strengths") or []
+        strengths_by_faculty: Dict[int, List[str]] = {}
+        for s in strengths:
+            try:
+                fid = int(s.get("faculty_id"))
+            except Exception:
+                continue
+            bullets = s.get("bullets") or []
+            if isinstance(bullets, list):
+                strengths_by_faculty[fid] = [str(b).strip() for b in bullets if str(b).strip()]
+
+        if quality == "bad":
+            lines.append("- Overall evidence indicates a fundamental mismatch with grant requirements.")
+        else:
+            wrote_strength = False
+            for m in r.get("team_members", []):
+                fid = m.get("faculty_id")
+                name = m.get("faculty_name") or f"Faculty {fid}"
+                bullets = strengths_by_faculty.get(int(fid)) if isinstance(fid, int) else None
+                if bullets:
+                    wrote_strength = True
+                    lines.append(f"**{name}'s Strengths:**")
+                    for b in bullets[:10]:
+                        lines.append(f"- {_format_strength_bullet(b)}")
+                    lines.append("")
+            if not wrote_strength:
+                one_paragraph = (just.get("one_paragraph") or "").strip()
+                if one_paragraph:
+                    lines.append(f"- {one_paragraph}")
+                else:
+                    lines.append("- Not available in provided data.")
+
+        lines.append("")
+        lines.append("---")
+        lines.append("")
+
+        lines.append(risk_heading)
+        lines.append("")
+        lines.append("**Critical Gaps:**")
+        why_not = just.get("why_not_working") or []
         coverage = just.get("coverage", {}) or {}
-        strong = coverage.get("strong", []) or []
-        partial = coverage.get("partial", []) or []
-        for item in strong:
-            lines.append(f"- Strong coverage: {item}")
-        for item in partial:
-            lines.append(f"- Partial coverage: {item}")
-
-        lines.append("Why this might not work:")
         missing = coverage.get("missing", []) or []
-        if missing:
-            for item in missing:
-                lines.append(f"- Missing coverage risk: {item}")
+        gap_items = []
+        if isinstance(why_not, list):
+            gap_items.extend([str(x).strip() for x in why_not if str(x).strip()])
+        if isinstance(missing, list):
+            gap_items.extend([str(x).strip() for x in missing if str(x).strip()])
+        gap_items.extend(_deterministic_gap_items(r))
+        # De-duplicate while preserving order.
+        if gap_items:
+            seen = set()
+            deduped: List[str] = []
+            for g in gap_items:
+                key = g.strip().lower()
+                if not key or key in seen:
+                    continue
+                seen.add(key)
+                deduped.append(g)
+            gap_items = deduped
+        if gap_items:
+            for item in gap_items:
+                lines.append(f"- {item}")
         else:
             lines.append("- No explicit missing coverage was flagged.")
+        lines.append("")
+        lines.append("---")
+        lines.append("")
+        lines.append("## Recommendation")
+        lines.append("")
+        recommendation = (just.get("recommendation") or "").strip()
+        if quality == "bad":
+            lines.append("Do not pursue.")
+        elif recommendation:
+            lines.append(recommendation)
+        else:
+            if gap_items:
+                top = "; ".join(gap_items[:3])
+                lines.append(
+                    f"Proceed only if you add collaborators to cover the highest-priority uncovered areas: {top}. "
+                    "Update scope to these requirements and rerun matching before submission."
+                )
+            else:
+                lines.append("Refine team composition or scope based on the listed critical gaps, then reassess.")
 
         lines.append("")
 
     return "\n".join(lines).strip()
-
-
-def _fallback_user_format_one(result: Dict[str, Any]) -> str:
-    return _fallback_user_format([result]).strip()
-
 
 def _write_markdown_report(markdown_text: str, output_path: Optional[str] = None) -> Path:
     if output_path:
@@ -363,7 +463,6 @@ def _write_markdown_report(markdown_text: str, output_path: Optional[str] = None
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(markdown_text, encoding="utf-8")
     return out
-
 
 
 def run_justifications_from_group_results_agentic(
@@ -481,7 +580,6 @@ def run_justifications_from_group_results_agentic(
                     fac_ctxs=[dict(f) for f in fac_ctxs],
                     coverage=coverage,
                     group_meta=group_meta,
-                    max_rewrite_rounds=1,
                     trace={"index": idx, "opp_id": opp_id, "team": team},
                 )
 
@@ -501,6 +599,7 @@ def run_justifications_from_group_results_agentic(
                     ],
                     "score": r.get("score"),
                     "final_coverage": coverage,
+                    "requirement_specs": extract_requirement_specs(opp_ctx),
                     "justification": justification.model_dump(),
                 }
                 if include_trace:
@@ -518,22 +617,7 @@ def run_justifications_from_group_results_agentic(
                     "error": f"{type(e).__name__}: {e}",
                 })
 
-        try:
-            polisher = get_llm_client().build()
-            polish_chain = POLISH_PROMPT | polisher | StrOutputParser()
-            rendered_sections: List[str] = []
-            for item in results:
-                try:
-                    rendered = polish_chain.invoke({"result_json": safe_json(item)}).strip()
-                    if rendered:
-                        rendered_sections.append(rendered)
-                    else:
-                        rendered_sections.append(_fallback_user_format_one(item))
-                except Exception:
-                    rendered_sections.append(_fallback_user_format_one(item))
-            return "\n\n---\n\n".join(rendered_sections).strip()
-        except Exception:
-            return _fallback_user_format(results)
+        return _render_markdown_report(results)
 
 
 
