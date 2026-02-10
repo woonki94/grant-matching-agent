@@ -297,12 +297,26 @@ def _render_markdown_report(results: List[Dict[str, Any]]) -> str:
                 if isinstance(spec, dict):
                     txt = str(spec.get("text") or f"{sec} requirement {idx}")
                     w = float(spec.get("weight") or 0.0)
-                    gap_rows.append((w, f"{sec}[{idx}] {txt} (w={w:.2f}) has coverage {cov:.2f}"))
+                    gap_rows.append((w, txt))
                 else:
-                    gap_rows.append((0.0, f"{sec}[{idx}] has coverage {cov:.2f}"))
+                    gap_rows.append((0.0, f"{sec} capability gap"))
 
         gap_rows.sort(key=lambda x: x[0], reverse=True)
-        return [row[1] for row in gap_rows[:8]]
+        raw = [row[1] for row in gap_rows]
+        # Deduplicate by normalized text and keep concise grouped factors.
+        seen = set()
+        grouped: List[str] = []
+        for txt in raw:
+            key = txt.strip().lower()
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            grouped.append(
+                f"Strengthen capability in '{txt}' so the team can execute this requirement reliably."
+            )
+            if len(grouped) >= 5:
+                break
+        return grouped
 
     def _format_strength_bullet(text: str) -> str:
         s = (text or "").strip()
@@ -381,23 +395,17 @@ def _render_markdown_report(results: List[Dict[str, Any]]) -> str:
         if quality == "bad":
             lines.append("- Overall evidence indicates a fundamental mismatch with grant requirements.")
         else:
-            wrote_strength = False
             for m in r.get("team_members", []):
                 fid = m.get("faculty_id")
                 name = m.get("faculty_name") or f"Faculty {fid}"
                 bullets = strengths_by_faculty.get(int(fid)) if isinstance(fid, int) else None
+                lines.append(f"**{name}'s Strengths:**")
                 if bullets:
-                    wrote_strength = True
-                    lines.append(f"**{name}'s Strengths:**")
                     for b in bullets[:10]:
                         lines.append(f"- {_format_strength_bullet(b)}")
-                    lines.append("")
-            if not wrote_strength:
-                one_paragraph = (just.get("one_paragraph") or "").strip()
-                if one_paragraph:
-                    lines.append(f"- {one_paragraph}")
                 else:
-                    lines.append("- Not available in provided data.")
+                    lines.append("- Not enough faculty-specific evidence was extracted; regenerate this section.")
+                lines.append("")
 
         lines.append("")
         lines.append("---")
@@ -633,7 +641,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--team-size",
         type=int,
-        default=2,
+        default=3,
         help="Number of agents in the team (default: 3)",
     )
     parser.add_argument(

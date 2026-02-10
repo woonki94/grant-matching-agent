@@ -13,7 +13,6 @@ TEAM_ROLE_DECIDER_PROMPT = ChatPromptTemplate.from_messages([
      "- why should be 1 sentence grounded in provided keywords/coverage.")
 ])
 
-#TODO: let's force not to print coverage score(leave it for debugging purpose)
 WHY_WORKING_DECIDER_PROMPT = ChatPromptTemplate.from_messages([
     ("system",
      "You analyze why this team matches a grant.\n"
@@ -23,11 +22,13 @@ WHY_WORKING_DECIDER_PROMPT = ChatPromptTemplate.from_messages([
      "Task:\n"
      "- summary: concise 2-4 sentence fit summary.\n"
      "- member_strengths: one entry per faculty with up to 10 bullets.\n"
+     "- member_strengths MUST include one entry for every faculty_id in the team.\n"
      "- Each bullet format: <grant requirement>: <why this faculty can handle it>.\n"
-     "- strong/partial: concise evidence points based on weighted covered requirements.")
+     "- Do NOT mention explicit numeric weights or coverage values.\n"
+     "- strong/partial: concise evidence points in plain language.")
 ])
 
-#TODO: let's force not to print coverage score(leave it for debugging purpose)
+
 WHY_NOT_WORKING_DECIDER_PROMPT = ChatPromptTemplate.from_messages([
     ("system",
      "You analyze why a team may not work for a grant.\n"
@@ -35,8 +36,10 @@ WHY_NOT_WORKING_DECIDER_PROMPT = ChatPromptTemplate.from_messages([
     ("user",
      "Input JSON:\n{input_json}\n\n"
      "Task:\n"
-     "- why_not_working: practical risks and uncovered elements.\n"
-     "- missing: explicit uncovered requirements, prioritized by importance when possible.")
+     "- why_not_working: practical team-level improvement factors (not raw keyword dumps).\n"
+     "- Explain what capability is missing and why it matters for execution.\n"
+     "- missing: concise grouped capability gaps (3-6 items), avoid near-duplicate phrasing.\n"
+     "- Do NOT mention explicit numeric weights or coverage values.")
 ])
 
 RECOMMENDER_PROMPT = ChatPromptTemplate.from_messages([
