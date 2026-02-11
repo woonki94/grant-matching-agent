@@ -1,135 +1,86 @@
 {
-  "messages": [
+  "email": "afern@oregonstate.edu",
+  "faculty_id": 396,
+  "results": [
     {
-      "role": "user",
-      "content": "I’m a professor at Oregon State University working in scientific visualization, high-performance computer graphics, geometric modeling, and computer-aided design.  I’m looking for relevant external research grants that align with my work. Please find and rank suitable opportunities.\n"
+      "opportunity_id": "c026db8a-157d-42de-bac7-4baf5602cd0a",
+      "title": "Agriculture and Food Research Initiative  Strengthening Agricultural Systems",
+      "agency": "National Institute of Food and Agriculture",
+      "domain_score": 0.5334116816520691,
+      "llm_score": 0.62,
+      "reason": "Strong AI and robotics expertise for agricultural automation and pest detection; limited coverage of food safety, soil health, and farmer economics."
+    },
+    {
+      "opportunity_id": "b09d00a3-4b76-4540-8fea-9de1543e83c1",
+      "title": "ROSES25: C.12 Foundational Artificial Intelligence for the Moon and Mars",
+      "agency": "NASA Headquarters",
+      "domain_score": 0.5168756246566772,
+      "llm_score": 0.32,
+      "reason": "Faculty expertise in robotics and machine learning partially overlaps with space AI, but lacks domain-critical space systems knowledge."
+    },
+    {
+      "opportunity_id": "11efd047-3fa4-4de3-843f-79fda61924ba",
+      "title": "Pilot Program to Increase Research Capacity at  Historically Black Colleges and Universities and Other Minority-Serving Institutions",
+      "agency": "Dept of the Army -- Materiel Command",
+      "domain_score": 0.1922307163476944,
+      "llm_score": 0.32,
+      "reason": "AI robotics expertise partially aligns with Army research interests; limited institutional capacity coverage."
+    },
+    {
+      "opportunity_id": "26ddba31-5cad-48a7-9b78-ac5a5e15154a",
+      "title": "Postdoctoral Research Fellowships in Biology",
+      "agency": "U.S. National Science Foundation",
+      "domain_score": 0.45521478221460554,
+      "llm_score": 0.28,
+      "reason": "AI algorithms and complex systems analysis present, but biotechnology domain expertise absent."
+    },
+    {
+      "opportunity_id": "fbe9738b-8440-4690-a838-9d0f99d9e777",
+      "title": "Research Initiatives at the Naval Postgraduate School",
+      "agency": "Naval Supply Systems Command",
+      "domain_score": 0.17091526091098785,
+      "llm_score": 0.25,
+      "reason": "Faculty expertise in robotics and AI lacks administrative grant management and compliance capabilities."
+    },
+    {
+      "opportunity_id": "5bf434f3-5a29-4c07-a179-1ba41c662fd3",
+      "title": "Agriculture and Food Research Initiative Competitive Grants Program Education and Workforce Development",
+      "agency": "National Institute of Food and Agriculture",
+      "domain_score": 0.40743411690782394,
+      "llm_score": 0.15,
+      "reason": "Faculty expertise in robotics and agricultural AI lacks educational program design and workforce development capabilities."
+    },
+    {
+      "opportunity_id": "c3b72a13-83cd-4e74-83d4-a8f130d8cc1b",
+      "title": "CyberAICorps Scholarship for Service",
+      "agency": "U.S. National Science Foundation",
+      "domain_score": 0.32110127806663513,
+      "llm_score": 0.15,
+      "reason": "Faculty expertise in agricultural robotics and machine learning lacks cybersecurity and AI security focus."
+    },
+    {
+      "opportunity_id": "db2370bb-df90-4845-890a-7d25963d44ef",
+      "title": "BRAIN Initiative: Brain-Behavior Quantification and Synchronization – Transformative Research on Behavior at the Organismal Level",
+      "agency": "National Institutes of Health",
+      "domain_score": 0.30349135398864746,
+      "llm_score": 0.15,
+      "reason": "Faculty expertise in agricultural robotics and machine learning lacks neuroscience and neural recording capabilities."
+    },
+    {
+      "opportunity_id": "74ad7de5-a0f5-463d-b337-4f037a11602c",
+      "title": "PRIA 5 Training Development",
+      "agency": "Environmental Protection Agency",
+      "domain_score": 0.29730671644210815,
+      "llm_score": 0.15,
+      "reason": "Faculty expertise in agricultural robotics and AI lacks pesticide regulatory and EPA compliance knowledge."
+    },
+    {
+      "opportunity_id": "f7e1fde4-9931-4971-bc53-c3dec8472e14",
+      "title": "Single Source for Continuation of the Accelerating Medicines Partnership (AMP) in Common Metabolic Diseases (CMD) Knowledge Portal (U01 Research Project (Cooperative Agreement) Clinical Trial not allowed)",
+      "agency": "National Institutes of Health",
+      "domain_score": 0.28339284658432007,
+      "llm_score": 0.15,
+      "reason": "Faculty expertise in agricultural robotics and machine learning lacks biomedical, genomic, and metabolic disease focus."
     }
-  ],
-  "slots": {},
-  "research_areas": [
-    "scientific visualization",
-    "high-performance computer graphics",
-    "geometric modeling",
-    "computer-aided design"
-  ],
-  "institution": "Oregon State University",
-  "user_role": "professor",
-  "query_submitted": true,
-  "last_tool_result": {
-    "query_text": "scientific visualization high-performance computer graphics geometric modeling computer-aided design",
-    "results": [
-      {
-        "opportunity_id": "67d97081-2134-43c3-8257-14a67f20222c",
-        "title": "Building Sustainable Software Tools for Open Science (R03 Clinical Trial Not Allowed)",
-        "agency": "National Institutes of Health",
-        "category": "discretionary",
-        "status": "forecasted",
-        "domain_score": 0.25839753398910004,
-        "llm_score": 0.35,
-        "reason": "Graphics optimization and performance scalability overlap; software engineering expertise limited."
-      },
-      {
-        "opportunity_id": "11efd047-3fa4-4de3-843f-79fda61924ba",
-        "title": "Pilot Program to Increase Research Capacity at  Historically Black Colleges and Universities and Other Minority-Serving Institutions",
-        "agency": "Dept of the Army -- Materiel Command",
-        "category": "discretionary",
-        "status": "posted",
-        "domain_score": 0.22650250792503357,
-        "llm_score": 0.32,
-        "reason": "Graphics expertise supports technology transfer; visualization research advances faculty capability."
-      },
-      {
-        "opportunity_id": "60b8b017-30ec-4f31-a160-f00b7ee384e7",
-        "title": "Carderock BAA",
-        "agency": "NSWC - Carderock - N00167",
-        "category": "discretionary",
-        "status": "posted",
-        "domain_score": 0.2929133176803589,
-        "llm_score": 0.28,
-        "reason": "3D modeling and CAD tools overlap minimally with naval hydrodynamics and marine engineering requirements."
-      },
-      {
-        "opportunity_id": "db2370bb-df90-4845-890a-7d25963d44ef",
-        "title": "BRAIN Initiative: Brain-Behavior Quantification and Synchronization – Transformative Research on Behavior at the Organismal Level",
-        "agency": "National Institutes of Health",
-        "category": "discretionary",
-        "status": "forecasted",
-        "domain_score": 0.23393619060516357,
-        "llm_score": 0.28,
-        "reason": "Faculty expertise in visualization and graphics lacks neuroscience, signal processing, and behavioral recording capabilities."
-      },
-      {
-        "opportunity_id": "4c7d870d-04a6-4636-a613-edd1a6dececa",
-        "title": "ROSES25: B.2 Heliophysics Foundational Research",
-        "agency": "NASA Headquarters",
-        "category": "discretionary",
-        "status": "posted",
-        "domain_score": 0.1946259836031231,
-        "llm_score": 0.28,
-        "reason": "Graphics expertise lacks heliophysics domain; minimal application requirement coverage."
-      },
-      {
-        "opportunity_id": "ecbe2890-046d-4963-bbd0-2125d4f3e7bd",
-        "title": "National Centers for Cryo-electron Tomography (cryoET) (R24 -Clinical Trial Not Allowed)",
-        "agency": "National Institutes of Health",
-        "category": "discretionary",
-        "status": "posted",
-        "domain_score": 0.35180099585044433,
-        "llm_score": 0.15,
-        "reason": "Faculty expertise in visualization and 3D reconstruction lacks cryo-electron tomography domain knowledge."
-      },
-      {
-        "opportunity_id": "d81a40ea-48d5-4f1d-80f6-830e3dab76e6",
-        "title": "Cooperative Agreement for affiliated Partner with the Californian Cooperative Ecosystem Studies Unit",
-        "agency": "Geological Survey",
-        "category": "discretionary",
-        "status": "posted",
-        "domain_score": 0.28554568972911354,
-        "llm_score": 0.15,
-        "reason": "Faculty expertise in computer graphics and visualization lacks coastal ecosystem and wetland ecology knowledge."
-      },
-      {
-        "opportunity_id": "d1aa3067-5978-40bd-a18a-a8c219bdcee2",
-        "title": "Physical Oceanography",
-        "agency": "U.S. National Science Foundation",
-        "category": "discretionary",
-        "status": "posted",
-        "domain_score": 0.242610187219359,
-        "llm_score": 0.15,
-        "reason": "Faculty expertise in graphics and visualization lacks oceanographic domain knowledge."
-      },
-      {
-        "opportunity_id": "2dac0aa9-d6f2-4b26-a56e-3dfd2bd1ac3a",
-        "title": "ROSES25: B.6 Heliophysics Technology and Instrument Development for Science",
-        "agency": "NASA Headquarters",
-        "category": "discretionary",
-        "status": "posted",
-        "domain_score": 0.2306251972913742,
-        "llm_score": 0.15,
-        "reason": "Faculty expertise in graphics and visualization lacks space instrumentation and plasma diagnostics capabilities."
-      },
-      {
-        "opportunity_id": "a55926dd-83b8-4e51-801e-384852d46065",
-        "title": "National Resource Network for the Study of Human Auditory and Vestibular Disorders",
-        "agency": "National Institutes of Health",
-        "category": "discretionary",
-        "status": "forecasted",
-        "domain_score": 0.2285627288482951,
-        "llm_score": 0.15,
-        "reason": "Faculty expertise in graphics and visualization lacks human tissue preparation and biomedical research capabilities."
-      }
-    ],
-    "meta": {
-      "top_k": 10,
-      "filters": {
-        "agency": null,
-        "category": null,
-        "status": null,
-        "user_urls": []
-      }
-    }
-  },
-  "search_completed": true,
-  "results_presented": true,
-  "recommendation_provided": true
+  ]
 }

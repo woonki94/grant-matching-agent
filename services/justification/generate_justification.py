@@ -76,7 +76,7 @@ def print_faculty_recs(out, email: str, *, width: int = 92, show_full_id: bool =
         print("      " + _w(rec.suggested_pitch, width=width, indent="        ").lstrip())
         print("-" * width)
 
-def main(email: str, k: int) -> None:
+def generate_faculty_recs(email: str, k: int) -> FacultyRecsOut:
     llm = get_llm_client().build()
     chain = FACULTY_RECS_PROMPT | llm.with_structured_output(FacultyRecsOut)
 
@@ -97,8 +97,7 @@ def main(email: str, k: int) -> None:
         )
 
         if not fac:
-            print(f"No faculty found with email: {email}")
-            return
+            raise ValueError(f"No faculty found with email: {email}")
 
         # 2) Get top-K opp ids from match_results
         rows = match_dao.top_matches_for_faculty(
@@ -110,8 +109,7 @@ def main(email: str, k: int) -> None:
         score_map = {gid: {"domain_score": d, "llm_score": l} for (gid, d, l) in rows}
 
         if not opp_ids:
-            print(f"No matches found for {fac.name} ({email}).")
-            return
+            raise ValueError(f"No matches found for {fac.name} ({email}).")
 
         # 3) Batch fetch opportunities (+ relations)
         opps = opp_dao.read_opportunities_by_ids_with_relations(opp_ids)
@@ -147,8 +145,12 @@ def main(email: str, k: int) -> None:
             "faculty_json": json.dumps(fac_ctx, ensure_ascii=False),
             "opps_json": json.dumps(opp_payloads, ensure_ascii=False),
         })
+        return out
 
-        print_faculty_recs(out, email, show_full_id=True)
+
+def main(email: str, k: int) -> None:
+    out = generate_faculty_recs(email=email, k=k)
+    print_faculty_recs(out, email, show_full_id=True)
 
 
 if __name__ == "__main__":

@@ -50,7 +50,7 @@ def _matches_filters(
     return True
 
 
-def _generate_query_keywords(
+def generate_query_keywords(
     query_text: str,
     user_urls: Optional[List[str]],
 ) -> Dict[str, Any]:
@@ -121,7 +121,7 @@ def search_grants(
         match_dao = MatchDAO(sess)
         opp_dao = OpportunityDAO(sess)
 
-        query_keywords = _generate_query_keywords(query_text, user_urls)
+        query_keywords = generate_query_keywords(query_text, user_urls)
         r_domains, a_domains = _extract_domains_from_keywords(query_keywords)
         r_vec = _embed_domain_bucket(r_domains)
         a_vec = _embed_domain_bucket(a_domains)

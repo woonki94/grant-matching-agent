@@ -328,7 +328,7 @@ def load_extracted_content(
         return bucket_default, cp.lstrip("/")
 
     for r in rows or []:
-        if getattr(r, "extract_status", None) != "done":
+        if getattr(r, "extract_status", None) not in ("done", "success"):
             continue
         if getattr(r, "extract_error", None):
             continue

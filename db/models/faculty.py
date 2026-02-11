@@ -43,6 +43,7 @@ class Faculty(Base):
     # text blocks
     address = Column(Text)        # keep newlines
     biography = Column(Text)
+    profile_last_refreshed_at = Column(DateTime)
 
     # collapsed arrays (store as JSON)
     degrees = Column(JSONB)         # list[str] (ordered)

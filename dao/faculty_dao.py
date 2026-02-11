@@ -34,6 +34,15 @@ class FacultyDAO:
     def __init__(self, session: Session):
         self.session = session
 
+    def get_by_email(self, email: str) -> Optional[Faculty]:
+        if not email:
+            return None
+        return (
+            self.session.query(Faculty)
+            .filter(Faculty.email == email)
+            .one_or_none()
+        )
+
     def upsert_faculty(self, dto: FacultyDTO) -> Faculty:
         obj = (
             self.session.query(Faculty)
