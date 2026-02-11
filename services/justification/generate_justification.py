@@ -10,7 +10,6 @@ from typing import Any, Dict, List
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from sqlalchemy import text
 from sqlalchemy.orm import selectinload
 
 from dao.match_dao import MatchDAO
@@ -26,11 +25,7 @@ from services.keywords.generate_context import (
     faculty_to_keyword_context,
     opportunity_to_keyword_context,
 )
-from utils.content_compressor import cap_extracted_blocks, cap_fac, cap_opp
-
-from langchain_openai import ChatOpenAI
-from langchain_core.prompts import ChatPromptTemplate
-from pydantic import BaseModel, Field
+from utils.content_compressor import cap_fac, cap_opp
 from config import get_llm_client
 
 def llm_label(llm_score: float) -> str:
