@@ -158,6 +158,12 @@ class MemberStrengthOut(BaseModel):
 class TeamRoleOut(BaseModel):
     member_roles: List[MemberRoleOut] = Field(default_factory=list)
 
+class GrantBriefOut(BaseModel):
+    grant_title: str = ""
+    grant_link: str = ""
+    grant_quick_explanation: str = ""
+    priority_themes: List[str] = Field(default_factory=list)
+
 class WhyWorkingOut(BaseModel):
     summary: str = ""
     member_strengths: List[MemberStrengthOut] = Field(default_factory=list)
@@ -169,12 +175,10 @@ class WhyNotWorkingOut(BaseModel):
     missing: List[str] = Field(default_factory=list)
 
 class RecommendationOut(BaseModel):
-    match_quality: Literal["good", "moderate", "bad"] = "moderate"
     recommendation: str = ""
 
 
 class GroupJustificationOut(BaseModel):
-    match_quality: Literal["good", "moderate", "bad"] = "moderate"
     one_paragraph: str
     member_roles: List[MemberRoleOut] = Field(default_factory=list)
     coverage: CoverageOut = Field(default_factory=CoverageOut)

@@ -28,7 +28,7 @@ def import_opportunity(page_size: int, query: str | None) -> None:
     # 1) Fetch
     # -------------------------
     logger.info("Starting opportunity pipeline (Fetching %s Opportunities)", page_size)
-    opportunities = run_search_pipeline(page_size=page_size, q=query)
+    opportunities = run_search_pipeline(page_size=page_size, q=query,agencies=["HHS-NIH11"])
     logger.info("[1/3 FETCH] Completed (%d opportunities)", len(opportunities))
 
     # -------------------------
@@ -55,8 +55,6 @@ def import_opportunity(page_size: int, query: str | None) -> None:
     link_subdir = "opportunity_additional_links"
 
     common = dict(
-        backend="s3",
-        base_dir=None,
         s3_bucket=settings.extracted_content_bucket,
         s3_prefix=settings.extracted_content_prefix_opportunity,
         aws_region=settings.aws_region,

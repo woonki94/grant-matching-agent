@@ -122,9 +122,22 @@ def run_group_match(
         # Deduplicate while preserving order.
         unique_emails = list(dict.fromkeys(faculty_emails))
         fac_ids = [fac_dao.get_faculty_id_by_email(email) for email in unique_emails]
-        anchor_fac_id = fac_ids[0]
-
-        target_opp_ids = opp_ids if opp_ids else match_dao.get_grant_ids_for_faculty(faculty_id=anchor_fac_id)
+        if opp_ids:
+            target_opp_ids = opp_ids
+        else:
+            # Intersection of grant ids across all provided faculty ids.
+            # Preserve order from the first faculty's grant list.
+            per_fac_opp_lists: List[List[str]] = [
+                list(match_dao.get_grant_ids_for_faculty(faculty_id=fid) or [])
+                for fid in fac_ids
+            ]
+            if not per_fac_opp_lists:
+                target_opp_ids = []
+            else:
+                common = set(per_fac_opp_lists[0])
+                for fac_list in per_fac_opp_lists[1:]:
+                    common &= set(fac_list)
+                target_opp_ids = [oid for oid in per_fac_opp_lists[0] if oid in common]
 
         flat_results = []
         for opp_id in target_opp_ids:
