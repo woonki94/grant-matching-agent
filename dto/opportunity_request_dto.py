@@ -12,10 +12,17 @@ class SortOrder:
 class OpportunityStatusFilter:
     one_of: List[str]
 
+
+@dataclass
+class AgencyFilter:
+    one_of: List[str]
+
+
 @dataclass
 class Filters:
     # Add other filters here as needed (agency, post_date, etc.)
     opportunity_status: Optional[OpportunityStatusFilter] = None
+    agency: Optional[AgencyFilter] = None
 
 @dataclass
 class Pagination:

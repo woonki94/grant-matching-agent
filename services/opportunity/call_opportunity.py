@@ -11,6 +11,7 @@ from dto.opportunity_request_dto import (
     SearchRequest,
     Pagination,
     SortOrder,
+    AgencyFilter,
     OpportunityStatusFilter,
     Filters,
 )
@@ -60,6 +61,7 @@ def build_search_request(
     order_by: str = "post_date",
     sort_direction: str = "descending",
     statuses: Optional[List[str]] = None,
+    agencies: Optional[List[str]] = None,
     q: Optional[str] = None,
 ) -> SearchRequest:
     statuses = statuses or ["forecasted", "posted"]
@@ -71,7 +73,8 @@ def build_search_request(
             sort_order=[SortOrder(order_by=order_by, sort_direction=sort_direction)],
         ),
         filters=Filters(
-            opportunity_status=OpportunityStatusFilter(one_of=statuses)
+            opportunity_status=OpportunityStatusFilter(one_of=statuses),
+            agency=AgencyFilter(one_of=agencies) if agencies else None,
         ),
         q=q,
     )
@@ -110,6 +113,7 @@ def run_search_pipeline(
     order_by: str = "post_date",
     sort_direction: str = "descending",
     statuses: Optional[List[str]] = None,
+    agencies: Optional[List[str]] = None,
     q: Optional[str] = None,
     include_files: bool = True,
 ) -> List[OpportunityDTO]:
@@ -124,6 +128,7 @@ def run_search_pipeline(
         order_by=order_by,
         sort_direction=sort_direction,
         statuses=statuses,
+        agencies=agencies,
         q=q,
     )
 
@@ -145,4 +150,3 @@ def run_search_pipeline(
                 opp.attachments = opp.attachments or []
 
     return opportunities
-
