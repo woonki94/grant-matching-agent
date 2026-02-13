@@ -420,39 +420,58 @@ def main() -> None:
                 "need_y": collab["need_y"],
                 "opp_ids": collab.get("opp_ids"),
             }
-            result = call_tool("find_additional_collaborators", tool_input)
+            while True:
+                result = call_tool("find_additional_collaborators", tool_input)
             state_path = args.state_json or ".agent_state.json"
             _save_state(state_path, {"tool_result": result})
-            print(f"State saved to: {state_path}")
-            if isinstance(result, dict) and result.get("error"):
-                err = result["error"]
-                print(err.get("message") or "Missing information.")
-            elif isinstance(result, str):
-                print(result)
-            else:
-                print(json.dumps(result, ensure_ascii=False, indent=2))
-            return
+                if isinstance(result, dict) and result.get("error"):
+                    err = result["error"]
+                    msg = err.get("message") or "Missing information."
+                    missing = err.get("missing_fields") or []
+                    print(msg)
+                    if "faculty_emails" in missing:
+                        resp = input("Enter current team emails (comma-separated): ").strip()
+                        if resp:
+                            tool_input["faculty_emails"] = [e.strip() for e in resp.split(",") if e.strip()]
+                            continue
+                    if "need_y" in missing:
+                        resp = input("How many additional collaborators do you need to add? ").strip()
+                        if resp.isdigit():
+                            tool_input["need_y"] = int(resp)
+                            continue
+                    # If still missing, break to avoid infinite loop
+                    return
+                elif isinstance(result, str):
+                    print(result)
+                else:
+                    print(json.dumps(result, ensure_ascii=False, indent=2))
+                return
 
+        # Planner path with interactive clarification loop
         prompt_text = _inject_opportunity_hint(args.prompt)
         state = _load_state(args.state_json)
-        result = run_agent(prompt_text, state=state)
-        result_state = result.get("state") or {}
+        while True:
+            result = run_agent(prompt_text, state=state)
+            result_state = result.get("state") or {}
 
-        state_path = args.state_json or ".agent_state.json"
-        _save_state(state_path, result_state)
-        print(f"State saved to: {state_path}")
+            state_path = args.state_json or ".agent_state.json"
+            _save_state(state_path, result_state)
 
-        if result.get("type") == "clarification":
-            print(result.get("question") or "")
-            print(f"Hint: rerun with --state-json {state_path} to continue.")
+            if result.get("type") == "clarification":
+                print(result.get("question") or "")
+                user_reply = input("> ").strip()
+                if not user_reply:
+                    continue
+                prompt_text = user_reply
+                state = result_state
+                continue
+
+            if result.get("type") == "final":
+                print(result.get("answer") or "")
+                return
+
+            print("Unexpected response type.")
             return
-
-        if result.get("type") == "final":
-            print(result.get("answer") or "")
-            return
-
-        print("Unexpected response type.")
-        return
 
     email = (parsed.get("email") or "").strip().lower()
     used_email_fallback = False
@@ -571,7 +590,6 @@ def main() -> None:
             "results": results,
         },
     )
-    print(f"State saved to: {state_path}")
 
 
 if __name__ == "__main__":
