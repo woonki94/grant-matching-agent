@@ -422,8 +422,8 @@ def main() -> None:
             }
             while True:
                 result = call_tool("find_additional_collaborators", tool_input)
-            state_path = args.state_json or ".agent_state.json"
-            _save_state(state_path, {"tool_result": result})
+                state_path = args.state_json or ".agent_state.json"
+                _save_state(state_path, {"tool_result": result})
                 if isinstance(result, dict) and result.get("error"):
                     err = result["error"]
                     msg = err.get("message") or "Missing information."
