@@ -9,6 +9,9 @@ import re
 from db.models.faculty import Faculty
 from dao.opportunity_dao import OpportunityDAO
 from services.matching.group_match_super_faculty import run_group_match
+from services.justification.generate_group_justification import (
+    run_justifications_from_group_results_agentic,
+)
 
 
 def find_additional_collaborators(
@@ -106,6 +109,18 @@ def find_additional_collaborators(
             out["per_opportunity_explanations"] = list(per_opp)
         if results:
             out["raw_scores"] = list(results)
+        try:
+            report = run_justifications_from_group_results_agentic(
+                faculty_emails=faculty_emails,
+                team_size=int(team_size),
+                opp_ids=resolved_opp_ids,
+                limit_rows=500,
+                include_trace=False,
+            )
+            out["report_markdown"] = report
+        except Exception:
+            # Best-effort; do not fail tool output
+            pass
         return out
     finally:
         sess.close()
