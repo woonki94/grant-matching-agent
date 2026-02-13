@@ -1,6 +1,7 @@
 from typing import Any, Dict, List, Tuple, Optional
 
-from sqlalchemy import text, desc
+from sqlalchemy import text, desc, bindparam
+from pgvector.sqlalchemy import Vector
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import Session
 from db.models.match_result import MatchResult  # wherever you put it
@@ -24,6 +25,28 @@ WHERE femb.faculty_id = :faculty_id
 ORDER BY domain_sim DESC NULLS LAST
 LIMIT :k
 """)
+
+
+SQL_TOPK_OPPS_FOR_QUERY = text("""
+SELECT
+  oemb.opportunity_id,
+  GREATEST(
+    CASE WHEN :q_research_vec IS NOT NULL AND oemb.research_domain_vec IS NOT NULL
+      THEN 1 - (oemb.research_domain_vec <=> :q_research_vec) END,
+    CASE WHEN :q_application_vec IS NOT NULL AND oemb.application_domain_vec IS NOT NULL
+      THEN 1 - (oemb.application_domain_vec <=> :q_application_vec) END,
+    CASE WHEN :q_research_vec IS NOT NULL AND oemb.application_domain_vec IS NOT NULL
+      THEN 1 - (oemb.application_domain_vec <=> :q_research_vec) END,
+    CASE WHEN :q_application_vec IS NOT NULL AND oemb.research_domain_vec IS NOT NULL
+      THEN 1 - (oemb.research_domain_vec <=> :q_application_vec) END
+  ) AS domain_sim
+FROM opportunity_keyword_embedding oemb
+ORDER BY domain_sim DESC NULLS LAST
+LIMIT :k
+""").bindparams(
+    bindparam("q_research_vec", type_=Vector),
+    bindparam("q_application_vec", type_=Vector),
+)
 
 
 class MatchDAO:
@@ -55,6 +78,23 @@ class MatchDAO:
             {"faculty_id": faculty_id, "k": k},
         ).all()
 
+        return [(r.opportunity_id, float(r.domain_sim or 0.0)) for r in rows]
+
+    def topk_opps_for_query(
+        self,
+        *,
+        research_vec: Optional[List[float]],
+        application_vec: Optional[List[float]],
+        k: int,
+    ) -> List[Tuple[str, float]]:
+        rows = self.session.execute(
+            SQL_TOPK_OPPS_FOR_QUERY,
+            {
+                "q_research_vec": research_vec,
+                "q_application_vec": application_vec,
+                "k": k,
+            },
+        ).all()
         return [(r.opportunity_id, float(r.domain_sim or 0.0)) for r in rows]
 
     def top_matches_for_faculty(self, faculty_id: int, k: int = 5):

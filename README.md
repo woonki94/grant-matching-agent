@@ -29,6 +29,12 @@ DATABASE_URL = "postgresql+psycopg2://user:password@localhost:5432/grants"
 ```
 This creates the database and tables.
 
+	3b.	Run SQL migrations (if any):
+```bash
+./scripts/run_migrations.sh
+```
+This script tracks applied migrations in the `schema_migrations` table and skips already applied files.
+
 	4.	Fetch and save grant data:
 ```bash
 ./scripts/fetch_commit_grant.sh [page_offset] [page_size] [query]

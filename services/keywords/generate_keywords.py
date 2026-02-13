@@ -19,6 +19,7 @@ from config import settings, get_llm_client, get_embedding_client
 from dao.faculty_dao import FacultyDAO
 from dao.opportunity_dao import OpportunityDAO
 from db.db_conn import SessionLocal
+from db.models.faculty import Faculty
 from dto.llm_response_dto import KeywordsOut, CandidatesOut, WeightedSpecsOut
 from services.keywords.generate_context import (
     faculty_to_keyword_context,
@@ -103,7 +104,7 @@ def _load_extracted_content_s3(
     title_attr: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     """
-    Loads extracted text for rows whose extract_status='done' and extract_error is empty.
+    Loads extracted text for rows whose extract_status in ('done','success') and extract_error is empty.
     Reads the actual text from S3 using r.content_path as key (or s3:// URI).
     """
     if not rows:
@@ -113,7 +114,7 @@ def _load_extracted_content_s3(
     out: List[Dict[str, Any]] = []
 
     for r in rows:
-        if getattr(r, "extract_status", None) != "done":
+        if getattr(r, "extract_status", None) not in ("done", "success"):
             continue
         if getattr(r, "extract_error", None):
             continue
@@ -307,6 +308,66 @@ def generate_keywords(
     raw_debug = sanitize_for_postgres(raw_debug)
 
     return kw_weighted, raw_debug
+
+
+def generate_faculty_keywords_for_id(faculty_id: int) -> Optional[dict]:
+    if not faculty_id:
+        return None
+
+    faculty_cand_chain, faculty_kw_chain, faculty_w_chain = build_keyword_chain(
+        FACULTY_CANDIDATE_PROMPT,
+        FACULTY_KEYWORDS_PROMPT,
+        FACULTY_SPECIALIZATION_WEIGHT_PROMPT,
+    )
+
+    with SessionLocal() as sess:
+        fac_dao = FacultyDAO(sess)
+        fac = sess.get(Faculty, faculty_id)
+        if not fac:
+            return None
+
+        faculty_keywords, faculty_keywords_raw = generate_keywords(
+            fac,
+            context_builder=faculty_to_keyword_context,
+            candidates_chain=faculty_cand_chain,
+            keywords_chain=faculty_kw_chain,
+            weight_chain=faculty_w_chain,
+        )
+
+        faculty_keywords = sanitize_for_postgres(faculty_keywords)
+        faculty_keywords_raw = sanitize_for_postgres(faculty_keywords_raw)
+
+        source_model = settings.bedrock_model_id
+        embed_model = settings.bedrock_embed_model_id
+
+        fac_dao.upsert_keywords_json(
+            [
+                {
+                    "faculty_id": fac.faculty_id,
+                    "keywords": faculty_keywords,
+                    "raw_json": faculty_keywords_raw,
+                    "source": source_model,
+                }
+            ]
+        )
+
+        r_domains, a_domains = _extract_domains_from_keywords(faculty_keywords)
+        r_vec = _embed_domain_bucket(r_domains)
+        a_vec = _embed_domain_bucket(a_domains)
+
+        if r_vec is not None or a_vec is not None:
+            fac_dao.upsert_keyword_embedding(
+                {
+                    "faculty_id": fac.faculty_id,
+                    "model": embed_model,
+                    "research_domain_vec": r_vec,
+                    "application_domain_vec": a_vec,
+                }
+            )
+
+        sess.commit()
+
+    return faculty_keywords
 
 
 if __name__ == "__main__":

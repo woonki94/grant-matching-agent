@@ -123,7 +123,7 @@ def run_extraction_pipeline(
                         "detected_type": detected_type,
                         "content_char_count": len(text),
                         "extracted_at": extracted_at,
-                        "extract_status": "done",
+                        "extract_status": "success",
                         "extract_error": None,
                     }
                 )
