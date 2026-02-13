@@ -136,10 +136,19 @@ def _parse_collab_intent_inputs(prompt_text: str) -> Dict[str, Any]:
     if m:
         opp_title = m.group(1).strip()
 
+    team_size = None
+    m = re.search(r"\bteam\s+of\s+(\d+)", text, flags=re.IGNORECASE)
+    if m:
+        try:
+            team_size = int(m.group(1))
+        except Exception:
+            team_size = None
+
     return {
         "faculty_emails": emails,
         "need_y": need_y,
         "opp_ids": [opp_title] if opp_title else None,
+        "team_size": team_size,
     }
 
 
@@ -419,6 +428,7 @@ def main() -> None:
             "faculty_emails": collab.get("faculty_emails") or [],
             "need_y": collab.get("need_y"),
             "opp_ids": collab.get("opp_ids"),
+            "team_size": collab.get("team_size"),
         }
         while True:
             if not tool_input["faculty_emails"]:
@@ -439,7 +449,18 @@ def main() -> None:
                 err = result["error"]
                 msg = err.get("message") or "Missing information."
                 missing = err.get("missing_fields") or []
+                details = err.get("details") or {}
                 print(msg)
+                if "expected_team_size" in details and "provided_team_size" in details:
+                    expected = details.get("expected_team_size")
+                    resp = input(
+                        f"Team size should be {expected}. Enter final team size (or press Enter to use {expected}): "
+                    ).strip()
+                    if resp.isdigit():
+                        tool_input["team_size"] = int(resp)
+                    else:
+                        tool_input["team_size"] = expected
+                    continue
                 if "faculty_emails" in missing:
                     tool_input["faculty_emails"] = []
                     continue
