@@ -456,10 +456,18 @@ def main() -> None:
                     resp = input(
                         f"Team size should be {expected}. Enter final team size (or press Enter to use {expected}): "
                     ).strip()
-                    if resp.isdigit():
-                        tool_input["team_size"] = int(resp)
+                    m = re.search(r"\d+", resp)
+                    if m:
+                        tool_input["team_size"] = int(m.group(0))
                     else:
                         tool_input["team_size"] = expected
+                    # keep need_y consistent with team_size
+                    if tool_input.get("team_size") is not None:
+                        cur = len(tool_input.get("faculty_emails") or [])
+                        tool_input["need_y"] = int(tool_input["team_size"]) - cur
+                        if tool_input["need_y"] < 1:
+                            print("Final team size must be greater than current team size.")
+                            tool_input["need_y"] = None
                     continue
                 if "faculty_emails" in missing:
                     tool_input["faculty_emails"] = []
