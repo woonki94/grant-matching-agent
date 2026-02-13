@@ -108,11 +108,8 @@ def find_additional_collaborators(
                 limit_rows=500,
                 include_trace=False,
             )
-            return {"report_markdown": report}
+            return report
         except Exception as exc:
-            return {
-                "report_markdown": "",
-                "error": f"{type(exc).__name__}: {exc}",
-            }
+            return f"Error generating report: {type(exc).__name__}: {exc}"
     finally:
         sess.close()
