@@ -7,6 +7,7 @@ from typing import Any, Dict, Optional
 
 from config import get_llm_client
 from services.agent.tools import call_tool, list_tools
+from services.agent.tool_errors import MISSING_FIELD_FRIENDLY_BY_TOOL
 from services.prompts.agent_planner_prompt import AGENT_PLANNER_PROMPT
 
 
@@ -99,6 +100,17 @@ def run_agent(user_prompt: str, state: Optional[dict] = None, max_steps: int = 5
         action = plan.get("action")
         if action == "ask_user":
             question = plan.get("question") or "Could you clarify?"
+            # Strong fallback: if planner asks for opportunity ID but title exists in prompt,
+            # inject it into state and continue planning without user interruption.
+            if re.search(r"opportunity id", question, flags=re.IGNORECASE):
+                m = re.search(r"\bopportunity\s+([^\n\.\,]+)", user_prompt, flags=re.IGNORECASE)
+                if m:
+                    title = m.group(1).strip()
+                    if title:
+                        slots = state.get("slots") or {}
+                        slots["opp_ids"] = [title]
+                        state["slots"] = slots
+                        continue
             return {"type": "clarification", "question": question, "state": state}
 
         if action == "call_tool":
@@ -111,6 +123,14 @@ def run_agent(user_prompt: str, state: Optional[dict] = None, max_steps: int = 5
                     "state": state,
                 }
 
+            # Heuristic: if collaborator tool lacks opp_ids, try to extract opportunity title from user prompt
+            if tool_name == "find_additional_collaborators" and not tool_input.get("opp_ids"):
+                m = re.search(r"\bopportunity\s+([^\n\.\,]+)", user_prompt, flags=re.IGNORECASE)
+                if m:
+                    title = m.group(1).strip()
+                    if title:
+                        tool_input["opp_ids"] = [title]
+
             logger.info("calling_tool=%s", tool_name)
             try:
                 result = call_tool(tool_name, tool_input)
@@ -121,6 +141,35 @@ def run_agent(user_prompt: str, state: Optional[dict] = None, max_steps: int = 5
                     "question": "I hit an error running the tool. Can you try again?",
                     "state": state,
                 }
+
+            if isinstance(result, dict) and "error" in result:
+                err = result.get("error") or {}
+                err_tool = err.get("tool_name")
+                missing = err.get("missing_fields") or []
+                details = err.get("details") or {}
+
+                if "faculty_emails" in missing:
+                    question = "Please provide at least one email for the current team members."
+                elif "expected_team_size" in details and "provided_team_size" in details:
+                    x = details.get("current_team_size")
+                    y = details.get("need_y")
+                    z = details.get("expected_team_size")
+                    question = (
+                        f"You currently have {x} people and want {y} more, so the final team size should be {z}. "
+                        "Do you want the team size to be {z} or something else?"
+                    )
+                    question = question.format(z=z)
+                elif missing:
+                    field = missing[0]
+                    tool_map = (MISSING_FIELD_FRIENDLY_BY_TOOL or {}).get(err_tool) or {}
+                    if field in ("opp_ids", "opportunity_id"):
+                        question = "Please provide the opportunity ID or title."
+                    else:
+                        question = f"Please provide {tool_map.get(field, field)}."
+                else:
+                    question = "Could you clarify the missing information?"
+
+                return {"type": "clarification", "question": question, "state": state}
 
             state["last_tool_result"] = result
             continue

@@ -220,6 +220,17 @@ class FacultyDAO:
 
         return row.faculty_id if row else None
 
+    def get_names_by_emails(self, emails: List[str]) -> Dict[str, Optional[str]]:
+        if not emails:
+            return {}
+        rows = (
+            self.session
+            .query(Faculty.email, Faculty.name)
+            .filter(Faculty.email.in_(emails))
+            .all()
+        )
+        return {email: name for (email, name) in rows}
+
 
     def iter_faculty_missing_keywords(
         self,

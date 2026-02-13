@@ -24,6 +24,8 @@ from dto.llm_response_dto import LLMMatchOut
 from utils.keyword_accessor import keywords_for_matching, requirements_indexed
 from services.matching.hybrid_matcher import covered_to_grouped, missing_to_grouped
 from services.justification.generate_justification import generate_faculty_recs, print_faculty_recs
+from services.agent.agent import run_agent
+from services.agent.tools import call_tool
 
 
 logger = logging.getLogger(__name__)
@@ -69,6 +71,76 @@ def parse_structured_prompt(prompt_text: str) -> Dict[str, Optional[str]]:
 
     fields["query_text"] = "\n".join(query_lines).strip()
     return fields
+
+
+def _should_use_agent_planner(prompt_text: str, parsed: Dict[str, Optional[str]]) -> bool:
+    # If there's no structured section and the prompt looks like a collaborator request,
+    # use the planner-based agent flow.
+    has_structured = any(
+        parsed.get(k)
+        for k in ("name", "email", "osu_webpage", "google_scholar", "personal_website")
+    )
+    if has_structured:
+        return False
+    text = (prompt_text or "").lower()
+    keywords = (
+        "collaborator",
+        "collaborators",
+        "team",
+        "add",
+        "additional",
+        "add people",
+        "co-pi",
+        "co pi",
+        "co-investigator",
+        "co investigator",
+        "partner",
+        "coauthor",
+        "co-author",
+    )
+    return any(k in text for k in keywords)
+
+
+def _inject_opportunity_hint(prompt_text: str) -> str:
+    m = re.search(r"\bopportunity\s+([^\n\.\,]+)", prompt_text, flags=re.IGNORECASE)
+    if not m:
+        return prompt_text
+    title = m.group(1).strip()
+    if not title:
+        return prompt_text
+    # Add a structured hint line to help the planner/tooling
+    return f"{prompt_text.rstrip()}\nOpportunity ID or title: {title}\n"
+
+
+def _parse_collab_intent_inputs(prompt_text: str) -> Dict[str, Any]:
+    text = prompt_text or ""
+    emails = re.findall(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}", text)
+    emails = list(dict.fromkeys([e.strip().lower() for e in emails if e.strip()]))
+
+    need_y = None
+    for pat in (
+        r"\bneed\s+(\d+)\s+more",
+        r"\bneed\s+(\d+)\s+additional",
+        r"\badd\s+(\d+)\b",
+    ):
+        m = re.search(pat, text, flags=re.IGNORECASE)
+        if m:
+            try:
+                need_y = int(m.group(1))
+                break
+            except Exception:
+                pass
+
+    opp_title = None
+    m = re.search(r"\bopportunity\s+([^\n\.\,]+)", text, flags=re.IGNORECASE)
+    if m:
+        opp_title = m.group(1).strip()
+
+    return {
+        "faculty_emails": emails,
+        "need_y": need_y,
+        "opp_ids": [opp_title] if opp_title else None,
+    }
 
 
 def prompt_for_email() -> str:
@@ -319,6 +391,13 @@ def _save_state(state_path: str, state: Dict[str, Any]) -> None:
         json.dump(state, f, ensure_ascii=False, indent=2)
 
 
+def _load_state(state_path: Optional[str]) -> Optional[Dict[str, Any]]:
+    if not state_path:
+        return None
+    with open(state_path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Run the grant-matching agent")
     parser.add_argument("--prompt", required=True, help="User prompt")
@@ -331,6 +410,47 @@ def main() -> None:
     args = parser.parse_args()
 
     parsed = parse_structured_prompt(args.prompt)
+
+    if _should_use_agent_planner(args.prompt, parsed):
+        # Strong direct path for collaborator requests
+        collab = _parse_collab_intent_inputs(args.prompt)
+        if collab.get("faculty_emails") and collab.get("need_y"):
+            tool_input = {
+                "faculty_emails": collab["faculty_emails"],
+                "need_y": collab["need_y"],
+                "opp_ids": collab.get("opp_ids"),
+            }
+            result = call_tool("find_additional_collaborators", tool_input)
+            state_path = args.state_json or ".agent_state.json"
+            _save_state(state_path, {"tool_result": result})
+            print(f"State saved to: {state_path}")
+            if isinstance(result, dict) and result.get("error"):
+                err = result["error"]
+                print(err.get("message") or "Missing information.")
+            else:
+                print(json.dumps(result, ensure_ascii=False, indent=2))
+            return
+
+        prompt_text = _inject_opportunity_hint(args.prompt)
+        state = _load_state(args.state_json)
+        result = run_agent(prompt_text, state=state)
+        result_state = result.get("state") or {}
+
+        state_path = args.state_json or ".agent_state.json"
+        _save_state(state_path, result_state)
+        print(f"State saved to: {state_path}")
+
+        if result.get("type") == "clarification":
+            print(result.get("question") or "")
+            print(f"Hint: rerun with --state-json {state_path} to continue.")
+            return
+
+        if result.get("type") == "final":
+            print(result.get("answer") or "")
+            return
+
+        print("Unexpected response type.")
+        return
 
     email = (parsed.get("email") or "").strip().lower()
     used_email_fallback = False

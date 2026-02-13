@@ -152,6 +152,17 @@ class OpportunityDAO:
             .all()
         )
 
+    def find_opportunity_ids_by_title(self, title: str, limit: int = 5) -> list[str]:
+        if not title:
+            return []
+        rows = (
+            self.session.query(Opportunity.opportunity_id)
+            .filter(Opportunity.opportunity_title.ilike(f"%{title}%"))
+            .limit(limit)
+            .all()
+        )
+        return [oid for (oid,) in rows]
+
     def upsert_keywords_json(self, rows: List[Dict[str, Any]]) -> int:
         """
         Bulk upsert OpportunityKeyword rows by opportunity_id (or opportunity_id FK).

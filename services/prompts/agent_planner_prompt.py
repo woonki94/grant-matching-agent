@@ -21,6 +21,7 @@ AGENT_PLANNER_PROMPT = ChatPromptTemplate.from_messages([
      "- Use ONLY the tools in available_tools.\n"
      "- If required fields for a chosen tool are missing, action MUST be \"ask_user\".\n"
      "- When asking the user, question must request ONLY the missing info.\n"
+     "- For missing opportunity identifiers, you may ask for either the opportunity ID OR the opportunity title.\n"
      "- tool_input MUST match the tool's input_schema exactly.\n"
      "- state_updates should store extracted info (e.g., query_text, filters).\n"
      "- NEVER hallucinate grant results. Only tools can return grants.\n"
