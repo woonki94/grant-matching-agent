@@ -427,6 +427,8 @@ def main() -> None:
             if isinstance(result, dict) and result.get("error"):
                 err = result["error"]
                 print(err.get("message") or "Missing information.")
+            elif isinstance(result, str):
+                print(result)
             else:
                 print(json.dumps(result, ensure_ascii=False, indent=2))
             return
