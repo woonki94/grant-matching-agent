@@ -414,40 +414,46 @@ def main() -> None:
     if _should_use_agent_planner(args.prompt, parsed):
         # Strong direct path for collaborator requests
         collab = _parse_collab_intent_inputs(args.prompt)
-        if collab.get("faculty_emails") and collab.get("need_y"):
-            tool_input = {
-                "faculty_emails": collab["faculty_emails"],
-                "need_y": collab["need_y"],
-                "opp_ids": collab.get("opp_ids"),
-            }
-            while True:
-                result = call_tool("find_additional_collaborators", tool_input)
-                state_path = args.state_json or ".agent_state.json"
-                _save_state(state_path, {"tool_result": result})
-                if isinstance(result, dict) and result.get("error"):
-                    err = result["error"]
-                    msg = err.get("message") or "Missing information."
-                    missing = err.get("missing_fields") or []
-                    print(msg)
-                    if "faculty_emails" in missing:
-                        resp = input("Enter current team emails (comma-separated): ").strip()
-                        if resp:
-                            tool_input["faculty_emails"] = [e.strip() for e in resp.split(",") if e.strip()]
-                            continue
-                    if "need_y" in missing:
-                        resp = input("How many additional collaborators do you need to add? ").strip()
-                        if resp.isdigit():
-                            tool_input["need_y"] = int(resp)
-                            continue
-                    # If still missing, break to avoid infinite loop
-                    return
-                elif isinstance(result, str):
-                    print(result)
-                else:
-                    print(json.dumps(result, ensure_ascii=False, indent=2))
-                return
+        # Ensure required collaborator inputs; ask interactively if missing
+        tool_input = {
+            "faculty_emails": collab.get("faculty_emails") or [],
+            "need_y": collab.get("need_y"),
+            "opp_ids": collab.get("opp_ids"),
+        }
+        while True:
+            if not tool_input["faculty_emails"]:
+                resp = input("Enter current team emails (comma-separated): ").strip()
+                if resp:
+                    tool_input["faculty_emails"] = [e.strip() for e in resp.split(",") if e.strip()]
+                    continue
+            if tool_input.get("need_y") is None:
+                resp = input("How many additional collaborators do you need to add? ").strip()
+                if resp.isdigit():
+                    tool_input["need_y"] = int(resp)
+                    continue
 
-        # Planner path with interactive clarification loop
+            result = call_tool("find_additional_collaborators", tool_input)
+            state_path = args.state_json or ".agent_state.json"
+            _save_state(state_path, {"tool_result": result})
+            if isinstance(result, dict) and result.get("error"):
+                err = result["error"]
+                msg = err.get("message") or "Missing information."
+                missing = err.get("missing_fields") or []
+                print(msg)
+                if "faculty_emails" in missing:
+                    tool_input["faculty_emails"] = []
+                    continue
+                if "need_y" in missing:
+                    tool_input["need_y"] = None
+                    continue
+                return
+            elif isinstance(result, str):
+                print(result)
+            else:
+                print(json.dumps(result, ensure_ascii=False, indent=2))
+            return
+
+        # Planner path with interactive clarification loop (non-collaborator)
         prompt_text = _inject_opportunity_hint(args.prompt)
         state = _load_state(args.state_json)
         while True:
