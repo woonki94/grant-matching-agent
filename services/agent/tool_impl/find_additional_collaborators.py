@@ -100,15 +100,6 @@ def find_additional_collaborators(
             if all(name_map.get(e) for e in selected_additional_emails):
                 selected_additional_names = [name_map[e] for e in selected_additional_emails]
 
-        out: Dict[str, Any] = {
-            "selected_additional_emails": list(selected_additional_emails),
-        }
-        if selected_additional_names:
-            out["selected_additional_names"] = list(selected_additional_names)
-        if per_opp:
-            out["per_opportunity_explanations"] = list(per_opp)
-        if results:
-            out["raw_scores"] = list(results)
         try:
             report = run_justifications_from_group_results_agentic(
                 faculty_emails=faculty_emails,
@@ -117,10 +108,11 @@ def find_additional_collaborators(
                 limit_rows=500,
                 include_trace=False,
             )
-            out["report_markdown"] = report
-        except Exception:
-            # Best-effort; do not fail tool output
-            pass
-        return out
+            return {"report_markdown": report}
+        except Exception as exc:
+            return {
+                "report_markdown": "",
+                "error": f"{type(exc).__name__}: {exc}",
+            }
     finally:
         sess.close()
