@@ -26,5 +26,9 @@ MISSING_FIELD_FRIENDLY_BY_TOOL = {
         "team_size": "the final team size",
         "opp_ids": "the opportunity ID(s)",
         "faculty_emails": "at least one email for the current team members",
-    }
+    },
+    "find_team_for_grant": {
+        "opp_ids": "the opportunity ID(s)",
+        "team_size": "the final team size",
+    },
 }

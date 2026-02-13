@@ -48,6 +48,154 @@ def _expand_group_results(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return expanded
 
 
+def _run_justifications_from_rows(
+    *,
+    rows: List[Dict[str, Any]],
+    odao: OpportunityDAO,
+    fdao: FacultyDAO,
+    mdao: MatchDAO,
+    engine: GroupJustificationEngine,
+    limit_rows: int = 500,
+    include_trace: bool = False,
+) -> str:
+    normalized_rows = _expand_group_results(rows)
+    if not normalized_rows:
+        raise ValueError("No group matches found for provided rows")
+
+    opp_cache: Dict[str, Dict[str, Any]] = {}
+    fac_cache: Dict[int, Dict[str, Any]] = {}
+    opp_member_cov_cache: Dict[str, Dict[int, Dict[str, Dict[int, float]]]] = {}
+
+    results: List[Dict[str, Any]] = []
+
+    for idx, row in enumerate(normalized_rows):
+        opp_id = row["opp_id"]
+        team: List[int] = row["team"]
+        coverage = row.get("final_coverage")
+
+        if opp_id not in opp_cache:
+            opp_cache[opp_id] = odao.get_opportunity_context(opp_id) or {}
+        opp_ctx = opp_cache[opp_id]
+
+        if not opp_ctx:
+            results.append(
+                {
+                    "index": idx,
+                    "grant_id": opp_id,
+                    "grant_title": None,
+                    "grant_link": f"https://simpler.grants.gov/opportunity/{opp_id}",
+                    "team": team,
+                    "error": "Opportunity not found",
+                }
+            )
+            continue
+
+        fac_ctxs: List[Dict[str, Any]] = []
+        for fid in team:
+            if fid not in fac_cache:
+                fac_cache[fid] = fdao.get_faculty_keyword_context(fid) or {}
+            if fac_cache[fid]:
+                fac_ctxs.append(fac_cache[fid])
+
+        if opp_id not in opp_member_cov_cache:
+            rows = mdao.list_matches_for_opportunity(opp_id, limit=limit_rows) or []
+            fac_cov: Dict[int, Dict[str, Dict[int, float]]] = {}
+            for match in rows:
+                try:
+                    fid = int(match.get("faculty_id"))
+                except Exception:
+                    continue
+                covered = match.get("covered") or {}
+                if fid not in fac_cov:
+                    fac_cov[fid] = {"application": {}, "research": {}}
+                for sec in ("application", "research"):
+                    sec_map = covered.get(sec) if isinstance(covered, dict) else None
+                    if not isinstance(sec_map, dict):
+                        continue
+                    for k, v in sec_map.items():
+                        try:
+                            req_idx = int(k)
+                            cov_val = float(v)
+                        except Exception:
+                            continue
+                        prev = fac_cov[fid][sec].get(req_idx, 0.0)
+                        fac_cov[fid][sec][req_idx] = max(prev, cov_val)
+            opp_member_cov_cache[opp_id] = fac_cov
+
+        member_coverages = {
+            int(fid): opp_member_cov_cache.get(opp_id, {}).get(int(fid), {"application": {}, "research": {}})
+            for fid in team
+        }
+
+        if not fac_ctxs:
+            results.append(
+                {
+                    "index": idx,
+                    "grant_id": opp_id,
+                    "grant_title": opp_ctx.get("title") or opp_ctx.get("opportunity_title"),
+                    "grant_link": f"https://simpler.grants.gov/opportunity/{opp_id}",
+                    "team": team,
+                    "error": "No faculty contexts found for team",
+                }
+            )
+            continue
+
+        group_meta = {
+            "group_id": row.get("group_id") or row.get("id"),
+            "lambda": row.get("lambda"),
+            "k": row.get("k"),
+            "objective": row.get("objective"),
+            "redundancy": row.get("redundancy"),
+            "meta": row.get("meta"),
+        }
+
+        try:
+            justification, trace = engine.run_one(
+                opp_ctx=dict(opp_ctx),
+                fac_ctxs=[dict(f) for f in fac_ctxs],
+                coverage=coverage,
+                member_coverages=member_coverages,
+                group_meta=group_meta,
+                trace={"index": idx, "opp_id": opp_id, "team": team},
+            )
+
+            out = {
+                "index": idx,
+                "grant_id": opp_id,
+                "grant_title": opp_ctx.get("title") or opp_ctx.get("opportunity_title"),
+                "grant_link": f"https://simpler.grants.gov/opportunity/{opp_id}",
+                "team": team,
+                "team_members": [
+                    {
+                        "faculty_id": f.get("faculty_id") or f.get("id"),
+                        "faculty_name": f.get("name"),
+                        "faculty_email": f.get("email"),
+                    }
+                    for f in fac_ctxs
+                ],
+                "score": row.get("score"),
+                "final_coverage": coverage,
+                "requirement_specs": extract_requirement_specs(opp_ctx),
+                "justification": justification.model_dump(),
+            }
+            if include_trace:
+                out["trace"] = trace
+            results.append(out)
+        except Exception as e:
+            results.append(
+                {
+                    "index": idx,
+                    "grant_id": opp_id,
+                    "grant_title": opp_ctx.get("title") or opp_ctx.get("opportunity_title"),
+                    "grant_link": f"https://simpler.grants.gov/opportunity/{opp_id}",
+                    "team": team,
+                    "error": f"{type(e).__name__}: {e}",
+                }
+            )
+
+    return render_markdown_report(results)
+
+
 def run_justifications_from_group_results_agentic(
     *,
     faculty_emails: Union[str, List[str]],
@@ -69,142 +217,37 @@ def run_justifications_from_group_results_agentic(
             limit_rows=limit_rows,
             opp_ids=opp_ids,
         )
-        normalized_rows = _expand_group_results(group_results)
-        if not normalized_rows:
-            raise ValueError(f"No group matches found for {faculty_emails}")
+        return _run_justifications_from_rows(
+            rows=group_results,
+            odao=odao,
+            fdao=fdao,
+            mdao=mdao,
+            engine=engine,
+            limit_rows=limit_rows,
+            include_trace=include_trace,
+        )
 
-        opp_cache: Dict[str, Dict[str, Any]] = {}
-        fac_cache: Dict[int, Dict[str, Any]] = {}
-        opp_member_cov_cache: Dict[str, Dict[int, Dict[str, Dict[int, float]]]] = {}
 
-        results: List[Dict[str, Any]] = []
-
-        for idx, row in enumerate(normalized_rows):
-            opp_id = row["opp_id"]
-            team: List[int] = row["team"]
-            coverage = row.get("final_coverage")
-
-            if opp_id not in opp_cache:
-                opp_cache[opp_id] = odao.get_opportunity_context(opp_id) or {}
-            opp_ctx = opp_cache[opp_id]
-
-            if not opp_ctx:
-                results.append(
-                    {
-                        "index": idx,
-                        "grant_id": opp_id,
-                        "grant_title": None,
-                        "grant_link": f"https://simpler.grants.gov/opportunity/{opp_id}",
-                        "team": team,
-                        "error": "Opportunity not found",
-                    }
-                )
-                continue
-
-            fac_ctxs: List[Dict[str, Any]] = []
-            for fid in team:
-                if fid not in fac_cache:
-                    fac_cache[fid] = fdao.get_faculty_keyword_context(fid) or {}
-                if fac_cache[fid]:
-                    fac_ctxs.append(fac_cache[fid])
-
-            if opp_id not in opp_member_cov_cache:
-                rows = mdao.list_matches_for_opportunity(opp_id, limit=limit_rows) or []
-                fac_cov: Dict[int, Dict[str, Dict[int, float]]] = {}
-                for match in rows:
-                    try:
-                        fid = int(match.get("faculty_id"))
-                    except Exception:
-                        continue
-                    covered = match.get("covered") or {}
-                    if fid not in fac_cov:
-                        fac_cov[fid] = {"application": {}, "research": {}}
-                    for sec in ("application", "research"):
-                        sec_map = covered.get(sec) if isinstance(covered, dict) else None
-                        if not isinstance(sec_map, dict):
-                            continue
-                        for k, v in sec_map.items():
-                            try:
-                                req_idx = int(k)
-                                cov_val = float(v)
-                            except Exception:
-                                continue
-                            prev = fac_cov[fid][sec].get(req_idx, 0.0)
-                            fac_cov[fid][sec][req_idx] = max(prev, cov_val)
-                opp_member_cov_cache[opp_id] = fac_cov
-
-            member_coverages = {
-                int(fid): opp_member_cov_cache.get(opp_id, {}).get(int(fid), {"application": {}, "research": {}})
-                for fid in team
-            }
-
-            if not fac_ctxs:
-                results.append(
-                    {
-                        "index": idx,
-                        "grant_id": opp_id,
-                        "grant_title": opp_ctx.get("title") or opp_ctx.get("opportunity_title"),
-                        "grant_link": f"https://simpler.grants.gov/opportunity/{opp_id}",
-                        "team": team,
-                        "error": "No faculty contexts found for team",
-                    }
-                )
-                continue
-
-            group_meta = {
-                "group_id": row.get("group_id") or row.get("id"),
-                "lambda": row.get("lambda"),
-                "k": row.get("k"),
-                "objective": row.get("objective"),
-                "redundancy": row.get("redundancy"),
-                "meta": row.get("meta"),
-            }
-
-            try:
-                justification, trace = engine.run_one(
-                    opp_ctx=dict(opp_ctx),
-                    fac_ctxs=[dict(f) for f in fac_ctxs],
-                    coverage=coverage,
-                    member_coverages=member_coverages,
-                    group_meta=group_meta,
-                    trace={"index": idx, "opp_id": opp_id, "team": team},
-                )
-
-                out = {
-                    "index": idx,
-                    "grant_id": opp_id,
-                    "grant_title": opp_ctx.get("title") or opp_ctx.get("opportunity_title"),
-                    "grant_link": f"https://simpler.grants.gov/opportunity/{opp_id}",
-                    "team": team,
-                    "team_members": [
-                        {
-                            "faculty_id": f.get("faculty_id") or f.get("id"),
-                            "faculty_name": f.get("name"),
-                            "faculty_email": f.get("email"),
-                        }
-                        for f in fac_ctxs
-                    ],
-                    "score": row.get("score"),
-                    "final_coverage": coverage,
-                    "requirement_specs": extract_requirement_specs(opp_ctx),
-                    "justification": justification.model_dump(),
-                }
-                if include_trace:
-                    out["trace"] = trace
-                results.append(out)
-            except Exception as e:
-                results.append(
-                    {
-                        "index": idx,
-                        "grant_id": opp_id,
-                        "grant_title": opp_ctx.get("title") or opp_ctx.get("opportunity_title"),
-                        "grant_link": f"https://simpler.grants.gov/opportunity/{opp_id}",
-                        "team": team,
-                        "error": f"{type(e).__name__}: {e}",
-                    }
-                )
-
-        return render_markdown_report(results)
+def run_justifications_from_group_results(
+    *,
+    group_results: List[Dict[str, Any]],
+    limit_rows: int = 500,
+    include_trace: bool = False,
+) -> str:
+    with SessionLocal() as sess:
+        odao = OpportunityDAO(sess)
+        fdao = FacultyDAO(sess)
+        mdao = MatchDAO(sess)
+        engine = GroupJustificationEngine(odao=odao, fdao=fdao)
+        return _run_justifications_from_rows(
+            rows=group_results,
+            odao=odao,
+            fdao=fdao,
+            mdao=mdao,
+            engine=engine,
+            limit_rows=limit_rows,
+            include_trace=include_trace,
+        )
 
 
 if __name__ == "__main__":

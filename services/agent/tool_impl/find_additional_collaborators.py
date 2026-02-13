@@ -10,7 +10,7 @@ from db.models.faculty import Faculty
 from dao.opportunity_dao import OpportunityDAO
 from services.matching.group_match_super_faculty import run_group_match
 from services.justification.generate_group_justification import (
-    run_justifications_from_group_results_agentic,
+    run_justifications_from_group_results,
 )
 
 
@@ -51,7 +51,6 @@ def find_additional_collaborators(
             desired_team_count=1,
             use_llm_selection=False,
         )
-
         id_set = set()
         for row in results or []:
             for team in row.get("selected_teams", []):
@@ -101,10 +100,8 @@ def find_additional_collaborators(
                 selected_additional_names = [name_map[e] for e in selected_additional_emails]
 
         try:
-            report = run_justifications_from_group_results_agentic(
-                faculty_emails=faculty_emails,
-                team_size=int(team_size),
-                opp_ids=resolved_opp_ids,
+            report = run_justifications_from_group_results(
+                group_results=results,
                 limit_rows=500,
                 include_trace=False,
             )

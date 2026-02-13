@@ -152,6 +152,33 @@ def _parse_collab_intent_inputs(prompt_text: str) -> Dict[str, Any]:
     }
 
 
+def _parse_team_for_grant_inputs(prompt_text: str) -> Dict[str, Any]:
+    text = prompt_text or ""
+    opp_title = None
+    m = re.search(r"\bopportunity\s+([^\n\.\,]+)", text, flags=re.IGNORECASE)
+    if m:
+        opp_title = m.group(1).strip()
+
+    team_size = None
+    for pat in (
+        r"\bteam\s+of\s+size\s+(\d+)",
+        r"\bteam\s+size\s+(\d+)",
+        r"\bteam\s+of\s+(\d+)",
+    ):
+        m = re.search(pat, text, flags=re.IGNORECASE)
+        if m:
+            try:
+                team_size = int(m.group(1))
+                break
+            except Exception:
+                team_size = None
+
+    return {
+        "opp_ids": [opp_title] if opp_title else None,
+        "team_size": team_size,
+    }
+
+
 def prompt_for_email() -> str:
     while True:
         raw = input("Email is required. Please enter your OSU email (e.g., name@oregonstate.edu): ").strip()
@@ -423,7 +450,50 @@ def main() -> None:
     if _should_use_agent_planner(args.prompt, parsed):
         # Strong direct path for collaborator requests
         collab = _parse_collab_intent_inputs(args.prompt)
-        # Ensure required collaborator inputs; ask interactively if missing
+        has_current_team = bool(re.search(r"\bcurrent\s+team\b", args.prompt, flags=re.IGNORECASE))
+
+        # No current team case: build a team from scratch (from 7d0ddc8)
+        if not has_current_team and not (collab.get("faculty_emails") or []):
+            team_req = _parse_team_for_grant_inputs(args.prompt)
+            tool_input = {
+                "opp_ids": team_req.get("opp_ids"),
+                "team_size": team_req.get("team_size"),
+            }
+            while True:
+                if not tool_input.get("opp_ids"):
+                    resp = input("Enter opportunity ID or title: ").strip()
+                    if resp:
+                        parts = [p.strip() for p in re.split(r"[;,]", resp) if p.strip()]
+                        tool_input["opp_ids"] = parts
+                        continue
+                if not tool_input.get("team_size"):
+                    resp = input("What final team size do you want? ").strip()
+                    if resp.isdigit():
+                        tool_input["team_size"] = int(resp)
+                        continue
+
+                result = call_tool("find_team_for_grant", tool_input)
+                state_path = args.state_json or ".agent_state.json"
+                _save_state(state_path, {"tool_result": result})
+                if isinstance(result, dict) and result.get("error"):
+                    err = result["error"]
+                    msg = err.get("message") or "Missing information."
+                    missing = err.get("missing_fields") or []
+                    print(msg)
+                    if "opp_ids" in missing:
+                        tool_input["opp_ids"] = None
+                        continue
+                    if "team_size" in missing:
+                        tool_input["team_size"] = None
+                        continue
+                    return
+                elif isinstance(result, str):
+                    print(result)
+                else:
+                    print(json.dumps(result, ensure_ascii=False, indent=2))
+                return
+
+        # Collaborator flow (restore from 65ad3d6)
         tool_input = {
             "faculty_emails": collab.get("faculty_emails") or [],
             "need_y": collab.get("need_y"),
@@ -441,6 +511,31 @@ def main() -> None:
                 if resp.isdigit():
                     tool_input["need_y"] = int(resp)
                     continue
+            if tool_input.get("opp_ids"):
+                tool_input["opp_ids"] = [p for p in tool_input["opp_ids"] if str(p).strip()]
+            if not tool_input.get("opp_ids"):
+                resp = input("Enter opportunity ID or title: ").strip()
+                if resp:
+                    parts = [p.strip() for p in re.split(r"[;,]", resp) if p.strip()]
+                    tool_input["opp_ids"] = parts
+                    continue
+            else:
+                # Resolve title -> id to avoid long runs if title doesn't match
+                from dao.opportunity_dao import OpportunityDAO
+                with SessionLocal() as sess:
+                    odao = OpportunityDAO(sess)
+                    resolved = []
+                    for v in tool_input["opp_ids"]:
+                        if re.match(r"^[0-9a-fA-F-]{32,36}$", v):
+                            resolved.append(v)
+                        else:
+                            resolved.extend(odao.find_opportunity_ids_by_title(v, limit=5))
+                    resolved = list(dict.fromkeys(resolved))
+                if not resolved:
+                    tool_input["opp_ids"] = None
+                    print("Couldn't find a matching opportunity. Please provide a valid opportunity ID or title.")
+                    continue
+                tool_input["opp_ids"] = resolved[:1]
 
             result = call_tool("find_additional_collaborators", tool_input)
             state_path = args.state_json or ".agent_state.json"

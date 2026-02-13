@@ -32,6 +32,19 @@ def _find_additional_collaborators(tool_input: Dict[str, Any]) -> Dict[str, Any]
     )
 
 
+def _find_team_for_grant(tool_input: Dict[str, Any]) -> Dict[str, Any]:
+    from services.agent.tool_impl.find_team_for_grant import (
+        find_team_for_grant,
+    )
+
+    opp_ids = tool_input.get("opp_ids") or []
+    team_size = tool_input.get("team_size")
+    return find_team_for_grant(
+        opp_ids=opp_ids,
+        team_size=int(team_size),
+    )
+
+
 _TOOLS: Dict[str, Tool] = {
     "find_relevant_grants": {
         "name": "find_relevant_grants",
@@ -71,6 +84,21 @@ _TOOLS: Dict[str, Tool] = {
             "additionalProperties": False,
         },
         "fn": _find_additional_collaborators,
+    }
+    ,
+    "find_team_for_grant": {
+        "name": "find_team_for_grant",
+        "description": "Given an opportunity ID or title and desired team size, recommend a full faculty team.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "opp_ids": {"type": "array", "items": {"type": "string"}},
+                "team_size": {"type": "integer", "minimum": 1},
+            },
+            "required": ["opp_ids", "team_size"],
+            "additionalProperties": False,
+        },
+        "fn": _find_team_for_grant,
     }
 }
 
@@ -142,6 +170,25 @@ def call_tool(name: str, tool_input: Dict[str, Any]) -> Dict[str, Any]:
             # opp_ids optional; pass through as None if missing/empty
             if not tool_input.get("opp_ids"):
                 tool_input["opp_ids"] = None
+        if name == "find_team_for_grant":
+            opp_ids = tool_input.get("opp_ids")
+            if not opp_ids:
+                raise ToolInputError(
+                    tool_name=name,
+                    message="Please provide the opportunity ID or title.",
+                    missing_fields=["opp_ids"],
+                )
+            team_size = tool_input.get("team_size")
+            try:
+                team_size_int = int(team_size)
+            except Exception:
+                team_size_int = None
+            if team_size_int is None or team_size_int < 1:
+                raise ToolInputError(
+                    tool_name=name,
+                    message="What final team size do you want?",
+                    missing_fields=["team_size"],
+                )
 
         return fn(tool_input)
     except ToolInputError as exc:
