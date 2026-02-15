@@ -78,7 +78,7 @@ class LLMMatchOut(BaseModel):
 
 
 # ───────────────────────────────────────────────
-# Justification
+# One-to-One Match Justification
 # ───────────────────────────────────────────────
 class FacultyOpportunityRec(BaseModel):
     opportunity_id: str
@@ -95,48 +95,6 @@ class FacultyOpportunityRec(BaseModel):
 class FacultyRecsOut(BaseModel):
     faculty_name: str
     recommendations: List[FacultyOpportunityRec] = Field(default_factory=list)
-
-NeedKind = Literal["research_domain", "method", "application", "compliance"]
-
-# ───────────────────────────────────────────────
-# For group matcher
-# ───────────────────────────────────────────────
-class Need(BaseModel):
-    need_id: str
-    label: str
-    description: str
-    weight: int = Field(ge=1, le=5, default=3)
-    kind: NeedKind = "research_domain"
-    must_have: bool = False
-
-class NeedsOut(BaseModel):
-    opportunity_id: str
-    opportunity_title: str
-    scope_confidence: float = Field(ge=0.0, le=1.0)
-    suggested_team_size: int = Field(ge=1, le=8, default=3)
-    needs: List[Need] = Field(default_factory=list)
-
-class TeamMember(BaseModel):
-    faculty_id: int
-    name: str | None = None
-    email: str | None = None
-    role: str | None = None
-
-class TeamMatchOut(BaseModel):
-    opportunity_id: str
-    selected: List[TeamMember] = Field(default_factory=list)
-    covered_need_ids: List[str] = Field(default_factory=list)
-    missing_need_ids: List[str] = Field(default_factory=list)
-
-#
-class PairPenalty(BaseModel):
-    f: int = Field(..., description="Faculty id")
-    g: int = Field(..., description="Faculty id")
-    p: float = Field(..., ge=0, description="Penalty magnitude in score units")
-    why: Optional[str] = Field(None, description="Short reason")
-
-class PairPenaltiesOut(BaseModel):
-    pair_penalties: List[PairPenalty] = Field(default_factory=list)
 
 # ───────────────────────────────────────────────
 # Group justification
@@ -177,7 +135,6 @@ class WhyNotWorkingOut(BaseModel):
 class RecommendationOut(BaseModel):
     recommendation: str = ""
 
-
 class GroupJustificationOut(BaseModel):
     one_paragraph: str
     member_roles: List[MemberRoleOut] = Field(default_factory=list)
@@ -186,22 +143,8 @@ class GroupJustificationOut(BaseModel):
     why_not_working: List[str] = Field(default_factory=list)
     recommendation: str = ""
 
-class PlannerRequest(BaseModel):
-    opp_fields: List[str] = Field(default_factory=list, description="Additional opportunity fields to fetch if available.")
-    faculty_fields: List[str] = Field(default_factory=list, description="Additional faculty fields to fetch if available.")
-    ask_for_more_faculty: bool = Field(default=False, description="Whether writer needs richer faculty context than keywords.")
-    ask_for_more_opp: bool = Field(default=False, description="Whether writer needs richer opportunity context than summary/keywords.")
-    focus_points: List[str] = Field(default_factory=list, description="Key angles to emphasize in justification.")
-
-
-class CriticVerdict(BaseModel):
-    ok: bool = Field(..., description="True if justification is acceptable and grounded.")
-    issues: List[str] = Field(default_factory=list, description="Problems found: vagueness, missing grounding, etc.")
-    request_more: PlannerRequest = Field(default_factory=PlannerRequest, description="If not ok, what more to fetch.")
-
-
 # ───────────────────────────────────────────────
-# Candidate team selection
+# Candidate team selection (Additional layer for selecting group)
 # ───────────────────────────────────────────────
 class TeamCandidateSelectionOut(BaseModel):
     selected_candidate_indices: List[int] = Field(default_factory=list)

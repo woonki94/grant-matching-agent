@@ -10,23 +10,25 @@ from typing import Any, Dict, Optional, List
 from dao.faculty_dao import FacultyDAO
 from db.db_conn import SessionLocal
 from services.faculty.enrich_profile import enrich_new_faculty
-from services.keywords.generate_keywords import (
-    generate_faculty_keywords_for_id,
-    _extract_domains_from_keywords,
-    _embed_domain_bucket,
-)
+from services.context.context_generator import ContextGenerator
+from services.keywords.keyword_service import KeywordGenerationService
 from services.search.search_grants import generate_query_keywords
 from dao.match_dao import MatchDAO
 from dao.opportunity_dao import OpportunityDAO
 from config import get_llm_client
 from services.prompts.matching_prompt import MATCH_PROMPT
-from dto.llm_response_dto import LLMMatchOut
-from utils.keyword_accessor import keywords_for_matching, requirements_indexed
-from services.matching.hybrid_matcher import covered_to_grouped, missing_to_grouped
+from dto.llm_response_dto import LLMMatchOut, ScoredCoveredItem, MissingItem
+from utils.embedder import embed_domain_bucket
+from utils.keyword_utils import (
+    extract_domains_from_keywords,
+    keywords_for_matching,
+    requirements_indexed,
+)
 from services.justification.generate_justification import generate_faculty_recs, print_faculty_recs
 
 
 logger = logging.getLogger(__name__)
+keyword_service = KeywordGenerationService(context_generator=ContextGenerator())
 
 
 _EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
@@ -185,15 +187,38 @@ def _merge_keywords(fac_kw: dict, query_kw: dict) -> dict:
     return out
 
 
+def covered_to_grouped(items: List[ScoredCoveredItem]):
+    out = {"application": {}, "research": {}}
+    for it in items or []:
+        sec = it.section
+        idx = str(int(it.idx))
+        c = float(it.c)
+        prev = out[sec].get(idx)
+        out[sec][idx] = c if prev is None else max(prev, c)
+    return out
+
+
+def missing_to_grouped(items: List[MissingItem]):
+    out = {"application": [], "research": []}
+    for it in items or []:
+        out[it.section].append(int(it.idx))
+    # stable dedupe
+    for sec in out:
+        seen = set()
+        out[sec] = [x for x in out[sec] if not (x in seen or seen.add(x))]
+    return out
+
+
+
 def _run_matching_for_faculty_query(
     *,
     faculty_id: int,
     combined_kw: dict,
     top_k: int = 10,
 ) -> List[Dict[str, Any]]:
-    r_domains, a_domains = _extract_domains_from_keywords(combined_kw)
-    r_vec = _embed_domain_bucket(r_domains)
-    a_vec = _embed_domain_bucket(a_domains)
+    r_domains, a_domains = extract_domains_from_keywords(combined_kw)
+    r_vec = embed_domain_bucket(r_domains)
+    a_vec = embed_domain_bucket(a_domains)
 
     if r_vec is None and a_vec is None:
         return []
@@ -408,7 +433,7 @@ def main() -> None:
         return
 
     # 1) Faculty keywords + embeddings
-    fac_kw = generate_faculty_keywords_for_id(faculty_id) if faculty_id else None
+    fac_kw = keyword_service.generate_faculty_keywords_for_id(faculty_id) if faculty_id else None
     if not fac_kw:
         print("Failed to generate faculty keywords.")
         return

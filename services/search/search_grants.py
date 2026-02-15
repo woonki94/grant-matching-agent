@@ -9,20 +9,21 @@ from dao.match_dao import MatchDAO
 from dao.opportunity_dao import OpportunityDAO
 from db.db_conn import SessionLocal
 from dto.llm_response_dto import LLMMatchOut
-from services.keywords.generate_keywords import (
-    _apply_weighted_specializations,
-    _embed_domain_bucket,
-    _extract_domains_from_keywords,
-    build_keyword_chain,
-    sanitize_for_postgres,
-)
+from services.keywords.keyword_service import KeywordGenerationService
 from services.prompts.keyword_prompts import (
     QUERY_CANDIDATE_PROMPT,
     QUERY_KEYWORDS_PROMPT,
     QUERY_SPECIALIZATION_WEIGHT_PROMPT,
 )
 from services.prompts.matching_prompt import MATCH_PROMPT
-from utils.keyword_accessor import keywords_for_matching, requirements_indexed
+from utils.embedder import embed_domain_bucket
+from utils.keyword_utils import (
+    apply_weighted_specializations,
+    extract_domains_from_keywords,
+    keywords_for_matching,
+    requirements_indexed,
+)
+from utils.payload_sanitizer import sanitize_for_postgres
 
 logger = logging.getLogger(__name__)
 
@@ -54,7 +55,7 @@ def generate_query_keywords(
     query_text: str,
     user_urls: Optional[List[str]],
 ) -> Dict[str, Any]:
-    candidates_chain, keywords_chain, weight_chain = build_keyword_chain(
+    candidates_chain, keywords_chain, weight_chain = KeywordGenerationService.build_keyword_chain(
         QUERY_CANDIDATE_PROMPT,
         QUERY_KEYWORDS_PROMPT,
         QUERY_SPECIALIZATION_WEIGHT_PROMPT,
@@ -89,7 +90,7 @@ def generate_query_keywords(
         }
     )
 
-    kw_weighted = _apply_weighted_specializations(keywords=kw_dict, weighted=weighted_out)
+    kw_weighted = apply_weighted_specializations(keywords=kw_dict, weighted=weighted_out)
     kw_weighted = sanitize_for_postgres(kw_weighted)
     return kw_weighted
 
@@ -122,9 +123,9 @@ def search_grants(
         opp_dao = OpportunityDAO(sess)
 
         query_keywords = generate_query_keywords(query_text, user_urls)
-        r_domains, a_domains = _extract_domains_from_keywords(query_keywords)
-        r_vec = _embed_domain_bucket(r_domains)
-        a_vec = _embed_domain_bucket(a_domains)
+        r_domains, a_domains = extract_domains_from_keywords(query_keywords)
+        r_vec = embed_domain_bucket(r_domains)
+        a_vec = embed_domain_bucket(a_domains)
 
         if r_vec is None and a_vec is None:
             return {

@@ -33,23 +33,13 @@ def cosine_sim_matrix(A: np.ndarray, B: np.ndarray) -> np.ndarray:
     B = B / (np.linalg.norm(B, axis=1, keepdims=True) + 1e-9)
     return A @ B.T
 
-def _centroid(vecs: np.ndarray) -> Optional[List[float]]:
-    if vecs.size == 0:
-        return None
-    c = vecs.mean(axis=0)
-    n = np.linalg.norm(c)
-    if n == 0:
-        return None
-    return (c / n).tolist()
 
 def embed_domain_bucket(domains: List[str]) -> Optional[List[float]]:
-    domains = [d.strip() for d in domains if isinstance(d, str) and d.strip()]
+    """Embed joined domain labels using the configured embedding client."""
+    domains = [d.strip() for d in (domains or []) if d and str(d).strip()]
     if not domains:
         return None
-    vecs = embed_texts(domains)     # (N, D)
-    return _centroid(vecs)
-
-def extract_domains(keywords: dict) -> tuple[list[str], list[str]]:
-    r = [(x or "").strip() for x in (keywords.get("research") or {}).get("domain", [])]
-    a = [(x or "").strip() for x in (keywords.get("application") or {}).get("domain", [])]
-    return [x for x in r if x], [x for x in a if x]
+    emb = get_embedding_client().build()
+    text = " ; ".join(domains)
+    vec = emb.embed_query(text)
+    return vec if vec else None

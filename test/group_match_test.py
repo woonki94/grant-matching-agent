@@ -1,6 +1,8 @@
-from services.matching.group_match_super_faculty import team_selection_super_faculty
+from services.matching.super_faculty_selector import SuperFacultySelector
 from services.matching.group_matcher_with_mat_llm import team_redundancy_from_pair_penalties, quality_gate, \
     solve_team_with_pair_penalties_milp, redundancy_penalty_fn_full, compute_base_scores
+
+super_faculty_selector = SuperFacultySelector()
 
 
 def make_dummy_inputs():
@@ -155,8 +157,8 @@ if __name__ == "__main__":
     faculty_ids, requirements, coverage = build_synthetic_grants()
 
     K = 2
-    team, final_cov = team_selection_super_faculty(
-        faculty_ids=faculty_ids,
+    team, final_cov = super_faculty_selector.team_selection_super_faculty(
+        cand_faculty_ids=faculty_ids,
         requirements=requirements,
         coverage=coverage,
         K=K,

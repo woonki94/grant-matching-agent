@@ -5,7 +5,11 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from services.matching.super_faculty_selector import team_selection_super_faculty
+from services.matching.group_match_llm_selector import GroupMatchLLMSelector
+from services.matching.super_faculty_selector import SuperFacultySelector
+
+super_faculty_selector = SuperFacultySelector()
+group_match_llm_selector = GroupMatchLLMSelector()
 
 
 def make_synthetic_inputs():
@@ -27,7 +31,7 @@ def make_synthetic_inputs():
 
 def test_no_required_faculty_selects_best_team():
     faculty_ids, requirements, coverage = make_synthetic_inputs()
-    team, final_coverage = team_selection_super_faculty(
+    team, final_coverage = super_faculty_selector.team_selection_super_faculty(
         cand_faculty_ids=faculty_ids,
         requirements=requirements,
         coverage=coverage,
@@ -39,7 +43,7 @@ def test_no_required_faculty_selects_best_team():
 
 def test_single_required_faculty_is_included_and_used_as_baseline():
     faculty_ids, requirements, coverage = make_synthetic_inputs()
-    team, final_coverage = team_selection_super_faculty(
+    team, final_coverage = super_faculty_selector.team_selection_super_faculty(
         cand_faculty_ids=faculty_ids,
         requirements=requirements,
         coverage=coverage,
@@ -53,7 +57,7 @@ def test_single_required_faculty_is_included_and_used_as_baseline():
 
 def test_single_required_faculty_with_k_one_returns_required_only():
     faculty_ids, requirements, coverage = make_synthetic_inputs()
-    team, final_coverage = team_selection_super_faculty(
+    team, final_coverage = super_faculty_selector.team_selection_super_faculty(
         cand_faculty_ids=faculty_ids,
         requirements=requirements,
         coverage=coverage,
@@ -66,7 +70,7 @@ def test_single_required_faculty_with_k_one_returns_required_only():
 
 def test_single_required_faculty_with_duplicate_required_ids_is_deduped():
     faculty_ids, requirements, coverage = make_synthetic_inputs()
-    team, final_coverage = team_selection_super_faculty(
+    team, final_coverage = super_faculty_selector.team_selection_super_faculty(
         cand_faculty_ids=faculty_ids,
         requirements=requirements,
         coverage=coverage,
@@ -81,7 +85,7 @@ def test_single_required_faculty_with_duplicate_required_ids_is_deduped():
 
 def test_multiple_required_faculty_are_all_included():
     faculty_ids, requirements, coverage = make_synthetic_inputs()
-    team, final_coverage = team_selection_super_faculty(
+    team, final_coverage = super_faculty_selector.team_selection_super_faculty(
         cand_faculty_ids=faculty_ids,
         requirements=requirements,
         coverage=coverage,
@@ -94,7 +98,7 @@ def test_multiple_required_faculty_are_all_included():
 
 def test_multiple_required_faculty_order_is_preserved_in_team_prefix():
     faculty_ids, requirements, coverage = make_synthetic_inputs()
-    team, _ = team_selection_super_faculty(
+    team, _ = super_faculty_selector.team_selection_super_faculty(
         cand_faculty_ids=faculty_ids,
         requirements=requirements,
         coverage=coverage,
@@ -107,7 +111,7 @@ def test_multiple_required_faculty_order_is_preserved_in_team_prefix():
 
 def test_multiple_required_faculty_with_k_equal_required_uses_baseline_only():
     faculty_ids, requirements, coverage = make_synthetic_inputs()
-    team, final_coverage = team_selection_super_faculty(
+    team, final_coverage = super_faculty_selector.team_selection_super_faculty(
         cand_faculty_ids=faculty_ids,
         requirements=requirements,
         coverage=coverage,
@@ -120,7 +124,7 @@ def test_multiple_required_faculty_with_k_equal_required_uses_baseline_only():
 
 def test_k_zero_with_no_required_returns_zero_coverage():
     faculty_ids, requirements, coverage = make_synthetic_inputs()
-    team, final_coverage = team_selection_super_faculty(
+    team, final_coverage = super_faculty_selector.team_selection_super_faculty(
         cand_faculty_ids=faculty_ids,
         requirements=requirements,
         coverage=coverage,
@@ -133,7 +137,7 @@ def test_k_zero_with_no_required_returns_zero_coverage():
 def test_missing_required_faculty_raises_value_error():
     faculty_ids, requirements, coverage = make_synthetic_inputs()
     try:
-        team_selection_super_faculty(
+        super_faculty_selector.team_selection_super_faculty(
             cand_faculty_ids=faculty_ids,
             requirements=requirements,
             coverage=coverage,
@@ -148,7 +152,7 @@ def test_missing_required_faculty_raises_value_error():
 def test_k_less_than_number_of_required_faculty_raises_value_error():
     faculty_ids, requirements, coverage = make_synthetic_inputs()
     try:
-        team_selection_super_faculty(
+        super_faculty_selector.team_selection_super_faculty(
             cand_faculty_ids=faculty_ids,
             requirements=requirements,
             coverage=coverage,
@@ -162,7 +166,7 @@ def test_k_less_than_number_of_required_faculty_raises_value_error():
 
 def test_returns_top_n_candidates_sorted_by_weighted_score():
     faculty_ids, requirements, coverage = make_synthetic_inputs()
-    candidates = team_selection_super_faculty(
+    candidates = super_faculty_selector.team_selection_super_faculty(
         cand_faculty_ids=faculty_ids,
         requirements=requirements,
         coverage=coverage,
@@ -178,7 +182,7 @@ def test_returns_top_n_candidates_sorted_by_weighted_score():
 
 def test_returns_top_n_candidates_with_required_faculty():
     faculty_ids, requirements, coverage = make_synthetic_inputs()
-    candidates = team_selection_super_faculty(
+    candidates = super_faculty_selector.team_selection_super_faculty(
         cand_faculty_ids=faculty_ids,
         requirements=requirements,
         coverage=coverage,
@@ -193,10 +197,8 @@ def test_returns_top_n_candidates_with_required_faculty():
 
 
 def test_llm_selection_print_only_demo():
-    from services.matching.team_candidate_llm_selector import select_candidate_teams_with_llm
-
     faculty_ids, requirements, coverage = make_synthetic_inputs()
-    candidates = team_selection_super_faculty(
+    candidates = super_faculty_selector.team_selection_super_faculty(
         cand_faculty_ids=faculty_ids,
         requirements=requirements,
         coverage=coverage,
@@ -217,7 +219,7 @@ def test_llm_selection_print_only_demo():
             }
         )
 
-    result = select_candidate_teams_with_llm(
+    result = group_match_llm_selector.select_candidate_teams_with_llm(
         opportunity_id="synthetic-opp-001",
         desired_team_count=2,
         candidates=llm_candidates,

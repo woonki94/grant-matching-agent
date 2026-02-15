@@ -5,7 +5,9 @@ from typing import Any, Dict, List
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from services.matching.team_candidate_llm_selector import select_candidate_teams_with_llm
+from services.matching.group_match_llm_selector import GroupMatchLLMSelector
+
+group_match_llm_selector = GroupMatchLLMSelector()
 
 
 def scenario_high_weight_blindspot() -> Dict[str, Any]:
@@ -178,7 +180,7 @@ def run_scenario(scenario: Dict[str, Any]) -> None:
     for i, c in enumerate(candidates):
         print(f"  idx={i} team={c['team']} score={c['score']:.4f}")
 
-    out = select_candidate_teams_with_llm(
+    out = group_match_llm_selector.select_candidate_teams_with_llm(
         opportunity_id=scenario["opportunity_id"],
         desired_team_count=desired,
         candidates=candidates,

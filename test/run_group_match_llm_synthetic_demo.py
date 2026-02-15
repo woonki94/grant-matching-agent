@@ -5,7 +5,7 @@ from unittest.mock import patch
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from services.matching.group_match_super_faculty import run_group_match
+from services.matching.team_grant_matcher import TeamGrantMatcherService
 
 
 SYNTHETIC_EMAIL_TO_ID = {
@@ -80,9 +80,16 @@ def _fake_build_inputs_for_opportunity(*, sess, opportunity_id: str, limit_rows:
     f = list(row["F"])
     w = row["w"]
     c = row["c"]
-    i_app = sorted(w["application"].keys())
-    i_res = sorted(w["research"].keys())
-    return f, i_app, i_res, w, c
+    return f, w, c
+
+
+class _FakeContextGenerator:
+    def build_matching_inputs_for_opportunity(self, *, sess, opportunity_id: str, limit_rows: int = 500):
+        return _fake_build_inputs_for_opportunity(
+            sess=sess,
+            opportunity_id=opportunity_id,
+            limit_rows=limit_rows,
+        )
 
 
 def _teams_by_opp(rows):
@@ -98,13 +105,14 @@ def main():
     opp_ids = list(SYNTHETIC_OPP_INPUTS.keys())
     desired_team_count = 2
 
-    with patch("services.matching.group_match_super_faculty.SessionLocal", _FakeSessionCtx), patch(
-        "services.matching.group_match_super_faculty.FacultyDAO", _FakeFacultyDAO
-    ), patch("services.matching.group_match_super_faculty.MatchDAO", _FakeMatchDAO), patch(
-        "services.matching.group_match_super_faculty.build_inputs_for_opportunity",
-        _fake_build_inputs_for_opportunity,
+    with patch("services.matching.team_grant_matcher.SessionLocal", _FakeSessionCtx), patch(
+        "services.matching.team_grant_matcher.FacultyDAO", _FakeFacultyDAO
+    ), patch("services.matching.team_grant_matcher.MatchDAO", _FakeMatchDAO), patch(
+        "services.matching.team_grant_matcher.ContextGenerator",
+        _FakeContextGenerator,
     ):
-        deterministic = run_group_match(
+        service = TeamGrantMatcherService()
+        deterministic = service.run_group_match(
             faculty_emails=faculty_emails,
             team_size=3,
             num_candidates=5,
@@ -113,7 +121,7 @@ def main():
             desired_team_count=desired_team_count,
             group_by_opp=False,
         )
-        llm_based = run_group_match(
+        llm_based = service.run_group_match(
             faculty_emails=faculty_emails,
             team_size=3,
             num_candidates=5,
@@ -123,7 +131,7 @@ def main():
             group_by_opp=False,
         )
 
-    print("Synthetic comparison using run_group_match (deterministic vs LLM).\n")
+    print("Synthetic comparison using TeamGrantMatcherService.run_group_match (deterministic vs LLM).\n")
     det_map = _teams_by_opp(deterministic)
     llm_map = _teams_by_opp(llm_based)
 

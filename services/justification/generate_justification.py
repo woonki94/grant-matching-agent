@@ -21,12 +21,11 @@ from services.prompts.justification_prompts import FACULTY_RECS_PROMPT
 from db.db_conn import SessionLocal
 from db.models.faculty import Faculty
 from dao.opportunity_dao import OpportunityDAO
-from services.keywords.generate_context import (
-    faculty_to_keyword_context,
-    opportunity_to_keyword_context,
-)
+from services.context.context_generator import ContextGenerator
 from utils.content_compressor import cap_fac, cap_opp
 from config import get_llm_client
+
+context_generator = ContextGenerator()
 
 def llm_label(llm_score: float) -> str:
     if llm_score < 0.30:
@@ -111,14 +110,14 @@ def generate_faculty_recs(email: str, k: int) -> FacultyRecsOut:
         opp_map = {o.opportunity_id: o for o in opps}
 
         # 4) Build payloads
-        fac_ctx = cap_fac(faculty_to_keyword_context(fac))
+        fac_ctx = cap_fac(context_generator.build_faculty_basic_context(fac))
         opp_payloads: List[Dict[str, Any]] = []
 
         for oid in opp_ids:
             opp = opp_map.get(oid)
             if not opp:
                 continue
-            ctx = cap_opp(opportunity_to_keyword_context(opp))
+            ctx = cap_opp(context_generator.build_opportunity_basic_context(opp))
             scores = score_map.get(oid, {"domain_score": None, "llm_score": None})
 
             opp_payloads.append({

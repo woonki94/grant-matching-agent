@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -14,7 +15,8 @@ from dto.llm_response_dto import (
     WhyNotWorkingOut,
     WhyWorkingOut,
 )
-from utils.payload_utils import build_base_payload, extract_requirement_specs, safe_json
+from services.context.context_generator import ContextGenerator
+from utils.keyword_utils import extract_requirement_specs
 from services.prompts.group_match_prompt import (
     GRANT_BRIEF_PROMPT,
     RECOMMENDER_PROMPT,
@@ -35,9 +37,16 @@ def build_llms() -> GroupJustificationLLMs:
 
 
 class GroupJustificationEngine:
-    def __init__(self, *, odao: OpportunityDAO, fdao: FacultyDAO):
+    def __init__(
+        self,
+        *,
+        odao: OpportunityDAO,
+        fdao: FacultyDAO,
+        context_generator: Optional[ContextGenerator] = None,
+    ):
         self.odao = odao
         self.fdao = fdao
+        self.context_generator = context_generator or ContextGenerator()
         self.llms = build_llms()
 
         self.grant_brief_chain = GRANT_BRIEF_PROMPT | self.llms.writer.with_structured_output(GrantBriefOut)
@@ -45,6 +54,10 @@ class GroupJustificationEngine:
         self.why_working_chain = WHY_WORKING_DECIDER_PROMPT | self.llms.writer.with_structured_output(WhyWorkingOut)
         self.why_not_working_chain = WHY_NOT_WORKING_DECIDER_PROMPT | self.llms.writer.with_structured_output(WhyNotWorkingOut)
         self.recommender_chain = RECOMMENDER_PROMPT | self.llms.writer.with_structured_output(RecommendationOut)
+
+    @staticmethod
+    def _safe_json(obj: Any) -> str:
+        return json.dumps(obj, ensure_ascii=False, indent=2)
 
     def run_one(
         self,
@@ -59,7 +72,7 @@ class GroupJustificationEngine:
         trace = trace or {}
         trace.setdefault("steps", {})
 
-        context = build_base_payload(
+        context = self.context_generator.build_group_matching_context(
             opp_ctx=opp_ctx,
             fac_ctxs=fac_ctxs,
             coverage=coverage,
@@ -85,7 +98,7 @@ class GroupJustificationEngine:
                 },
                 "requirements": requirements,
             }
-            grant_brief = self.grant_brief_chain.invoke({"input_json": safe_json(grant_brief_input)})
+            grant_brief = self.grant_brief_chain.invoke({"input_json": self._safe_json(grant_brief_input)})
             trace["steps"]["grant_brief"] = {
                 "status": "ok",
                 "input": grant_brief_input,
@@ -101,7 +114,7 @@ class GroupJustificationEngine:
                 "requirements": requirements,
                 "team": team_block,
             }
-            team_roles = self.team_role_chain.invoke({"input_json": safe_json(team_role_input)})
+            team_roles = self.team_role_chain.invoke({"input_json": self._safe_json(team_role_input)})
             trace["steps"]["team_roles"] = {
                 "status": "ok",
                 "input": team_role_input,
@@ -118,7 +131,7 @@ class GroupJustificationEngine:
                 "team": team_block,
                 "team_final_coverage": coverage_block,
             }
-            why_working = self.why_working_chain.invoke({"input_json": safe_json(why_working_input)})
+            why_working = self.why_working_chain.invoke({"input_json": self._safe_json(why_working_input)})
             trace["steps"]["why_working"] = {
                 "status": "ok",
                 "input": why_working_input,
@@ -135,7 +148,7 @@ class GroupJustificationEngine:
                 "team": team_block,
                 "team_final_coverage": coverage_block,
             }
-            why_not = self.why_not_working_chain.invoke({"input_json": safe_json(why_not_input)})
+            why_not = self.why_not_working_chain.invoke({"input_json": self._safe_json(why_not_input)})
             trace["steps"]["why_not_working"] = {
                 "status": "ok",
                 "input": why_not_input,
@@ -152,7 +165,7 @@ class GroupJustificationEngine:
                 "why_working": why_working.model_dump(),
                 "why_not_working": why_not.model_dump(),
             }
-            recommendation = self.recommender_chain.invoke({"input_json": safe_json(rec_input)})
+            recommendation = self.recommender_chain.invoke({"input_json": self._safe_json(rec_input)})
             trace["steps"]["recommendation"] = {
                 "status": "ok",
                 "input": rec_input,

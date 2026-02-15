@@ -1,20 +1,19 @@
 from __future__ import annotations
 
-import logging
-from typing import List, Dict, Any, Iterator, Optional
+from typing import Any, Dict, Iterator, List, Optional
+
 from sqlalchemy.orm import Session
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import selectinload
 
-from db.models.opportunity import Opportunity, OpportunityAttachment, OpportunityAdditionalInfo, OpportunityKeyword, \
-    OpportunityKeywordEmbedding
+from db.models.opportunity import (
+    Opportunity,
+    OpportunityAdditionalInfo,
+    OpportunityAttachment,
+    OpportunityKeyword,
+    OpportunityKeywordEmbedding,
+)
 from dto.opportunity_dto import OpportunityDTO, OpportunityAttachmentDTO, OpportunityAdditionalInfoDTO
-
-
-from logging_setup import setup_logging
-
-logger = logging.getLogger(__name__)
-setup_logging()
 
 OPPORTUNITY_COLS = {
     "agency_name",
@@ -46,10 +45,19 @@ class OpportunityDAO:
     def __init__(self, session: Session):
         self.session = session
 
+    # =============== Helper Actions ===============
+    @staticmethod
+    def _with_common_relations(query):
+        return query.options(
+            selectinload(Opportunity.additional_info),
+            selectinload(Opportunity.attachments),
+            selectinload(Opportunity.keyword),
+        )
+
+    # =============== Upsert Actions ===============
     def upsert_opportunity(self, dto: OpportunityDTO) -> Opportunity:
         if not dto.opportunity_id:
-            logger.exception("Opportunity ID is required for email-based upsert")
-            raise
+            raise ValueError("Opportunity ID is required for upsert")
 
         obj = self.session.get(Opportunity, dto.opportunity_id)
         if obj is None:
@@ -84,7 +92,6 @@ class OpportunityDAO:
                 )
                 self.session.add(obj)
             else:
-                # keep download path current, but DO NOT reset status here
                 obj.file_download_path = a.file_download_path
 
             count += 1
@@ -115,55 +122,13 @@ class OpportunityDAO:
             count += 1
         return count
 
-    def iter_opportunities_with_relations(self, batch_size: int = 200) -> Iterator[Opportunity]:
-        q = (
-            self.session.query(Opportunity)
-            .options(
-                selectinload(Opportunity.additional_info),
-                selectinload(Opportunity.attachments),
-                selectinload(Opportunity.keyword),
-            )
-            .yield_per(batch_size)
-        )
-
-        for opp in q:
-            yield opp
-
-    def iter_opportunity_ids(self, batch_size: int = 500) -> Iterator[str]:
-        # Only pull the PK; no joins, no relations
-        q = (
-            self.session.query(Opportunity.opportunity_id)
-            .yield_per(batch_size)
-        )
-        for (oid,) in q:
-            yield oid
-
-    def read_opportunities_by_ids_with_relations(self, ids: list[str]) -> list[Opportunity]:
-        if not ids:
-            return []
-        return (
-            self.session.query(Opportunity)
-            .options(
-                selectinload(Opportunity.additional_info),
-                selectinload(Opportunity.attachments),
-                selectinload(Opportunity.keyword),
-            )
-            .filter(Opportunity.opportunity_id.in_(ids))
-            .all()
-        )
-
     def upsert_keywords_json(self, rows: List[Dict[str, Any]]) -> int:
-        """
-        Bulk upsert OpportunityKeyword rows by opportunity_id (or opportunity_id FK).
-        Does NOT commit (caller commits).
-        Returns number of rows provided.
-        """
         if not rows:
             return 0
 
         stmt = pg_insert(OpportunityKeyword).values(rows)
         stmt = stmt.on_conflict_do_update(
-            index_elements=[OpportunityKeyword.opportunity_id],  # or OpportunityKeyword.opportunity_id_fk
+            index_elements=[OpportunityKeyword.opportunity_id],
             set_={
                 "keywords": stmt.excluded.keywords,
                 "raw_json": stmt.excluded.raw_json,
@@ -174,23 +139,7 @@ class OpportunityDAO:
         self.session.execute(stmt)
         return len(rows)
 
-    def iter_opportunities_with_keywords(self):
-        return (
-            self.session.query(Opportunity)
-            .options(selectinload(Opportunity.keyword))
-            .yield_per(200)
-        )
-
-
     def upsert_keyword_embedding(self, row: dict) -> None:
-        """
-        row = {
-          faculty_id: int,
-          model: str,
-          research_domain_vec: list[float] | None,
-          application_domain_vec: list[float] | None
-        }
-        """
         stmt = pg_insert(OpportunityKeywordEmbedding).values([row])
         stmt = stmt.on_conflict_do_update(
             index_elements=["opportunity_id"],
@@ -202,7 +151,17 @@ class OpportunityDAO:
         )
         self.session.execute(stmt)
 
-    def get_opportunity_context(self, opportunity_id: str) -> Optional[Dict[str, Any]]:
+    # =============== Read Actions ===============
+    def read_opportunities_by_ids_with_relations(self, ids: list[str]) -> list[Opportunity]:
+        if not ids:
+            return []
+        return (
+            self._with_common_relations(self.session.query(Opportunity))
+            .filter(Opportunity.opportunity_id.in_(ids))
+            .all()
+        )
+
+    def read_opportunity_context(self, opportunity_id: str) -> Optional[Dict[str, Any]]:
         opp = (
             self.session.query(Opportunity)
             .options(selectinload(Opportunity.keyword))
@@ -219,23 +178,18 @@ class OpportunityDAO:
             "title": getattr(opp, "opportunity_title", None),
             "agency": getattr(opp, "agency_name", None),
             "summary": getattr(opp, "summary_description", None),
-            "keywords": kw,  # your JSON keyword schema
+            "keywords": kw,
         }
 
-
-
-
-
+    # =============== Iteration Actions ===============
     def iter_opportunity_missing_keywords(self, batch_size: int = 200) -> Iterator[Opportunity]:
+        """
+        Iterate over grants that has not yet generated keywords.
+        """
         q = (
-            self.session.query(Opportunity)
+            self._with_common_relations(self.session.query(Opportunity))
             .outerjoin(OpportunityKeyword, OpportunityKeyword.opportunity_id == Opportunity.opportunity_id)
-            .options(
-                selectinload(Opportunity.additional_info),
-                selectinload(Opportunity.attachments),
-                selectinload(Opportunity.keyword),
-            )
-            .filter(OpportunityKeyword.opportunity_id.is_(None))  # only missing keywords
+            .filter(OpportunityKeyword.opportunity_id.is_(None))
             .yield_per(batch_size)
         )
         yield from q

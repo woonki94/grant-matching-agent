@@ -4,27 +4,8 @@ from sqlalchemy import text, desc, bindparam
 from pgvector.sqlalchemy import Vector
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import Session
-from db.models.match_result import MatchResult  # wherever you put it
 
-SQL_TOPK_OPPS_FOR_FACULTY = text("""
-SELECT
-  oemb.opportunity_id,
-  GREATEST(
-    CASE WHEN femb.research_domain_vec IS NOT NULL AND oemb.research_domain_vec IS NOT NULL
-      THEN 1 - (femb.research_domain_vec <=> oemb.research_domain_vec) END,
-    CASE WHEN femb.application_domain_vec IS NOT NULL AND oemb.application_domain_vec IS NOT NULL
-      THEN 1 - (femb.application_domain_vec <=> oemb.application_domain_vec) END,
-    CASE WHEN femb.research_domain_vec IS NOT NULL AND oemb.application_domain_vec IS NOT NULL
-      THEN 1 - (femb.research_domain_vec <=> oemb.application_domain_vec) END,
-    CASE WHEN femb.application_domain_vec IS NOT NULL AND oemb.research_domain_vec IS NOT NULL
-      THEN 1 - (femb.application_domain_vec <=> oemb.research_domain_vec) END
-  ) AS domain_sim
-FROM faculty_keyword_embedding femb
-JOIN opportunity_keyword_embedding oemb ON TRUE
-WHERE femb.faculty_id = :faculty_id
-ORDER BY domain_sim DESC NULLS LAST
-LIMIT :k
-""")
+from db.models.match_result import MatchResult
 
 
 SQL_TOPK_OPPS_FOR_QUERY = text("""
@@ -50,10 +31,21 @@ LIMIT :k
 
 
 class MatchDAO:
+    """Data access layer for match result read/write operations."""
+
     def __init__(self, session: Session):
+        """Initialize DAO with an active SQLAlchemy session."""
         self.session = session
 
+    # =============== Helper Actions ===============
+    @staticmethod
+    def _rows_to_scored_pairs(rows) -> List[Tuple[str, float]]:
+        """Normalize SQL result rows to (opportunity_id, domain_similarity)."""
+        return [(r.opportunity_id, float(r.domain_sim or 0.0)) for r in rows]
+
+    # =============== Upsert Actions ===============
     def upsert_matches(self, rows: List[Dict[str, Any]]) -> int:
+        """Bulk upsert match rows by (grant_id, faculty_id)."""
         if not rows:
             return 0
 
@@ -66,19 +58,33 @@ class MatchDAO:
                 "reason": stmt.excluded.reason,
                 "covered": stmt.excluded.covered,
                 "missing": stmt.excluded.missing,
-                #"evidence": stmt.excluded.evidence,
             },
         )
         self.session.execute(stmt)
         return len(rows)
 
+    # =============== Search/Ranking Actions ===============
     def topk_opps_for_faculty(self, faculty_id: int, k: int) -> List[Tuple[str, float]]:
-        rows = self.session.execute(
-            SQL_TOPK_OPPS_FOR_FACULTY,
-            {"faculty_id": faculty_id, "k": k},
-        ).all()
+        """Find top-k opportunities using stored faculty embedding vectors."""
+        faculty_vecs = self.session.execute(
+            text(
+                """
+                SELECT research_domain_vec, application_domain_vec
+                FROM faculty_keyword_embedding
+                WHERE faculty_id = :faculty_id
+                LIMIT 1
+                """
+            ),
+            {"faculty_id": faculty_id},
+        ).first()
+        if not faculty_vecs:
+            return []
 
-        return [(r.opportunity_id, float(r.domain_sim or 0.0)) for r in rows]
+        return self.topk_opps_for_query(
+            research_vec=faculty_vecs.research_domain_vec,
+            application_vec=faculty_vecs.application_domain_vec,
+            k=k,
+        )
 
     def topk_opps_for_query(
         self,
@@ -87,6 +93,7 @@ class MatchDAO:
         application_vec: Optional[List[float]],
         k: int,
     ) -> List[Tuple[str, float]]:
+        """Find top-k opportunities using runtime query vectors."""
         rows = self.session.execute(
             SQL_TOPK_OPPS_FOR_QUERY,
             {
@@ -95,9 +102,11 @@ class MatchDAO:
                 "k": k,
             },
         ).all()
-        return [(r.opportunity_id, float(r.domain_sim or 0.0)) for r in rows]
+        return self._rows_to_scored_pairs(rows)
 
+    # =============== Read Actions ===============
     def top_matches_for_faculty(self, faculty_id: int, k: int = 5):
+        """Read top stored match results for one faculty ordered by LLM/domain score."""
         q = (
             self.session.query(MatchResult.grant_id, MatchResult.domain_score, MatchResult.llm_score)
             .filter(MatchResult.faculty_id == faculty_id)
@@ -107,6 +116,7 @@ class MatchDAO:
         return [(gid, float(d), float(l)) for (gid, d, l) in q.all()]
 
     def list_matches_for_opportunity(self, opportunity_id: str, limit: int = 200):
+        """List stored faculty match rows for a given opportunity."""
         q = text("""
             SELECT faculty_id, domain_score, llm_score, covered, missing
             FROM match_results
@@ -118,21 +128,15 @@ class MatchDAO:
         return [dict(r) for r in rows]
 
     def get_grant_ids_for_faculty(
-            self,
-            *,
-            faculty_id: int,
-            min_domain_score: Optional[float] = None,
-            min_llm_score: Optional[float] = None,
-            limit: Optional[int] = None,
-            order_by: str = "llm",  # "llm" | "domain"
+        self,
+        *,
+        faculty_id: int,
+        min_domain_score: Optional[float] = None,
+        min_llm_score: Optional[float] = None,
+        limit: Optional[int] = None,
+        order_by: str = "llm",  # "llm" | "domain"
     ) -> List[str]:
-        """
-        Return a list of grant_ids matched to a faculty.
-
-        This is intended as a Stage-1 / Stage-2 filter before
-        running expensive group matching.
-        """
-
+        """Return matched grant ids for one faculty with optional filters."""
         q = (
             self.session
             .query(MatchResult.grant_id)
