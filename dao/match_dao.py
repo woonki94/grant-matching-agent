@@ -1,3 +1,5 @@
+import ast
+import json
 from typing import Any, Dict, List, Tuple, Optional
 
 from sqlalchemy import text, desc, bindparam
@@ -42,6 +44,48 @@ class MatchDAO:
     def _rows_to_scored_pairs(rows) -> List[Tuple[str, float]]:
         """Normalize SQL result rows to (opportunity_id, domain_similarity)."""
         return [(r.opportunity_id, float(r.domain_sim or 0.0)) for r in rows]
+
+    @staticmethod
+    def _coerce_vector_param(vec: Any) -> Optional[List[float]]:
+        """
+        Normalize vector values to List[float] for pgvector binding.
+
+        Handles:
+        - None
+        - list/tuple of numeric-ish values
+        - JSON / repr string, e.g. "[0.1, -0.2, ...]"
+        """
+        if vec is None:
+            return None
+
+        if isinstance(vec, str):
+            s = vec.strip()
+            if not s:
+                return None
+            parsed = None
+            try:
+                parsed = json.loads(s)
+            except Exception:
+                try:
+                    parsed = ast.literal_eval(s)
+                except Exception as exc:
+                    raise ValueError(f"Invalid vector string format: {s[:120]}") from exc
+            vec = parsed
+
+        if isinstance(vec, tuple):
+            vec = list(vec)
+
+        if isinstance(vec, list):
+            out: List[float] = []
+            for x in vec:
+                out.append(float(x))
+            return out
+
+        # Last resort: try generic iterable (e.g., numpy array)
+        try:
+            return [float(x) for x in vec]
+        except Exception as exc:
+            raise ValueError(f"Unsupported vector type: {type(vec).__name__}") from exc
 
     # =============== Upsert Actions ===============
     def upsert_matches(self, rows: List[Dict[str, Any]]) -> int:
@@ -94,11 +138,17 @@ class MatchDAO:
         k: int,
     ) -> List[Tuple[str, float]]:
         """Find top-k opportunities using runtime query vectors."""
+        q_research_vec = self._coerce_vector_param(research_vec)
+        q_application_vec = self._coerce_vector_param(application_vec)
+
+        if q_research_vec is None and q_application_vec is None:
+            return []
+
         rows = self.session.execute(
             SQL_TOPK_OPPS_FOR_QUERY,
             {
-                "q_research_vec": research_vec,
-                "q_application_vec": application_vec,
+                "q_research_vec": q_research_vec,
+                "q_application_vec": q_application_vec,
                 "k": k,
             },
         ).all()

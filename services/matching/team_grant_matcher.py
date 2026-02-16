@@ -14,7 +14,7 @@ from services.matching.group_match_llm_selector import GroupMatchLLMSelector
 from services.matching.super_faculty_selector import SuperFacultySelector
 
 
-class TeamGrantMatcherService:
+class TeamGrantMatcher:
     def __init__(self, *, session_factory=SessionLocal, context_generator: Optional[ContextGenerator] = None):
         self.session_factory = session_factory
         self.context_generator = context_generator or ContextGenerator()

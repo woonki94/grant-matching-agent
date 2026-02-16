@@ -5,7 +5,7 @@ from unittest.mock import patch
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from services.matching.team_grant_matcher import TeamGrantMatcherService
+from services.matching.team_grant_matcher import TeamGrantMatcher
 
 
 SYNTHETIC_EMAIL_TO_ID = {
@@ -111,7 +111,7 @@ def main():
         "services.matching.team_grant_matcher.ContextGenerator",
         _FakeContextGenerator,
     ):
-        service = TeamGrantMatcherService()
+        service = TeamGrantMatcher()
         deterministic = service.run_group_match(
             faculty_emails=faculty_emails,
             team_size=3,
@@ -131,7 +131,7 @@ def main():
             group_by_opp=False,
         )
 
-    print("Synthetic comparison using TeamGrantMatcherService.run_group_match (deterministic vs LLM).\n")
+    print("Synthetic comparison using TeamGrantMatcher.run_group_match (deterministic vs LLM).\n")
     det_map = _teams_by_opp(deterministic)
     llm_map = _teams_by_opp(llm_based)
 

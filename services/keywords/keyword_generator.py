@@ -32,7 +32,7 @@ from utils.payload_sanitizer import sanitize_for_postgres
 ContextBuilder = Callable[[Any], Dict[str, Any]]
 
 
-class KeywordGenerationService:
+class KeywordGenerator:
     def __init__(self, *, context_generator: ContextGenerator):
         self.context_generator = context_generator
 
@@ -139,7 +139,7 @@ class KeywordGenerationService:
                 weight_chain=faculty_w_chain,
             )
 
-            source_model = settings.bedrock_model_id
+            source_model = settings.haiku
             embed_model = settings.bedrock_embed_model_id
             fac_dao.upsert_keywords_json(
                 [
@@ -182,7 +182,7 @@ class KeywordGenerationService:
         with SessionLocal() as sess:
             fac_dao = FacultyDAO(sess)
             opp_dao = OpportunityDAO(sess)
-            source_model = settings.bedrock_model_id
+            source_model = settings.haiku
             embed_model = settings.bedrock_embed_model_id
 
             if run_faculty:

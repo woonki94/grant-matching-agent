@@ -1,12 +1,17 @@
 from __future__ import annotations
 
 import argparse
+import sys
+from pathlib import Path
+
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(PROJECT_ROOT))
 
 from services.context.context_generator import ContextGenerator
-from services.keywords.keyword_service import KeywordGenerationService
+from services.keywords.keyword_generator import KeywordGenerator
 
 context_generator = ContextGenerator()
-keyword_service = KeywordGenerationService(context_generator=context_generator)
+keyword_service = KeywordGenerator(context_generator=context_generator)
 
 
 if __name__ == "__main__":

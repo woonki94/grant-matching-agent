@@ -1,14 +1,18 @@
 from __future__ import annotations
 
 import argparse
+import sys
+from pathlib import Path
+
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(PROJECT_ROOT))
 
 from services.matching.faculty_grant_matcher import (
-    FacultyGrantMatcherService
+    FacultyGrantMatcher
 )
 
-#TODO: Move to CLI
 def main(k: int, min_domain: float, limit_faculty: int, commit_every: int = 30):
-    service = FacultyGrantMatcherService()
+    service = FacultyGrantMatcher()
     service.run(
         k=k,
         min_domain=min_domain,

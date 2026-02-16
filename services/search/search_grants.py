@@ -9,7 +9,7 @@ from dao.match_dao import MatchDAO
 from dao.opportunity_dao import OpportunityDAO
 from db.db_conn import SessionLocal
 from dto.llm_response_dto import LLMMatchOut
-from services.keywords.keyword_service import KeywordGenerationService
+from services.keywords.keyword_generator import KeywordGenerator
 from services.prompts.keyword_prompts import (
     QUERY_CANDIDATE_PROMPT,
     QUERY_KEYWORDS_PROMPT,
@@ -55,7 +55,7 @@ def generate_query_keywords(
     query_text: str,
     user_urls: Optional[List[str]],
 ) -> Dict[str, Any]:
-    candidates_chain, keywords_chain, weight_chain = KeywordGenerationService.build_keyword_chain(
+    candidates_chain, keywords_chain, weight_chain = KeywordGenerator.build_keyword_chain(
         QUERY_CANDIDATE_PROMPT,
         QUERY_KEYWORDS_PROMPT,
         QUERY_SPECIALIZATION_WEIGHT_PROMPT,

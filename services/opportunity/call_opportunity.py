@@ -21,6 +21,7 @@ from dto.opportunity_dto import OpportunityDTO
 
 # New mappers (pure)
 from mappers.portal_to_opportunity import (
+    map_portal_detail_response_to_opportunity,
     map_portal_search_response,
     map_portal_attachments_response,
 )
@@ -91,16 +92,32 @@ class OpportunitySearchService:
         resp.raise_for_status()
         return resp.json() or {}
 
-    def fetch_attachments(self, opportunity_id: str) -> Dict[str, Any]:
+    def fetch_opportunity_detail(self, opportunity_id: str) -> Dict[str, Any]:
+        """
+        Fetch full opportunity detail payload by opportunity_id.
+        This includes richer fields than search results (e.g., attachments, competitions, forms).
+        """
         sess = self._session()
         url = f"{self.detail_base_url}{opportunity_id}"
         resp = sess.get(url, headers=self._auth_headers(), timeout=30)
         resp.raise_for_status()
         return resp.json() or {}
 
+    def fetch_opportunity_by_id(self, opportunity_id: str) -> Dict[str, Any]:
+        """
+        Return the full `data` object from the opportunity detail API for one opp_id.
+        Use this when user already knows the target opportunity.
+        """
+        payload = self.fetch_opportunity_detail(opportunity_id)
+        data = payload.get("data")
+        if not isinstance(data, dict):
+            raise ValueError(f"Invalid detail payload for opportunity_id={opportunity_id}")
+        return data
+
     def run_search_pipeline(
         self,
         *,
+        opportunity_id: Optional[str] = None,
         page_offset: int = 1,
         page_size: int = 50,
         order_by: str = "post_date",
@@ -110,6 +127,13 @@ class OpportunitySearchService:
         q: Optional[str] = None,
         include_files: bool = True,
     ) -> List[OpportunityDTO]:
+        # Exact-by-id path: retrieve full detail payload and map to one DTO.
+        if opportunity_id:
+            detail_payload = self.fetch_opportunity_detail(opportunity_id)
+            dto = map_portal_detail_response_to_opportunity(detail_payload)
+            return [dto] if dto is not None else []
+
+        # Broad search path: query + filters + optional attachment enrichment.
         req = self.build_search_request(
             page_offset=page_offset,
             page_size=page_size,
@@ -125,7 +149,7 @@ class OpportunitySearchService:
         if include_files:
             for opp in opportunities:
                 try:
-                    attachments = self.fetch_attachments(opp.opportunity_id)
+                    attachments = self.fetch_opportunity_detail(opp.opportunity_id)
                     opp.attachments = map_portal_attachments_response(attachments)
                 except Exception:
                     opp.attachments = opp.attachments or []

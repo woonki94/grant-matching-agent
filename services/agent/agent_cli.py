@@ -11,7 +11,7 @@ from dao.faculty_dao import FacultyDAO
 from db.db_conn import SessionLocal
 from services.faculty.enrich_profile import enrich_new_faculty
 from services.context.context_generator import ContextGenerator
-from services.keywords.keyword_service import KeywordGenerationService
+from services.keywords.keyword_generator import KeywordGenerator
 from services.search.search_grants import generate_query_keywords
 from dao.match_dao import MatchDAO
 from dao.opportunity_dao import OpportunityDAO
@@ -28,7 +28,7 @@ from services.justification.generate_justification import generate_faculty_recs,
 
 
 logger = logging.getLogger(__name__)
-keyword_service = KeywordGenerationService(context_generator=ContextGenerator())
+keyword_service = KeywordGenerator(context_generator=ContextGenerator())
 
 
 _EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")

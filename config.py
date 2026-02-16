@@ -104,13 +104,6 @@ class Settings(BaseSettings):
     def opus(self) -> Optional[str]:
         return self.bedrock_claude_opus
 
-    @model_validator(mode="after")
-    def _default_bedrock_model(self):
-        # Ensure existing code that references settings.bedrock_model_id still resolves to haiku by default.
-        if not self.bedrock_model_id:
-            self.bedrock_model_id = self.bedrock_claude_haiku
-        return self
-
     # =========================
     # Extracted Content Storage (S3 ONLY)
     # =========================
