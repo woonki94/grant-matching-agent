@@ -53,7 +53,6 @@ class MatchingContextBuilder:
         opportunity_id: str,
         limit_rows: int = 500,
     ) -> Tuple[List[int], Dict[str, Dict[int, float]], Dict[int, Dict[str, Dict[int, float]]]]:
-        match_dao = MatchDAO(sess)
         opp_dao = OpportunityDAO(sess)
 
         opps = opp_dao.read_opportunities_by_ids_with_relations([opportunity_id])

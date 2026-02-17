@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
 from config import get_llm_client
@@ -26,16 +25,6 @@ from services.prompts.group_match_prompt import (
 )
 
 
-@dataclass
-class GroupJustificationLLMs:
-    writer: Any
-
-
-def build_llms() -> GroupJustificationLLMs:
-    base = get_llm_client().build()
-    return GroupJustificationLLMs(writer=base)
-
-
 class GroupJustificationEngine:
     def __init__(
         self,
@@ -47,13 +36,13 @@ class GroupJustificationEngine:
         self.odao = odao
         self.fdao = fdao
         self.context_generator = context_generator or ContextGenerator()
-        self.llms = build_llms()
+        self.llm = get_llm_client().build()
 
-        self.grant_brief_chain = GRANT_BRIEF_PROMPT | self.llms.writer.with_structured_output(GrantBriefOut)
-        self.team_role_chain = TEAM_ROLE_DECIDER_PROMPT | self.llms.writer.with_structured_output(TeamRoleOut)
-        self.why_working_chain = WHY_WORKING_DECIDER_PROMPT | self.llms.writer.with_structured_output(WhyWorkingOut)
-        self.why_not_working_chain = WHY_NOT_WORKING_DECIDER_PROMPT | self.llms.writer.with_structured_output(WhyNotWorkingOut)
-        self.recommender_chain = RECOMMENDER_PROMPT | self.llms.writer.with_structured_output(RecommendationOut)
+        self.grant_brief_chain = GRANT_BRIEF_PROMPT | self.llm.with_structured_output(GrantBriefOut)
+        self.team_role_chain = TEAM_ROLE_DECIDER_PROMPT | self.llm.with_structured_output(TeamRoleOut)
+        self.why_working_chain = WHY_WORKING_DECIDER_PROMPT | self.llm.with_structured_output(WhyWorkingOut)
+        self.why_not_working_chain = WHY_NOT_WORKING_DECIDER_PROMPT | self.llm.with_structured_output(WhyNotWorkingOut)
+        self.recommender_chain = RECOMMENDER_PROMPT | self.llm.with_structured_output(RecommendationOut)
 
     @staticmethod
     def _safe_json(obj: Any) -> str:
