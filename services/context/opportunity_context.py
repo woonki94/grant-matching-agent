@@ -24,3 +24,17 @@ class OpportunityContextBuilder:
                 title_attr="file_name",
             ),
         }
+
+    def build_opportunity_keyword_context(self, opp: Opportunity) -> Dict[str, Any]:
+        kw = (getattr(opp, "keyword", None) and getattr(opp.keyword, "keywords", None)) or {}
+        first_link = None
+        infos = list(getattr(opp, "additional_info", None) or [])
+        if infos:
+            first_link = getattr(infos[0], "additional_info_url", None)
+        return {
+            "opportunity_id": opp.opportunity_id,
+            "opportunity_title": opp.opportunity_title,
+            "agency_name": opp.agency_name,
+            "opportunity_link": first_link,
+            "keywords": kw,
+        }

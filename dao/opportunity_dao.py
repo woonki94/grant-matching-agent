@@ -2,8 +2,9 @@ from __future__ import annotations
 
 from typing import Any, Dict, Iterator, List, Optional
 
+from sqlalchemy import String, bindparam, func, text
 from sqlalchemy.orm import Session
-from sqlalchemy.dialects.postgresql import insert as pg_insert
+from sqlalchemy.dialects.postgresql import ARRAY, insert as pg_insert
 from sqlalchemy.orm import selectinload
 
 from db.models.opportunity import (
@@ -139,6 +140,37 @@ class OpportunityDAO:
         self.session.execute(stmt)
         return len(rows)
 
+    def update_keyword_categories(
+        self,
+        *,
+        opportunity_id: str,
+        broad_category: Optional[str],
+        specific_categories: Optional[List[str]],
+    ) -> None:
+        """Update opportunity keyword category columns without model-column coupling."""
+        if not opportunity_id:
+            return
+
+        clean_specific = [str(x).strip() for x in (specific_categories or []) if str(x).strip()]
+        stmt = text(
+            """
+            UPDATE opportunity_keywords
+            SET broad_category = :broad_category,
+                specific_categories = :specific_categories
+            WHERE opportunity_id = :opportunity_id
+            """
+        ).bindparams(
+            bindparam("specific_categories", type_=ARRAY(String)),
+        )
+        self.session.execute(
+            stmt,
+            {
+                "opportunity_id": str(opportunity_id),
+                "broad_category": (str(broad_category).strip() if broad_category else None),
+                "specific_categories": clean_specific,
+            },
+        )
+
     def upsert_keyword_embedding(self, row: dict) -> None:
         stmt = pg_insert(OpportunityKeywordEmbedding).values([row])
         stmt = stmt.on_conflict_do_update(
@@ -161,6 +193,19 @@ class OpportunityDAO:
             .all()
         )
 
+    def read_opportunities_by_ids_for_keyword_context(self, ids: list[str]) -> list[Opportunity]:
+        if not ids:
+            return []
+        return (
+            self.session.query(Opportunity)
+            .options(
+                selectinload(Opportunity.additional_info),
+                selectinload(Opportunity.keyword),
+            )
+            .filter(Opportunity.opportunity_id.in_(ids))
+            .all()
+        )
+
     def read_opportunity_context(self, opportunity_id: str) -> Optional[Dict[str, Any]]:
         opp = (
             self.session.query(Opportunity)
@@ -172,6 +217,19 @@ class OpportunityDAO:
             return None
 
         kw = (opp.keyword.keywords if opp.keyword else {}) or {}
+        cat_row = self.session.execute(
+            text(
+                """
+                SELECT broad_category, specific_categories
+                FROM opportunity_keywords
+                WHERE opportunity_id = :opportunity_id
+                LIMIT 1
+                """
+            ),
+            {"opportunity_id": str(opportunity_id)},
+        ).mappings().first()
+        broad_category = cat_row["broad_category"] if cat_row else None
+        specific_categories = list(cat_row["specific_categories"] or []) if cat_row else []
 
         return {
             "opportunity_id": opp.opportunity_id,
@@ -179,9 +237,52 @@ class OpportunityDAO:
             "agency": getattr(opp, "agency_name", None),
             "summary": getattr(opp, "summary_description", None),
             "keywords": kw,
+            "broad_category": broad_category,
+            "specific_categories": specific_categories,
         }
 
+    def has_keyword_row(self, opportunity_id: str) -> bool:
+        """Return True when opportunity has a keyword row."""
+        if not opportunity_id:
+            return False
+        row = (
+            self.session.query(OpportunityKeyword.opportunity_id)
+            .filter(OpportunityKeyword.opportunity_id == str(opportunity_id))
+            .one_or_none()
+        )
+        return row is not None
+
+    def find_opportunity_by_title(self, title: str) -> Optional[Opportunity]:
+        """Find one opportunity by title (exact, then case-insensitive partial)."""
+        q = (title or "").strip()
+        if not q:
+            return None
+
+        exact = (
+            self._with_common_relations(self.session.query(Opportunity))
+            .filter(func.lower(Opportunity.opportunity_title) == q.lower())
+            .order_by(Opportunity.created_at.desc().nullslast())
+            .first()
+        )
+        if exact:
+            return exact
+
+        return (
+            self._with_common_relations(self.session.query(Opportunity))
+            .filter(Opportunity.opportunity_title.ilike(f"%{q}%"))
+            .order_by(Opportunity.created_at.desc().nullslast())
+            .first()
+        )
+
     # =============== Iteration Actions ===============
+    def iter_opportunities_with_relations(self, batch_size: int = 200) -> Iterator[Opportunity]:
+        """Iterate all opportunities with common relations preloaded."""
+        q = (
+            self._with_common_relations(self.session.query(Opportunity))
+            .yield_per(batch_size)
+        )
+        yield from q
+
     def iter_opportunity_missing_keywords(self, batch_size: int = 200) -> Iterator[Opportunity]:
         """
         Iterate over grants that has not yet generated keywords.

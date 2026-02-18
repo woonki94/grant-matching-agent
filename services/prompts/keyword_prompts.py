@@ -158,6 +158,35 @@ OPP_SPECIALIZATION_WEIGHT_PROMPT = ChatPromptTemplate.from_messages([
     )
 ])
 
+OPP_CATEGORY_PROMPT = ChatPromptTemplate.from_messages([
+    ("system",
+     "You classify a funding opportunity into high-level grant categories.\n\n"
+     "Definitions:\n"
+     "- broad area grant: large domain where many project variants can fit.\n"
+     "- specialized grant: niche or specific research/specialization requirement.\n"
+     "- basic research: general science/research knowledge generation.\n"
+     "- applied research: research/invention focused on real-world use.\n"
+     "- educational: creation/improvement/evaluation of education programs.\n\n"
+     "Output JSON schema:\n"
+     "{{\n"
+     "  \"broad_category\": \"basic_research|applied_research|educational|unclear\",\n"
+     "  \"specific_categories\": [\"snake_case_code\", \"...\"]\n"
+     "}}\n\n"
+     "Rules:\n"
+     "- Use ONLY provided opportunity context and extracted keywords.\n"
+     "- specific_categories must be short snake_case codes.\n"
+     "- Include one scope marker in specific_categories when possible: broad_area or specialized.\n"
+     "- Add extra topic codes when clear (e.g., k12, teacher_pd, climate_resilience).\n"
+     "- Deduplicate specific_categories.\n"
+     "- If evidence is insufficient, set broad_category=unclear and keep categories minimal."
+    ),
+    ("human",
+     "OPPORTUNITY CONTEXT (JSON):\n{context_json}\n\n"
+     "OPPORTUNITY KEYWORDS (JSON):\n{keywords_json}\n\n"
+     "Return category JSON."
+    )
+])
+
 QUERY_CANDIDATE_PROMPT = ChatPromptTemplate.from_messages([
     ("system",
      "You extract candidate keyword phrases from a user research query for later structuring.\n\n"

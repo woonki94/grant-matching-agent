@@ -18,12 +18,16 @@ if [[ -f "$PROJECT_ROOT/.env" ]]; then
 fi
 
 if [[ -z "${DATABASE_URL:-}" ]]; then
-  if [[ -n "${PGUSER:-}" && -n "${PGPASSWORD:-}" && -n "${PGHOST:-}" && -n "${PGPORT:-}" && -n "${PGDATABASE:-}" ]]; then
-    DATABASE_URL="postgresql://${PGUSER}:${PGPASSWORD}@${PGHOST}:${PGPORT}/${PGDATABASE}"
+  if [[ -n "${PGUSER:-}" && -n "${PGHOST:-}" && -n "${PGPORT:-}" && -n "${PGDATABASE:-}" ]]; then
+    if [[ -n "${PGPASSWORD:-}" ]]; then
+      DATABASE_URL="postgresql://${PGUSER}:${PGPASSWORD}@${PGHOST}:${PGPORT}/${PGDATABASE}"
+    else
+      DATABASE_URL="postgresql://${PGUSER}@${PGHOST}:${PGPORT}/${PGDATABASE}"
+    fi
     export DATABASE_URL
-    echo "DATABASE_URL not set; constructed from PG* env vars."
+    echo "DATABASE_URL not set; constructed from PG* env vars (password optional)."
   else
-    echo "DATABASE_URL is not set, and PG* env vars are incomplete. Export DATABASE_URL or set PGUSER/PGPASSWORD/PGHOST/PGPORT/PGDATABASE in .env."
+    echo "DATABASE_URL is not set, and PG* env vars are incomplete. Export DATABASE_URL or set PGUSER/PGHOST/PGPORT/PGDATABASE (and optional PGPASSWORD) in .env."
     exit 1
   fi
 fi
@@ -51,6 +55,7 @@ SQL
 echo "Running SQL migrations..."
 shopt -s nullglob
 files=("$PROJECT_ROOT/db/migrations/"*.sql)
+
 if [[ ${#files[@]} -eq 0 ]]; then
   echo "No SQL migrations found."
   exit 0
