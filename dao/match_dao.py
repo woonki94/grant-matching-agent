@@ -31,6 +31,45 @@ LIMIT :k
     bindparam("q_application_vec", type_=Vector),
 )
 
+SQL_TOPK_FACULTY_FOR_OPPORTUNITY = text("""
+SELECT
+  femb.faculty_id,
+  GREATEST(
+    CASE WHEN femb.research_domain_vec IS NOT NULL AND oemb.research_domain_vec IS NOT NULL
+      THEN 1 - (femb.research_domain_vec <=> oemb.research_domain_vec) END,
+    CASE WHEN femb.application_domain_vec IS NOT NULL AND oemb.application_domain_vec IS NOT NULL
+      THEN 1 - (femb.application_domain_vec <=> oemb.application_domain_vec) END,
+    CASE WHEN femb.research_domain_vec IS NOT NULL AND oemb.application_domain_vec IS NOT NULL
+      THEN 1 - (femb.research_domain_vec <=> oemb.application_domain_vec) END,
+    CASE WHEN femb.application_domain_vec IS NOT NULL AND oemb.research_domain_vec IS NOT NULL
+      THEN 1 - (femb.application_domain_vec <=> oemb.research_domain_vec) END
+  ) AS domain_sim
+FROM faculty_keyword_embedding femb
+JOIN opportunity_keyword_embedding oemb
+  ON oemb.opportunity_id = :opportunity_id
+ORDER BY domain_sim DESC NULLS LAST
+LIMIT :k
+""")
+
+SQL_DOMAIN_SIM_FOR_FACULTY_OPP = text("""
+SELECT
+  GREATEST(
+    CASE WHEN femb.research_domain_vec IS NOT NULL AND oemb.research_domain_vec IS NOT NULL
+      THEN 1 - (femb.research_domain_vec <=> oemb.research_domain_vec) END,
+    CASE WHEN femb.application_domain_vec IS NOT NULL AND oemb.application_domain_vec IS NOT NULL
+      THEN 1 - (femb.application_domain_vec <=> oemb.application_domain_vec) END,
+    CASE WHEN femb.research_domain_vec IS NOT NULL AND oemb.application_domain_vec IS NOT NULL
+      THEN 1 - (femb.research_domain_vec <=> oemb.application_domain_vec) END,
+    CASE WHEN femb.application_domain_vec IS NOT NULL AND oemb.research_domain_vec IS NOT NULL
+      THEN 1 - (femb.application_domain_vec <=> oemb.research_domain_vec) END
+  ) AS domain_sim
+FROM faculty_keyword_embedding femb
+JOIN opportunity_keyword_embedding oemb
+  ON oemb.opportunity_id = :opportunity_id
+WHERE femb.faculty_id = :faculty_id
+LIMIT 1
+""")
+
 
 class MatchDAO:
     """Data access layer for match result read/write operations."""
@@ -154,6 +193,34 @@ class MatchDAO:
         ).all()
         return self._rows_to_scored_pairs(rows)
 
+    def topk_faculties_for_opportunity(self, *, opportunity_id: str, k: int) -> List[Tuple[int, float]]:
+        """Find top-k faculty for one opportunity using stored embedding vectors."""
+        if not opportunity_id:
+            return []
+        rows = self.session.execute(
+            SQL_TOPK_FACULTY_FOR_OPPORTUNITY,
+            {"opportunity_id": str(opportunity_id), "k": int(k)},
+        ).all()
+        return [(int(r.faculty_id), float(r.domain_sim or 0.0)) for r in rows]
+
+    def domain_similarity_for_faculty_opportunity(
+        self,
+        *,
+        faculty_id: int,
+        opportunity_id: str,
+    ) -> Optional[float]:
+        """Compute embedding-domain similarity for one faculty-opportunity pair."""
+        row = self.session.execute(
+            SQL_DOMAIN_SIM_FOR_FACULTY_OPP,
+            {
+                "faculty_id": int(faculty_id),
+                "opportunity_id": str(opportunity_id),
+            },
+        ).first()
+        if not row:
+            return None
+        return float(row.domain_sim or 0.0)
+
     # =============== Read Actions ===============
     def top_matches_for_faculty(self, faculty_id: int, k: int = 5):
         """Read top stored match results for one faculty ordered by LLM/domain score."""
@@ -164,6 +231,29 @@ class MatchDAO:
             .limit(k)
         )
         return [(gid, float(d), float(l)) for (gid, d, l) in q.all()]
+
+    def get_match_for_faculty_opportunity(
+        self,
+        *,
+        faculty_id: int,
+        opportunity_id: str,
+    ) -> Optional[Dict[str, Any]]:
+        """Read one stored match row by exact (faculty_id, opportunity_id)."""
+        row = self.session.execute(
+            text(
+                """
+                SELECT grant_id, faculty_id, domain_score, llm_score, covered, missing, reason
+                FROM match_results
+                WHERE faculty_id = :faculty_id AND grant_id = :opportunity_id
+                LIMIT 1
+                """
+            ),
+            {
+                "faculty_id": int(faculty_id),
+                "opportunity_id": str(opportunity_id),
+            },
+        ).mappings().first()
+        return dict(row) if row else None
 
     def list_matches_for_opportunity(self, opportunity_id: str, limit: int = 200):
         """List stored faculty match rows for a given opportunity."""

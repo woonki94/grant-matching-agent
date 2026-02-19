@@ -35,3 +35,13 @@ class FacultyContextBuilder:
                 for p in pubs
             ],
         }
+
+    def build_faculty_keyword_context(self, fac: Faculty) -> Dict[str, Any]:
+        kw = (getattr(fac, "keyword", None) and getattr(fac.keyword, "keywords", None)) or {}
+        return {
+            "faculty_id": fac.faculty_id,
+            "name": fac.name,
+            "email": fac.email,
+            "profile_url": fac.source_url,
+            "keywords": kw,
+        }

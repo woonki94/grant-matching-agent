@@ -8,6 +8,7 @@ from services.agent_v2.router import IntentRouter
 from services.agent_v2.state import GrantMatchRequest, GrantMatchWorkflowState
 from services.agent_v2.tool_agents import (
     FacultyContextAgent,
+    GeneralConversationAgent,
     MatchingExecutionAgent,
     OpportunityContextAgent,
 )
@@ -19,6 +20,7 @@ __all__ = [
     "build_memory_checkpointer",
     "IntentRouter",
     "FacultyContextAgent",
+    "GeneralConversationAgent",
     "OpportunityContextAgent",
     "MatchingExecutionAgent",
 ]

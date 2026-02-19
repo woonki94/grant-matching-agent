@@ -314,6 +314,7 @@ class KeywordGenerator:
         limit: int,
         force_regenerate: Optional[bool] = None,
     ) -> None:
+        commit_every = 10
         force = self._resolve_force(force_regenerate)
         faculty_cand_chain, faculty_kw_chain, faculty_w_chain = self.build_keyword_chain(
             FACULTY_CANDIDATE_PROMPT,
@@ -334,6 +335,7 @@ class KeywordGenerator:
             embed_model = settings.bedrock_embed_model_id
 
             if run_faculty:
+                fac_processed = 0
                 fac_iter = fac_dao.iter_faculty_with_relations() if force else fac_dao.iter_faculty_missing_keywords()
                 for fac in self._apply_limit(fac_iter, limit):
                     faculty_keywords, faculty_keywords_raw = self.generate_keywords(
@@ -366,9 +368,14 @@ class KeywordGenerator:
                                 "application_domain_vec": a_vec,
                             }
                         )
-                sess.commit()
+                    fac_processed += 1
+                    if fac_processed % commit_every == 0:
+                        sess.commit()
+                if fac_processed % commit_every != 0:
+                    sess.commit()
 
             if run_opp:
+                opp_processed = 0
                 opp_iter = (
                     opp_dao.iter_opportunities_with_relations()
                     if force
@@ -419,4 +426,8 @@ class KeywordGenerator:
                                 "application_domain_vec": a_vec,
                             }
                         )
-                sess.commit()
+                    opp_processed += 1
+                    if opp_processed % commit_every == 0:
+                        sess.commit()
+                if opp_processed % commit_every != 0:
+                    sess.commit()

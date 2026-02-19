@@ -61,7 +61,7 @@ class GroupJustificationGenerator:
         opp_ids: Optional[List[str]] = None,
         limit_rows: int = 500,
         include_trace: bool = False,
-    ) -> str:
+    ) -> List[Dict[str, Any]]:
         with self.session_factory() as sess:
             odao = OpportunityDAO(sess)
             fdao = FacultyDAO(sess)
@@ -96,6 +96,8 @@ class GroupJustificationGenerator:
                 if opp_id not in opp_cache:
                     opp_cache[opp_id] = odao.read_opportunity_context(opp_id) or {}
                 opp_ctx = opp_cache[opp_id]
+                grant_title = opp_ctx.get("title") or opp_ctx.get("opportunity_title")
+                agency_name = opp_ctx.get("agency") or opp_ctx.get("agency_name")
 
                 if not opp_ctx:
                     results.append(
@@ -103,6 +105,7 @@ class GroupJustificationGenerator:
                             "index": idx,
                             "grant_id": opp_id,
                             "grant_title": None,
+                            "agency_name": None,
                             "grant_link": f"https://simpler.grants.gov/opportunity/{opp_id}",
                             "team": team,
                             "error": "Opportunity not found",
@@ -134,7 +137,8 @@ class GroupJustificationGenerator:
                         {
                             "index": idx,
                             "grant_id": opp_id,
-                            "grant_title": opp_ctx.get("title") or opp_ctx.get("opportunity_title"),
+                            "grant_title": grant_title,
+                            "agency_name": agency_name,
                             "grant_link": f"https://simpler.grants.gov/opportunity/{opp_id}",
                             "team": team,
                             "error": "No faculty contexts found for team",
@@ -164,8 +168,9 @@ class GroupJustificationGenerator:
                     out = {
                         "index": idx,
                         "grant_id": opp_id,
-                        "grant_title": opp_ctx.get("title") or opp_ctx.get("opportunity_title"),
-                        "grant_link": f"https://simpler.grants.gov/opportunity/{opp_id}",
+                        "grant_title": grant_title,
+                        "agency_name": agency_name,
+                        #"grant_link": f"https://simpler.grants.gov/opportunity/{opp_id}",
                         "team": team,
                         "team_members": [
                             {
@@ -175,9 +180,9 @@ class GroupJustificationGenerator:
                             }
                             for f in fac_ctxs
                         ],
-                        "score": row.get("score"),
-                        "final_coverage": coverage,
-                        "requirement_specs": extract_requirement_specs(opp_ctx),
+                        #"score": row.get("score"),
+                        #"final_coverage": coverage,
+                        #"requirement_specs": extract_requirement_specs(opp_ctx),
                         "justification": justification.model_dump(),
                     }
                     if include_trace:
@@ -188,7 +193,8 @@ class GroupJustificationGenerator:
                         {
                             "index": idx,
                             "grant_id": opp_id,
-                            "grant_title": opp_ctx.get("title") or opp_ctx.get("opportunity_title"),
+                            "grant_title": grant_title,
+                            "agency_name": agency_name,
                             "grant_link": f"https://simpler.grants.gov/opportunity/{opp_id}",
                             "team": team,
                             "error": f"{type(e).__name__}: {e}",

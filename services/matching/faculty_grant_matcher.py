@@ -11,6 +11,7 @@ from dao.match_dao import MatchDAO
 from dao.opportunity_dao import OpportunityDAO
 from db.db_conn import SessionLocal
 from db.models.faculty import Faculty
+from sqlalchemy.orm import selectinload
 from dto.llm_response_dto import LLMMatchOut, MissingItem, ScoredCoveredItem
 from services.prompts.matching_prompt import MATCH_PROMPT
 from utils.keyword_utils import keywords_for_matching, requirements_indexed
@@ -196,3 +197,114 @@ class FacultyGrantMatcher:
                 sess.commit()
 
             return len(out_rows)
+
+    def run_for_opportunity(
+        self,
+        *,
+        opportunity_id: str,
+        faculty_ids: Optional[List[int]] = None,
+        k: int = 200,
+        min_domain: float = 0.30,
+    ) -> int:
+        """
+        Generate one-to-one match rows for exactly one grant.
+        If faculty_ids is provided, compute only for those faculty.
+        Otherwise compute for top-k faculty by embedding similarity.
+        Returns number of upserted match rows.
+        """
+        if not opportunity_id:
+            return 0
+
+        chain = self._build_chain()
+
+        with self.session_factory() as sess:
+            opp_dao = OpportunityDAO(sess)
+            match_dao = MatchDAO(sess)
+
+            opps = opp_dao.read_opportunities_by_ids_with_relations([str(opportunity_id)])
+            if not opps:
+                return 0
+            opp = opps[0]
+
+            opp_kw = keywords_for_matching(getattr(opp.keyword, "keywords", {}) or {})
+            req_idx = requirements_indexed(opp_kw)
+            opp_req_idx_json = json.dumps(req_idx, ensure_ascii=False)
+
+            candidates: List[tuple[int, float]] = []
+            if faculty_ids:
+                for fid in sorted({int(x) for x in faculty_ids if x is not None}):
+                    sim = match_dao.domain_similarity_for_faculty_opportunity(
+                        faculty_id=fid,
+                        opportunity_id=str(opportunity_id),
+                    )
+                    if sim is None:
+                        continue
+                    if float(sim) >= float(min_domain):
+                        candidates.append((fid, float(sim)))
+            else:
+                cands = match_dao.topk_faculties_for_opportunity(
+                    opportunity_id=str(opportunity_id),
+                    k=max(int(k), 1),
+                )
+                candidates = [(fid, sim) for (fid, sim) in cands if float(sim) >= float(min_domain)]
+
+            if not candidates:
+                return 0
+
+            fac_ids = [fid for (fid, _) in candidates]
+            fac_rows = (
+                sess.query(Faculty)
+                .options(selectinload(Faculty.keyword))
+                .filter(Faculty.faculty_id.in_(fac_ids))
+                .all()
+            )
+            fac_map = {int(f.faculty_id): f for f in fac_rows}
+
+            out_rows = []
+            for fid, domain_sim in candidates:
+                fac = fac_map.get(int(fid))
+                if not fac:
+                    continue
+
+                fac_kw = keywords_for_matching(getattr(fac.keyword, "keywords", {}) or {})
+                fac_json = json.dumps(fac_kw, ensure_ascii=False)
+
+                scored: LLMMatchOut = chain.invoke(
+                    {
+                        "faculty_kw_json": fac_json,
+                        "requirements_indexed": opp_req_idx_json,
+                    }
+                )
+
+                out_rows.append(
+                    {
+                        "grant_id": str(opportunity_id),
+                        "faculty_id": int(fid),
+                        "domain_score": float(domain_sim),
+                        "llm_score": float(scored.llm_score),
+                        "reason": (scored.reason or "").strip(),
+                        "covered": self._covered_to_grouped(scored.covered),
+                        "missing": self._missing_to_grouped(scored.missing),
+                    }
+                )
+
+            if out_rows:
+                match_dao.upsert_matches(out_rows)
+                sess.commit()
+            return len(out_rows)
+
+    def run_for_opp(
+        self,
+        *,
+        opportunity_id: str,
+        faculty_ids: Optional[List[int]] = None,
+        k: int = 200,
+        min_domain: float = 0.30,
+    ) -> int:
+        """Compatibility alias. Use run_for_opportunity for new code."""
+        return self.run_for_opportunity(
+            opportunity_id=opportunity_id,
+            faculty_ids=faculty_ids,
+            k=k,
+            min_domain=min_domain,
+        )

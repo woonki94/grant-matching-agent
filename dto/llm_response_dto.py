@@ -56,6 +56,10 @@ class WeightedSpecsOut(BaseModel):
     research: List[KeywordItem] = Field(default_factory=list)
     application: List[KeywordItem] = Field(default_factory=list)
 
+class OpportunityCategoryOut(BaseModel):
+    broad_category: Literal["basic_research", "applied_research", "educational", "unclear"] = "unclear"
+    specific_categories: List[str] = Field(default_factory=list)
+
 
 # ───────────────────────────────────────────────
 # Matching / scoring

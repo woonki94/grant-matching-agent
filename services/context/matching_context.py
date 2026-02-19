@@ -46,6 +46,27 @@ class MatchingContextBuilder:
             payload["group_match"] = group_meta
         return payload
 
+    def build_top_match_payload(
+        self,
+        *,
+        sess,
+        top_rows: List[Tuple[str, float, float]],
+    ) -> List[Dict[str, Any]]:
+        opp_dao = OpportunityDAO(sess)
+        out: List[Dict[str, Any]] = []
+        for opp_id, domain_score, llm_score in top_rows or []:
+            opp_ctx = opp_dao.read_opportunity_context(opp_id) or {}
+            out.append(
+                {
+                    "opportunity_id": opp_id,
+                    "title": opp_ctx.get("title"),
+                    "agency": opp_ctx.get("agency"),
+                    "domain_score": float(domain_score),
+                    "llm_score": float(llm_score),
+                }
+            )
+        return out
+
     def build_inputs_for_opportunity(
         self,
         *,

@@ -29,8 +29,8 @@ def main() -> None:
     parser.add_argument("--include-trace", action="store_true", help="Include trace output in result payload")
     args = parser.parse_args()
 
-    service = GroupJustificationGenerator()
-    result = service.run_justifications_from_group_results(
+    group_justification = GroupJustificationGenerator()
+    result = group_justification.run_justifications_from_group_results(
         faculty_emails=args.email,
         team_size=args.team_size,
         opp_ids=args.opp_id,

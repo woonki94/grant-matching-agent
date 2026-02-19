@@ -85,6 +85,17 @@ class FacultyDAO:
             "keywords": kw,
         }
 
+    def has_keyword_row(self, faculty_id: int) -> bool:
+        """Return True when faculty has a keyword row."""
+        if not faculty_id:
+            return False
+        row = (
+            self.session.query(FacultyKeyword.faculty_id)
+            .filter(FacultyKeyword.faculty_id == int(faculty_id))
+            .one_or_none()
+        )
+        return row is not None
+
     # =============== Upsert Actions ===============
     def upsert_faculty(self, dto: FacultyDTO) -> Faculty:
         """Insert or update a faculty row keyed by email."""
