@@ -52,6 +52,84 @@ class FacultyGrantMatcher:
             out[sec] = [x for x in out[sec] if not (x in seen or seen.add(x))]
         return out
 
+    @staticmethod
+    def _faculty_keywords_json(fac: Faculty) -> str:
+        fac_kw = keywords_for_matching(getattr(fac.keyword, "keywords", {}) or {})
+        return json.dumps(fac_kw, ensure_ascii=False)
+
+    @staticmethod
+    def _opportunity_requirements_json(opp) -> str:
+        opp_kw = keywords_for_matching(getattr(opp.keyword, "keywords", {}) or {})
+        req_idx = requirements_indexed(opp_kw)
+        return json.dumps(req_idx, ensure_ascii=False)
+
+    @staticmethod
+    def _score_pair(
+        *,
+        chain,
+        fac_json: str,
+        opp_req_idx_json: str,
+    ) -> LLMMatchOut:
+        return chain.invoke(
+            {
+                "faculty_kw_json": fac_json,
+                "requirements_indexed": opp_req_idx_json,
+            }
+        )
+
+    def _build_match_row(
+        self,
+        *,
+        grant_id: str,
+        faculty_id: int,
+        domain_sim: float,
+        scored: LLMMatchOut,
+    ) -> dict:
+        return {
+            "grant_id": str(grant_id),
+            "faculty_id": int(faculty_id),
+            "domain_score": float(domain_sim),
+            "llm_score": float(scored.llm_score),
+            "reason": (scored.reason or "").strip(),
+            "covered": self._covered_to_grouped(scored.covered),
+            "missing": self._missing_to_grouped(scored.missing),
+        }
+
+    def _build_rows_for_faculty_candidates(
+        self,
+        *,
+        chain,
+        fac: Faculty,
+        faculty_id: int,
+        candidates: List[tuple[str, float]],
+        opp_map: dict,
+    ) -> List[dict]:
+        fac_json = self._faculty_keywords_json(fac)
+        opp_req_cache: dict[str, str] = {}
+        out_rows: List[dict] = []
+
+        for opp_id, domain_sim in candidates:
+            opp = opp_map.get(opp_id)
+            if not opp:
+                continue
+            if opp_id not in opp_req_cache:
+                opp_req_cache[opp_id] = self._opportunity_requirements_json(opp)
+            scored = self._score_pair(
+                chain=chain,
+                fac_json=fac_json,
+                opp_req_idx_json=opp_req_cache[opp_id],
+            )
+            out_rows.append(
+                self._build_match_row(
+                    grant_id=opp_id,
+                    faculty_id=faculty_id,
+                    domain_sim=domain_sim,
+                    scored=scored,
+                )
+            )
+
+        return out_rows
+
     def run(
         self,
         *,
@@ -80,41 +158,17 @@ class FacultyGrantMatcher:
                     processed += 1
                     continue
 
-                fac_kw = keywords_for_matching(getattr(fac.keyword, "keywords", {}) or {})
-                fac_json = json.dumps(fac_kw, ensure_ascii=False)
-
                 opp_ids = [opp_id for opp_id, _ in candidates]
                 opps = opp_dao.read_opportunities_by_ids_with_relations(opp_ids)
                 opp_map = {o.opportunity_id: o for o in opps}
 
-                out_rows = []
-                for opp_id, domain_sim in candidates:
-                    opp = opp_map.get(opp_id)
-                    if not opp:
-                        continue
-
-                    opp_kw = keywords_for_matching(getattr(opp.keyword, "keywords", {}) or {})
-                    req_idx = requirements_indexed(opp_kw)
-                    opp_req_idx_json = json.dumps(req_idx, ensure_ascii=False)
-
-                    scored: LLMMatchOut = chain.invoke(
-                        {
-                            "faculty_kw_json": fac_json,
-                            "requirements_indexed": opp_req_idx_json,
-                        }
-                    )
-
-                    out_rows.append(
-                        {
-                            "grant_id": opp_id,
-                            "faculty_id": fac.faculty_id,
-                            "domain_score": float(domain_sim),
-                            "llm_score": float(scored.llm_score),
-                            "reason": (scored.reason or "").strip(),
-                            "covered": self._covered_to_grouped(scored.covered),
-                            "missing": self._missing_to_grouped(scored.missing),
-                        }
-                    )
+                out_rows = self._build_rows_for_faculty_candidates(
+                    chain=chain,
+                    fac=fac,
+                    faculty_id=int(fac.faculty_id),
+                    candidates=candidates,
+                    opp_map=opp_map,
+                )
 
                 if out_rows:
                     match_dao.upsert_matches(out_rows)
@@ -156,41 +210,17 @@ class FacultyGrantMatcher:
             if not candidates:
                 return 0
 
-            fac_kw = keywords_for_matching(getattr(fac.keyword, "keywords", {}) or {})
-            fac_json = json.dumps(fac_kw, ensure_ascii=False)
-
             opp_ids = [opp_id for opp_id, _ in candidates]
             opps = opp_dao.read_opportunities_by_ids_with_relations(opp_ids)
             opp_map = {o.opportunity_id: o for o in opps}
 
-            out_rows = []
-            for opp_id, domain_sim in candidates:
-                opp = opp_map.get(opp_id)
-                if not opp:
-                    continue
-
-                opp_kw = keywords_for_matching(getattr(opp.keyword, "keywords", {}) or {})
-                req_idx = requirements_indexed(opp_kw)
-                opp_req_idx_json = json.dumps(req_idx, ensure_ascii=False)
-
-                scored: LLMMatchOut = chain.invoke(
-                    {
-                        "faculty_kw_json": fac_json,
-                        "requirements_indexed": opp_req_idx_json,
-                    }
-                )
-
-                out_rows.append(
-                    {
-                        "grant_id": opp_id,
-                        "faculty_id": int(faculty_id),
-                        "domain_score": float(domain_sim),
-                        "llm_score": float(scored.llm_score),
-                        "reason": (scored.reason or "").strip(),
-                        "covered": self._covered_to_grouped(scored.covered),
-                        "missing": self._missing_to_grouped(scored.missing),
-                    }
-                )
+            out_rows = self._build_rows_for_faculty_candidates(
+                chain=chain,
+                fac=fac,
+                faculty_id=int(faculty_id),
+                candidates=candidates,
+                opp_map=opp_map,
+            )
 
             if out_rows:
                 match_dao.upsert_matches(out_rows)
@@ -226,9 +256,7 @@ class FacultyGrantMatcher:
                 return 0
             opp = opps[0]
 
-            opp_kw = keywords_for_matching(getattr(opp.keyword, "keywords", {}) or {})
-            req_idx = requirements_indexed(opp_kw)
-            opp_req_idx_json = json.dumps(req_idx, ensure_ascii=False)
+            opp_req_idx_json = self._opportunity_requirements_json(opp)
 
             candidates: List[tuple[int, float]] = []
             if faculty_ids:
@@ -266,26 +294,19 @@ class FacultyGrantMatcher:
                 if not fac:
                     continue
 
-                fac_kw = keywords_for_matching(getattr(fac.keyword, "keywords", {}) or {})
-                fac_json = json.dumps(fac_kw, ensure_ascii=False)
-
-                scored: LLMMatchOut = chain.invoke(
-                    {
-                        "faculty_kw_json": fac_json,
-                        "requirements_indexed": opp_req_idx_json,
-                    }
+                fac_json = self._faculty_keywords_json(fac)
+                scored = self._score_pair(
+                    chain=chain,
+                    fac_json=fac_json,
+                    opp_req_idx_json=opp_req_idx_json,
                 )
-
                 out_rows.append(
-                    {
-                        "grant_id": str(opportunity_id),
-                        "faculty_id": int(fid),
-                        "domain_score": float(domain_sim),
-                        "llm_score": float(scored.llm_score),
-                        "reason": (scored.reason or "").strip(),
-                        "covered": self._covered_to_grouped(scored.covered),
-                        "missing": self._missing_to_grouped(scored.missing),
-                    }
+                    self._build_match_row(
+                        grant_id=str(opportunity_id),
+                        faculty_id=int(fid),
+                        domain_sim=float(domain_sim),
+                        scored=scored,
+                    )
                 )
 
             if out_rows:

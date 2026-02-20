@@ -17,9 +17,10 @@ class GrantMatchRequest:
     grant_in_db: Optional[bool] = None
     grant_link_valid: Optional[bool] = None
     grant_title_confirmed: Optional[bool] = None
-    desired_broad_category: Optional[str] = None
+    desired_broad_category: Optional[str | List[str]] = None
     topic_query: Optional[str] = None
     requested_team_size: Optional[int] = None
+    requested_top_k_grants: Optional[int] = None
 
 
 class GrantMatchWorkflowState(TypedDict, total=False):
@@ -34,9 +35,10 @@ class GrantMatchWorkflowState(TypedDict, total=False):
     grant_in_db: Optional[bool]
     grant_link_valid: Optional[bool]
     grant_title_confirmed: Optional[bool]
-    desired_broad_category: Optional[str]
+    desired_broad_category: Optional[str | List[str]]
     topic_query: Optional[str]
     requested_team_size: Optional[int]
+    requested_top_k_grants: Optional[int]
 
     scenario: str
     decision: str
@@ -47,9 +49,10 @@ class GrantMatchWorkflowState(TypedDict, total=False):
     emails_detected: List[str]
     grant_link_detected: Optional[str]
     grant_title_detected: Optional[str]
-    desired_broad_category_detected: Optional[str]
+    desired_broad_category_detected: Optional[str | List[str]]
     topic_query_detected: Optional[str]
     requested_team_size_detected: Optional[int]
+    requested_top_k_grants_detected: Optional[int]
     faculty_ids: List[int]
     missing_emails: List[str]
     opportunity_id: Optional[str]

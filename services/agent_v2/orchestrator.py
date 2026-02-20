@@ -4,7 +4,7 @@ from typing import Any, Dict, List, Optional
 
 from services.agent_v2.router import IntentRouter
 from services.agent_v2.state import GrantMatchRequest, GrantMatchWorkflowState
-from services.agent_v2.tool_agents import (
+from services.agent_v2.agents import (
     FacultyContextAgent,
     GeneralConversationAgent,
     MatchingExecutionAgent,
@@ -91,6 +91,7 @@ class GrantMatchOrchestrator:
         )
         topic_query = state.get("topic_query") or inferred.get("topic_query")
         requested_team_size = state.get("requested_team_size") or inferred.get("requested_team_size")
+        requested_top_k_grants = state.get("requested_top_k_grants") or inferred.get("requested_top_k_grants")
         grant_identifier_type = (
             state.get("grant_identifier_type")
             or inferred.get("grant_identifier_type")
@@ -110,6 +111,7 @@ class GrantMatchOrchestrator:
             "desired_broad_category": desired_broad_category,
             "topic_query": topic_query,
             "requested_team_size": requested_team_size,
+            "requested_top_k_grants": requested_top_k_grants,
             "grant_identifier_type": grant_identifier_type,
             "has_faculty_signal": bool(inferred.get("has_faculty_signal")),
             "has_group_signal": bool(inferred.get("has_group_signal")),
@@ -121,6 +123,7 @@ class GrantMatchOrchestrator:
             "desired_broad_category_detected": desired_broad_category,
             "topic_query_detected": topic_query,
             "requested_team_size_detected": requested_team_size,
+            "requested_top_k_grants_detected": requested_top_k_grants,
         }
 
     def _edge_from_route(self, state: GrantMatchWorkflowState) -> str:
@@ -313,13 +316,16 @@ class GrantMatchOrchestrator:
         self._call("GrantMatchOrchestrator._node_generate_keywords_group_specific_grant")
         faculty_ids = [int(x) for x in (state.get("faculty_ids") or [])]
         opp_id = str(state.get("opportunity_id") or "")
+        emails = list(state.get("emails") or [])
         if not faculty_ids:
             return {"decision": "ask_user_reference_data"}
         if not opp_id:
             return {"decision": "ask_grant_identifier"}
+        team_size = self._resolve_team_size(state, emails)
         out = self.matching_agent.generate_keywords_and_matches_for_group_specific_grant(
             faculty_ids=faculty_ids,
             opportunity_id=opp_id,
+            team_size=team_size,
         )
         if str(out.get("next_action", "")).startswith("error_"):
             return {"result": out, "decision": "return_error"}
@@ -333,6 +339,7 @@ class GrantMatchOrchestrator:
         return {
             "result": self.matching_agent.run_one_to_one_matching(
                 faculty_id=int(faculty_ids[0]),
+                top_k=int(state.get("requested_top_k_grants") or 10),
                 broad_category=state.get("desired_broad_category"),
                 query_text=state.get("topic_query"),
             )
@@ -350,6 +357,7 @@ class GrantMatchOrchestrator:
             "result": self.matching_agent.run_one_to_one_matching_with_specific_grant(
                 faculty_id=int(faculty_ids[0]),
                 opportunity_id=opp_id,
+                top_k_grants=state.get("requested_top_k_grants"),
             )
         }
 
@@ -388,6 +396,7 @@ class GrantMatchOrchestrator:
             "result": self.matching_agent.run_group_matching(
                 faculty_emails=emails,
                 team_size=team_size,
+                top_k_grants=state.get("requested_top_k_grants"),
                 broad_category=state.get("desired_broad_category"),
                 query_text=state.get("topic_query"),
             )
@@ -407,6 +416,7 @@ class GrantMatchOrchestrator:
                 faculty_emails=emails,
                 opportunity_id=opp_id,
                 team_size=team_size,
+                top_k_grants=state.get("requested_top_k_grants"),
                 broad_category=state.get("desired_broad_category"),
                 query_text=state.get("topic_query"),
             )
@@ -505,6 +515,7 @@ class GrantMatchOrchestrator:
             "desired_broad_category": request.desired_broad_category,
             "topic_query": request.topic_query,
             "requested_team_size": request.requested_team_size,
+            "requested_top_k_grants": request.requested_top_k_grants,
             "grant_identifier_type": request.grant_identifier_type,
             "grant_in_db": request.grant_in_db,
             "grant_link_valid": request.grant_link_valid,
@@ -513,6 +524,22 @@ class GrantMatchOrchestrator:
 
     @staticmethod
     def _format_output(out: Dict[str, Any]) -> Dict[str, Any]:
+        result = dict(out.get("result") or {})
+        top_k = result.get("top_k_grants")
+        if top_k is None:
+            top_k = out.get("requested_top_k_grants_detected")
+        try:
+            k = int(top_k) if top_k is not None else None
+        except Exception:
+            k = None
+        if k is not None and k > 0:
+            if isinstance(result.get("matches"), list):
+                result["matches"] = list(result["matches"])[:k]
+            recommendation = result.get("recommendation")
+            if isinstance(recommendation, dict) and isinstance(recommendation.get("recommendations"), list):
+                recommendation = dict(recommendation)
+                recommendation["recommendations"] = list(recommendation["recommendations"])[:k]
+                result["recommendation"] = recommendation
         return {
             "scenario": out.get("scenario") or "one_to_one",
             "email_detected": out.get("email_detected"),
@@ -522,7 +549,8 @@ class GrantMatchOrchestrator:
             "desired_broad_category_detected": out.get("desired_broad_category_detected"),
             "topic_query_detected": out.get("topic_query_detected"),
             "requested_team_size_detected": out.get("requested_team_size_detected"),
-            "result": out.get("result") or {},
+            "requested_top_k_grants_detected": out.get("requested_top_k_grants_detected"),
+            "result": result,
         }
 
     def stream(self, request: GrantMatchRequest, *, thread_id: Optional[str] = None):

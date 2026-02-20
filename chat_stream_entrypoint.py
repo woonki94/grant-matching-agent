@@ -137,9 +137,19 @@ def chat():
             grant_in_db=_to_optional_bool(body.get("grant_in_db")),
             grant_link_valid=_to_optional_bool(body.get("grant_link_valid")),
             grant_title_confirmed=_to_optional_bool(body.get("grant_title_confirmed")),
-            desired_broad_category=body.get("desired_broad_category"),
+            desired_broad_category=(
+                body["desired_broad_category"]
+                if "desired_broad_category" in body
+                else body.get("broad_category_filter")
+            ),
             topic_query=body.get("topic_query"),
             requested_team_size=_to_optional_int(body.get("requested_team_size") or body.get("team_size")),
+            requested_top_k_grants=_to_optional_int(
+                body.get("requested_top_k_grants")
+                or body.get("top_k_grants")
+                or body.get("top_k")
+                or body.get("k")
+            ),
         )
 
         decision_out: Dict[str, Any] = {}

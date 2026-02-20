@@ -100,19 +100,83 @@ class SingleJustificationGenerator:
             )
         return out
 
+    @staticmethod
+    def _get_faculty_by_email(sess, *, email: str) -> Faculty:
+        fac = (
+            sess.query(Faculty)
+            .options(selectinload(Faculty.keyword))
+            .filter(Faculty.email == email)
+            .one_or_none()
+        )
+        if not fac:
+            raise ValueError(f"No faculty found with email: {email}")
+        return fac
+
+    @staticmethod
+    def _invoke_llm_recommendations(
+        *,
+        chain,
+        fac_ctx: Dict[str, Any],
+        opp_payloads: List[Dict[str, Any]],
+    ) -> List[FacultyOpportunityRec]:
+        try:
+            out: FacultyRecsOut = chain.invoke(
+                {
+                    "faculty_json": json.dumps(fac_ctx, ensure_ascii=False),
+                    "opps_json": json.dumps(opp_payloads, ensure_ascii=False),
+                }
+            )
+            return list(getattr(out, "recommendations", None) or [])
+        except Exception:
+            return []
+
+    def _build_recommendations_from_payloads(
+        self,
+        *,
+        chain,
+        fac_ctx: Dict[str, Any],
+        opp_payloads: List[Dict[str, Any]],
+        faculty_name: str,
+        k: int,
+        batch_size: int,
+    ) -> FacultyRecsOut:
+        size = max(1, int(batch_size))
+        target_n = min(len(opp_payloads), max(1, int(k)))
+        collected: List[FacultyOpportunityRec] = []
+
+        for start in range(0, target_n, size):
+            chunk = opp_payloads[start : start + size]
+            chunk_recs = self._invoke_llm_recommendations(
+                chain=chain,
+                fac_ctx=fac_ctx,
+                opp_payloads=chunk,
+            )
+            merged_chunk = self._merge_llm_with_db_payloads(
+                llm_recs=chunk_recs,
+                payloads=chunk,
+                faculty_name=faculty_name,
+            )
+            if merged_chunk:
+                collected.extend(merged_chunk)
+
+        if not collected:
+            return self._fallback_recommendations_from_payloads(
+                faculty_name=faculty_name,
+                opp_payloads=opp_payloads,
+                k=target_n,
+            )
+
+        return FacultyRecsOut(
+            faculty_name=faculty_name,
+            recommendations=collected[:target_n],
+        )
+
     def generate_faculty_recs(self, *, email: str, k: int) -> FacultyRecsOut:
         chain = self._build_chain()
 
         with SessionLocal() as sess:
             match_dao = MatchDAO(sess)
-            fac = (
-                sess.query(Faculty)
-                .options(selectinload(Faculty.keyword))
-                .filter(Faculty.email == email)
-                .one_or_none()
-            )
-            if not fac:
-                raise ValueError(f"No faculty found with email: {email}")
+            fac = self._get_faculty_by_email(sess, email=email)
 
             rows = match_dao.top_matches_for_faculty(
                 faculty_id=fac.faculty_id,
@@ -132,43 +196,15 @@ class SingleJustificationGenerator:
                     f"Top matches exist but opportunities are missing in DB for faculty {fac.faculty_id}. "
                     "Re-fetch opportunities or rebuild match_results."
                 )
-
             faculty_name = getattr(fac, "name", None) or email
-            target_n = min(len(opp_payloads), max(1, int(k)))
-            batch_size = 3
-            collected: List[FacultyOpportunityRec] = []
 
-            for start in range(0, target_n, batch_size):
-                chunk = opp_payloads[start : start + batch_size]
-                try:
-                    out: FacultyRecsOut = chain.invoke(
-                        {
-                            "faculty_json": json.dumps(fac_ctx, ensure_ascii=False),
-                            "opps_json": json.dumps(chunk, ensure_ascii=False),
-                        }
-                    )
-                    chunk_recs = list(getattr(out, "recommendations", None) or [])
-                except Exception:
-                    chunk_recs = []
-
-                merged_chunk = self._merge_llm_with_db_payloads(
-                    llm_recs=chunk_recs,
-                    payloads=chunk,
-                    faculty_name=faculty_name,
-                )
-                if merged_chunk:
-                    collected.extend(merged_chunk)
-
-            if not collected:
-                return self._fallback_recommendations_from_payloads(
-                    faculty_name=faculty_name,
-                    opp_payloads=opp_payloads,
-                    k=target_n,
-                )
-
-            return FacultyRecsOut(
+            return self._build_recommendations_from_payloads(
+                chain=chain,
+                fac_ctx=fac_ctx,
+                opp_payloads=opp_payloads,
                 faculty_name=faculty_name,
-                recommendations=collected[:target_n],
+                k=k,
+                batch_size=3,
             )
 
     def generate_for_specific_grant(self, *, email: str, opportunity_id: str) -> FacultyRecsOut:
@@ -181,14 +217,7 @@ class SingleJustificationGenerator:
 
         with SessionLocal() as sess:
             match_dao = MatchDAO(sess)
-            fac = (
-                sess.query(Faculty)
-                .options(selectinload(Faculty.keyword))
-                .filter(Faculty.email == email)
-                .one_or_none()
-            )
-            if not fac:
-                raise ValueError(f"No faculty found with email: {email}")
+            fac = self._get_faculty_by_email(sess, email=email)
 
             pair_row = match_dao.get_match_for_faculty_opportunity(
                 faculty_id=int(fac.faculty_id),
@@ -214,32 +243,13 @@ class SingleJustificationGenerator:
                 raise ValueError(
                     f"Match row exists but opportunity payload is missing for opportunity_id={opp_id}"
                 )
-
             faculty_name = getattr(fac, "name", None) or email
-            try:
-                out: FacultyRecsOut = chain.invoke(
-                    {
-                        "faculty_json": json.dumps(fac_ctx, ensure_ascii=False),
-                        "opps_json": json.dumps(opp_payloads[:1], ensure_ascii=False),
-                    }
-                )
-                llm_recs = list(getattr(out, "recommendations", None) or [])
-            except Exception:
-                llm_recs = []
 
-            merged = self._merge_llm_with_db_payloads(
-                llm_recs=llm_recs[:1],
-                payloads=opp_payloads[:1],
+            return self._build_recommendations_from_payloads(
+                chain=chain,
+                fac_ctx=fac_ctx,
+                opp_payloads=opp_payloads[:1],
                 faculty_name=faculty_name,
-            )
-            if not merged:
-                return self._fallback_recommendations_from_payloads(
-                    faculty_name=faculty_name,
-                    opp_payloads=opp_payloads[:1],
-                    k=1,
-                )
-
-            return FacultyRecsOut(
-                faculty_name=faculty_name,
-                recommendations=merged[:1],
+                k=1,
+                batch_size=1,
             )

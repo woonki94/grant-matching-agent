@@ -6,7 +6,7 @@ from services.agent_v2.orchestrator import (
 )
 from services.agent_v2.router import IntentRouter
 from services.agent_v2.state import GrantMatchRequest, GrantMatchWorkflowState
-from services.agent_v2.tool_agents import (
+from services.agent_v2.agents import (
     FacultyContextAgent,
     GeneralConversationAgent,
     MatchingExecutionAgent,
