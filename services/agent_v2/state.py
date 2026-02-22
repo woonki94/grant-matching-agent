@@ -6,6 +6,11 @@ from typing import Any, Dict, List, Optional, TypedDict
 # email (lowercase) → raw PDF bytes for that faculty member's CV
 CvPdfMap = Dict[str, bytes]
 
+# email (lowercase) → explicit OSU engineering profile URL for that faculty member.
+# Used when the URL cannot be reliably derived from the email address
+# (e.g. houssam.abbas@osu.edu → /people/houssam-abbas, not /people/houssam.abbas).
+OsuUrlMap = Dict[str, str]
+
 
 @dataclass
 class GrantMatchRequest:
@@ -27,6 +32,8 @@ class GrantMatchRequest:
     # email → PDF bytes map; each entry triggers publication ingestion for that faculty.
     # Supports 0, 1, or N CVs in a single request.
     cv_pdf_map: Optional[CvPdfMap] = None
+    # email → explicit OSU profile URL; required for every faculty email provided in the request.
+    osu_url_map: Optional[OsuUrlMap] = None
 
 
 class GrantMatchWorkflowState(TypedDict, total=False):
@@ -47,6 +54,8 @@ class GrantMatchWorkflowState(TypedDict, total=False):
     requested_top_k_grants: Optional[int]
     # email → PDF bytes map; passed through from GrantMatchRequest.
     cv_pdf_map: Optional[CvPdfMap]
+    # email → explicit OSU profile URL; required per faculty, passed through from GrantMatchRequest.
+    osu_url_map: Optional[OsuUrlMap]
 
     scenario: str
     decision: str

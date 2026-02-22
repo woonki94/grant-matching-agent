@@ -86,36 +86,39 @@ def _sanitize_step_update(update: Dict[str, Any]) -> Dict[str, Any]:
     return {"result": {}}
 
 
-def _parse_request() -> tuple[dict, Optional[dict]]:
+def _parse_request() -> tuple[dict, Optional[dict], Optional[dict]]:
     """
-    Parse the incoming request into (fields_dict, cv_pdf_map_or_none).
+    Parse the incoming request into (fields_dict, cv_pdf_map, osu_url_map).
 
-    cv_pdf_map is a dict of {email_lowercase: pdf_bytes} so multiple CVs can be
-    attached in a single request (one per faculty member).
+    cv_pdf_map  — {email: pdf_bytes}  — per-faculty CV upload
+    osu_url_map — {email: osu_url}    — explicit OSU profile URL when the slug
+                                        cannot be derived from the email address
+                                        (e.g. houssam.abbas → /people/houssam-abbas)
 
     Supported content types
     ───────────────────────
     application/json
-        Standard JSON body, no file upload.  cv_pdf_map will be None.
+        Standard JSON body, no file upload.  Both maps will be None.
 
-    multipart/form-data — two attachment styles:
+    multipart/form-data — two attachment styles for each map:
 
-      Style A — single CV (most common, backward-compatible):
-        Field  "cv"       → the PDF file
-        The CV is mapped to the value of the "email" form field.
+      CV  — Style A (single faculty):
+        Field "cv"       → the PDF file  (mapped to the "email" form field)
+      CV  — Style B (group):
+        Fields "cv_email" + "cv_file"   → repeated pairs, one per faculty
 
-      Style B — multiple CVs (group matching):
-        Fields "cv_email" → repeated, one per faculty (e.g. A@osu.edu, B@osu.edu)
-        Fields "cv_file"  → repeated, PDF file for each cv_email (same order)
-        Both lists are zipped together to build the map.
+      OSU — Style A (single faculty):
+        Field "osu_url"  → explicit URL  (mapped to the "email" form field)
+      OSU — Style B (group):
+        Fields "osu_url_email" + "osu_url_value" → repeated pairs, one per faculty
 
-    Style B takes precedence when cv_email/cv_file fields are present.
+    Style B takes precedence over Style A for both maps.
     """
     content_type = (request.content_type or "").lower()
 
     if "multipart/form-data" not in content_type:
         body = request.get_json(silent=True) or {}
-        return body, None
+        return body, None, None
 
     # ── Collect scalar/list form fields ──────────────────────────────────────
     body: dict = {}
@@ -132,41 +135,59 @@ def _parse_request() -> tuple[dict, Optional[dict]]:
             except Exception:
                 pass
 
+    primary_email = str(body.get("email") or "").strip().lower()
+
     # ── Build cv_pdf_map ─────────────────────────────────────────────────────
     cv_pdf_map: dict = {}
 
-    # Style B: explicit per-faculty email+file pairs (group use case).
-    # Each cv_email field is the "label/comment" identifying whose CV the
-    # corresponding cv_file belongs to.  File names are ignored entirely.
     cv_emails = request.form.getlist("cv_email")
     cv_files = request.files.getlist("cv_file")
     if cv_emails and cv_files:
         if len(cv_emails) != len(cv_files):
             logger.warning(
                 "_parse_request: cv_email count (%d) != cv_file count (%d); "
-                "extra entries will be dropped (zip stops at the shorter list)",
-                len(cv_emails),
-                len(cv_files),
+                "extra entries will be dropped",
+                len(cv_emails), len(cv_files),
             )
-        for email, fobj in zip(cv_emails, cv_files):
-            email = email.strip().lower()
-            if email:
-                cv_pdf_map[email] = fobj.read()
+        for em, fobj in zip(cv_emails, cv_files):
+            em = em.strip().lower()
+            if em:
+                cv_pdf_map[em] = fobj.read()
 
-    # Style A: single "cv" file → associate with the primary "email" field.
     if not cv_pdf_map:
         cv_file = request.files.get("cv")
-        if cv_file:
-            primary_email = str(body.get("email") or "").strip().lower()
-            if primary_email:
-                cv_pdf_map[primary_email] = cv_file.read()
+        if cv_file and primary_email:
+            cv_pdf_map[primary_email] = cv_file.read()
 
-    return body, cv_pdf_map or None
+    # ── Build osu_url_map ─────────────────────────────────────────────────────
+    osu_url_map: dict = {}
+
+    osu_url_emails = request.form.getlist("osu_url_email")
+    osu_url_values = request.form.getlist("osu_url_value")
+    if osu_url_emails and osu_url_values:
+        if len(osu_url_emails) != len(osu_url_values):
+            logger.warning(
+                "_parse_request: osu_url_email count (%d) != osu_url_value count (%d); "
+                "extra entries will be dropped",
+                len(osu_url_emails), len(osu_url_values),
+            )
+        for em, url in zip(osu_url_emails, osu_url_values):
+            em = em.strip().lower()
+            url = url.strip()
+            if em and url:
+                osu_url_map[em] = url
+
+    if not osu_url_map:
+        single_osu_url = str(body.get("osu_url") or "").strip()
+        if single_osu_url and primary_email:
+            osu_url_map[primary_email] = single_osu_url
+
+    return body, cv_pdf_map or None, osu_url_map or None
 
 
 @app.post("/api/chat")
 def chat():
-    body, cv_pdf_map = _parse_request()
+    body, cv_pdf_map, osu_url_map = _parse_request()
     user_message = str(body.get("message") or "").strip()
     thread_id = str(body.get("thread_id") or "default-thread")
 
@@ -187,6 +208,34 @@ def chat():
                 },
             )
             return
+
+        # Validate: every explicitly provided email must have a matching osu_url entry.
+        # This check only applies when emails are given in the request body; the
+        # orchestrator may still ask for emails later (via ask_email / ask_group_emails).
+        explicitly_provided_emails: List[str] = []
+        raw_single = str(body.get("email") or "").strip().lower()
+        if raw_single:
+            explicitly_provided_emails.append(raw_single)
+        for e in _to_email_list(body.get("emails")):
+            if e not in explicitly_provided_emails:
+                explicitly_provided_emails.append(e)
+
+        if explicitly_provided_emails:
+            missing_osu = [e for e in explicitly_provided_emails if e not in (osu_url_map or {})]
+            if missing_osu:
+                print(f"chat.request_info.missing_osu_url: {missing_osu}")
+                yield emit(
+                    "request_info",
+                    {
+                        "type": "missing_osu_url",
+                        "message": (
+                            "Please provide an OSU engineering profile URL for each faculty member. "
+                            f"Missing for: {', '.join(missing_osu)}"
+                        ),
+                        "emails_missing_osu_url": missing_osu,
+                    },
+                )
+                return
 
         orchestrator, orchestrator_error = _get_orchestrator()
         if orchestrator is None:
@@ -232,6 +281,7 @@ def chat():
                 or body.get("k")
             ),
             cv_pdf_map=cv_pdf_map,
+            osu_url_map=osu_url_map,
         )
 
         decision_out: Dict[str, Any] = {}

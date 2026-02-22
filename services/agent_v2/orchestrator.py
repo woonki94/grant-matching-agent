@@ -146,6 +146,7 @@ class GrantMatchOrchestrator:
         ingested = self.faculty_agent.resolve_and_ingest_faculties(
             emails=[str(state.get("email"))],
             cv_pdf_map=state.get("cv_pdf_map"),
+            osu_url_map=state.get("osu_url_map"),
         )
         # Only fall back to asking the user when scraping itself failed (i.e., no
         # faculty IDs could be resolved at all — not merely "not in DB").
@@ -175,9 +176,11 @@ class GrantMatchOrchestrator:
         # resolve_and_ingest_faculties: scrapes + inserts any missing/stale faculty in
         # parallel, then runs keyword generation for newly added members.
         # cv_pdf_map carries per-faculty CV bytes; only emails present as keys are enriched.
+        # osu_url_map carries explicit OSU profile URLs for faculty whose slugs differ from email.
         ingested = self.faculty_agent.resolve_and_ingest_faculties(
             emails=emails,
             cv_pdf_map=state.get("cv_pdf_map"),
+            osu_url_map=state.get("osu_url_map"),
         )
         # Proceed even if some emails failed — as long as at least one faculty resolved.
         # Only hard-stop when no faculty could be resolved at all.
@@ -198,9 +201,11 @@ class GrantMatchOrchestrator:
         # resolve_and_ingest_faculties: scrapes + inserts any missing/stale faculty in
         # parallel, then runs keyword generation for newly added members.
         # cv_pdf_map carries per-faculty CV bytes; only emails present as keys are enriched.
+        # osu_url_map carries explicit OSU profile URLs for faculty whose slugs differ from email.
         ingested = self.faculty_agent.resolve_and_ingest_faculties(
             emails=emails,
             cv_pdf_map=state.get("cv_pdf_map"),
+            osu_url_map=state.get("osu_url_map"),
         )
         # Proceed even if some emails failed — as long as at least one faculty resolved.
         # Only hard-stop when no faculty could be resolved at all.
@@ -545,6 +550,7 @@ class GrantMatchOrchestrator:
             "grant_link_valid": request.grant_link_valid,
             "grant_title_confirmed": request.grant_title_confirmed,
             "cv_pdf_map": request.cv_pdf_map,
+            "osu_url_map": request.osu_url_map,
         }
 
     @staticmethod

@@ -76,12 +76,6 @@ class FacultyContextAgent:
     # Ingestion helpers
     # ──────────────────────────────────────────────────────────────────
 
-    @staticmethod
-    def _osu_profile_url(email: str) -> str:
-        """Derive OSU engineering profile URL from an email address."""
-        prefix = email.split("@")[0]
-        return f"{settings.osu_eng_base_url}/people/{prefix}"
-
     def _classify_emails(
         self,
         normalized: List[str],
@@ -123,16 +117,19 @@ class FacultyContextAgent:
 
         return {"known": known, "stale": stale, "unknown": unknown}
 
-    def _scrape_and_upsert_one(self, email: str) -> int:
+    def _scrape_and_upsert_one(self, email: str, osu_url: str) -> int:
         """
-        Scrape the OSU engineering profile for `email`, upsert the record into
-        the DB, and enrich from personal/lab website links.
+        Scrape the OSU engineering profile for `email` using the supplied URL,
+        upsert the record into the DB, and enrich from personal/lab website links.
         Publication ingestion from a CV PDF is handled separately.
+
+        osu_url: the exact OSU engineering profile URL provided by the caller.
+                 No URL is derived automatically — callers must always pass it.
 
         Opens its own DB session — safe to call from a worker thread.
         Returns the faculty_id on success; raises on failure.
         """
-        url = self._osu_profile_url(email)
+        url = osu_url
         profile = parse_profile(url)
 
         # Guarantee the email field is populated even when the page omits it.
@@ -187,6 +184,7 @@ class FacultyContextAgent:
         keyword_generator: Optional[Any] = None,
         stale_threshold_days: int = _STALE_DAYS,
         cv_pdf_map: Optional[Dict[str, bytes]] = None,
+        osu_url_map: Optional[Dict[str, str]] = None,
     ) -> Dict[str, Any]:
         """
         Full resolution with automatic ingestion of missing or stale faculty.
@@ -206,6 +204,12 @@ class FacultyContextAgent:
             email (lowercase) → raw PDF bytes for that faculty member's CV.
             Supports 0, 1, or N CVs in a single call.
 
+        osu_url_map: Dict[str, str]
+            email (lowercase) → explicit OSU engineering profile URL.
+            Required for any email that is not already in the DB (unknown) or
+            needs a profile refresh (stale).  Without an entry here, stale
+            emails are kept as-is and unknown emails are marked as failed.
+
         Returns:
             {
                 "resolved":    List[int],   # faculty_ids ready for matching
@@ -218,15 +222,35 @@ class FacultyContextAgent:
 
         # ── 1. Classify ───────────────────────────────────────────────
         classes = self._classify_emails(normalized, stale_threshold_days)
-        known_emails: List[str] = classes["known"]
-        to_ingest: List[str] = classes["stale"] + classes["unknown"]
+        url_map = osu_url_map or {}
+
+        # Stale emails with no OSU URL provided → keep existing DB data (treat as known).
+        # Unknown emails with no OSU URL provided → cannot create record → fail.
+        stale_with_url    = [e for e in classes["stale"]   if e in url_map]
+        stale_without_url = [e for e in classes["stale"]   if e not in url_map]
+        unknown_with_url  = [e for e in classes["unknown"] if e in url_map]
+        unknown_without_url = [e for e in classes["unknown"] if e not in url_map]
+
+        known_emails: List[str] = classes["known"] + stale_without_url
+        to_ingest: List[str]    = stale_with_url + unknown_with_url
 
         logger.info(
-            "FacultyContextAgent.resolve_and_ingest_faculties: known=%d stale=%d unknown=%d",
-            len(known_emails),
-            len(classes["stale"]),
-            len(classes["unknown"]),
+            "FacultyContextAgent.resolve_and_ingest_faculties: "
+            "known=%d stale_refresh=%d stale_skip=%d unknown_ingest=%d unknown_fail=%d",
+            len(classes["known"]),
+            len(stale_with_url),
+            len(stale_without_url),
+            len(unknown_with_url),
+            len(unknown_without_url),
         )
+
+        if unknown_without_url:
+            logger.warning(
+                "FacultyContextAgent: %d email(s) not in DB and no osu_url provided — "
+                "they will be marked as failed: %s",
+                len(unknown_without_url),
+                unknown_without_url,
+            )
 
         # Fetch faculty_ids for already-known emails and build email→fid map.
         email_to_fid: Dict[str, int] = {}
@@ -242,12 +266,16 @@ class FacultyContextAgent:
 
         # ── 2. Parallel scrape + upsert ───────────────────────────────
         newly_added: List[str] = []
-        failed: List[str] = []
+        failed: List[str] = list(unknown_without_url)
 
         if to_ingest:
             with ThreadPoolExecutor(max_workers=_MAX_SCRAPE_WORKERS) as pool:
                 future_to_email = {
-                    pool.submit(self._scrape_and_upsert_one, email): email
+                    pool.submit(
+                        self._scrape_and_upsert_one,
+                        email,
+                        url_map[email],   # always present — filtered above
+                    ): email
                     for email in to_ingest
                 }
                 for future in as_completed(future_to_email):
