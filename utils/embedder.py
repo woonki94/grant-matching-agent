@@ -1,28 +1,17 @@
 from __future__ import annotations
-import os, time, numpy as np
+import numpy as np
 from typing import List, Optional
-from openai import OpenAI, APIError, RateLimitError, APITimeoutError
-from dotenv import load_dotenv
-from pathlib import Path
 
-from config import settings, get_embedding_client
+from config import get_embedding_client
 
-def _retry(fn, n: int = 4, backoff: float = 0.75):
-    for i in range(n):
-        try:
-            return fn()
-        except (RateLimitError, APITimeoutError, APIError):
-            if i == n - 1:
-                raise
-            time.sleep(backoff * (2 ** i))
 
 def embed_texts(texts: List[str]) -> np.ndarray:
     clean = [(t or "").strip() for t in texts]
     if not clean:
         return np.zeros((0, 0), dtype=np.float32)
 
-    embedding_client =  get_embedding_client().build()
-    vecs = _retry(lambda: embedding_client.embed_documents(clean))
+    embedding_client = get_embedding_client().build()
+    vecs = embedding_client.embed_documents(clean)
 
     return np.array(vecs, dtype=np.float32)
 
