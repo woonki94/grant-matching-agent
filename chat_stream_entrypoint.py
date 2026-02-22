@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import json
+import logging
 from typing import Any, Dict, List, Optional
 
 from flask import Flask, Response, request, stream_with_context
+
+logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
 
@@ -83,9 +86,87 @@ def _sanitize_step_update(update: Dict[str, Any]) -> Dict[str, Any]:
     return {"result": {}}
 
 
+def _parse_request() -> tuple[dict, Optional[dict]]:
+    """
+    Parse the incoming request into (fields_dict, cv_pdf_map_or_none).
+
+    cv_pdf_map is a dict of {email_lowercase: pdf_bytes} so multiple CVs can be
+    attached in a single request (one per faculty member).
+
+    Supported content types
+    ───────────────────────
+    application/json
+        Standard JSON body, no file upload.  cv_pdf_map will be None.
+
+    multipart/form-data — two attachment styles:
+
+      Style A — single CV (most common, backward-compatible):
+        Field  "cv"       → the PDF file
+        The CV is mapped to the value of the "email" form field.
+
+      Style B — multiple CVs (group matching):
+        Fields "cv_email" → repeated, one per faculty (e.g. A@osu.edu, B@osu.edu)
+        Fields "cv_file"  → repeated, PDF file for each cv_email (same order)
+        Both lists are zipped together to build the map.
+
+    Style B takes precedence when cv_email/cv_file fields are present.
+    """
+    content_type = (request.content_type or "").lower()
+
+    if "multipart/form-data" not in content_type:
+        body = request.get_json(silent=True) or {}
+        return body, None
+
+    # ── Collect scalar/list form fields ──────────────────────────────────────
+    body: dict = {}
+    for key in request.form:
+        values = request.form.getlist(key)
+        body[key] = values[0] if len(values) == 1 else values
+
+    # JSON-decode fields that may be sent as JSON strings (e.g. emails array).
+    for key in ("emails",):
+        raw = body.get(key)
+        if isinstance(raw, str):
+            try:
+                body[key] = json.loads(raw)
+            except Exception:
+                pass
+
+    # ── Build cv_pdf_map ─────────────────────────────────────────────────────
+    cv_pdf_map: dict = {}
+
+    # Style B: explicit per-faculty email+file pairs (group use case).
+    # Each cv_email field is the "label/comment" identifying whose CV the
+    # corresponding cv_file belongs to.  File names are ignored entirely.
+    cv_emails = request.form.getlist("cv_email")
+    cv_files = request.files.getlist("cv_file")
+    if cv_emails and cv_files:
+        if len(cv_emails) != len(cv_files):
+            logger.warning(
+                "_parse_request: cv_email count (%d) != cv_file count (%d); "
+                "extra entries will be dropped (zip stops at the shorter list)",
+                len(cv_emails),
+                len(cv_files),
+            )
+        for email, fobj in zip(cv_emails, cv_files):
+            email = email.strip().lower()
+            if email:
+                cv_pdf_map[email] = fobj.read()
+
+    # Style A: single "cv" file → associate with the primary "email" field.
+    if not cv_pdf_map:
+        cv_file = request.files.get("cv")
+        if cv_file:
+            primary_email = str(body.get("email") or "").strip().lower()
+            if primary_email:
+                cv_pdf_map[primary_email] = cv_file.read()
+
+    return body, cv_pdf_map or None
+
+
 @app.post("/api/chat")
 def chat():
-    body = request.get_json(silent=True) or {}
+    body, cv_pdf_map = _parse_request()
     user_message = str(body.get("message") or "").strip()
     thread_id = str(body.get("thread_id") or "default-thread")
 
@@ -150,6 +231,7 @@ def chat():
                 or body.get("top_k")
                 or body.get("k")
             ),
+            cv_pdf_map=cv_pdf_map,
         )
 
         decision_out: Dict[str, Any] = {}

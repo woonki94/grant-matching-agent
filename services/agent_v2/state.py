@@ -3,6 +3,9 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, TypedDict
 
+# email (lowercase) → raw PDF bytes for that faculty member's CV
+CvPdfMap = Dict[str, bytes]
+
 
 @dataclass
 class GrantMatchRequest:
@@ -21,6 +24,9 @@ class GrantMatchRequest:
     topic_query: Optional[str] = None
     requested_team_size: Optional[int] = None
     requested_top_k_grants: Optional[int] = None
+    # email → PDF bytes map; each entry triggers publication ingestion for that faculty.
+    # Supports 0, 1, or N CVs in a single request.
+    cv_pdf_map: Optional[CvPdfMap] = None
 
 
 class GrantMatchWorkflowState(TypedDict, total=False):
@@ -39,6 +45,8 @@ class GrantMatchWorkflowState(TypedDict, total=False):
     topic_query: Optional[str]
     requested_team_size: Optional[int]
     requested_top_k_grants: Optional[int]
+    # email → PDF bytes map; passed through from GrantMatchRequest.
+    cv_pdf_map: Optional[CvPdfMap]
 
     scenario: str
     decision: str

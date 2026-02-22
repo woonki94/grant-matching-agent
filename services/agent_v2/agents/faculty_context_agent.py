@@ -9,7 +9,7 @@ from config import settings
 from dao.faculty_dao import FacultyDAO
 from db.db_conn import SessionLocal
 from mappers.page_to_faculty import map_faculty_profile_to_dto
-from services.faculty.enrich_profile import enrich_new_faculty
+from services.faculty.enrich_profile import enrich_faculty_publications_from_cv, enrich_new_faculty
 from services.faculty.profile_parser import parse_profile
 
 logger = logging.getLogger(__name__)
@@ -186,6 +186,7 @@ class FacultyContextAgent:
         emails: List[str],
         keyword_generator: Optional[Any] = None,
         stale_threshold_days: int = _STALE_DAYS,
+        cv_pdf_map: Optional[Dict[str, bytes]] = None,
     ) -> Dict[str, Any]:
         """
         Full resolution with automatic ingestion of missing or stale faculty.
@@ -196,6 +197,14 @@ class FacultyContextAgent:
              (up to _MAX_SCRAPE_WORKERS threads, each with its own DB session).
           3. Run keyword generation sequentially for every newly ingested
              faculty (serialised to avoid Bedrock rate limits).
+          4. If cv_pdf_map is provided, run publication enrichment from the
+             per-faculty CV PDFs.  Only emails present as keys in cv_pdf_map
+             are enriched — the rest are skipped.  Title-based dedup makes
+             re-runs safe.
+
+        cv_pdf_map: Dict[str, bytes]
+            email (lowercase) → raw PDF bytes for that faculty member's CV.
+            Supports 0, 1, or N CVs in a single call.
 
         Returns:
             {
@@ -219,22 +228,21 @@ class FacultyContextAgent:
             len(classes["unknown"]),
         )
 
-        # Fetch faculty_ids for already-known emails.
-        resolved: List[int] = []
+        # Fetch faculty_ids for already-known emails and build email→fid map.
+        email_to_fid: Dict[str, int] = {}
         try:
             with self.session_factory() as sess:
                 dao = FacultyDAO(sess)
                 for email in known_emails:
                     fid = dao.get_faculty_id_by_email(email)
                     if fid is not None:
-                        resolved.append(int(fid))
+                        email_to_fid[email] = int(fid)
         except Exception:
             logger.exception("FacultyContextAgent: could not fetch known faculty_ids")
 
         # ── 2. Parallel scrape + upsert ───────────────────────────────
         newly_added: List[str] = []
         failed: List[str] = []
-        newly_added_ids: Dict[str, int] = {}  # email → faculty_id
 
         if to_ingest:
             with ThreadPoolExecutor(max_workers=_MAX_SCRAPE_WORKERS) as pool:
@@ -247,7 +255,7 @@ class FacultyContextAgent:
                     try:
                         faculty_id = future.result()
                         newly_added.append(email)
-                        newly_added_ids[email] = faculty_id
+                        email_to_fid[email] = faculty_id
                         logger.info(
                             "FacultyContextAgent: ingested %s → faculty_id=%s",
                             email,
@@ -260,7 +268,7 @@ class FacultyContextAgent:
         # ── 3. Sequential keyword generation ─────────────────────────
         if keyword_generator is not None:
             for email in newly_added:
-                fid = newly_added_ids.get(email)
+                fid = email_to_fid.get(email)
                 if not fid:
                     continue
                 try:
@@ -275,9 +283,32 @@ class FacultyContextAgent:
                         "FacultyContextAgent: keyword generation failed for faculty_id=%s", fid
                     )
 
-        # Merge newly-ingested ids into the resolved list.
-        resolved.extend(newly_added_ids[e] for e in newly_added if e in newly_added_ids)
+        # ── 4. CV publication enrichment (per-email, explicit map) ────
+        # For each email that has an entry in cv_pdf_map, run enrichment
+        # against that specific faculty's CV.  Works for 1 or N CVs.
+        if cv_pdf_map:
+            for email in normalized:
+                cv_bytes = cv_pdf_map.get(email)
+                fid = email_to_fid.get(email)
+                if not cv_bytes or not fid:
+                    continue
+                try:
+                    inserted = enrich_faculty_publications_from_cv(fid, cv_bytes)
+                    logger.info(
+                        "FacultyContextAgent: CV enrichment inserted %d publications "
+                        "for email=%s faculty_id=%s",
+                        inserted,
+                        email,
+                        fid,
+                    )
+                except Exception:
+                    logger.exception(
+                        "FacultyContextAgent: CV enrichment failed for email=%s faculty_id=%s",
+                        email,
+                        fid,
+                    )
 
+        resolved = list(email_to_fid.values())
         return {
             "resolved": resolved,
             "newly_added": newly_added,

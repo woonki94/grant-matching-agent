@@ -6,7 +6,7 @@ from typing import Optional
 
 import boto3
 
-from config import settings
+from config import get_llm_client, settings
 from db.db_conn import SessionLocal
 from db.models.faculty import Faculty, FacultyAdditionalInfo
 from services.faculty.profile_parser import parse_profile
@@ -180,3 +180,55 @@ def enrich_new_faculty(
             "personal_used": bool(personal_website),
         },
     )
+
+
+def enrich_faculty_publications_from_cv(
+    faculty_id: int,
+    cv_pdf_bytes: bytes,
+) -> int:
+    """
+    Extract publications from a CV PDF and persist them to the DB.
+
+    Uses the LLM to parse the publication list from the CV text, then
+    enriches each entry with an abstract via arXiv → Semantic Scholar → URL.
+    Deduplication is title-based so re-running is safe.
+
+    Returns the number of new publication rows inserted.
+    """
+    if not faculty_id or not cv_pdf_bytes:
+        return 0
+
+    # Lazy import to avoid circular deps and defer heavy startup cost.
+    from utils.publication_extractor import extract_publications_from_cv_bytes
+
+    try:
+        llm = get_llm_client().build()
+        dtos = extract_publications_from_cv_bytes(cv_pdf_bytes, llm)
+    except Exception:
+        logger.exception(
+            "Failed to extract publications from CV",
+            extra={"faculty_id": faculty_id},
+        )
+        return 0
+
+    if not dtos:
+        logger.info("No publications extracted from CV", extra={"faculty_id": faculty_id})
+        return 0
+
+    try:
+        with SessionLocal() as sess:
+            dao = FacultyDAO(sess)
+            count = dao.upsert_publications_by_title(faculty_id, dtos)
+            sess.commit()
+        logger.info(
+            "CV publication enrichment: inserted %d rows",
+            count,
+            extra={"faculty_id": faculty_id},
+        )
+        return count
+    except Exception:
+        logger.exception(
+            "Failed to save CV publications to DB",
+            extra={"faculty_id": faculty_id},
+        )
+        return 0

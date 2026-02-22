@@ -142,8 +142,10 @@ class GrantMatchOrchestrator:
             return {"decision": "ask_email"}
         # resolve_and_ingest_faculties: looks up DB, scrapes + inserts if missing/stale,
         # then runs keyword generation for any newly added faculty.
+        # cv_pdf_map triggers per-faculty CV publication ingestion when provided.
         ingested = self.faculty_agent.resolve_and_ingest_faculties(
-            emails=[str(state.get("email"))]
+            emails=[str(state.get("email"))],
+            cv_pdf_map=state.get("cv_pdf_map"),
         )
         # Only fall back to asking the user when scraping itself failed (i.e., no
         # faculty IDs could be resolved at all — not merely "not in DB").
@@ -172,7 +174,11 @@ class GrantMatchOrchestrator:
             return {"decision": "ask_group_emails"}
         # resolve_and_ingest_faculties: scrapes + inserts any missing/stale faculty in
         # parallel, then runs keyword generation for newly added members.
-        ingested = self.faculty_agent.resolve_and_ingest_faculties(emails=emails)
+        # cv_pdf_map carries per-faculty CV bytes; only emails present as keys are enriched.
+        ingested = self.faculty_agent.resolve_and_ingest_faculties(
+            emails=emails,
+            cv_pdf_map=state.get("cv_pdf_map"),
+        )
         # Proceed even if some emails failed — as long as at least one faculty resolved.
         # Only hard-stop when no faculty could be resolved at all.
         if not ingested.get("resolved"):
@@ -191,7 +197,11 @@ class GrantMatchOrchestrator:
             return {"decision": "ask_group_emails"}
         # resolve_and_ingest_faculties: scrapes + inserts any missing/stale faculty in
         # parallel, then runs keyword generation for newly added members.
-        ingested = self.faculty_agent.resolve_and_ingest_faculties(emails=emails)
+        # cv_pdf_map carries per-faculty CV bytes; only emails present as keys are enriched.
+        ingested = self.faculty_agent.resolve_and_ingest_faculties(
+            emails=emails,
+            cv_pdf_map=state.get("cv_pdf_map"),
+        )
         # Proceed even if some emails failed — as long as at least one faculty resolved.
         # Only hard-stop when no faculty could be resolved at all.
         if not ingested.get("resolved"):
@@ -534,6 +544,7 @@ class GrantMatchOrchestrator:
             "grant_in_db": request.grant_in_db,
             "grant_link_valid": request.grant_link_valid,
             "grant_title_confirmed": request.grant_title_confirmed,
+            "cv_pdf_map": request.cv_pdf_map,
         }
 
     @staticmethod
