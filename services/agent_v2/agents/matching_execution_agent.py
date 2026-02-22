@@ -723,3 +723,278 @@ class MatchingExecutionAgent:
             "query_text": (str(query_text or "").strip() or None),
             "broad_category_filter": self._normalize_broad_category_for_output(broad_category),
         }
+
+    # ──────────────────────────────────────────────────────────────────
+    # Collaborator / team-formation helpers
+    # ──────────────────────────────────────────────────────────────────
+
+    def _get_faculty_details(self, faculty_id: int, is_existing: bool = False) -> Optional[Dict[str, Any]]:
+        """Return a dict of faculty profile + keyword info for one faculty_id."""
+        try:
+            from db.models.faculty import Faculty as FacultyModel
+            with self.session_factory() as sess:
+                fac = sess.get(FacultyModel, int(faculty_id))
+                if not fac:
+                    return None
+                kw_ctx = FacultyDAO(sess).get_faculty_keyword_context(int(faculty_id))
+                keywords = (kw_ctx or {}).get("keywords", {})
+                return {
+                    "faculty_id": int(faculty_id),
+                    "name": getattr(fac, "name", None),
+                    "email": getattr(fac, "email", None),
+                    "position": getattr(fac, "position", None),
+                    "expertise": list(getattr(fac, "expertise", None) or []),
+                    "research_domains": list((keywords.get("research") or {}).get("domain", [])),
+                    "application_domains": list((keywords.get("application") or {}).get("domain", [])),
+                    "is_existing_member": is_existing,
+                }
+        except Exception:
+            return None
+
+    def _ensure_opportunity_embedding(self, opportunity_id: str) -> None:
+        """Generate opportunity keywords+embedding if not already present."""
+        with self.session_factory() as sess:
+            if not OpportunityDAO(sess).has_keyword_row(opportunity_id):
+                self.keyword_generator.generate_opportunity_keywords_for_id(opportunity_id)
+
+    # LLM pre-filter pool multiplier: score this many candidates via LLM, keep top-N
+    LLM_POOL_MULTIPLIER = 4
+    LLM_POOL_MIN = 15
+
+    def _run_llm_scoring_for_candidates(
+        self,
+        opp_id: str,
+        candidate_ids: List[int],
+    ) -> Dict[int, Dict[str, Any]]:
+        """
+        Run FacultyGrantMatcher for a batch of candidates against one opportunity,
+        then read the stored MatchResult rows.
+
+        Returns {faculty_id: {llm_score, domain_score, reason, covered, missing}}.
+        """
+        if not candidate_ids:
+            return {}
+
+        # FacultyGrantMatcher.run_for_opportunity computes + stores match rows.
+        self.faculty_matcher.run_for_opportunity(
+            opportunity_id=opp_id,
+            faculty_ids=candidate_ids,
+            min_domain=0.0,
+        )
+
+        scores: Dict[int, Dict[str, Any]] = {}
+        with self.session_factory() as sess:
+            mdao = MatchDAO(sess)
+            for fid in candidate_ids:
+                row = mdao.get_match_for_faculty_opportunity(
+                    faculty_id=int(fid),
+                    opportunity_id=opp_id,
+                )
+                if row:
+                    scores[int(fid)] = {
+                        "llm_score":    round(float(row.get("llm_score")    or 0), 3),
+                        "domain_score": round(float(row.get("domain_score") or 0), 3),
+                        "reason":   str(row.get("reason")  or ""),
+                        "covered":  list(row.get("covered") or []),
+                        "missing":  list(row.get("missing") or []),
+                    }
+        return scores
+
+    def find_collaborators_for_grant(
+        self,
+        *,
+        opportunity_id: str,
+        existing_faculty_ids: Optional[List[int]] = None,
+        additional_count: int = 3,
+    ) -> Dict[str, Any]:
+        """
+        Find top `additional_count` faculty who would complement the existing team
+        for a specific grant.
+
+        Two-phase approach:
+          1. Fast embedding pre-filter — topk_faculties_for_opportunity (pgvector)
+          2. LLM scoring — FacultyGrantMatcher on the top-N*LLM_POOL candidates
+          3. Re-rank by llm_score; return top additional_count with rich output.
+
+        Each result includes: name, email, position, expertise, research/application
+        domains, domain_score, llm_score, reason (one-line LLM justification),
+        covered topics, and missing topics.
+        """
+        self._call("MatchingExecutionAgent.find_collaborators_for_grant")
+        opp_id = str(opportunity_id or "").strip()
+        if not opp_id:
+            return {
+                "next_action": "error_find_collaborators",
+                "error": "Missing opportunity_id.",
+                "suggested_collaborators": [],
+            }
+
+        exclude_ids: Set[int] = set(map(int, existing_faculty_ids or []))
+
+        try:
+            # ── Phase 0: ensure opportunity has keyword embeddings ─────────
+            self._ensure_opportunity_embedding(opp_id)
+
+            from db.models.opportunity import Opportunity as OppModel
+            with self.session_factory() as sess:
+                opp = sess.get(OppModel, opp_id)
+                opp_title = getattr(opp, "opportunity_title", None) if opp else None
+
+            # ── Phase 1: fast embedding pre-filter ────────────────────────
+            llm_pool_size = max(additional_count * self.LLM_POOL_MULTIPLIER, self.LLM_POOL_MIN)
+            k_fetch = llm_pool_size + len(exclude_ids)  # fetch extra to cover exclusions
+            with self.session_factory() as sess:
+                top_pairs = MatchDAO(sess).topk_faculties_for_opportunity(
+                    opportunity_id=opp_id, k=k_fetch
+                )
+
+            candidate_ids = [
+                fid for fid, _ in top_pairs if fid not in exclude_ids
+            ][:llm_pool_size]
+
+            # ── Phase 2: LLM scoring for the candidate pool ───────────────
+            scores = self._run_llm_scoring_for_candidates(opp_id, candidate_ids)
+
+            # ── Phase 3: re-rank by llm_score ─────────────────────────────
+            ranked = sorted(
+                candidate_ids,
+                key=lambda fid: (
+                    scores.get(fid, {}).get("llm_score", 0),
+                    scores.get(fid, {}).get("domain_score", 0),
+                ),
+                reverse=True,
+            )
+            top_n = ranked[:additional_count]
+
+            # ── Phase 4: enrich with faculty profile ──────────────────────
+            suggested = []
+            for fid in top_n:
+                details = self._get_faculty_details(int(fid), is_existing=False)
+                if details:
+                    details.update(scores.get(int(fid), {}))
+                    suggested.append(details)
+
+            return {
+                "next_action": "return_collaborators",
+                "opportunity_id": opp_id,
+                "opportunity_title": opp_title,
+                "additional_count": additional_count,
+                "suggested_collaborators": suggested,
+            }
+
+        except Exception as e:
+            return {
+                "next_action": "error_find_collaborators",
+                "error": f"{type(e).__name__}: {e}",
+                "suggested_collaborators": [],
+            }
+
+    def find_team_for_grant(
+        self,
+        *,
+        opportunity_id: str,
+        team_size: int = 3,
+        existing_faculty_ids: Optional[List[int]] = None,
+    ) -> Dict[str, Any]:
+        """
+        Suggest a team of `team_size` faculty for a grant.
+
+        Two-phase approach:
+          1. Fast embedding pre-filter — topk_faculties_for_opportunity
+          2. LLM scoring — FacultyGrantMatcher on the top candidate pool
+          3. Re-rank new candidates by llm_score; always keep existing members.
+
+        Existing members provided by the caller are always included and marked
+        ``is_existing_member: True``.  Remaining slots are filled by the
+        top-scoring new candidates from the DB.
+
+        Each result includes: name, email, position, expertise, research/application
+        domains, domain_score, llm_score, reason, covered topics, missing topics,
+        and is_existing_member flag.
+        """
+        self._call("MatchingExecutionAgent.find_team_for_grant")
+        opp_id = str(opportunity_id or "").strip()
+        if not opp_id:
+            return {
+                "next_action": "error_find_team",
+                "error": "Missing opportunity_id.",
+                "suggested_team": [],
+            }
+
+        existing_ids: Set[int] = set(map(int, existing_faculty_ids or []))
+
+        try:
+            # ── Phase 0: ensure opportunity has keyword embeddings ─────────
+            self._ensure_opportunity_embedding(opp_id)
+
+            from db.models.opportunity import Opportunity as OppModel
+            with self.session_factory() as sess:
+                opp = sess.get(OppModel, opp_id)
+                opp_title = getattr(opp, "opportunity_title", None) if opp else None
+
+            # ── Phase 1: fast embedding pre-filter ────────────────────────
+            remaining_slots = max(0, team_size - len(existing_ids))
+            llm_pool_size = max(remaining_slots * self.LLM_POOL_MULTIPLIER, self.LLM_POOL_MIN)
+            k_fetch = llm_pool_size + len(existing_ids)
+            with self.session_factory() as sess:
+                top_pairs = MatchDAO(sess).topk_faculties_for_opportunity(
+                    opportunity_id=opp_id, k=k_fetch
+                )
+
+            # Separate: existing members in top results vs new candidates
+            existing_in_top = [(fid, sc) for fid, sc in top_pairs if fid in existing_ids]
+            new_candidates  = [fid for fid, _ in top_pairs if fid not in existing_ids]
+            candidate_pool  = new_candidates[:llm_pool_size]
+
+            # Existing members not returned by embedding query (no embedding yet)
+            seen = {fid for fid, _ in existing_in_top}
+            extra_existing_ids = [eid for eid in existing_ids if eid not in seen]
+
+            # ── Phase 2: LLM scoring — new candidates + existing members ──
+            all_to_score = candidate_pool + extra_existing_ids + [fid for fid, _ in existing_in_top]
+            # also score existing members so we return their llm_score/reason
+            scores = self._run_llm_scoring_for_candidates(opp_id, all_to_score)
+
+            # ── Phase 3: re-rank new candidates by llm_score ──────────────
+            ranked_new = sorted(
+                candidate_pool,
+                key=lambda fid: (
+                    scores.get(fid, {}).get("llm_score", 0),
+                    scores.get(fid, {}).get("domain_score", 0),
+                ),
+                reverse=True,
+            )
+            top_new = ranked_new[:remaining_slots]
+
+            # ── Phase 4: assemble final team ──────────────────────────────
+            # existing first (sorted by llm_score), then top new
+            existing_order = sorted(
+                list(existing_ids),
+                key=lambda fid: scores.get(fid, {}).get("llm_score", 0),
+                reverse=True,
+            )
+            final_team_ids = existing_order + top_new
+
+            # ── Phase 5: enrich with faculty profile ──────────────────────
+            suggested_team = []
+            for fid in final_team_ids:
+                is_existing = int(fid) in existing_ids
+                details = self._get_faculty_details(int(fid), is_existing=is_existing)
+                if details:
+                    details.update(scores.get(int(fid), {}))
+                    suggested_team.append(details)
+
+            return {
+                "next_action": "return_team",
+                "opportunity_id": opp_id,
+                "opportunity_title": opp_title,
+                "team_size": team_size,
+                "suggested_team": suggested_team,
+            }
+
+        except Exception as e:
+            return {
+                "next_action": "error_find_team",
+                "error": f"{type(e).__name__}: {e}",
+                "suggested_team": [],
+            }

@@ -388,5 +388,292 @@ def chat():
     return Response(generate(), mimetype="text/event-stream", headers=headers)
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Team endpoints — shared helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _sse_headers() -> dict:
+    return {"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no"}
+
+
+def _sse(event: str, payload: dict) -> str:
+    return f"event: {event}\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
+
+def _parse_team_request():
+    """
+    Parse multipart/form-data (or JSON) for team sub-endpoints.
+    Returns:
+        (grant_link, grant_title, emails, osu_url_map, cv_pdf_map,
+         additional_count, team_size, message)
+    """
+    content_type = (request.content_type or "").lower()
+
+    if "multipart/form-data" in content_type:
+        body: dict = {}
+        for key in request.form:
+            values = request.form.getlist(key)
+            body[key] = values[0] if len(values) == 1 else values
+
+        for key in ("emails",):
+            raw = body.get(key)
+            if isinstance(raw, str):
+                try:
+                    body[key] = json.loads(raw)
+                except Exception:
+                    pass
+
+        primary_email = str(body.get("email") or "").strip().lower()
+
+        # OSU URL map
+        osu_url_map: dict = {}
+        for em, url in zip(request.form.getlist("osu_url_email"), request.form.getlist("osu_url_value")):
+            em, url = em.strip().lower(), url.strip()
+            if em and url:
+                osu_url_map[em] = url
+        if not osu_url_map:
+            single_osu = str(body.get("osu_url") or "").strip()
+            if single_osu and primary_email:
+                osu_url_map[primary_email] = single_osu
+
+        # CV map
+        cv_pdf_map: dict = {}
+        for em, fobj in zip(request.form.getlist("cv_email"), request.files.getlist("cv_file")):
+            em = em.strip().lower()
+            if em:
+                cv_pdf_map[em] = fobj.read()
+        if not cv_pdf_map:
+            cv_file = request.files.get("cv")
+            if cv_file and primary_email:
+                cv_pdf_map[primary_email] = cv_file.read()
+    else:
+        body = request.get_json(silent=True) or {}
+        osu_url_map = {}
+        cv_pdf_map = {}
+
+    grant_link  = str(body.get("grant_link")  or "").strip() or None
+    grant_title = str(body.get("grant_title") or "").strip() or None
+    emails      = _to_email_list(body.get("emails") or body.get("email"))
+    additional_count = _to_optional_int(body.get("additional_count")) or 3
+    team_size        = _to_optional_int(body.get("team_size"))        or 3
+    message = str(body.get("message") or "").strip() or None
+
+    return (
+        grant_link, grant_title, emails,
+        osu_url_map or None, cv_pdf_map or None,
+        additional_count, team_size, message,
+    )
+
+
+def _resolve_opportunity_id(grant_link=None, grant_title=None):
+    """
+    Find opportunity_id from a simpler.grants.gov URL, a bare opportunity ID,
+    or a title/keyword search.  Returns (opportunity_id, opportunity_title) or (None, None).
+
+    Delegates to OpportunityContextAgent so the extraction logic stays in one place.
+    """
+    from services.agent_v2.agents.opportunity_context_agent import OpportunityContextAgent
+    agent = OpportunityContextAgent()
+
+    logger.info("_resolve_opportunity_id: grant_link=%r  grant_title=%r", grant_link, grant_title)
+
+    # 1. Try link/URL/bare-ID lookup first
+    if grant_link:
+        result = agent.search_grant_by_link_in_db(grant_link=str(grant_link).strip())
+        logger.info("_resolve_opportunity_id: link search result=%s", result)
+        if result.get("found"):
+            return result["opportunity_id"], result.get("opportunity_title")
+
+    # 2. Try title search
+    if grant_title:
+        result = agent.search_grant_by_title_in_db(grant_title=str(grant_title).strip())
+        logger.info("_resolve_opportunity_id: title search result=%s", result)
+        if result.get("found"):
+            return result["opportunity_id"], result.get("opportunity_title")
+
+    # 3. If user put title text in the link field (no URL detected), try that too
+    if grant_link and not grant_title:
+        result = agent.search_grant_by_title_in_db(grant_title=str(grant_link).strip())
+        logger.info("_resolve_opportunity_id: link-as-title search result=%s", result)
+        if result.get("found"):
+            return result["opportunity_id"], result.get("opportunity_title")
+
+    logger.warning("_resolve_opportunity_id: grant not found for link=%r title=%r", grant_link, grant_title)
+    return None, None
+
+
+def _resolve_faculty_ids_for_team(emails, osu_url_map, cv_pdf_map):
+    """
+    Resolve + optionally ingest faculty, return {email: faculty_id}.
+    Skips gracefully if emails is empty.
+    """
+    if not emails:
+        return {}
+    try:
+        from services.agent_v2.agents.faculty_context_agent import FacultyContextAgent
+        agent = FacultyContextAgent()
+        result = agent.resolve_and_ingest_faculties(
+            emails=emails,
+            osu_url_map=osu_url_map,
+            cv_pdf_map=cv_pdf_map,
+        )
+        # Build email → faculty_id from resolved ids
+        from db.db_conn import SessionLocal
+        from dao.faculty_dao import FacultyDAO
+        email_to_fid = {}
+        with SessionLocal() as sess:
+            dao = FacultyDAO(sess)
+            for email in emails:
+                fid = dao.get_faculty_id_by_email(email)
+                if fid:
+                    email_to_fid[email] = int(fid)
+        return email_to_fid
+    except Exception:
+        logger.exception("_resolve_faculty_ids_for_team failed")
+        return {}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# POST /api/team/find-collaborators  — scenario b
+# ─────────────────────────────────────────────────────────────────────────────
+
+@app.post("/api/team/find-collaborators")
+def find_collaborators():
+    (grant_link, grant_title, emails,
+     osu_url_map, cv_pdf_map,
+     additional_count, _, message) = _parse_team_request()
+
+    @stream_with_context
+    def generate():
+        if not grant_link and not grant_title:
+            yield _sse("request_info", {"type": "missing_grant", "message": "Please provide a grant link or title."})
+            return
+        if not emails:
+            yield _sse("request_info", {"type": "missing_emails", "message": "Please provide at least one existing team member email."})
+            return
+
+        # Validate osu_url for provided emails
+        missing_osu = [e for e in emails if e not in (osu_url_map or {})]
+        if missing_osu:
+            yield _sse("request_info", {
+                "type": "missing_osu_url",
+                "message": f"Please provide an OSU profile URL for: {', '.join(missing_osu)}",
+                "emails_missing_osu_url": missing_osu,
+            })
+            return
+
+        searched = grant_title or grant_link or "(none)"
+        yield _sse("step_update", {"message": f"Searching for grant: {searched!r}..."})
+        opp_id, opp_title = _resolve_opportunity_id(grant_link, grant_title)
+        if not opp_id:
+            yield _sse("message", {
+                "type": "error",
+                "message": (
+                    f"Grant not found in the database for: {searched!r}. "
+                    "Try the exact grant title or paste the simpler.grants.gov URL."
+                ),
+            })
+            return
+
+        yield _sse("step_update", {"message": f"Grant resolved: {opp_title or opp_id}. Resolving existing team members..."})
+        email_to_fid = _resolve_faculty_ids_for_team(emails, osu_url_map, cv_pdf_map)
+        existing_ids = list(email_to_fid.values())
+
+        yield _sse("step_update", {"message": f"Searching for {additional_count} collaborator(s)..."})
+        try:
+            from services.agent_v2.agents.matching_execution_agent import MatchingExecutionAgent
+            agent = MatchingExecutionAgent()
+            result = agent.find_collaborators_for_grant(
+                opportunity_id=opp_id,
+                existing_faculty_ids=existing_ids,
+                additional_count=additional_count,
+            )
+        except Exception as e:
+            yield _sse("message", {"type": "error", "message": f"Matching error: {e}"})
+            return
+
+        if result.get("next_action", "").startswith("error"):
+            yield _sse("message", {"type": "error", "message": result.get("error", "Unknown error.")})
+            return
+
+        yield _sse("message", {
+            "message": "Here are the suggested collaborators.",
+            "result": result,
+        })
+
+    return Response(generate(), mimetype="text/event-stream", headers=_sse_headers())
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# POST /api/team/form-team  — scenario c
+# ─────────────────────────────────────────────────────────────────────────────
+
+@app.post("/api/team/form-team")
+def form_team():
+    (grant_link, grant_title, emails,
+     osu_url_map, cv_pdf_map,
+     _, team_size, message) = _parse_team_request()
+
+    @stream_with_context
+    def generate():
+        if not grant_link and not grant_title:
+            yield _sse("request_info", {"type": "missing_grant", "message": "Please provide a grant link or title."})
+            return
+
+        # If emails given, osu_url is required for each
+        if emails:
+            missing_osu = [e for e in emails if e not in (osu_url_map or {})]
+            if missing_osu:
+                yield _sse("request_info", {
+                    "type": "missing_osu_url",
+                    "message": f"Please provide an OSU profile URL for: {', '.join(missing_osu)}",
+                    "emails_missing_osu_url": missing_osu,
+                })
+                return
+
+        searched = grant_title or grant_link or "(none)"
+        yield _sse("step_update", {"message": f"Searching for grant: {searched!r}..."})
+        opp_id, opp_title = _resolve_opportunity_id(grant_link, grant_title)
+        if not opp_id:
+            yield _sse("message", {
+                "type": "error",
+                "message": (
+                    f"Grant not found in the database for: {searched!r}. "
+                    "Try the exact grant title or paste the simpler.grants.gov URL."
+                ),
+            })
+            return
+
+        existing_ids: List[int] = []
+        if emails:
+            yield _sse("step_update", {"message": "Resolving existing team members..."})
+            email_to_fid = _resolve_faculty_ids_for_team(emails, osu_url_map, cv_pdf_map)
+            existing_ids = list(email_to_fid.values())
+
+        yield _sse("step_update", {"message": f"Finding best team of {team_size} for this grant..."})
+        try:
+            from services.agent_v2.agents.matching_execution_agent import MatchingExecutionAgent
+            agent = MatchingExecutionAgent()
+            result = agent.find_team_for_grant(
+                opportunity_id=opp_id,
+                team_size=team_size,
+                existing_faculty_ids=existing_ids or None,
+            )
+        except Exception as e:
+            yield _sse("message", {"type": "error", "message": f"Matching error: {e}"})
+            return
+
+        if result.get("next_action", "").startswith("error"):
+            yield _sse("message", {"type": "error", "message": result.get("error", "Unknown error.")})
+            return
+
+        yield _sse("message", {
+            "message": "Here is the suggested team.",
+            "result": result,
+        })
+
+    return Response(generate(), mimetype="text/event-stream", headers=_sse_headers())
+
+
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5001, debug=True, threaded=True)
+    app.run(host="0.0.0.0", port=5000, debug=True, threaded=True)

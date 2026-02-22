@@ -253,23 +253,54 @@ class OpportunityDAO:
         return row is not None
 
     def find_opportunity_by_title(self, title: str) -> Optional[Opportunity]:
-        """Find one opportunity by title (exact, then case-insensitive partial)."""
+        """
+        Find one opportunity by title using a multi-stage search:
+          1. Exact title match (case-insensitive)
+          2. Partial title ILIKE match
+          3. Partial summary_description ILIKE match (handles NULL/missing title rows)
+
+        All searches skip rows where the target column is NULL so PostgreSQL's
+        ``NULL ILIKE …`` silent-no-match behaviour never causes a false negative.
+        """
         q = (title or "").strip()
         if not q:
             return None
 
+        base = self._with_common_relations(self.session.query(Opportunity))
+
+        # 1. Exact title (non-NULL only)
         exact = (
-            self._with_common_relations(self.session.query(Opportunity))
-            .filter(func.lower(Opportunity.opportunity_title) == q.lower())
+            base
+            .filter(
+                Opportunity.opportunity_title.isnot(None),
+                func.lower(Opportunity.opportunity_title) == q.lower(),
+            )
             .order_by(Opportunity.created_at.desc().nullslast())
             .first()
         )
         if exact:
             return exact
 
+        # 2. Partial title (non-NULL only)
+        partial = (
+            base
+            .filter(
+                Opportunity.opportunity_title.isnot(None),
+                Opportunity.opportunity_title.ilike(f"%{q}%"),
+            )
+            .order_by(Opportunity.created_at.desc().nullslast())
+            .first()
+        )
+        if partial:
+            return partial
+
+        # 3. Fallback: search summary_description (catches records with NULL title)
         return (
-            self._with_common_relations(self.session.query(Opportunity))
-            .filter(Opportunity.opportunity_title.ilike(f"%{q}%"))
+            base
+            .filter(
+                Opportunity.summary_description.isnot(None),
+                Opportunity.summary_description.ilike(f"%{q}%"),
+            )
             .order_by(Opportunity.created_at.desc().nullslast())
             .first()
         )
