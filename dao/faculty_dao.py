@@ -178,6 +178,44 @@ class FacultyDAO:
 
         return count
 
+    def upsert_publications_by_title(self, faculty_id: int, items: List[FacultyPublicationDTO]) -> int:
+        """
+        Insert or update faculty publication rows keyed by normalised title.
+
+        Used for CV-based ingestion where no external work ID is available.
+        Deduplication is done in Python (normalised lowercase title) because the
+        DB unique constraint is on openalex_work_id which will be NULL for all
+        CV-sourced publications.
+        """
+        existing_titles = {
+            (row.title or "").strip().lower()
+            for row in self.session.query(FacultyPublication.title)
+            .filter(FacultyPublication.faculty_id == faculty_id)
+            .all()
+        }
+
+        count = 0
+        for pub in items:
+            title = (pub.title or "").strip()
+            if not title:
+                continue
+            if title.lower() in existing_titles:
+                continue
+
+            obj = FacultyPublication(
+                faculty_id=faculty_id,
+                openalex_work_id=None,
+                scholar_author_id=None,
+                title=title,
+                abstract=pub.abstract,
+                year=pub.year,
+            )
+            self.session.add(obj)
+            existing_titles.add(title.lower())
+            count += 1
+
+        return count
+
     def upsert_keywords_json(self, rows: List[Dict[str, Any]]) -> int:
         """Bulk upsert faculty keyword JSON rows by faculty_id."""
         if not rows:

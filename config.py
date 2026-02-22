@@ -42,11 +42,6 @@ class Settings(BaseSettings):
     simpler_detail_base_url: str
 
     # =========================
-    # OpenAlex: fetching publications
-    # =========================
-    openalex_base_url: str = "https://api.openalex.org"
-
-    # =========================
     # Providers (Bedrock only)
     # =========================
     llm_provider: LLMProvider = "bedrock"

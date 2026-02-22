@@ -126,7 +126,8 @@ class FacultyContextAgent:
     def _scrape_and_upsert_one(self, email: str) -> int:
         """
         Scrape the OSU engineering profile for `email`, upsert the record into
-        the DB, and enrich from Google Scholar / personal website links.
+        the DB, and enrich from personal/lab website links.
+        Publication ingestion from a CV PDF is handled separately.
 
         Opens its own DB session — safe to call from a worker thread.
         Returns the faculty_id on success; raises on failure.
@@ -152,21 +153,14 @@ class FacultyContextAgent:
             fac.profile_last_refreshed_at = datetime.now(timezone.utc)
             sess.commit()
 
-        # Resolve enrichment URLs from the additional_info DTOs.
-        google_scholar_url: Optional[str] = next(
-            (
-                info.additional_info_url
-                for info in (dto.additional_info or [])
-                if "scholar.google" in (info.additional_info_url or "")
-            ),
-            None,
-        )
+        # Resolve personal/lab website from additional_info DTOs.
+        # Scholar URLs are no longer used — publication ingestion is handled
+        # separately via CV upload (utils/publication_extractor.py).
         personal_website_url: Optional[str] = next(
             (
                 info.additional_info_url
                 for info in (dto.additional_info or [])
                 if info.additional_info_url
-                and "scholar.google" not in info.additional_info_url
                 and "oregonstate.edu" not in info.additional_info_url
             ),
             None,
@@ -178,7 +172,6 @@ class FacultyContextAgent:
             faculty_id=faculty_id,
             osu_webpage=url,
             personal_website=personal_website_url,
-            google_scholar=google_scholar_url,
         )
 
         return faculty_id
