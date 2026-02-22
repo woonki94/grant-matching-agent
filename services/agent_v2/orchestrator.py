@@ -140,13 +140,19 @@ class GrantMatchOrchestrator:
         self._call("GrantMatchOrchestrator._node_decide_one_to_one")
         if not state.get("email"):
             return {"decision": "ask_email"}
-        resolved = self.faculty_agent.resolve_faculties(emails=[str(state.get("email"))])
-        if not resolved.get("all_in_db"):
+        # resolve_and_ingest_faculties: looks up DB, scrapes + inserts if missing/stale,
+        # then runs keyword generation for any newly added faculty.
+        ingested = self.faculty_agent.resolve_and_ingest_faculties(
+            emails=[str(state.get("email"))]
+        )
+        # Only fall back to asking the user when scraping itself failed (i.e., no
+        # faculty IDs could be resolved at all — not merely "not in DB").
+        if not ingested.get("resolved"):
             return {"decision": "ask_user_reference_data"}
-        faculty_ids = list(resolved.get("faculty_ids") or [])
+        faculty_ids = list(ingested.get("resolved") or [])
         resolved_state: GrantMatchWorkflowState = {
             "faculty_ids": faculty_ids,
-            "missing_emails": list(resolved.get("missing_emails") or []),
+            "missing_emails": list(ingested.get("failed") or []),
         }
         ident = self._resolve_grant_identifier_type(state)
         if ident == "link":
@@ -164,13 +170,17 @@ class GrantMatchOrchestrator:
         emails = list(state.get("emails") or [])
         if len(emails) < 2:
             return {"decision": "ask_group_emails"}
-        resolved = self.faculty_agent.resolve_faculties(emails=emails)
-        if not resolved.get("all_in_db"):
+        # resolve_and_ingest_faculties: scrapes + inserts any missing/stale faculty in
+        # parallel, then runs keyword generation for newly added members.
+        ingested = self.faculty_agent.resolve_and_ingest_faculties(emails=emails)
+        # Proceed even if some emails failed — as long as at least one faculty resolved.
+        # Only hard-stop when no faculty could be resolved at all.
+        if not ingested.get("resolved"):
             return {"decision": "ask_user_reference_data"}
         return {
-            "emails": list(resolved.get("emails") or emails),
-            "faculty_ids": list(resolved.get("faculty_ids") or []),
-            "missing_emails": list(resolved.get("missing_emails") or []),
+            "emails": emails,
+            "faculty_ids": list(ingested.get("resolved") or []),
+            "missing_emails": list(ingested.get("failed") or []),
             "decision": "generate_keywords_group",
         }
 
@@ -179,14 +189,18 @@ class GrantMatchOrchestrator:
         emails = list(state.get("emails") or [])
         if len(emails) < 2:
             return {"decision": "ask_group_emails"}
-        resolved = self.faculty_agent.resolve_faculties(emails=emails)
-        if not resolved.get("all_in_db"):
+        # resolve_and_ingest_faculties: scrapes + inserts any missing/stale faculty in
+        # parallel, then runs keyword generation for newly added members.
+        ingested = self.faculty_agent.resolve_and_ingest_faculties(emails=emails)
+        # Proceed even if some emails failed — as long as at least one faculty resolved.
+        # Only hard-stop when no faculty could be resolved at all.
+        if not ingested.get("resolved"):
             return {"decision": "ask_user_reference_data"}
 
         resolved_state: GrantMatchWorkflowState = {
-            "emails": list(resolved.get("emails") or emails),
-            "faculty_ids": list(resolved.get("faculty_ids") or []),
-            "missing_emails": list(resolved.get("missing_emails") or []),
+            "emails": emails,
+            "faculty_ids": list(ingested.get("resolved") or []),
+            "missing_emails": list(ingested.get("failed") or []),
         }
 
         ident = self._resolve_grant_identifier_type(state)
