@@ -4,15 +4,12 @@ Flask==3.0.3
 # HTTP client for calling the Grants.gov API
 requests==2.32.3
 
-dotenv~=0.9.9
 
 pdfminer.six
 docx2txt~=0.9
 openpyxl~=3.1.5
 xlrd==1.2.0
 
-
-google-genai
 
 
 # Database ORM
@@ -23,37 +20,22 @@ db~=0.1.1
 # Optional but highly recommended for JSONB + PostgreSQL integration
 sqlalchemy-utils>=0.41.0
 
-openai~=2.7.1
-
-beautifulsoup4~=4.14.2
-lxml
-
 
 # For embeddings
 numpy~=2.3.4
 scikit-learn
-sentence-transformers~=5.1.2
 
 
-python-dotenv~=1.2.1
+
 protobuf~=5.29.5
 pydantic-settings~=2.12.0
 
-readability-lxml~=0.8.4.1
-pypdf~=6.5.0
 pydantic~=2.12.3
 tqdm~=4.67.1
 
-boto3~=1.42.32
-langchain-core~=1.2.7
-langchain-openai~=1.1.7
-langchain-aws~=1.2.1
-
 pgvector~=0.4.2
-networkx~=3.5
-
 pandas~=3.0.0
 tabulate~=0.9.0
 
 boto3~=1.42.32
-botocore~=1.42.38
+langgraph~=1.0.9
