@@ -1074,8 +1074,11 @@ class MatchingExecutionAgent:
                     details["missing"]      = sc.get("missing",      [])
                     suggested.append(details)
 
-            # Sort suggested collaborators by llm_score descending (best match first)
-            suggested.sort(key=lambda d: d.get("llm_score", 0.0), reverse=True)
+            # Sort by llm_score desc, then domain_score desc as tie-breaker
+            suggested.sort(
+                key=lambda d: (d.get("llm_score", 0.0), d.get("domain_score", 0.0)),
+                reverse=True,
+            )
 
             # Also enrich existing members so the UI can resolve their names/emails
             # in the justification panel (member_roles / member_strengths reference faculty_id)
