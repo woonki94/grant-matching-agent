@@ -1074,6 +1074,13 @@ class MatchingExecutionAgent:
                     details["missing"]      = sc.get("missing",      [])
                     suggested.append(details)
 
+            # Also enrich existing members so the UI can resolve their names/emails
+            # in the justification panel (member_roles / member_strengths reference faculty_id)
+            existing_details_map = self._get_faculty_details_batch(
+                existing_ids, existing_ids=existing_set
+            )
+            existing_team_details = list(existing_details_map.values())
+
             return {
                 "next_action": "return_collaborators",
                 "opportunity_id": opp_id,
@@ -1081,6 +1088,7 @@ class MatchingExecutionAgent:
                 "additional_count": additional_count,
                 "team_score": team_score,
                 "suggested_collaborators": suggested,
+                "existing_team_details": existing_team_details,
                 "group_justification": justification,
             }
 
