@@ -1100,20 +1100,20 @@ class MatchingExecutionAgent:
         existing_faculty_ids: Optional[List[int]] = None,
     ) -> Dict[str, Any]:
         """
-        Suggest a team of `team_size` faculty for a grant.
+        Suggest an optimal team of `team_size` faculty for a grant.
 
-        Two-phase approach:
-          1. Fast embedding pre-filter — topk_faculties_for_opportunity
-          2. LLM scoring — FacultyGrantMatcher on the top candidate pool
-          3. Re-rank new candidates by llm_score; always keep existing members.
+        Uses SuperFacultySelector with any existing members pinned, so the
+        selector fills remaining slots with faculty that maximise collective
+        grant coverage.  GroupJustificationEngine then produces a team narrative.
 
-        Existing members provided by the caller are always included and marked
-        ``is_existing_member: True``.  Remaining slots are filled by the
-        top-scoring new candidates from the DB.
-
-        Each result includes: name, email, position, expertise, research/application
-        domains, domain_score, llm_score, reason, covered topics, missing topics,
-        and is_existing_member flag.
+        Pipeline:
+          0. Ensure opportunity keyword embeddings exist.
+          1. pgvector pre-filter — get a candidate pool (excluding existing members).
+          2. LLM scoring — FacultyGrantMatcher for existing + candidates (cached to DB).
+          3. Build per-faculty coverage vectors via context_generator.
+          4. SuperFacultySelector — pin existing, fill remaining slots optimally.
+          5. GroupJustificationEngine — team narrative.
+          6. Enrich all members with profiles and decoded LLM scores.
         """
         self._call("MatchingExecutionAgent.find_team_for_grant")
         opp_id = str(opportunity_id or "").strip()
@@ -1124,7 +1124,8 @@ class MatchingExecutionAgent:
                 "suggested_team": [],
             }
 
-        existing_ids: Set[int] = set(map(int, existing_faculty_ids or []))
+        existing_ids: List[int] = list(dict.fromkeys(int(f) for f in (existing_faculty_ids or [])))
+        existing_set: Set[int] = set(existing_ids)
 
         try:
             # ── Phase 0: ensure opportunity has keyword embeddings ─────────
@@ -1135,56 +1136,90 @@ class MatchingExecutionAgent:
                 opp = sess.get(OppModel, opp_id)
                 opp_title = getattr(opp, "opportunity_title", None) if opp else None
 
-            # ── Phase 1: fast embedding pre-filter ────────────────────────
+            # ── Phase 1: pgvector pre-filter for candidate pool ────────────
             remaining_slots = max(0, team_size - len(existing_ids))
             llm_pool_size = max(remaining_slots * self.LLM_POOL_MULTIPLIER, self.LLM_POOL_MIN)
-            k_fetch = llm_pool_size + len(existing_ids)
+            k_fetch = llm_pool_size + len(existing_ids) + 20
             with self.session_factory() as sess:
                 top_pairs = MatchDAO(sess).topk_faculties_for_opportunity(
                     opportunity_id=opp_id, k=k_fetch
                 )
+            candidate_ids = [fid for fid, _ in top_pairs if fid not in existing_set][:llm_pool_size]
 
-            # Separate: existing members in top results vs new candidates
-            existing_in_top = [(fid, sc) for fid, sc in top_pairs if fid in existing_ids]
-            new_candidates  = [fid for fid, _ in top_pairs if fid not in existing_ids]
-            candidate_pool  = new_candidates[:llm_pool_size]
+            # ── Phase 2: LLM scoring for existing team + candidate pool ────
+            all_to_score = existing_ids + [fid for fid in candidate_ids if fid not in existing_set]
+            self._run_llm_scoring_for_candidates(opp_id, all_to_score)
 
-            # Existing members not returned by embedding query (no embedding yet)
-            seen = {fid for fid, _ in existing_in_top}
-            extra_existing_ids = [eid for eid in existing_ids if eid not in seen]
+            # ── Phase 3: build SuperFacultySelector inputs ─────────────────
+            with self.session_factory() as sess:
+                f, w, c = self.context_generator.build_matching_inputs_for_opportunity(
+                    sess=sess,
+                    opportunity_id=opp_id,
+                    limit_rows=500,
+                )
 
-            # ── Phase 2: LLM scoring — new candidates + existing members ──
-            all_to_score = candidate_pool + extra_existing_ids + [fid for fid, _ in existing_in_top]
-            # also score existing members so we return their llm_score/reason
-            scores = self._run_llm_scoring_for_candidates(opp_id, all_to_score)
+            for fid in existing_ids:
+                if fid not in c:
+                    c[fid] = {
+                        "application": {i: 0.0 for i in w.get("application", {}).keys()},
+                        "research":    {i: 0.0 for i in w.get("research",    {}).keys()},
+                    }
 
-            # ── Phase 3: re-rank new candidates by llm_score ──────────────
-            ranked_new = sorted(
-                candidate_pool,
-                key=lambda fid: (
-                    scores.get(fid, {}).get("llm_score", 0),
-                    scores.get(fid, {}).get("domain_score", 0),
+            our_pool: Set[int] = existing_set | set(candidate_ids)
+            cand_faculty_ids = [fid for fid in f if fid in our_pool]
+            for fid in existing_ids:
+                if fid not in cand_faculty_ids:
+                    cand_faculty_ids.append(fid)
+
+            # ── Phase 4: SuperFacultySelector — pin existing, fill slots ───
+            K = min(team_size, len(cand_faculty_ids))
+
+            full_team, final_coverage = self.super_faculty_selector.team_selection_super_faculty(
+                cand_faculty_ids=cand_faculty_ids,
+                requirements=w,
+                coverage=c,
+                K=K,
+                required_faculty_ids=existing_ids,
+                num_candidates=1,
+            )
+
+            team_score = round(
+                sum(
+                    float(w[sec][i]) * float(final_coverage.get(sec, {}).get(i, 0.0))
+                    for sec in w
+                    for i in w[sec]
                 ),
-                reverse=True,
+                4,
             )
-            top_new = ranked_new[:remaining_slots]
 
-            # ── Phase 4: assemble final team ──────────────────────────────
-            # existing first (sorted by llm_score), then top new
-            existing_order = sorted(
-                list(existing_ids),
-                key=lambda fid: scores.get(fid, {}).get("llm_score", 0),
-                reverse=True,
+            # ── Phase 5: group justification ───────────────────────────────
+            member_coverages = {fid: c.get(fid, {}) for fid in full_team}
+            justification = self._run_group_justification(
+                opp_id, full_team, final_coverage, member_coverages
             )
-            final_team_ids = existing_order + top_new
 
-            # ── Phase 5: enrich with faculty profile (one batch session) ─────
-            all_details = self._get_faculty_details_batch(final_team_ids, existing_ids=existing_ids)
-            suggested_team = []
-            for fid in final_team_ids:
+            # ── Phase 6: decode individual LLM scores ─────────────────────
+            raw_scores = self._run_llm_scoring_for_candidates(opp_id, full_team)
+            idx_to_label = self._build_opp_index_to_label(opp_id)
+            decoded_scores = self._decode_scores(raw_scores, idx_to_label)
+
+            # ── Phase 7: enrich all members with faculty profiles ──────────
+            # Existing members appear first, new members after
+            ordered_team = (
+                [fid for fid in full_team if fid in existing_set] +
+                [fid for fid in full_team if fid not in existing_set]
+            )
+            all_details = self._get_faculty_details_batch(ordered_team, existing_ids=existing_set)
+            suggested_team: List[Dict[str, Any]] = []
+            for fid in ordered_team:
                 details = all_details.get(int(fid))
                 if details:
-                    details.update(scores.get(int(fid), {}))
+                    sc = decoded_scores.get(int(fid), {})
+                    details["llm_score"]    = sc.get("llm_score",    0.0)
+                    details["domain_score"] = sc.get("domain_score", 0.0)
+                    details["reason"]       = sc.get("reason",       "")
+                    details["covered"]      = sc.get("covered",      [])
+                    details["missing"]      = sc.get("missing",      [])
                     suggested_team.append(details)
 
             return {
@@ -1192,10 +1227,13 @@ class MatchingExecutionAgent:
                 "opportunity_id": opp_id,
                 "opportunity_title": opp_title,
                 "team_size": team_size,
+                "team_score": team_score,
                 "suggested_team": suggested_team,
+                "group_justification": justification,
             }
 
         except Exception as e:
+            logger.exception("find_team_for_grant failed for opp=%s", opp_id)
             return {
                 "next_action": "error_find_team",
                 "error": f"{type(e).__name__}: {e}",
