@@ -4,7 +4,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Final, Literal, Optional
 
-from pydantic import computed_field, field_validator
+from pydantic import computed_field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from client.llm_client import LLMChatClient, LLMConfig
@@ -42,11 +42,6 @@ class Settings(BaseSettings):
     simpler_detail_base_url: str
 
     # =========================
-    # OpenAlex: fetching publications
-    # =========================
-    openalex_base_url: str = "https://api.openalex.org"
-
-    # =========================
     # Providers (Bedrock only)
     # =========================
     llm_provider: LLMProvider = "bedrock"
@@ -72,8 +67,10 @@ class Settings(BaseSettings):
     aws_region: str = "us-east-2"
     aws_profile: Optional[str] = None
 
-    # Required for Bedrock usage
-    bedrock_model_id: str
+    # Bedrock LLM models
+    bedrock_claude_haiku: str
+    bedrock_claude_sonnet: Optional[str] = None
+    bedrock_claude_opus: Optional[str] = None
     bedrock_embed_model_id: str
 
     # =========================
@@ -86,6 +83,21 @@ class Settings(BaseSettings):
     @property
     def embed_dim(self) -> int:
         return 1024
+
+    @computed_field
+    @property
+    def haiku(self) -> str:
+        return self.bedrock_claude_haiku
+
+    @computed_field
+    @property
+    def sonnet(self) -> Optional[str]:
+        return self.bedrock_claude_sonnet
+
+    @computed_field
+    @property
+    def opus(self) -> Optional[str]:
+        return self.bedrock_claude_opus
 
     # =========================
     # Extracted Content Storage (S3 ONLY)
@@ -156,14 +168,18 @@ settings = Settings()
 Grant_API_KEY: Final[str] = settings.grant_api_key
 
 
-@lru_cache(maxsize=1)
-def get_llm_client() -> LLMChatClient:
+@lru_cache(maxsize=8)
+def get_llm_client(model_id: Optional[str] = None) -> LLMChatClient:
+    use_model_id = (model_id or settings.haiku or "").strip()
+    if not use_model_id:
+        raise ValueError("No Bedrock model id configured. Set BEDROCK_CLAUDE_HAIKU.")
+
     return LLMChatClient(
         LLMConfig(
             temperature=settings.llm_temperature,
             aws_region=settings.aws_region,
             aws_profile=settings.aws_profile,
-            bedrock_model_id=settings.bedrock_model_id,
+            bedrock_model_id=use_model_id,
         )
     )
 

@@ -15,10 +15,12 @@ fi
 
 MODE="${1:-all}"
 LIMIT="${2:-}"
+FORCE_MODE="${3:-}"
 
 echo "Running keyword generation pipeline..."
 echo "  Mode  : $MODE"
 echo "  Limit : ${LIMIT:-none}"
+echo "  Force : ${FORCE_MODE:-false}"
 echo
 echo "  LLM_PROVIDER                         : ${LLM_PROVIDER:-}"
 echo "  EMBEDDING_PROVIDER                   : ${EMBEDDING_PROVIDER:-}"
@@ -30,28 +32,35 @@ echo
 
 PYTHON_FILE="$PROJECT_ROOT/services/keywords/generate_keywords.py"
 
-EXTRA_ARGS=""
+EXTRA_ARGS=()
 if [ -n "$LIMIT" ] && [ "$LIMIT" != "0" ]; then
-  EXTRA_ARGS="$EXTRA_ARGS --limit $LIMIT"
+  EXTRA_ARGS+=(--limit "$LIMIT")
 fi
 
 case "$MODE" in
   all) ;;
-  faculty) EXTRA_ARGS="$EXTRA_ARGS --faculty-only" ;;
-  opp) EXTRA_ARGS="$EXTRA_ARGS --opp-only" ;;
+  faculty) EXTRA_ARGS+=(--faculty-only) ;;
+  opp) EXTRA_ARGS+=(--opp-only) ;;
   *)
     echo "Error: invalid mode '$MODE' (use: all | faculty | opp)" >&2
     exit 1
     ;;
 esac
 
+case "$FORCE_MODE" in
+  ""|false|0|no) ;;
+  true|1|yes|force|--force-regenerate) EXTRA_ARGS+=(--force-regenerate) ;;
+  *)
+    echo "Error: invalid force flag '$FORCE_MODE' (use: true|false or force)" >&2
+    exit 1
+    ;;
+esac
+
 PYTHON_BIN="${PROJECT_ROOT}/venv/bin/python"
 if [ -x "$PYTHON_BIN" ]; then
-  # shellcheck disable=SC2086
-  "$PYTHON_BIN" "$PYTHON_FILE" $EXTRA_ARGS
+  "$PYTHON_BIN" "$PYTHON_FILE" "${EXTRA_ARGS[@]}"
 else
-  # shellcheck disable=SC2086
-  python3 "$PYTHON_FILE" $EXTRA_ARGS
+  python3 "$PYTHON_FILE" "${EXTRA_ARGS[@]}"
 fi
 
 echo

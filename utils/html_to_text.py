@@ -1,7 +1,6 @@
 from html.parser import HTMLParser
 import html as html_lib
 
-#TODO: Need fix on HTML parser
 class _HTMLToText(HTMLParser):
     BLOCK_TAGS = {
         "p","div","section","article","header","footer","main","aside",

@@ -158,3 +158,109 @@ OPP_SPECIALIZATION_WEIGHT_PROMPT = ChatPromptTemplate.from_messages([
     )
 ])
 
+OPP_CATEGORY_PROMPT = ChatPromptTemplate.from_messages([
+    ("system",
+     "You classify a funding opportunity into high-level grant categories.\n\n"
+     "Definitions:\n"
+     "- broad area grant: large domain where many project variants can fit.\n"
+     "- specialized grant: niche or specific research/specialization requirement.\n"
+     "- basic research: general science/research knowledge generation.\n"
+     "- applied research: research/invention focused on real-world use.\n"
+     "- educational: creation/improvement/evaluation of education programs.\n\n"
+     "Output JSON schema:\n"
+     "{{\n"
+     "  \"broad_category\": \"basic_research|applied_research|educational|unclear\",\n"
+     "  \"specific_categories\": [\"snake_case_code\", \"...\"]\n"
+     "}}\n\n"
+     "Rules:\n"
+     "- Use ONLY provided opportunity context and extracted keywords.\n"
+     "- specific_categories must be short snake_case codes.\n"
+     "- Include one scope marker in specific_categories when possible: broad_area or specialized.\n"
+     "- Add extra topic codes when clear (e.g., k12, teacher_pd, climate_resilience).\n"
+     "- Deduplicate specific_categories.\n"
+     "- If evidence is insufficient, set broad_category=unclear and keep categories minimal."
+    ),
+    ("human",
+     "OPPORTUNITY CONTEXT (JSON):\n{context_json}\n\n"
+     "OPPORTUNITY KEYWORDS (JSON):\n{keywords_json}\n\n"
+     "Return category JSON."
+    )
+])
+
+QUERY_CANDIDATE_PROMPT = ChatPromptTemplate.from_messages([
+    ("system",
+     "You extract candidate keyword phrases from a user research query for later structuring.\n\n"
+     "Rules:\n"
+     "- Use ONLY the provided context.\n"
+     "- Return a single JSON object with key `candidates` = list[str].\n"
+     "- Include TWO kinds of candidates:\n"
+     "  (A) AREA terms: 1–3 words, broad research fields or domains.\n"
+     "  (B) SPECIALIZATION statements: 8–25 words describing expertise, methods, systems, or problems relevant to the query.\n"
+     "- SPECIALIZATION phrases should describe capabilities the investigator WOULD NEED for the query topic.\n"
+     "- Write phrases neutrally (no 'seeks', 'needs', 'requires').\n"
+     "- Prefer technical and research content; avoid administrative language.\n"
+     "- Lowercase unless proper nouns.\n"
+     "- Deduplicate.\n"
+     "- Target ~20–60 candidates total."
+    ),
+    ("human", "Context (JSON):\n{context_json}")
+])
+
+QUERY_KEYWORDS_PROMPT = ChatPromptTemplate.from_messages([
+    ("system",
+     "You generate structured keywords from a user research query.\n\n"
+     "Output must match this JSON schema:\n"
+     "{{\n"
+     "  \"research\": {{\"domain\": [], \"specialization\": []}},\n"
+     "  \"application\": {{\"domain\": [], \"specialization\": []}}\n"
+     "}}\n\n"
+     "Definitions:\n"
+     "- domain: 1–3 words, broad fields defining the query topic.\n"
+     "- specialization: 8–25 words describing expertise, methods, or systems relevant to the query.\n\n"
+     "Rules:\n"
+     "- Use ONLY the provided context and candidate phrases.\n"
+     "- Do NOT invent new topics.\n"
+     "- Lowercase unless proper nouns.\n"
+     "- Deduplicate.\n"
+     "- research.domain: 4–10 items\n"
+     "- research.specialization: 5–15 items\n"
+     "- application.domain: 4–10 items\n"
+     "- application.specialization: 5–15 items\n"
+     "- Avoid administrative or institutional language."
+    ),
+    ("human",
+     "Context (JSON):\n{context_json}\n\n"
+     "Candidate phrases:\n{candidates}"
+    )
+])
+
+QUERY_SPECIALIZATION_WEIGHT_PROMPT = ChatPromptTemplate.from_messages([
+    ("system",
+     "You assign importance weights to specialization phrases for a user research query.\n\n"
+     "You will be given:\n"
+     "- query context (JSON)\n"
+     "- specialization lists for research and application\n\n"
+     "Important clarification:\n"
+     "- The given specialization phrases represent capabilities that are IMPORTANT for the query topic.\n\n"
+     "Task:\n"
+     "- For EACH specialization phrase, output an object with:\n"
+     "  - t: the exact original specialization text (unchanged)\n"
+     "  - w: a number in [0,1] representing how critical this capability is\n\n"
+     "Weight guidance:\n"
+     "- 0.85–1.00: core capability\n"
+     "- 0.60–0.84: important capability\n"
+     "- 0.35–0.59: supporting capability\n"
+     "- 0.10–0.34: minor capability\n\n"
+     "Rules:\n"
+     "- Do NOT invent new specialization phrases.\n"
+     "- Keep the text exactly the same as input for t.\n"
+     "- Base weights ONLY on evidence in the provided query context.\n"
+     "- If importance is unclear, be conservative (assign a lower weight).\n"
+     "- Return ONLY JSON in the specified output format."
+    ),
+    ("human",
+     "QUERY CONTEXT (JSON):\n{context_json}\n\n"
+     "SPECIALIZATIONS INPUT (JSON):\n{spec_json}\n\n"
+     "Return weighted specializations JSON."
+    )
+])

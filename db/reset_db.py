@@ -2,7 +2,7 @@ import os
 import sys
 from sqlalchemy import text
 
-from db.init_db import init_database
+from init_db import init_database
 
 # ───────────────────────────────────────────────
 # Ensure project root on sys.path

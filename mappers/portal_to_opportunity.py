@@ -86,3 +86,30 @@ def map_portal_attachments_response(detail_data: dict) -> List[OpportunityAttach
             continue
     return out
 
+# ─────────────────────────────
+# *) When searched with id
+# ─────────────────────────────
+def map_portal_detail_response_to_opportunity(detail_data: Dict[str, Any]) -> Optional[OpportunityDTO]:
+    """
+    Map detail endpoint payload to one OpportunityDTO.
+    """
+    data = (detail_data or {}).get("data")
+    if not isinstance(data, dict):
+        return None
+
+    # Normalize detail payload into search-like shape so we can reuse search mapper.
+    row: Dict[str, Any] = dict(data)
+    summary = row.get("summary") if isinstance(row.get("summary"), dict) else {}
+    if "summary_description" in row and "summary_description" not in summary:
+        summary["summary_description"] = row.get("summary_description")
+    if "additional_info_url" in row and "additional_info_url" not in summary:
+        summary["additional_info_url"] = row.get("additional_info_url")
+    row["summary"] = summary
+
+    base = map_portal_search_response({"data": [row]})
+    if not base:
+        return None
+    dto = base[0]
+
+    dto.attachments = map_portal_attachments_response(detail_data)
+    return dto

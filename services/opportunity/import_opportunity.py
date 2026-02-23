@@ -17,18 +17,23 @@ from dao.opportunity_dao import OpportunityDAO
 from db.db_conn import SessionLocal
 from db.models.opportunity import OpportunityAdditionalInfo, OpportunityAttachment
 from services.extract_content import run_extraction_pipeline
-from services.opportunity.call_opportunity import run_search_pipeline
+from services.opportunity.call_opportunity import OpportunitySearchService
 
 logger = logging.getLogger("import_opportunity")
 setup_logging()
 
 
-def import_opportunity(page_size: int, query: str | None) -> None:
+def import_opportunity(page_size: int, query: str | None, opp_id: str | None = None) -> None:
+    search_service = OpportunitySearchService()
     # -------------------------
     # 1) Fetch
     # -------------------------
-    logger.info("Starting opportunity pipeline (Fetching %s Opportunities)", page_size)
-    opportunities = run_search_pipeline(page_size=page_size, q=query)
+    if opp_id:
+        logger.info("Starting opportunity pipeline for single opportunity_id=%s", opp_id)
+        opportunities = search_service.run_search_pipeline(opportunity_id=opp_id)
+    else:
+        logger.info("Starting opportunity pipeline (Fetching %s Opportunities)", page_size)
+        opportunities = search_service.run_search_pipeline(page_size=page_size, q=query, agencies=["HHS-NIH11"])
     logger.info("[1/3 FETCH] Completed (%d opportunities)", len(opportunities))
 
     # -------------------------
@@ -55,8 +60,6 @@ def import_opportunity(page_size: int, query: str | None) -> None:
     link_subdir = "opportunity_additional_links"
 
     common = dict(
-        backend="s3",
-        base_dir=None,
         s3_bucket=settings.extracted_content_bucket,
         s3_prefix=settings.extracted_content_prefix_opportunity,
         aws_region=settings.aws_region,
@@ -85,7 +88,8 @@ if __name__ == "__main__":
 
     parser.add_argument("--page-size", type=int, default=100)
     parser.add_argument("--query", type=str, default=None)
+    parser.add_argument("--opp-id", type=str, default=None, help="Import a single opportunity by ID")
 
     args = parser.parse_args()
 
-    import_opportunity(page_size=args.page_size, query=args.query)
+    import_opportunity(page_size=args.page_size, query=args.query, opp_id=args.opp_id)

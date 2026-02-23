@@ -56,6 +56,10 @@ class WeightedSpecsOut(BaseModel):
     research: List[KeywordItem] = Field(default_factory=list)
     application: List[KeywordItem] = Field(default_factory=list)
 
+class OpportunityCategoryOut(BaseModel):
+    broad_category: Literal["basic_research", "applied_research", "educational", "unclear"] = "unclear"
+    specific_categories: List[str] = Field(default_factory=list)
+
 
 # ───────────────────────────────────────────────
 # Matching / scoring
@@ -78,7 +82,7 @@ class LLMMatchOut(BaseModel):
 
 
 # ───────────────────────────────────────────────
-# Justification
+# One-to-One Match Justification
 # ───────────────────────────────────────────────
 class FacultyOpportunityRec(BaseModel):
     opportunity_id: str
@@ -96,49 +100,9 @@ class FacultyRecsOut(BaseModel):
     faculty_name: str
     recommendations: List[FacultyOpportunityRec] = Field(default_factory=list)
 
-NeedKind = Literal["research_domain", "method", "application", "compliance"]
-
 # ───────────────────────────────────────────────
-# For group matcher
+# Group justification
 # ───────────────────────────────────────────────
-class Need(BaseModel):
-    need_id: str
-    label: str
-    description: str
-    weight: int = Field(ge=1, le=5, default=3)
-    kind: NeedKind = "research_domain"
-    must_have: bool = False
-
-class NeedsOut(BaseModel):
-    opportunity_id: str
-    opportunity_title: str
-    scope_confidence: float = Field(ge=0.0, le=1.0)
-    suggested_team_size: int = Field(ge=1, le=8, default=3)
-    needs: List[Need] = Field(default_factory=list)
-
-class TeamMember(BaseModel):
-    faculty_id: int
-    name: str | None = None
-    email: str | None = None
-    role: str | None = None
-
-class TeamMatchOut(BaseModel):
-    opportunity_id: str
-    selected: List[TeamMember] = Field(default_factory=list)
-    covered_need_ids: List[str] = Field(default_factory=list)
-    missing_need_ids: List[str] = Field(default_factory=list)
-
-#
-class PairPenalty(BaseModel):
-    f: int = Field(..., description="Faculty id")
-    g: int = Field(..., description="Faculty id")
-    p: float = Field(..., ge=0, description="Penalty magnitude in score units")
-    why: Optional[str] = Field(None, description="Short reason")
-
-class PairPenaltiesOut(BaseModel):
-    pair_penalties: List[PairPenalty] = Field(default_factory=list)
-
-
 class MemberRoleOut(BaseModel):
     faculty_id: int
     role: str = Field(..., description="Short label like 'AI/ML lead', 'Education/Outreach lead', etc.")
@@ -149,7 +113,43 @@ class CoverageOut(BaseModel):
     partial: List[str] = Field(default_factory=list)
     missing: List[str] = Field(default_factory=list)
 
+class MemberStrengthOut(BaseModel):
+    faculty_id: int
+    bullets: List[str] = Field(default_factory=list)
+
+class TeamRoleOut(BaseModel):
+    member_roles: List[MemberRoleOut] = Field(default_factory=list)
+
+class GrantBriefOut(BaseModel):
+    grant_title: str = ""
+    grant_link: str = ""
+    grant_quick_explanation: str = ""
+    priority_themes: List[str] = Field(default_factory=list)
+
+class WhyWorkingOut(BaseModel):
+    summary: str = ""
+    member_strengths: List[MemberStrengthOut] = Field(default_factory=list)
+    strong: List[str] = Field(default_factory=list)
+    partial: List[str] = Field(default_factory=list)
+
+class WhyNotWorkingOut(BaseModel):
+    why_not_working: List[str] = Field(default_factory=list)
+    missing: List[str] = Field(default_factory=list)
+
+class RecommendationOut(BaseModel):
+    recommendation: str = ""
+
 class GroupJustificationOut(BaseModel):
     one_paragraph: str
     member_roles: List[MemberRoleOut] = Field(default_factory=list)
     coverage: CoverageOut = Field(default_factory=CoverageOut)
+    member_strengths: List[MemberStrengthOut] = Field(default_factory=list)
+    why_not_working: List[str] = Field(default_factory=list)
+    recommendation: str = ""
+
+# ───────────────────────────────────────────────
+# Candidate team selection (Additional layer for selecting group)
+# ───────────────────────────────────────────────
+class TeamCandidateSelectionOut(BaseModel):
+    selected_candidate_indices: List[int] = Field(default_factory=list)
+    reason: Optional[str] = None
