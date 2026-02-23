@@ -180,7 +180,7 @@ class GroupJustificationGenerator:
                             }
                             for f in fac_ctxs
                         ],
-                        #"score": row.get("score"),
+                        "team_score": float(row.get("score") or 0.0),
                         #"final_coverage": coverage,
                         #"requirement_specs": extract_requirement_specs(opp_ctx),
                         "justification": justification.model_dump(),

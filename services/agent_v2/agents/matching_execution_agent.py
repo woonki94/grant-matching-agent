@@ -105,7 +105,13 @@ class MatchingExecutionAgent:
 
         category_filters = self._normalize_broad_category_filter(broad_category)
         if not category_filters and not str(query_text or "").strip():
-            return rows[: int(top_k)]
+            # No filters — preserve llm_score descending order from DAO, then slice
+            sorted_rows = sorted(
+                rows,
+                key=lambda r: (float(r.get("llm_score") or 0.0), float(r.get("domain_score") or 0.0)),
+                reverse=True,
+            )
+            return sorted_rows[: int(top_k)]
         query_map = self._build_query_similarity_map(
             query_text=query_text,
             k=max(int(top_k) * 30, 200),
@@ -166,7 +172,9 @@ class MatchingExecutionAgent:
 
         category_filters = self._normalize_broad_category_filter(broad_category)
         if not category_filters and not str(query_text or "").strip():
-            return rows
+            # No filters — sort purely by team_score (SuperFacultySelector score) descending
+            return sorted(rows, key=lambda r: float(r.get("team_score") or 0.0), reverse=True)
+
         query_map = self._build_query_similarity_map(
             query_text=query_text,
             k=max(len(rows) * 20, 200),
@@ -195,10 +203,11 @@ class MatchingExecutionAgent:
             out = list(rows)
 
         if query_map:
+            # With query: primary = query relevance, secondary = team_score
             out.sort(
                 key=lambda x: (
                     float(x.get("query_score") or 0.0),
-                    float(x.get("score") or 0.0),
+                    float(x.get("team_score") or 0.0),
                 ),
                 reverse=True,
             )
@@ -729,27 +738,46 @@ class MatchingExecutionAgent:
     # ──────────────────────────────────────────────────────────────────
 
     def _get_faculty_details(self, faculty_id: int, is_existing: bool = False) -> Optional[Dict[str, Any]]:
-        """Return a dict of faculty profile + keyword info for one faculty_id."""
+        """Return a dict of faculty profile + keyword info for one faculty_id (single-use helper)."""
+        details = self._get_faculty_details_batch([faculty_id], existing_ids={faculty_id} if is_existing else set())
+        return details.get(int(faculty_id))
+
+    def _get_faculty_details_batch(
+        self,
+        faculty_ids: List[int],
+        existing_ids: Optional[Set[int]] = None,
+    ) -> Dict[int, Dict[str, Any]]:
+        """
+        Fetch profile + keyword info for multiple faculty in ONE session.
+        Returns {faculty_id: details_dict}.
+        """
+        if not faculty_ids:
+            return {}
+        existing_ids = existing_ids or set()
+        result: Dict[int, Dict[str, Any]] = {}
         try:
             from db.models.faculty import Faculty as FacultyModel
             with self.session_factory() as sess:
-                fac = sess.get(FacultyModel, int(faculty_id))
-                if not fac:
-                    return None
-                kw_ctx = FacultyDAO(sess).get_faculty_keyword_context(int(faculty_id))
-                keywords = (kw_ctx or {}).get("keywords", {})
-                return {
-                    "faculty_id": int(faculty_id),
-                    "name": getattr(fac, "name", None),
-                    "email": getattr(fac, "email", None),
-                    "position": getattr(fac, "position", None),
-                    "expertise": list(getattr(fac, "expertise", None) or []),
-                    "research_domains": list((keywords.get("research") or {}).get("domain", [])),
-                    "application_domains": list((keywords.get("application") or {}).get("domain", [])),
-                    "is_existing_member": is_existing,
-                }
+                dao = FacultyDAO(sess)
+                for fid in faculty_ids:
+                    fac = sess.get(FacultyModel, int(fid))
+                    if not fac:
+                        continue
+                    kw_ctx  = dao.get_faculty_keyword_context(int(fid))
+                    keywords = (kw_ctx or {}).get("keywords", {})
+                    result[int(fid)] = {
+                        "faculty_id": int(fid),
+                        "name":     getattr(fac, "name",     None),
+                        "email":    getattr(fac, "email",    None),
+                        "position": getattr(fac, "position", None),
+                        "expertise": list(getattr(fac, "expertise", None) or []),
+                        "research_domains":     list((keywords.get("research")    or {}).get("domain", [])),
+                        "application_domains":  list((keywords.get("application") or {}).get("domain", [])),
+                        "is_existing_member": int(fid) in existing_ids,
+                    }
         except Exception:
-            return None
+            pass
+        return result
 
     def _ensure_opportunity_embedding(self, opportunity_id: str) -> None:
         """Generate opportunity keywords+embedding if not already present."""
@@ -767,37 +795,43 @@ class MatchingExecutionAgent:
         candidate_ids: List[int],
     ) -> Dict[int, Dict[str, Any]]:
         """
-        Run FacultyGrantMatcher for a batch of candidates against one opportunity,
-        then read the stored MatchResult rows.
+        Score candidates against one opportunity using FacultyGrantMatcher (LLM-backed).
+
+        Optimised three-step flow:
+          1. Batch-fetch already-cached match rows — no LLM needed for these.
+          2. Run FacultyGrantMatcher ONLY for candidates without a cached result.
+          3. Batch-fetch the newly computed rows.
 
         Returns {faculty_id: {llm_score, domain_score, reason, covered, missing}}.
         """
         if not candidate_ids:
             return {}
 
-        # FacultyGrantMatcher.run_for_opportunity computes + stores match rows.
-        self.faculty_matcher.run_for_opportunity(
-            opportunity_id=opp_id,
-            faculty_ids=candidate_ids,
-            min_domain=0.0,
-        )
+        candidate_set = set(int(f) for f in candidate_ids)
 
-        scores: Dict[int, Dict[str, Any]] = {}
+        # ── Step 1: load all cached rows in one query ────────────────────────
         with self.session_factory() as sess:
-            mdao = MatchDAO(sess)
-            for fid in candidate_ids:
-                row = mdao.get_match_for_faculty_opportunity(
-                    faculty_id=int(fid),
-                    opportunity_id=opp_id,
+            scores: Dict[int, Dict[str, Any]] = MatchDAO(sess).list_matches_for_opportunity_by_faculty_ids(
+                opp_id, list(candidate_set)
+            )
+
+        already_scored = set(scores.keys())
+        needs_scoring  = [fid for fid in candidate_ids if fid not in already_scored]
+
+        # ── Step 2: LLM scoring only for uncached candidates ─────────────────
+        if needs_scoring:
+            self.faculty_matcher.run_for_opportunity(
+                opportunity_id=opp_id,
+                faculty_ids=needs_scoring,
+                min_domain=0.0,
+            )
+            # ── Step 3: batch-fetch newly computed rows ───────────────────────
+            with self.session_factory() as sess:
+                new_scores = MatchDAO(sess).list_matches_for_opportunity_by_faculty_ids(
+                    opp_id, needs_scoring
                 )
-                if row:
-                    scores[int(fid)] = {
-                        "llm_score":    round(float(row.get("llm_score")    or 0), 3),
-                        "domain_score": round(float(row.get("domain_score") or 0), 3),
-                        "reason":   str(row.get("reason")  or ""),
-                        "covered":  list(row.get("covered") or []),
-                        "missing":  list(row.get("missing") or []),
-                    }
+            scores.update(new_scores)
+
         return scores
 
     def find_collaborators_for_grant(
@@ -866,10 +900,11 @@ class MatchingExecutionAgent:
             )
             top_n = ranked[:additional_count]
 
-            # ── Phase 4: enrich with faculty profile ──────────────────────
+            # ── Phase 4: enrich with faculty profile (one batch session) ─────
+            all_details = self._get_faculty_details_batch(top_n, existing_ids=set())
             suggested = []
             for fid in top_n:
-                details = self._get_faculty_details(int(fid), is_existing=False)
+                details = all_details.get(int(fid))
                 if details:
                     details.update(scores.get(int(fid), {}))
                     suggested.append(details)
@@ -975,11 +1010,11 @@ class MatchingExecutionAgent:
             )
             final_team_ids = existing_order + top_new
 
-            # ── Phase 5: enrich with faculty profile ──────────────────────
+            # ── Phase 5: enrich with faculty profile (one batch session) ─────
+            all_details = self._get_faculty_details_batch(final_team_ids, existing_ids=existing_ids)
             suggested_team = []
             for fid in final_team_ids:
-                is_existing = int(fid) in existing_ids
-                details = self._get_faculty_details(int(fid), is_existing=is_existing)
+                details = all_details.get(int(fid))
                 if details:
                     details.update(scores.get(int(fid), {}))
                     suggested_team.append(details)

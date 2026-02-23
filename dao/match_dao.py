@@ -256,9 +256,9 @@ class MatchDAO:
         return dict(row) if row else None
 
     def list_matches_for_opportunity(self, opportunity_id: str, limit: int = 200):
-        """List stored faculty match rows for a given opportunity."""
+        """List stored faculty match rows for a given opportunity, ordered by llm_score DESC."""
         q = text("""
-            SELECT faculty_id, domain_score, llm_score, covered, missing
+            SELECT faculty_id, domain_score, llm_score, reason, covered, missing
             FROM match_results
             WHERE grant_id = :oid
             ORDER BY llm_score DESC, domain_score DESC
@@ -266,6 +266,37 @@ class MatchDAO:
         """)
         rows = self.session.execute(q, {"oid": opportunity_id, "lim": limit}).mappings().all()
         return [dict(r) for r in rows]
+
+    def list_matches_for_opportunity_by_faculty_ids(
+        self,
+        opportunity_id: str,
+        faculty_ids: List[int],
+    ):
+        """
+        Batch-fetch match rows for a specific set of faculty against one opportunity.
+        Returns {faculty_id: {llm_score, domain_score, reason, covered, missing}}.
+        """
+        if not faculty_ids:
+            return {}
+        q = text("""
+            SELECT faculty_id, domain_score, llm_score, reason, covered, missing
+            FROM match_results
+            WHERE grant_id = :oid
+              AND faculty_id = ANY(:fids)
+        """)
+        rows = self.session.execute(
+            q, {"oid": str(opportunity_id), "fids": [int(f) for f in faculty_ids]}
+        ).mappings().all()
+        return {
+            int(r["faculty_id"]): {
+                "llm_score":    round(float(r["llm_score"]    or 0), 3),
+                "domain_score": round(float(r["domain_score"] or 0), 3),
+                "reason":  str(r["reason"]  or ""),
+                "covered": list(r["covered"] or []),
+                "missing": list(r["missing"] or []),
+            }
+            for r in rows
+        }
 
     def get_grant_ids_for_faculty(
         self,
