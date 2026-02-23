@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from typing import Any, Dict, List, Optional, Set
 
 from dao.faculty_dao import FacultyDAO
@@ -8,9 +9,13 @@ from dao.opportunity_dao import OpportunityDAO
 from db.db_conn import SessionLocal
 from db.models.faculty import Faculty
 from services.context.context_generator import ContextGenerator
+from services.justification.group_justification_engine import GroupJustificationEngine
 from services.justification.group_justification_generator import GroupJustificationGenerator
 from services.keywords.keyword_generator import KeywordGenerator
 from services.matching.faculty_grant_matcher import FacultyGrantMatcher
+from services.matching.super_faculty_selector import SuperFacultySelector
+
+logger = logging.getLogger(__name__)
 
 
 class MatchingExecutionAgent:
@@ -24,6 +29,7 @@ class MatchingExecutionAgent:
         self.context_generator = context_generator or ContextGenerator()
         self.keyword_generator = KeywordGenerator(context_generator=self.context_generator)
         self.faculty_matcher = FacultyGrantMatcher(session_factory=session_factory)
+        self.super_faculty_selector = SuperFacultySelector()
         self.group_justification_generator = GroupJustificationGenerator(
             session_factory=session_factory,
             context_generator=self.context_generator,
@@ -789,6 +795,109 @@ class MatchingExecutionAgent:
     LLM_POOL_MULTIPLIER = 4
     LLM_POOL_MIN = 15
 
+    def _build_opp_index_to_label(self, opp_id: str) -> Dict[str, Dict[int, str]]:
+        """Map numeric topic indices back to human-readable labels for one opportunity."""
+        try:
+            from utils.keyword_utils import extract_specializations
+            from sqlalchemy.orm import selectinload
+            from db.models.opportunity import Opportunity as OppModel
+
+            with self.session_factory() as sess:
+                opp = (
+                    sess.query(OppModel)
+                    .options(selectinload(OppModel.keyword))
+                    .filter(OppModel.opportunity_id == opp_id)
+                    .first()
+                )
+                if not opp or not opp.keyword:
+                    return {"application": {}, "research": {}}
+                kw = getattr(opp.keyword, "keywords", {}) or {}
+                specs = extract_specializations(kw)
+                return {
+                    sec: {i: s["t"] for i, s in enumerate(specs[sec])}
+                    for sec in ("application", "research")
+                }
+        except Exception:
+            return {"application": {}, "research": {}}
+
+    def _decode_scores(
+        self,
+        scores: Dict[int, Dict[str, Any]],
+        idx_to_label: Dict[str, Dict[int, str]],
+    ) -> Dict[int, Dict[str, Any]]:
+        """Convert indexed covered/missing fields to human-readable topic label lists."""
+        decoded: Dict[int, Dict[str, Any]] = {}
+        for fid, sc in scores.items():
+            covered_raw = sc.get("covered") or {}
+            missing_raw = sc.get("missing") or {}
+
+            covered_labels: List[str] = []
+            if isinstance(covered_raw, dict):
+                for sec in ("application", "research"):
+                    for k, v in (covered_raw.get(sec) or {}).items():
+                        try:
+                            label = idx_to_label.get(sec, {}).get(int(k))
+                            if label and float(v) > 0:
+                                covered_labels.append(label)
+                        except Exception:
+                            pass
+
+            missing_labels: List[str] = []
+            if isinstance(missing_raw, dict):
+                for sec in ("application", "research"):
+                    for idx in (missing_raw.get(sec) or []):
+                        try:
+                            label = idx_to_label.get(sec, {}).get(int(idx))
+                            if label:
+                                missing_labels.append(label)
+                        except Exception:
+                            pass
+
+            decoded[fid] = {**sc, "covered": covered_labels, "missing": missing_labels}
+        return decoded
+
+    def _run_group_justification(
+        self,
+        opp_id: str,
+        team_fac_ids: List[int],
+        final_coverage: Dict[str, Any],
+        member_coverages: Dict[int, Dict[str, Any]],
+    ) -> Optional[Dict[str, Any]]:
+        """Run GroupJustificationEngine for the given finalized team and return a dict."""
+        try:
+            with self.session_factory() as sess:
+                odao = OpportunityDAO(sess)
+                fdao = FacultyDAO(sess)
+
+                opp_ctx = odao.read_opportunity_context(opp_id) or {}
+                if not opp_ctx:
+                    return None
+
+                fac_ctxs: List[Dict[str, Any]] = []
+                for fid in team_fac_ids:
+                    ctx = fdao.get_faculty_keyword_context(int(fid)) or {}
+                    if ctx:
+                        fac_ctxs.append(ctx)
+
+                if not fac_ctxs:
+                    return None
+
+                engine = GroupJustificationEngine(
+                    odao=odao,
+                    fdao=fdao,
+                    context_generator=self.context_generator,
+                )
+                justification, _ = engine.run_one(
+                    opp_ctx=dict(opp_ctx),
+                    fac_ctxs=[dict(f) for f in fac_ctxs],
+                    coverage=final_coverage,
+                    member_coverages=member_coverages,
+                )
+                return justification.model_dump()
+        except Exception as exc:
+            logger.warning("Group justification failed for opp=%s: %s", opp_id, exc)
+            return None
+
     def _run_llm_scoring_for_candidates(
         self,
         opp_id: str,
@@ -842,17 +951,19 @@ class MatchingExecutionAgent:
         additional_count: int = 3,
     ) -> Dict[str, Any]:
         """
-        Find top `additional_count` faculty who would complement the existing team
-        for a specific grant.
+        Find `additional_count` faculty who best COMPLEMENT the existing team for a grant.
 
-        Two-phase approach:
-          1. Fast embedding pre-filter — topk_faculties_for_opportunity (pgvector)
-          2. LLM scoring — FacultyGrantMatcher on the top-N*LLM_POOL candidates
-          3. Re-rank by llm_score; return top additional_count with rich output.
+        Uses SuperFacultySelector with the existing team pinned as required members, so
+        new suggestions are chosen to maximise MARGINAL coverage gain (complementarity).
 
-        Each result includes: name, email, position, expertise, research/application
-        domains, domain_score, llm_score, reason (one-line LLM justification),
-        covered topics, and missing topics.
+        Pipeline:
+          0. Ensure opportunity keyword embeddings exist.
+          1. pgvector pre-filter — get a pool of candidate faculty (excluding existing).
+          2. LLM scoring — FacultyGrantMatcher for both existing + candidates (caches to DB).
+          3. Build per-faculty coverage vectors from match_results via context_generator.
+          4. SuperFacultySelector — pin existing team, pick best `additional_count` new members.
+          5. GroupJustificationEngine — narrative for the full combined team.
+          6. Enrich new members with profiles and decoded LLM scores.
         """
         self._call("MatchingExecutionAgent.find_collaborators_for_grant")
         opp_id = str(opportunity_id or "").strip()
@@ -863,7 +974,8 @@ class MatchingExecutionAgent:
                 "suggested_collaborators": [],
             }
 
-        exclude_ids: Set[int] = set(map(int, existing_faculty_ids or []))
+        existing_ids: List[int] = list(dict.fromkeys(int(f) for f in (existing_faculty_ids or [])))
+        existing_set: Set[int] = set(existing_ids)
 
         try:
             # ── Phase 0: ensure opportunity has keyword embeddings ─────────
@@ -874,39 +986,92 @@ class MatchingExecutionAgent:
                 opp = sess.get(OppModel, opp_id)
                 opp_title = getattr(opp, "opportunity_title", None) if opp else None
 
-            # ── Phase 1: fast embedding pre-filter ────────────────────────
+            # ── Phase 1: pgvector pre-filter for NEW candidate pool ────────
             llm_pool_size = max(additional_count * self.LLM_POOL_MULTIPLIER, self.LLM_POOL_MIN)
-            k_fetch = llm_pool_size + len(exclude_ids)  # fetch extra to cover exclusions
+            k_fetch = llm_pool_size + len(existing_ids) + 20
             with self.session_factory() as sess:
                 top_pairs = MatchDAO(sess).topk_faculties_for_opportunity(
                     opportunity_id=opp_id, k=k_fetch
                 )
+            candidate_ids = [fid for fid, _ in top_pairs if fid not in existing_set][:llm_pool_size]
 
-            candidate_ids = [
-                fid for fid, _ in top_pairs if fid not in exclude_ids
-            ][:llm_pool_size]
+            # ── Phase 2: LLM scoring for existing team + candidate pool ────
+            # Existing members are scored first so their coverage is in the DB
+            # before build_matching_inputs_for_opportunity is called.
+            all_to_score = existing_ids + [fid for fid in candidate_ids if fid not in existing_set]
+            self._run_llm_scoring_for_candidates(opp_id, all_to_score)
 
-            # ── Phase 2: LLM scoring for the candidate pool ───────────────
-            scores = self._run_llm_scoring_for_candidates(opp_id, candidate_ids)
+            # ── Phase 3: build SuperFacultySelector inputs ─────────────────
+            with self.session_factory() as sess:
+                f, w, c = self.context_generator.build_matching_inputs_for_opportunity(
+                    sess=sess,
+                    opportunity_id=opp_id,
+                    limit_rows=500,
+                )
 
-            # ── Phase 3: re-rank by llm_score ─────────────────────────────
-            ranked = sorted(
-                candidate_ids,
-                key=lambda fid: (
-                    scores.get(fid, {}).get("llm_score", 0),
-                    scores.get(fid, {}).get("domain_score", 0),
-                ),
-                reverse=True,
+            # Ensure every existing member is represented (add zero-coverage if absent)
+            for fid in existing_ids:
+                if fid not in c:
+                    c[fid] = {
+                        "application": {i: 0.0 for i in w.get("application", {}).keys()},
+                        "research":    {i: 0.0 for i in w.get("research",    {}).keys()},
+                    }
+
+            # Restrict cand_faculty_ids to our scored pool so the selector stays fast
+            our_pool: Set[int] = existing_set | set(candidate_ids)
+            cand_faculty_ids = [fid for fid in f if fid in our_pool]
+            for fid in existing_ids:
+                if fid not in cand_faculty_ids:
+                    cand_faculty_ids.append(fid)
+
+            # ── Phase 4: SuperFacultySelector — pin existing, pick best new ─
+            K = len(existing_ids) + additional_count
+            if K > len(cand_faculty_ids):
+                K = len(cand_faculty_ids)
+
+            full_team, final_coverage = self.super_faculty_selector.team_selection_super_faculty(
+                cand_faculty_ids=cand_faculty_ids,
+                requirements=w,
+                coverage=c,
+                K=K,
+                required_faculty_ids=existing_ids,
+                num_candidates=1,
             )
-            top_n = ranked[:additional_count]
 
-            # ── Phase 4: enrich with faculty profile (one batch session) ─────
-            all_details = self._get_faculty_details_batch(top_n, existing_ids=set())
-            suggested = []
-            for fid in top_n:
+            team_score = round(
+                sum(
+                    float(w[sec][i]) * float(final_coverage.get(sec, {}).get(i, 0.0))
+                    for sec in w
+                    for i in w[sec]
+                ),
+                4,
+            )
+
+            new_member_ids = [fid for fid in full_team if fid not in existing_set]
+
+            # ── Phase 5: group justification for the combined team ──────────
+            member_coverages = {fid: c.get(fid, {}) for fid in full_team}
+            justification = self._run_group_justification(
+                opp_id, full_team, final_coverage, member_coverages
+            )
+
+            # ── Phase 6: decode individual LLM scores for new members ───────
+            raw_scores = self._run_llm_scoring_for_candidates(opp_id, new_member_ids)
+            idx_to_label = self._build_opp_index_to_label(opp_id)
+            decoded_scores = self._decode_scores(raw_scores, idx_to_label)
+
+            # ── Phase 7: enrich new members with faculty profiles ────────────
+            all_details = self._get_faculty_details_batch(new_member_ids, existing_ids=set())
+            suggested: List[Dict[str, Any]] = []
+            for fid in new_member_ids:
                 details = all_details.get(int(fid))
                 if details:
-                    details.update(scores.get(int(fid), {}))
+                    sc = decoded_scores.get(int(fid), {})
+                    details["llm_score"]    = sc.get("llm_score",    0.0)
+                    details["domain_score"] = sc.get("domain_score", 0.0)
+                    details["reason"]       = sc.get("reason",       "")
+                    details["covered"]      = sc.get("covered",      [])
+                    details["missing"]      = sc.get("missing",      [])
                     suggested.append(details)
 
             return {
@@ -914,10 +1079,13 @@ class MatchingExecutionAgent:
                 "opportunity_id": opp_id,
                 "opportunity_title": opp_title,
                 "additional_count": additional_count,
+                "team_score": team_score,
                 "suggested_collaborators": suggested,
+                "group_justification": justification,
             }
 
         except Exception as e:
+            logger.exception("find_collaborators_for_grant failed for opp=%s", opp_id)
             return {
                 "next_action": "error_find_collaborators",
                 "error": f"{type(e).__name__}: {e}",

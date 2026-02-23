@@ -292,8 +292,8 @@ class MatchDAO:
                 "llm_score":    round(float(r["llm_score"]    or 0), 3),
                 "domain_score": round(float(r["domain_score"] or 0), 3),
                 "reason":  str(r["reason"]  or ""),
-                "covered": list(r["covered"] or []),
-                "missing": list(r["missing"] or []),
+                "covered": r["covered"] or {},
+                "missing": r["missing"] or {},
             }
             for r in rows
         }
