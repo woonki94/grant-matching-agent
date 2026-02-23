@@ -1218,14 +1218,9 @@ class MatchingExecutionAgent:
             decoded_scores = self._decode_scores(raw_scores, idx_to_label)
 
             # ── Phase 7: enrich all members with faculty profiles ──────────
-            # Existing members appear first, new members after
-            ordered_team = (
-                [fid for fid in full_team if fid in existing_set] +
-                [fid for fid in full_team if fid not in existing_set]
-            )
-            all_details = self._get_faculty_details_batch(ordered_team, existing_ids=existing_set)
+            all_details = self._get_faculty_details_batch(list(full_team), existing_ids=existing_set)
             suggested_team: List[Dict[str, Any]] = []
-            for fid in ordered_team:
+            for fid in full_team:
                 details = all_details.get(int(fid))
                 if details:
                     sc = decoded_scores.get(int(fid), {})
@@ -1235,6 +1230,16 @@ class MatchingExecutionAgent:
                     details["covered"]      = sc.get("covered",      [])
                     details["missing"]      = sc.get("missing",      [])
                     suggested_team.append(details)
+
+            # Existing members always first; within each group sort by llm_score desc,
+            # then domain_score desc as tie-breaker
+            suggested_team.sort(
+                key=lambda d: (
+                    not d.get("is_existing_member", False),  # existing = 0, new = 1 → existing first
+                    -d.get("llm_score",    0.0),
+                    -d.get("domain_score", 0.0),
+                )
+            )
 
             return {
                 "next_action": "return_team",
