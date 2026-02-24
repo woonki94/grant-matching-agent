@@ -259,6 +259,58 @@ class SingleJustificationGenerator:
                 batch_size=3,
             )
 
+    def generate_faculty_recs_for_matches(
+        self,
+        *,
+        email: str,
+        matches: List[Dict[str, Any]],
+        k: int,
+    ) -> FacultyRecsOut:
+        """Generate recommendations for an explicit ordered match list (already filtered/ranked)."""
+        target_k = max(1, int(k))
+        top_matches = list(matches or [])[:target_k]
+        if not top_matches:
+            raise ValueError("No matches provided for recommendation generation.")
+
+        chain = self._build_chain()
+
+        with SessionLocal() as sess:
+            fac = self._get_faculty_by_email(sess, email=email)
+            top_rows = []
+            for m in top_matches:
+                opp_id = str(m.get("opportunity_id") or m.get("grant_id") or "").strip()
+                if not opp_id:
+                    continue
+                top_rows.append(
+                    (
+                        opp_id,
+                        float(m.get("domain_score") or 0.0),
+                        float(m.get("llm_score") or 0.0),
+                    )
+                )
+
+            if not top_rows:
+                raise ValueError("No valid opportunity IDs found in provided matches.")
+
+            fac_ctx, opp_payloads = self.context_generator.build_faculty_recommendation_payloads(
+                sess=sess,
+                fac=fac,
+                top_rows=top_rows,
+            )
+            if not opp_payloads:
+                raise ValueError(
+                    "Match rows exist but opportunity payloads are missing in DB for recommendation generation."
+                )
+            faculty_name = getattr(fac, "name", None) or email
+            return self._build_recommendations_from_payloads(
+                chain=chain,
+                fac_ctx=fac_ctx,
+                opp_payloads=opp_payloads,
+                faculty_name=faculty_name,
+                k=min(target_k, len(opp_payloads)),
+                batch_size=3,
+            )
+
     def generate_for_specific_grant(self, *, email: str, opportunity_id: str) -> FacultyRecsOut:
         """Generate one-to-one justification for exactly one opportunity."""
         opp_id = str(opportunity_id or "").strip()

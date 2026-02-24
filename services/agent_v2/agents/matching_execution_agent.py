@@ -455,24 +455,11 @@ class MatchingExecutionAgent:
             try:
                 from services.justification.single_justification_generator import SingleJustificationGenerator
 
-                rec_out = SingleJustificationGenerator().generate_faculty_recs(
+                rec_out = SingleJustificationGenerator().generate_faculty_recs_for_matches(
                     email=faculty_email,
-                    k=max(prefilter_k, requested_k),
+                    matches=out,
+                    k=requested_k,
                 )
-                # Keep recommendation output aligned with returned matches and top-k.
-                order = {
-                    str(item.get("opportunity_id") or ""): idx
-                    for idx, item in enumerate(out)
-                }
-                filtered_recs = [
-                    r
-                    for r in (rec_out.recommendations or [])
-                    if str(getattr(r, "opportunity_id", "")) in order
-                ]
-                filtered_recs.sort(
-                    key=lambda r: order.get(str(getattr(r, "opportunity_id", "")), 10**9)
-                )
-                rec_out = rec_out.model_copy(update={"recommendations": filtered_recs[:requested_k]})
                 recommendation = rec_out.model_dump()
             except Exception as e:
                 recommendation_error = f"{type(e).__name__}: {e}"
