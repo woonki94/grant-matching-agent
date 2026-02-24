@@ -11,9 +11,9 @@
   "group_top_k": 5,
   "group_query_text": "",
   "group_broad_category": "",
-  "warmup": 1,
-  "repeats": 3,
-  "output_dir": "/Users/kimwoonki/Desktop/OSU/Fall2025/Capstone/GrantFetcher/outputs/benchmarks",
+  "warmup": 0,
+  "repeats": 1,
+  "output_dir": "/outputs/benchmarks",
   "skip_email_precheck": false,
   "dry_run_scenarios": false
 }
