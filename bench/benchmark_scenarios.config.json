@@ -1,0 +1,19 @@
+{
+  "single_email": "alan.fern@oregonstate.edu",
+  "group_emails": [
+    "alan.fern@oregonstate.edu",
+    "naomi.fitter@oregonstate.edu"
+  ],
+  "single_query_text": "machine learning",
+  "single_broad_category": "applied_research",
+  "single_top_k": 10,
+  "group_team_sizes": "2,3,4,5",
+  "group_top_k": 5,
+  "group_query_text": "",
+  "group_broad_category": "",
+  "warmup": 1,
+  "repeats": 3,
+  "output_dir": "/Users/kimwoonki/Desktop/OSU/Fall2025/Capstone/GrantFetcher/outputs/benchmarks",
+  "skip_email_precheck": false,
+  "dry_run_scenarios": false
+}
