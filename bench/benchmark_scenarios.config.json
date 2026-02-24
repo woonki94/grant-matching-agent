@@ -13,7 +13,7 @@
   "group_broad_category": "",
   "warmup": 0,
   "repeats": 1,
-  "output_dir": "/outputs/benchmarks",
+  "output_dir": "./outputs/benchmarks",
   "skip_email_precheck": false,
   "dry_run_scenarios": false
 }

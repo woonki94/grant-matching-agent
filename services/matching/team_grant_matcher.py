@@ -1,5 +1,7 @@
 import sys
+import os
 from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Dict, List, Optional
 
 
@@ -15,6 +17,8 @@ from services.matching.super_faculty_selector import SuperFacultySelector
 
 
 class TeamGrantMatcher:
+    DEFAULT_OPP_WORKERS = 4
+
     def __init__(self, *, session_factory=SessionLocal, context_generator: Optional[ContextGenerator] = None):
         self.session_factory = session_factory
         self.context_generator = context_generator or ContextGenerator()
@@ -54,6 +58,16 @@ class TeamGrantMatcher:
             return [{"team": team, "final_coverage": final_coverage, "score": score}]
         return selection
 
+    def _resolve_opp_workers(self, n_tasks: int) -> int:
+        if n_tasks <= 0:
+            return 1
+        raw = os.getenv("TEAM_MATCH_OPP_WORKERS", str(self.DEFAULT_OPP_WORKERS))
+        try:
+            val = int(raw)
+        except Exception:
+            val = self.DEFAULT_OPP_WORKERS
+        return max(1, min(val, int(n_tasks)))
+
     def run_group_match(
         self,
         *,
@@ -66,16 +80,16 @@ class TeamGrantMatcher:
         desired_team_count: int = 1,
         group_by_opp: bool = True,
     ):
+        if not faculty_emails:
+            raise ValueError("At least one faculty email is required.")
+        if desired_team_count < 1:
+            raise ValueError("desired_team_count must be >= 1")
+        if num_candidates < 1:
+            raise ValueError("num_candidates must be >= 1")
+
         with self.session_factory() as sess:
             match_dao = MatchDAO(sess)
             fac_dao = FacultyDAO(sess)
-
-            if not faculty_emails:
-                raise ValueError("At least one faculty email is required.")
-            if desired_team_count < 1:
-                raise ValueError("desired_team_count must be >= 1")
-            if num_candidates < 1:
-                raise ValueError("num_candidates must be >= 1")
 
             unique_emails = list(dict.fromkeys(faculty_emails))
             fac_ids = [fac_dao.get_faculty_id_by_email(email) for email in unique_emails]
@@ -94,77 +108,97 @@ class TeamGrantMatcher:
                         common &= set(fac_list)
                     target_opp_ids = [oid for oid in per_fac_opp_lists[0] if oid in common]
 
-            flat_results = []
-            for opp_id in target_opp_ids:
+        def _process_opp(opp_id: str) -> List[Dict[str, object]]:
+            with self.session_factory() as opp_sess:
                 f, w, c = self.context_generator.build_matching_inputs_for_opportunity(
-                    sess=sess,
+                    sess=opp_sess,
                     opportunity_id=opp_id,
                     limit_rows=limit_rows,
                 )
-                if not f:
-                    print("  ↳ skipped (no faculty candidates)")
-                    continue
+            if not f:
+                return []
 
-                missing_required = [fid for fid in fac_ids if fid not in f]
-                if missing_required:
-                    for fid in missing_required:
-                        f.append(fid)
-                        c[fid] = {
-                            "application": {i: 0.0 for i in w.get("application", {}).keys()},
-                            "research": {i: 0.0 for i in w.get("research", {}).keys()},
-                        }
-                    f = sorted(set(f))
-
-                candidate_pool_size = max(num_candidates, desired_team_count) if use_llm_selection else desired_team_count
-
-                selection = self.super_faculty_selector.team_selection_super_faculty(
-                    cand_faculty_ids=f,
-                    requirements=w,
-                    coverage=c,
-                    K=team_size,
-                    required_faculty_ids=fac_ids,
-                    num_candidates=candidate_pool_size,
-                )
-                candidates = self._normalize_candidates(selection, w)
-
-                if use_llm_selection:
-                    llm_selection = self.group_match_llm_selector.select_candidate_teams_with_llm(
-                        opportunity_id=opp_id,
-                        desired_team_count=desired_team_count,
-                        candidates=self._attach_member_coverages(candidates, c),
-                        requirement_weights=w,
-                    )
-                    selected_candidates = llm_selection["selected_candidates"]
-                else:
-                    selected_candidates = candidates[:desired_team_count]
-
-                for cand in selected_candidates[:desired_team_count]:
-                    flat_results.append(
-                        {
-                            "opp_id": opp_id,
-                            "team": cand["team"],
-                            "final_coverage": cand["final_coverage"],
-                            "score": cand["score"],
-                        }
-                    )
-
-            if not group_by_opp:
-                return flat_results
-
-            grouped: Dict[str, Dict[str, object]] = {}
-            for row in flat_results:
-                oid = row["opp_id"]
-                if oid not in grouped:
-                    grouped[oid] = {
-                        "opp_id": oid,
-                        "selected_teams": [],
+            missing_required = [fid for fid in fac_ids if fid not in f]
+            if missing_required:
+                for fid in missing_required:
+                    f.append(fid)
+                    c[fid] = {
+                        "application": {i: 0.0 for i in w.get("application", {}).keys()},
+                        "research": {i: 0.0 for i in w.get("research", {}).keys()},
                     }
-                grouped[oid]["selected_teams"].append(
+                f = sorted(set(f))
+
+            candidate_pool_size = max(num_candidates, desired_team_count) if use_llm_selection else desired_team_count
+            selection = self.super_faculty_selector.team_selection_super_faculty(
+                cand_faculty_ids=f,
+                requirements=w,
+                coverage=c,
+                K=team_size,
+                required_faculty_ids=fac_ids,
+                num_candidates=candidate_pool_size,
+            )
+            candidates = self._normalize_candidates(selection, w)
+
+            if use_llm_selection:
+                llm_selection = self.group_match_llm_selector.select_candidate_teams_with_llm(
+                    opportunity_id=opp_id,
+                    desired_team_count=desired_team_count,
+                    candidates=self._attach_member_coverages(candidates, c),
+                    requirement_weights=w,
+                )
+                selected_candidates = llm_selection["selected_candidates"]
+            else:
+                selected_candidates = candidates[:desired_team_count]
+
+            out_rows: List[Dict[str, object]] = []
+            for cand in selected_candidates[:desired_team_count]:
+                out_rows.append(
                     {
-                        "team": row["team"],
-                        "final_coverage": row["final_coverage"],
-                        "score": row["score"],
+                        "opp_id": opp_id,
+                        "team": cand["team"],
+                        "final_coverage": cand["final_coverage"],
+                        "score": cand["score"],
                     }
                 )
+            return out_rows
 
-            return list(grouped.values())
+        workers = self._resolve_opp_workers(len(target_opp_ids))
+        rows_by_index: Dict[int, List[Dict[str, object]]] = {}
+
+        if workers <= 1:
+            for idx, opp_id in enumerate(target_opp_ids):
+                rows_by_index[idx] = _process_opp(opp_id)
+        else:
+            with ThreadPoolExecutor(max_workers=workers) as ex:
+                futures = {
+                    ex.submit(_process_opp, opp_id): idx
+                    for idx, opp_id in enumerate(target_opp_ids)
+                }
+                for fut in as_completed(futures):
+                    idx = futures[fut]
+                    rows_by_index[idx] = fut.result()
+
+        flat_results: List[Dict[str, object]] = []
+        for idx in range(len(target_opp_ids)):
+            flat_results.extend(rows_by_index.get(idx, []))
+
+        if not group_by_opp:
+            return flat_results
+
+        grouped: Dict[str, Dict[str, object]] = {}
+        for row in flat_results:
+            oid = row["opp_id"]
+            if oid not in grouped:
+                grouped[oid] = {
+                    "opp_id": oid,
+                    "selected_teams": [],
+                }
+            grouped[oid]["selected_teams"].append(
+                {
+                    "team": row["team"],
+                    "final_coverage": row["final_coverage"],
+                    "score": row["score"],
+                }
+            )
+
+        return list(grouped.values())
