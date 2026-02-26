@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Dict, List, Optional, Tuple
 
 from config import get_llm_client
@@ -26,6 +27,8 @@ from services.prompts.group_match_prompt import (
 
 
 class GroupJustificationEngine:
+    INDEPENDENT_STAGE_WORKERS = 4
+
     def __init__(
         self,
         *,
@@ -87,13 +90,6 @@ class GroupJustificationEngine:
                 },
                 "requirements": requirements,
             }
-            grant_brief = self.grant_brief_chain.invoke({"input_json": self._safe_json(grant_brief_input)})
-            trace["steps"]["grant_brief"] = {
-                "status": "ok",
-                "input": grant_brief_input,
-                "output": grant_brief.model_dump(),
-            }
-
             team_role_input = {
                 "grant": {
                     "id": grant_block.get("id"),
@@ -103,13 +99,6 @@ class GroupJustificationEngine:
                 "requirements": requirements,
                 "team": team_block,
             }
-            team_roles = self.team_role_chain.invoke({"input_json": self._safe_json(team_role_input)})
-            trace["steps"]["team_roles"] = {
-                "status": "ok",
-                "input": team_role_input,
-                "output": team_roles.model_dump(),
-            }
-
             why_working_input = {
                 "grant": {
                     "id": grant_block.get("id"),
@@ -120,13 +109,6 @@ class GroupJustificationEngine:
                 "team": team_block,
                 "team_final_coverage": coverage_block,
             }
-            why_working = self.why_working_chain.invoke({"input_json": self._safe_json(why_working_input)})
-            trace["steps"]["why_working"] = {
-                "status": "ok",
-                "input": why_working_input,
-                "output": why_working.model_dump(),
-            }
-
             why_not_input = {
                 "grant": {
                     "id": grant_block.get("id"),
@@ -137,7 +119,55 @@ class GroupJustificationEngine:
                 "team": team_block,
                 "team_final_coverage": coverage_block,
             }
-            why_not = self.why_not_working_chain.invoke({"input_json": self._safe_json(why_not_input)})
+            section_jobs = {
+                "grant_brief": (
+                    self.grant_brief_chain,
+                    {"input_json": self._safe_json(grant_brief_input)},
+                ),
+                "team_roles": (
+                    self.team_role_chain,
+                    {"input_json": self._safe_json(team_role_input)},
+                ),
+                "why_working": (
+                    self.why_working_chain,
+                    {"input_json": self._safe_json(why_working_input)},
+                ),
+                "why_not_working": (
+                    self.why_not_working_chain,
+                    {"input_json": self._safe_json(why_not_input)},
+                ),
+            }
+
+            section_outputs: Dict[str, Any] = {}
+            with ThreadPoolExecutor(max_workers=self.INDEPENDENT_STAGE_WORKERS) as ex:
+                futures = {
+                    ex.submit(chain.invoke, payload): section_name
+                    for section_name, (chain, payload) in section_jobs.items()
+                }
+                for fut in as_completed(futures):
+                    section_name = futures[fut]
+                    section_outputs[section_name] = fut.result()
+
+            grant_brief: GrantBriefOut = section_outputs["grant_brief"]
+            team_roles: TeamRoleOut = section_outputs["team_roles"]
+            why_working: WhyWorkingOut = section_outputs["why_working"]
+            why_not: WhyNotWorkingOut = section_outputs["why_not_working"]
+
+            trace["steps"]["grant_brief"] = {
+                "status": "ok",
+                "input": grant_brief_input,
+                "output": grant_brief.model_dump(),
+            }
+            trace["steps"]["team_roles"] = {
+                "status": "ok",
+                "input": team_role_input,
+                "output": team_roles.model_dump(),
+            }
+            trace["steps"]["why_working"] = {
+                "status": "ok",
+                "input": why_working_input,
+                "output": why_working.model_dump(),
+            }
             trace["steps"]["why_not_working"] = {
                 "status": "ok",
                 "input": why_not_input,

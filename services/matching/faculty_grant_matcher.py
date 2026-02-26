@@ -3,7 +3,10 @@ from __future__ import annotations
 import argparse
 import json
 import logging
-from typing import List, Optional
+import os
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import Any, Dict, List, Optional, Tuple
 
 from config import get_llm_client
 from dao.faculty_dao import FacultyDAO
@@ -22,6 +25,7 @@ logger = logging.getLogger(__name__)
 
 class FacultyGrantMatcher:
     """One-to-one faculty↔grant matching service using vector retrieval + LLM scoring."""
+    DEFAULT_SCORE_WORKERS = 4
 
     def __init__(self, *, session_factory=SessionLocal):
         self.session_factory = session_factory
@@ -95,6 +99,16 @@ class FacultyGrantMatcher:
             "missing": self._missing_to_grouped(scored.missing),
         }
 
+    def _resolve_score_workers(self, n_tasks: int) -> int:
+        if n_tasks <= 0:
+            return 1
+        raw = os.getenv("FACULTY_MATCHER_WORKERS", str(self.DEFAULT_SCORE_WORKERS))
+        try:
+            val = int(raw)
+        except Exception:
+            val = self.DEFAULT_SCORE_WORKERS
+        return max(1, min(val, int(n_tasks)))
+
     def _build_rows_for_faculty_candidates(
         self,
         *,
@@ -105,30 +119,152 @@ class FacultyGrantMatcher:
         opp_map: dict,
     ) -> List[dict]:
         fac_json = self._faculty_keywords_json(fac)
-        opp_req_cache: dict[str, str] = {}
-        out_rows: List[dict] = []
-
-        for opp_id, domain_sim in candidates:
+        indexed_items: List[Tuple[int, str, float, str]] = []
+        for idx, (opp_id, domain_sim) in enumerate(candidates):
             opp = opp_map.get(opp_id)
             if not opp:
                 continue
-            if opp_id not in opp_req_cache:
-                opp_req_cache[opp_id] = self._opportunity_requirements_json(opp)
-            scored = self._score_pair(
-                chain=chain,
-                fac_json=fac_json,
-                opp_req_idx_json=opp_req_cache[opp_id],
-            )
-            out_rows.append(
-                self._build_match_row(
-                    grant_id=opp_id,
-                    faculty_id=faculty_id,
-                    domain_sim=domain_sim,
-                    scored=scored,
+            indexed_items.append(
+                (
+                    idx,
+                    str(opp_id),
+                    float(domain_sim),
+                    self._opportunity_requirements_json(opp),
                 )
             )
 
-        return out_rows
+        if not indexed_items:
+            return []
+
+        workers = self._resolve_score_workers(len(indexed_items))
+        if workers <= 1:
+            out_rows: List[dict] = []
+            for _, opp_id, domain_sim, req_json in indexed_items:
+                scored = self._score_pair(
+                    chain=chain,
+                    fac_json=fac_json,
+                    opp_req_idx_json=req_json,
+                )
+                out_rows.append(
+                    self._build_match_row(
+                        grant_id=opp_id,
+                        faculty_id=faculty_id,
+                        domain_sim=domain_sim,
+                        scored=scored,
+                    )
+                )
+            return out_rows
+
+        thread_local = threading.local()
+
+        def _get_chain():
+            local_chain = getattr(thread_local, "chain", None)
+            if local_chain is None:
+                local_chain = self._build_chain()
+                thread_local.chain = local_chain
+            return local_chain
+
+        def _score_item(item: Tuple[int, str, float, str]) -> Tuple[int, dict]:
+            idx, opp_id, domain_sim, req_json = item
+            scored = self._score_pair(
+                chain=_get_chain(),
+                fac_json=fac_json,
+                opp_req_idx_json=req_json,
+            )
+            row = self._build_match_row(
+                grant_id=opp_id,
+                faculty_id=faculty_id,
+                domain_sim=domain_sim,
+                scored=scored,
+            )
+            return idx, row
+
+        indexed_rows: List[Tuple[int, dict]] = []
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            futures = [ex.submit(_score_item, item) for item in indexed_items]
+            for fut in as_completed(futures):
+                indexed_rows.append(fut.result())
+
+        indexed_rows.sort(key=lambda x: x[0])
+        return [row for _, row in indexed_rows]
+
+    def _build_rows_for_opportunity_candidates(
+        self,
+        *,
+        chain,
+        opportunity_id: str,
+        candidates: List[tuple[int, float]],
+        fac_map: Dict[int, Faculty],
+        opp_req_idx_json: str,
+    ) -> List[dict]:
+        indexed_items: List[Tuple[int, int, float, str]] = []
+        for idx, (fid, domain_sim) in enumerate(candidates):
+            fac = fac_map.get(int(fid))
+            if not fac:
+                continue
+            indexed_items.append(
+                (
+                    idx,
+                    int(fid),
+                    float(domain_sim),
+                    self._faculty_keywords_json(fac),
+                )
+            )
+
+        if not indexed_items:
+            return []
+
+        workers = self._resolve_score_workers(len(indexed_items))
+        if workers <= 1:
+            out_rows: List[dict] = []
+            for _, fid, domain_sim, fac_json in indexed_items:
+                scored = self._score_pair(
+                    chain=chain,
+                    fac_json=fac_json,
+                    opp_req_idx_json=opp_req_idx_json,
+                )
+                out_rows.append(
+                    self._build_match_row(
+                        grant_id=str(opportunity_id),
+                        faculty_id=int(fid),
+                        domain_sim=float(domain_sim),
+                        scored=scored,
+                    )
+                )
+            return out_rows
+
+        thread_local = threading.local()
+
+        def _get_chain():
+            local_chain = getattr(thread_local, "chain", None)
+            if local_chain is None:
+                local_chain = self._build_chain()
+                thread_local.chain = local_chain
+            return local_chain
+
+        def _score_item(item: Tuple[int, int, float, str]) -> Tuple[int, dict]:
+            idx, fid, domain_sim, fac_json = item
+            scored = self._score_pair(
+                chain=_get_chain(),
+                fac_json=fac_json,
+                opp_req_idx_json=opp_req_idx_json,
+            )
+            row = self._build_match_row(
+                grant_id=str(opportunity_id),
+                faculty_id=int(fid),
+                domain_sim=float(domain_sim),
+                scored=scored,
+            )
+            return idx, row
+
+        indexed_rows: List[Tuple[int, dict]] = []
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            futures = [ex.submit(_score_item, item) for item in indexed_items]
+            for fut in as_completed(futures):
+                indexed_rows.append(fut.result())
+
+        indexed_rows.sort(key=lambda x: x[0])
+        return [row for _, row in indexed_rows]
 
     def run(
         self,
@@ -288,26 +424,13 @@ class FacultyGrantMatcher:
             )
             fac_map = {int(f.faculty_id): f for f in fac_rows}
 
-            out_rows = []
-            for fid, domain_sim in candidates:
-                fac = fac_map.get(int(fid))
-                if not fac:
-                    continue
-
-                fac_json = self._faculty_keywords_json(fac)
-                scored = self._score_pair(
-                    chain=chain,
-                    fac_json=fac_json,
-                    opp_req_idx_json=opp_req_idx_json,
-                )
-                out_rows.append(
-                    self._build_match_row(
-                        grant_id=str(opportunity_id),
-                        faculty_id=int(fid),
-                        domain_sim=float(domain_sim),
-                        scored=scored,
-                    )
-                )
+            out_rows = self._build_rows_for_opportunity_candidates(
+                chain=chain,
+                opportunity_id=str(opportunity_id),
+                candidates=candidates,
+                fac_map=fac_map,
+                opp_req_idx_json=opp_req_idx_json,
+            )
 
             if out_rows:
                 match_dao.upsert_matches(out_rows)

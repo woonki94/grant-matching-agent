@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import json
 import logging
+import os
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Dict, List, Optional
 
 from config import get_llm_client
@@ -26,6 +29,18 @@ from utils.keyword_utils import (
 from utils.payload_sanitizer import sanitize_for_postgres
 
 logger = logging.getLogger(__name__)
+DEFAULT_RERANK_WORKERS = 4
+
+
+def _resolve_rerank_workers(n_tasks: int) -> int:
+    if n_tasks <= 0:
+        return 1
+    raw = os.getenv("SEARCH_RERANK_WORKERS", str(DEFAULT_RERANK_WORKERS))
+    try:
+        val = int(raw)
+    except Exception:
+        val = DEFAULT_RERANK_WORKERS
+    return max(1, min(val, int(n_tasks)))
 
 
 def _query_context(query_text: str, user_urls: Optional[List[str]]) -> Dict[str, Any]:
@@ -157,8 +172,8 @@ def search_grants(
         opps = opp_dao.read_opportunities_by_ids_with_relations(opp_ids)
         opp_map = {o.opportunity_id: o for o in opps}
 
-        rows = []
-        for opp_id, domain_sim in candidates:
+        scored_inputs = []
+        for idx, (opp_id, domain_sim) in enumerate(candidates):
             opp = opp_map.get(opp_id)
             if not opp or not opp.keyword:
                 continue
@@ -168,26 +183,81 @@ def search_grants(
             opp_kw = keywords_for_matching(getattr(opp.keyword, "keywords", {}) or {})
             req_idx = requirements_indexed(opp_kw)
             req_idx_json = json.dumps(req_idx, ensure_ascii=False)
-
-            scored = chain.invoke(
-                {
-                    "faculty_kw_json": query_kw_json,
-                    "requirements_indexed": req_idx_json,
-                }
+            scored_inputs.append(
+                (
+                    idx,
+                    str(opp_id),
+                    float(domain_sim),
+                    req_idx_json,
+                    {
+                        "title": opp.opportunity_title,
+                        "agency": opp.agency_name,
+                        "category": opp.category,
+                        "status": opp.opportunity_status,
+                    },
+                )
             )
 
-            rows.append(
-                {
+        rows = []
+        workers = _resolve_rerank_workers(len(scored_inputs))
+        if workers <= 1:
+            for _, opp_id, domain_sim, req_idx_json, opp_meta in scored_inputs:
+                scored = chain.invoke(
+                    {
+                        "faculty_kw_json": query_kw_json,
+                        "requirements_indexed": req_idx_json,
+                    }
+                )
+                rows.append(
+                    {
+                        "opportunity_id": opp_id,
+                        "title": opp_meta.get("title"),
+                        "agency": opp_meta.get("agency"),
+                        "category": opp_meta.get("category"),
+                        "status": opp_meta.get("status"),
+                        "domain_score": float(domain_sim),
+                        "llm_score": float(scored.llm_score),
+                        "reason": (scored.reason or "").strip(),
+                    }
+                )
+        else:
+            thread_local = threading.local()
+
+            def _get_chain():
+                local_chain = getattr(thread_local, "chain", None)
+                if local_chain is None:
+                    llm_local = get_llm_client().build()
+                    local_chain = MATCH_PROMPT | llm_local.with_structured_output(LLMMatchOut)
+                    thread_local.chain = local_chain
+                return local_chain
+
+            def _score_item(item):
+                idx, opp_id, domain_sim, req_idx_json, opp_meta = item
+                scored = _get_chain().invoke(
+                    {
+                        "faculty_kw_json": query_kw_json,
+                        "requirements_indexed": req_idx_json,
+                    }
+                )
+                row = {
                     "opportunity_id": opp_id,
-                    "title": opp.opportunity_title,
-                    "agency": opp.agency_name,
-                    "category": opp.category,
-                    "status": opp.opportunity_status,
+                    "title": opp_meta.get("title"),
+                    "agency": opp_meta.get("agency"),
+                    "category": opp_meta.get("category"),
+                    "status": opp_meta.get("status"),
                     "domain_score": float(domain_sim),
                     "llm_score": float(scored.llm_score),
                     "reason": (scored.reason or "").strip(),
                 }
-            )
+                return idx, row
+
+            indexed_rows = []
+            with ThreadPoolExecutor(max_workers=workers) as ex:
+                futures = [ex.submit(_score_item, item) for item in scored_inputs]
+                for fut in as_completed(futures):
+                    indexed_rows.append(fut.result())
+            indexed_rows.sort(key=lambda x: x[0])
+            rows = [row for _, row in indexed_rows]
 
         rows.sort(key=lambda r: (r.get("llm_score", 0.0), r.get("domain_score", 0.0)), reverse=True)
         results = rows[:top_k]
