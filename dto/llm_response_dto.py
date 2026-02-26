@@ -84,6 +84,15 @@ class LLMMatchOut(BaseModel):
 # ───────────────────────────────────────────────
 # One-to-One Match Justification
 # ───────────────────────────────────────────────
+FitLabel = Literal["mismatch", "bad", "good", "great", "fantastic"]
+
+
+class WhyMatchOut(BaseModel):
+    summary: str = ""
+    alignment_points: List[str] = Field(default_factory=list)
+    risk_gaps: List[str] = Field(default_factory=list)
+
+
 class FacultyOpportunityRec(BaseModel):
     opportunity_id: str
     title: str
@@ -92,9 +101,20 @@ class FacultyOpportunityRec(BaseModel):
     # scores (explicit, no derived final score)
     domain_score: float = Field(ge=0.0, le=1.0)
     llm_score: float = Field(ge=0.0, le=1.0)
+    fit_label: FitLabel = "mismatch"
 
-    why_good_match: List[str] = Field(default_factory=list)  # 2–4 bullets
+    why_match: WhyMatchOut = Field(default_factory=WhyMatchOut)
     suggested_pitch: str = Field(min_length=1, max_length=500)
+
+    @field_validator("fit_label", mode="before")
+    @classmethod
+    def _normalize_fit_label(cls, v):
+        label = str(v or "").strip().lower()
+        if label == "greate":
+            return "great"
+        if label in {"mismatch", "bad", "good", "great", "fantastic"}:
+            return label
+        return "mismatch"
 
 class FacultyRecsOut(BaseModel):
     faculty_name: str

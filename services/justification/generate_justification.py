@@ -14,17 +14,7 @@ def print_faculty_recs(out: FacultyRecsOut, email: str, *, width: int = 92, show
     print("-" * width)
 
     for i, rec in enumerate(out.recommendations, start=1):
-        llm_score = float(rec.llm_score)
-        if llm_score < 0.30:
-            label = "sucks"
-        elif llm_score < 0.50:
-            label = "bad"
-        elif llm_score < 0.70:
-            label = "good"
-        elif llm_score < 0.85:
-            label = "great"
-        else:
-            label = "fantastic"
+        label = str(getattr(rec, "fit_label", "") or "mismatch")
 
         oid = rec.opportunity_id
         oid_disp = oid if show_full_id else (oid[:8] + "…" + oid[-6:])
@@ -36,7 +26,12 @@ def print_faculty_recs(out: FacultyRecsOut, email: str, *, width: int = 92, show
             print(f"    Agency: {rec.agency}")
         print(f"    Scores: {score_line}")
         print("    Why it matches:")
-        for b in rec.why_good_match:
+        why = getattr(rec, "why_match", None)
+        if why and getattr(why, "summary", None):
+            print("      • " + fill((why.summary or "").strip(), width=width, subsequent_indent="        ").lstrip())
+        for b in (getattr(why, "alignment_points", None) or []):
+            print("      • " + fill((b or "").strip(), width=width, subsequent_indent="        ").lstrip())
+        for b in (getattr(why, "risk_gaps", None) or []):
             print("      • " + fill((b or "").strip(), width=width, subsequent_indent="        ").lstrip())
         print("    Suggested pitch:")
         print("      " + fill((rec.suggested_pitch or "").strip(), width=width, subsequent_indent="        ").lstrip())

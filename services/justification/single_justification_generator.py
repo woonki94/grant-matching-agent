@@ -12,7 +12,7 @@ from config import get_llm_client
 from dao.match_dao import MatchDAO
 from db.db_conn import SessionLocal
 from db.models.faculty import Faculty
-from dto.llm_response_dto import FacultyOpportunityRec, FacultyRecsOut
+from dto.llm_response_dto import FacultyOpportunityRec, FacultyRecsOut, WhyMatchOut
 from services.context.context_generator import ContextGenerator
 from services.prompts.justification_prompts import FACULTY_RECS_PROMPT
 
@@ -30,8 +30,8 @@ class SingleJustificationGenerator:
 
     @staticmethod
     def _llm_label(llm_score: float) -> str:
-        if llm_score < 0.30:
-            return "sucks"
+        if llm_score < 0.15:
+            return "mismatch"
         if llm_score < 0.50:
             return "bad"
         if llm_score < 0.70:
@@ -53,6 +53,27 @@ class SingleJustificationGenerator:
             domain_score = float(p.get("domain_score") or 0.0)
             title = str(p.get("opportunity_title") or p.get("title") or "Untitled opportunity")
             agency = p.get("agency_name") or p.get("agency")
+            if llm_score < 0.15:
+                recs.append(
+                    FacultyOpportunityRec(
+                        opportunity_id=str(p.get("opportunity_id") or p.get("grant_id") or ""),
+                        title=title,
+                        agency=str(agency) if agency else None,
+                        domain_score=domain_score,
+                        llm_score=llm_score,
+                        fit_label="mismatch",
+                        why_match=WhyMatchOut(
+                            summary="No match found.",
+                            alignment_points=[],
+                            risk_gaps=[
+                                f"LLM score {llm_score:.2f} indicates a fundamental topical mismatch.",
+                                f"Domain overlap estimate is {domain_score:.2f}, which is insufficient for pursuit.",
+                            ],
+                        ),
+                        suggested_pitch="Do not pursue.",
+                    )
+                )
+                continue
             recs.append(
                 FacultyOpportunityRec(
                     opportunity_id=str(p.get("opportunity_id") or p.get("grant_id") or ""),
@@ -60,11 +81,19 @@ class SingleJustificationGenerator:
                     agency=str(agency) if agency else None,
                     domain_score=domain_score,
                     llm_score=llm_score,
-                    why_good_match=[
-                        f"Fit is {self._llm_label(llm_score)} by LLM score {llm_score:.2f}; domain overlap estimate is {domain_score:.2f}.",
-                        "Keyword overlap between faculty and opportunity indicates practical topical alignment.",
-                        "Potential gaps likely remain; tighten scope and add a targeted collaborator to reduce execution risk.",
-                    ],
+                    fit_label=self._llm_label(llm_score),
+                    why_match=WhyMatchOut(
+                        summary=(
+                            f"Fit is {self._llm_label(llm_score)} by LLM score {llm_score:.2f}; "
+                            f"domain overlap estimate is {domain_score:.2f}."
+                        ),
+                        alignment_points=[
+                            "Keyword overlap between faculty and opportunity indicates practical topical alignment.",
+                        ],
+                        risk_gaps=[
+                            "Potential gaps likely remain; tighten scope and add a targeted collaborator to reduce execution risk.",
+                        ],
+                    ),
                     suggested_pitch=(
                         "Frame your prior work directly against this program's scope and milestones. "
                         "Highlight one concrete deliverable and one measurable outcome in year one."
@@ -95,11 +124,25 @@ class SingleJustificationGenerator:
             if llm_rec is None:
                 out.append(fb)
                 continue
+            fit_label = llm_rec.fit_label or fb.fit_label
+            why_match = llm_rec.why_match
+            if not (
+                why_match.summary.strip()
+                or list(why_match.alignment_points or [])
+                or list(why_match.risk_gaps or [])
+            ):
+                why_match = fb.why_match
+            suggested_pitch = (llm_rec.suggested_pitch or "").strip() or fb.suggested_pitch
+            if fit_label == "mismatch":
+                suggested_pitch = "Do not pursue."
+                if not (why_match.summary or "").strip():
+                    why_match = why_match.model_copy(update={"summary": "No match found."})
             out.append(
                 fb.model_copy(
                     update={
-                        "why_good_match": llm_rec.why_good_match or fb.why_good_match,
-                        "suggested_pitch": llm_rec.suggested_pitch or fb.suggested_pitch,
+                        "fit_label": fit_label,
+                        "why_match": why_match,
+                        "suggested_pitch": suggested_pitch,
                     }
                 )
             )
