@@ -31,6 +31,9 @@ NODE_STEP_MESSAGES = {
     "run_group_matching_with_specific_grant": "Running group matching with specific grant...",
 }
 
+# Temporary safety override for email delivery during testing.
+FORCED_JUSTIFICATION_RECIPIENT = "kimwoon@oregonstate.edu"
+
 def _get_orchestrator():
     global _ORCHESTRATOR
     if _ORCHESTRATOR is not None:
@@ -73,6 +76,152 @@ def _to_email_list(v: Any) -> List[str]:
         x = v.strip()
         return [x] if x else []
     return []
+
+
+def _parse_json_value(v: Any) -> Any:
+    if isinstance(v, str):
+        s = v.strip()
+        if not s:
+            return None
+        try:
+            return json.loads(s)
+        except Exception:
+            return v
+    return v
+
+
+def _collect_recipient_emails(body: Dict[str, Any]) -> List[str]:
+    keys = (
+        "justification_email",
+        "justification_emails",
+        "recipient_email",
+        "recipient_emails",
+        "notify_email",
+        "notify_emails",
+        "email_to",
+        "email_to_list",
+    )
+    raw: List[str] = []
+    for key in keys:
+        raw.extend(_to_email_list(body.get(key)))
+
+    send_email = _parse_json_value(body.get("send_email"))
+    if isinstance(send_email, dict):
+        for key in ("to", "email", "emails", "recipient", "recipients"):
+            raw.extend(_to_email_list(send_email.get(key)))
+
+    out: List[str] = []
+    seen = set()
+    for x in raw:
+        parts = str(x).replace(";", ",").split(",")
+        for part in parts:
+            email = part.strip().lower()
+            if "@" not in email:
+                continue
+            if email in seen:
+                continue
+            seen.add(email)
+            out.append(email)
+    return out
+
+
+def _extract_frontend_justification_payload(body: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    candidates: List[Any] = []
+    for key in ("justification_result", "justification_payload", "result_payload", "result", "orchestrator"):
+        candidates.append(_parse_json_value(body.get(key)))
+    # Compact FE shape:
+    # { "title": "...", "content": "..." }
+    compact_title = str(body.get("title") or "").strip()
+    compact_content = str(body.get("content") or "").strip()
+    if compact_title or compact_content:
+        compact_payload: Dict[str, Any] = {}
+        if compact_title:
+            compact_payload["title"] = compact_title
+        if compact_content:
+            compact_payload["content"] = compact_content
+        candidates.append(compact_payload)
+
+    send_email = _parse_json_value(body.get("send_email"))
+    if isinstance(send_email, dict):
+        for key in ("result", "payload", "justification_result", "justification_payload"):
+            candidates.append(_parse_json_value(send_email.get(key)))
+        send_title = str(send_email.get("title") or "").strip()
+        send_content = str(send_email.get("content") or "").strip()
+        if send_title or send_content:
+            compact_send_payload: Dict[str, Any] = {}
+            if send_title:
+                compact_send_payload["title"] = send_title
+            if send_content:
+                compact_send_payload["content"] = send_content
+            candidates.append(compact_send_payload)
+
+    for raw in candidates:
+        if not isinstance(raw, dict) or not raw:
+            continue
+
+        if isinstance(raw.get("result"), dict) and raw.get("result"):
+            return dict(raw["result"])
+        if isinstance(raw.get("orchestrator"), dict):
+            inner = raw["orchestrator"].get("result")
+            if isinstance(inner, dict) and inner:
+                return dict(inner)
+        return dict(raw)
+    return None
+
+
+def _maybe_send_result_email(
+    *,
+    recipient_emails: List[str],
+    result: Dict[str, Any],
+    query: Optional[str] = None,
+) -> Dict[str, Any]:
+    if not recipient_emails:
+        return {"attempted": False, "status": "skipped", "reason": "no_recipients"}
+    if not isinstance(result, dict) or not result:
+        return {"attempted": False, "status": "skipped", "reason": "empty_result"}
+
+    try:
+        from services.notifications import SesEmailService
+        from services.notifications.justification_email_builder import build_justification_email
+
+        content = build_justification_email(result=result, query=query)
+        if content is None:
+            return {
+                "attempted": False,
+                "status": "skipped",
+                "reason": "no_justification_content",
+                "to": recipient_emails,
+            }
+
+        send_out = SesEmailService().send_email(
+            to_addresses=recipient_emails,
+            subject=content.subject,
+            text_body=content.text_body,
+            html_body=content.html_body,
+        )
+        return {
+            "attempted": True,
+            "status": "sent",
+            "to": recipient_emails,
+            "subject": content.subject,
+            "message_id": send_out.get("message_id"),
+        }
+    except RuntimeError as e:
+        logger.warning("SES justification email send failed: %s", e)
+        return {
+            "attempted": True,
+            "status": "error",
+            "to": recipient_emails,
+            "error": f"{type(e).__name__}: {e}",
+        }
+    except Exception as e:
+        logger.exception("SES justification email send failed")
+        return {
+            "attempted": True,
+            "status": "error",
+            "to": recipient_emails,
+            "error": f"{type(e).__name__}: {e}",
+        }
 
 
 def _sanitize_step_update(update: Dict[str, Any]) -> Dict[str, Any]:
@@ -673,6 +822,45 @@ def form_team():
         })
 
     return Response(generate(), mimetype="text/event-stream", headers=_sse_headers())
+
+
+@app.post("/api/notifications/email-justification")
+def email_justification():
+    body = request.get_json(silent=True) or {}
+    print("body")
+    print(body)
+    requested_recipients = _collect_recipient_emails(body)
+    payload = _extract_frontend_justification_payload(body)
+    query = str(body.get("query") or body.get("message") or "").strip() or None
+
+    if not isinstance(payload, dict) or not payload:
+        return {
+            "ok": False,
+            "error": "No justification result payload provided.",
+            "email_delivery": {"attempted": False, "status": "skipped", "reason": "empty_result"},
+        }, 400
+
+    print(f"email_justification.requested_recipients={requested_recipients}")
+    print(f"email_justification.delivery_recipient={FORCED_JUSTIFICATION_RECIPIENT}")
+
+    delivery_recipients = [FORCED_JUSTIFICATION_RECIPIENT]
+    delivery = _maybe_send_result_email(
+        recipient_emails=delivery_recipients,
+        result=payload,
+        query=query,
+    )
+    print(
+        "email_justification.status="
+        f"{delivery.get('status')} "
+        f"message_id={delivery.get('message_id')} "
+        f"error={delivery.get('error')}"
+    )
+    return {
+        "ok": delivery.get("status") == "sent",
+        "requested_recipients": requested_recipients,
+        "delivery_recipients": delivery_recipients,
+        "email_delivery": delivery,
+    }, (200 if delivery.get("status") in {"sent", "skipped"} else 502)
 
 
 if __name__ == "__main__":
