@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Optional, Tuple
 
+from dao.opportunity_dao import OpportunityDAO
 from db.models import Faculty, Opportunity
 from services.context.faculty_context import FacultyContextBuilder
 from services.context.justification_context import JustificationContextBuilder
@@ -26,6 +27,50 @@ class ContextGenerator:
 
     def build_opportunity_keyword_context(self, opp: Opportunity) -> Dict[str, Any]:
         return self.grant.build_opportunity_keyword_context(opp)
+
+    def build_opportunity_explanation_context(
+        self,
+        *,
+        sess,
+        opportunity_id: str,
+    ) -> Dict[str, Any]:
+        opp_id = str(opportunity_id or "").strip()
+        if not opp_id:
+            return {}
+        odao = OpportunityDAO(sess)
+        opps = odao.read_opportunities_by_ids_with_relations([opp_id])
+        if not opps:
+            return {}
+        return self.grant.build_opportunity_explanation_context(opps[0])
+
+    def build_opportunity_explanation_contexts(
+        self,
+        *,
+        sess,
+        opportunity_ids: List[str],
+    ) -> Dict[str, Dict[str, Any]]:
+        ids: List[str] = []
+        seen = set()
+        for x in opportunity_ids or []:
+            oid = str(x or "").strip()
+            if not oid or oid in seen:
+                continue
+            seen.add(oid)
+            ids.append(oid)
+        if not ids:
+            return {}
+
+        odao = OpportunityDAO(sess)
+        opps = odao.read_opportunities_by_ids_with_relations(ids)
+        by_id = {str(getattr(o, "opportunity_id", "") or ""): o for o in opps}
+
+        out: Dict[str, Dict[str, Any]] = {}
+        for oid in ids:
+            opp = by_id.get(oid)
+            if not opp:
+                continue
+            out[oid] = self.grant.build_opportunity_explanation_context(opp)
+        return out
 
     def build_faculty_basic_context(self, fac: Faculty) -> Dict[str, Any]:
         return self.faculty.build_faculty_basic_context(fac)

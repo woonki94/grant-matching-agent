@@ -51,3 +51,27 @@ FACULTY_RECS_PROMPT = ChatPromptTemplate.from_messages([
      "FACULTY CONTEXT (JSON):\n{faculty_json}\n\n"
      "TOP OPPORTUNITIES (JSON list):\n{opps_json}\n")
 ])
+
+
+GRANT_EXPLANATION_PROMPT = ChatPromptTemplate.from_messages([
+    (
+        "system",
+        "You write a concise grant explanation using ONLY provided JSON context.\n"
+        "Do not invent facts.\n"
+        "Return JSON matching this schema exactly:\n"
+        "{ \"grant_explanation\": string }.\n"
+        "\n"
+        "Rules:\n"
+        "- Keep it very brief: 1-2 short sentences (about 18-40 words total).\n"
+        "- Sentence 1: what the grant funds.\n"
+        "- Optional sentence 2: key priority themes/capabilities.\n"
+        "- Prefer plain, plausible language; avoid niche jargon unless explicitly in context.\n"
+        "- Never output ellipses ('...') or clipped text fragments.\n"
+        "- Each sentence must be complete and grammatical.\n"
+        "- Do not mention embeddings, cosine, vectors, or internal scoring pipelines.\n"
+    ),
+    (
+        "human",
+        "GRANT CONTEXT (JSON):\n{grant_json}\n",
+    ),
+])
