@@ -67,6 +67,13 @@ class MatchingExecutionAgent:
             return next(iter(filters))
         return sorted(filters)
 
+    @staticmethod
+    def _extract_grant_explanation(recommendation: Optional[Dict[str, Any]]) -> Optional[str]:
+        if not isinstance(recommendation, dict):
+            return None
+        text = str(recommendation.get("grant_explanation") or "").strip()
+        return text or None
+
     def _build_query_similarity_map(
         self,
         *,
@@ -473,6 +480,7 @@ class MatchingExecutionAgent:
             "broad_category_filter": self._normalize_broad_category_for_output(broad_category),
             "matches": out,
             "recommendation": recommendation or {},
+            "grant_explanation": self._extract_grant_explanation(recommendation),
             "recommendation_error": recommendation_error,
         }
 
@@ -628,11 +636,13 @@ class MatchingExecutionAgent:
                 opportunity_id=opp_id,
             )
             out["recommendation"] = rec_out.model_dump()
+            out["grant_explanation"] = self._extract_grant_explanation(out["recommendation"])
             out["recommendation_error"] = None
             out["justification_source"] = "specific_grant_llm"
             return out
         except Exception as e:
             out["recommendation"] = out.get("recommendation") or {}
+            out["grant_explanation"] = self._extract_grant_explanation(out["recommendation"])
             out["recommendation_error"] = f"{type(e).__name__}: {e}"
             out["justification_source"] = "specific_grant_fallback"
             return out

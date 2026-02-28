@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Dict, List, Optional, Tuple
@@ -12,9 +13,9 @@ from config import get_llm_client
 from dao.match_dao import MatchDAO
 from db.db_conn import SessionLocal
 from db.models.faculty import Faculty
-from dto.llm_response_dto import FacultyOpportunityRec, FacultyRecsOut, WhyMatchOut
+from dto.llm_response_dto import FacultyOpportunityRec, FacultyRecsOut, GrantExplanationOut, WhyMatchOut
 from services.context.context_generator import ContextGenerator
-from services.prompts.justification_prompts import FACULTY_RECS_PROMPT
+from services.prompts.justification_prompts import FACULTY_RECS_PROMPT, GRANT_EXPLANATION_PROMPT
 
 
 class SingleJustificationGenerator:
@@ -29,6 +30,11 @@ class SingleJustificationGenerator:
         return FACULTY_RECS_PROMPT | llm.with_structured_output(FacultyRecsOut)
 
     @staticmethod
+    def _build_grant_explanation_chain():
+        llm = get_llm_client().build()
+        return GRANT_EXPLANATION_PROMPT | llm.with_structured_output(GrantExplanationOut)
+
+    @staticmethod
     def _llm_label(llm_score: float) -> str:
         if llm_score < 0.15:
             return "mismatch"
@@ -39,6 +45,167 @@ class SingleJustificationGenerator:
         if llm_score < 0.85:
             return "great"
         return "fantastic"
+
+    @staticmethod
+    def _first_sentence(text: Any) -> str:
+        s = " ".join(str(text or "").split()).strip()
+        if not s:
+            return ""
+        m = re.search(r"[.!?]", s)
+        if not m:
+            return s
+        return s[: m.end()].strip()
+
+    @staticmethod
+    def _clean_grant_explanation(text: Any) -> str:
+        s = str(text or "").replace("\u2026", "...")
+        s = re.sub(r"\.\s*\.\s*\.", ".", s)
+        s = re.sub(r"\.{2,}", ".", s)
+        s = " ".join(s.split()).strip()
+        return s
+
+    def _fallback_grant_explanation_from_context(
+        self,
+        *,
+        grant_context: Optional[Dict[str, Any]],
+    ) -> str:
+        ctx = dict(grant_context or {})
+        if not ctx:
+            return ""
+
+        title = str(ctx.get("opportunity_title") or ctx.get("title") or "Grant opportunity").strip()
+        agency = str(ctx.get("agency_name") or ctx.get("agency") or "").strip()
+        summary = self._first_sentence(ctx.get("summary_description"))
+
+        keywords = ctx.get("keywords") if isinstance(ctx.get("keywords"), dict) else {}
+        r = (keywords.get("research") or {}) if isinstance(keywords, dict) else {}
+        a = (keywords.get("application") or {}) if isinstance(keywords, dict) else {}
+        themes: List[str] = []
+        for v in list((r.get("domain") or [])) + list((a.get("domain") or [])):
+            s = str(v).strip()
+            if not s or s in themes:
+                continue
+            themes.append(s)
+            if len(themes) >= 3:
+                break
+
+        if title and agency:
+            lead = f"{title} from {agency} supports targeted research and development priorities."
+        elif title:
+            lead = f"{title} supports targeted research and development priorities."
+        else:
+            lead = "This opportunity supports targeted research and development priorities."
+
+        parts: List[str] = [lead]
+        if summary:
+            parts.append(summary)
+        if themes:
+            parts.append(f"Priority themes include {', '.join(themes)}.")
+
+        return self._clean_grant_explanation(" ".join(parts))
+
+    def _build_grant_explanation(
+        self,
+        *,
+        chain,
+        grant_context: Optional[Dict[str, Any]],
+    ) -> str:
+        ctx = dict(grant_context or {})
+        if not ctx:
+            return ""
+        try:
+            out: GrantExplanationOut = chain.invoke(
+                {"grant_json": json.dumps(ctx, ensure_ascii=False)}
+            )
+            text = str(getattr(out, "grant_explanation", "") or "").strip()
+            if text:
+                cleaned = self._clean_grant_explanation(text)
+                if cleaned:
+                    return cleaned
+        except Exception:
+            pass
+        return self._clean_grant_explanation(
+            self._fallback_grant_explanation_from_context(grant_context=ctx)
+        )
+
+    @staticmethod
+    def _top_grant_explanation_from_recs(recs: List[FacultyOpportunityRec]) -> str:
+        if not recs:
+            return ""
+        text = str(getattr(recs[0], "grant_explanation", "") or "").strip()
+        return text
+
+    def _build_grant_explanations_for_payloads(
+        self,
+        *,
+        opp_payloads: List[Dict[str, Any]],
+        grant_explanation_contexts: Dict[str, Dict[str, Any]],
+    ) -> Dict[str, str]:
+        ordered_ids: List[str] = []
+        seen = set()
+        for p in opp_payloads or []:
+            oid = str(p.get("opportunity_id") or p.get("grant_id") or "").strip()
+            if not oid or oid in seen:
+                continue
+            seen.add(oid)
+            ordered_ids.append(oid)
+        if not ordered_ids:
+            return {}
+
+        raw_workers = os.getenv("SINGLE_JUST_EXPL_WORKERS", "4")
+        try:
+            configured_workers = int(raw_workers)
+        except Exception:
+            configured_workers = 4
+        workers = max(1, min(configured_workers, len(ordered_ids)))
+
+        out: Dict[str, str] = {}
+        if workers <= 1:
+            chain = self._build_grant_explanation_chain()
+            for oid in ordered_ids:
+                out[oid] = self._build_grant_explanation(
+                    chain=chain,
+                    grant_context=(grant_explanation_contexts or {}).get(oid) or {},
+                )
+            return out
+
+        thread_local = threading.local()
+
+        def _get_chain():
+            local_chain = getattr(thread_local, "chain", None)
+            if local_chain is None:
+                local_chain = self._build_grant_explanation_chain()
+                thread_local.chain = local_chain
+            return local_chain
+
+        def _run_one(oid: str) -> Tuple[str, str]:
+            return (
+                oid,
+                self._build_grant_explanation(
+                    chain=_get_chain(),
+                    grant_context=(grant_explanation_contexts or {}).get(oid) or {},
+                ),
+            )
+
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            futures = [ex.submit(_run_one, oid) for oid in ordered_ids]
+            for fut in as_completed(futures):
+                oid, text = fut.result()
+                out[oid] = text
+        return out
+
+    @staticmethod
+    def _attach_grant_explanations_to_recs(
+        recs: List[FacultyOpportunityRec],
+        *,
+        grant_explanations_by_opp: Dict[str, str],
+    ) -> List[FacultyOpportunityRec]:
+        out: List[FacultyOpportunityRec] = []
+        for rec in recs or []:
+            oid = str(getattr(rec, "opportunity_id", "") or "").strip()
+            text = str((grant_explanations_by_opp or {}).get(oid) or "").strip()
+            out.append(rec.model_copy(update={"grant_explanation": text}))
+        return out
 
     def _fallback_recommendations_from_payloads(
         self,
@@ -184,17 +351,27 @@ class SingleJustificationGenerator:
         chain,
         fac_ctx: Dict[str, Any],
         opp_payloads: List[Dict[str, Any]],
+        grant_explanation_contexts: Dict[str, Dict[str, Any]],
         faculty_name: str,
         k: int,
         batch_size: int,
     ) -> FacultyRecsOut:
         size = max(1, int(batch_size))
         target_n = min(len(opp_payloads), max(1, int(k)))
+        active_payloads = list(opp_payloads or [])[:target_n]
         collected: List[FacultyOpportunityRec] = []
+
+        # Run per-grant explanations concurrently with recommendation generation.
+        explanation_executor = ThreadPoolExecutor(max_workers=1)
+        explanation_future = explanation_executor.submit(
+            self._build_grant_explanations_for_payloads,
+            opp_payloads=active_payloads,
+            grant_explanation_contexts=grant_explanation_contexts or {},
+        )
 
         chunks: List[Tuple[int, List[Dict[str, Any]]]] = []
         for chunk_idx, start in enumerate(range(0, target_n, size)):
-            chunks.append((chunk_idx, opp_payloads[start : start + size]))
+            chunks.append((chunk_idx, active_payloads[start : start + size]))
 
         raw_workers = os.getenv(
             "SINGLE_JUST_WORKERS",
@@ -254,16 +431,40 @@ class SingleJustificationGenerator:
                 if merged:
                     collected.extend(merged)
 
+        grant_explanations_by_opp: Dict[str, str] = {}
+        try:
+            grant_explanations_by_opp = dict(explanation_future.result() or {})
+        except Exception:
+            grant_explanations_by_opp = {}
+        finally:
+            explanation_executor.shutdown(wait=True)
+
         if not collected:
-            return self._fallback_recommendations_from_payloads(
+            fallback_out = self._fallback_recommendations_from_payloads(
                 faculty_name=faculty_name,
-                opp_payloads=opp_payloads,
+                opp_payloads=active_payloads,
                 k=target_n,
             )
+            with_expl = self._attach_grant_explanations_to_recs(
+                list(fallback_out.recommendations or []),
+                grant_explanations_by_opp=grant_explanations_by_opp,
+            )
+            return fallback_out.model_copy(
+                update={
+                    "grant_explanation": self._top_grant_explanation_from_recs(with_expl),
+                    "recommendations": with_expl,
+                }
+            )
+
+        collected = self._attach_grant_explanations_to_recs(
+            list(collected[:target_n]),
+            grant_explanations_by_opp=grant_explanations_by_opp,
+        )
 
         return FacultyRecsOut(
             faculty_name=faculty_name,
-            recommendations=collected[:target_n],
+            grant_explanation=self._top_grant_explanation_from_recs(collected),
+            recommendations=collected,
         )
 
     def generate_faculty_recs(self, *, email: str, k: int) -> FacultyRecsOut:
@@ -292,11 +493,19 @@ class SingleJustificationGenerator:
                     "Re-fetch opportunities or rebuild match_results."
                 )
             faculty_name = getattr(fac, "name", None) or email
+            grant_explanation_contexts = self.context_generator.build_opportunity_explanation_contexts(
+                sess=sess,
+                opportunity_ids=[
+                    str(p.get("opportunity_id") or p.get("grant_id") or "").strip()
+                    for p in (opp_payloads or [])
+                ],
+            )
 
             return self._build_recommendations_from_payloads(
                 chain=chain,
                 fac_ctx=fac_ctx,
                 opp_payloads=opp_payloads,
+                grant_explanation_contexts=grant_explanation_contexts,
                 faculty_name=faculty_name,
                 k=k,
                 batch_size=3,
@@ -345,10 +554,18 @@ class SingleJustificationGenerator:
                     "Match rows exist but opportunity payloads are missing in DB for recommendation generation."
                 )
             faculty_name = getattr(fac, "name", None) or email
+            grant_explanation_contexts = self.context_generator.build_opportunity_explanation_contexts(
+                sess=sess,
+                opportunity_ids=[
+                    str(p.get("opportunity_id") or p.get("grant_id") or "").strip()
+                    for p in (opp_payloads or [])
+                ],
+            )
             return self._build_recommendations_from_payloads(
                 chain=chain,
                 fac_ctx=fac_ctx,
                 opp_payloads=opp_payloads,
+                grant_explanation_contexts=grant_explanation_contexts,
                 faculty_name=faculty_name,
                 k=min(target_k, len(opp_payloads)),
                 batch_size=3,
@@ -391,11 +608,16 @@ class SingleJustificationGenerator:
                     f"Match row exists but opportunity payload is missing for opportunity_id={opp_id}"
                 )
             faculty_name = getattr(fac, "name", None) or email
+            grant_explanation_contexts = self.context_generator.build_opportunity_explanation_contexts(
+                sess=sess,
+                opportunity_ids=[opp_id],
+            )
 
             return self._build_recommendations_from_payloads(
                 chain=chain,
                 fac_ctx=fac_ctx,
                 opp_payloads=opp_payloads[:1],
+                grant_explanation_contexts=grant_explanation_contexts,
                 faculty_name=faculty_name,
                 k=1,
                 batch_size=1,

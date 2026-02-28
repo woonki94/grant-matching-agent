@@ -97,6 +97,7 @@ class FacultyOpportunityRec(BaseModel):
     opportunity_id: str
     title: str
     agency: Optional[str] = None
+    grant_explanation: str = ""
 
     # scores (explicit, no derived final score)
     domain_score: float = Field(ge=0.0, le=1.0)
@@ -118,7 +119,12 @@ class FacultyOpportunityRec(BaseModel):
 
 class FacultyRecsOut(BaseModel):
     faculty_name: str
+    grant_explanation: str = ""
     recommendations: List[FacultyOpportunityRec] = Field(default_factory=list)
+
+
+class GrantExplanationOut(BaseModel):
+    grant_explanation: str = ""
 
 # ───────────────────────────────────────────────
 # Group justification

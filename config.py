@@ -66,6 +66,9 @@ class Settings(BaseSettings):
     # =========================
     aws_region: str = "us-east-2"
     aws_profile: Optional[str] = None
+    ses_from_email: Optional[str] = None
+    ses_reply_to_email: Optional[str] = None
+    ses_configuration_set: Optional[str] = None
 
     # Bedrock LLM models
     bedrock_claude_haiku: str
