@@ -863,5 +863,89 @@ def email_justification():
     }, (200 if delivery.get("status") in {"sent", "skipped"} else 502)
 
 
+@app.get("/api/faculty")
+def get_faculty_profiles():
+    faculty_id = _to_optional_int(request.args.get("faculty_id"))
+    email = str(request.args.get("email") or "").strip().lower() or None
+
+    limit_raw = _to_optional_int(request.args.get("limit"))
+    offset_raw = _to_optional_int(request.args.get("offset"))
+    limit = max(1, min(int(limit_raw or 50), 200))
+    offset = max(0, int(offset_raw or 0))
+
+    try:
+        from services.faculty.faculty_profile_service import FacultyProfileService
+
+        service = FacultyProfileService()
+        if faculty_id or email:
+            faculty = service.get_faculty_profile(faculty_id=faculty_id, email=email)
+            if not faculty:
+                return {
+                    "ok": False,
+                    "error": "Faculty not found.",
+                    "faculty_id": faculty_id,
+                    "email": email,
+                }, 404
+            return {"ok": True, "faculty": faculty}, 200
+
+        rows = service.list_faculty_profiles(limit=limit, offset=offset)
+        return {
+            "ok": True,
+            "count": len(rows),
+            "limit": limit,
+            "offset": offset,
+            "faculty": rows,
+        }, 200
+    except Exception as e:
+        logger.exception("GET /api/faculty failed")
+        return {"ok": False, "error": f"{type(e).__name__}: {e}"}, 500
+
+
+@app.get("/api/faculty/<int:faculty_id>")
+def get_faculty_profile_by_id(faculty_id: int):
+    try:
+        from services.faculty.faculty_profile_service import FacultyProfileService
+
+        service = FacultyProfileService()
+        faculty = service.get_faculty_profile(faculty_id=faculty_id)
+        if not faculty:
+            return {
+                "ok": False,
+                "error": "Faculty not found.",
+                "faculty_id": int(faculty_id),
+            }, 404
+        return {"ok": True, "faculty": faculty}, 200
+    except Exception as e:
+        logger.exception("GET /api/faculty/<faculty_id> failed")
+        return {"ok": False, "error": f"{type(e).__name__}: {e}"}, 500
+
+
+@app.post("/api/faculty/by-email")
+def get_faculty_profile_by_email():
+    body = request.get_json(silent=True) or {}
+    email = str(body.get("email") or "").strip().lower()
+
+    if not email:
+        return {
+            "ok": False,
+            "error": "email is required.",
+        }, 400
+    try:
+        from services.faculty.faculty_profile_service import FacultyProfileService
+
+        service = FacultyProfileService()
+        faculty = service.get_faculty_profile(email=email)
+        if not faculty:
+            return {
+                "ok": False,
+                "error": "Faculty not found.",
+                "email": email,
+            }, 404
+        return {"ok": True, "faculty": faculty}, 200
+    except Exception as e:
+        logger.exception("POST /api/faculty/by-email failed")
+        return {"ok": False, "error": f"{type(e).__name__}: {e}"}, 500
+
+
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000, debug=True, threaded=True)
