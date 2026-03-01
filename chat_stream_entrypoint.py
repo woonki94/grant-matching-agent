@@ -867,6 +867,12 @@ def email_justification():
 def get_faculty_profiles():
     faculty_id = _to_optional_int(request.args.get("faculty_id"))
     email = str(request.args.get("email") or "").strip().lower() or None
+    publication_year_from = _to_optional_int(
+        request.args.get("publication_year_from") or request.args.get("year_from")
+    )
+    publication_year_to = _to_optional_int(
+        request.args.get("publication_year_to") or request.args.get("year_to")
+    )
 
     limit_raw = _to_optional_int(request.args.get("limit"))
     offset_raw = _to_optional_int(request.args.get("offset"))
@@ -878,7 +884,12 @@ def get_faculty_profiles():
 
         service = FacultyProfileService()
         if faculty_id or email:
-            faculty = service.get_faculty_profile(faculty_id=faculty_id, email=email)
+            faculty = service.get_faculty_profile(
+                faculty_id=faculty_id,
+                email=email,
+                publication_year_from=publication_year_from,
+                publication_year_to=publication_year_to,
+            )
             if not faculty:
                 return {
                     "ok": False,
@@ -888,7 +899,12 @@ def get_faculty_profiles():
                 }, 404
             return {"ok": True, "faculty": faculty}, 200
 
-        rows = service.list_faculty_profiles(limit=limit, offset=offset)
+        rows = service.list_faculty_profiles(
+            limit=limit,
+            offset=offset,
+            publication_year_from=publication_year_from,
+            publication_year_to=publication_year_to,
+        )
         return {
             "ok": True,
             "count": len(rows),
@@ -896,6 +912,8 @@ def get_faculty_profiles():
             "offset": offset,
             "faculty": rows,
         }, 200
+    except ValueError as e:
+        return {"ok": False, "error": str(e)}, 400
     except Exception as e:
         logger.exception("GET /api/faculty failed")
         return {"ok": False, "error": f"{type(e).__name__}: {e}"}, 500
@@ -903,11 +921,21 @@ def get_faculty_profiles():
 
 @app.get("/api/faculty/<int:faculty_id>")
 def get_faculty_profile_by_id(faculty_id: int):
+    publication_year_from = _to_optional_int(
+        request.args.get("publication_year_from") or request.args.get("year_from")
+    )
+    publication_year_to = _to_optional_int(
+        request.args.get("publication_year_to") or request.args.get("year_to")
+    )
     try:
         from services.faculty.faculty_profile_service import FacultyProfileService
 
         service = FacultyProfileService()
-        faculty = service.get_faculty_profile(faculty_id=faculty_id)
+        faculty = service.get_faculty_profile(
+            faculty_id=faculty_id,
+            publication_year_from=publication_year_from,
+            publication_year_to=publication_year_to,
+        )
         if not faculty:
             return {
                 "ok": False,
@@ -915,15 +943,34 @@ def get_faculty_profile_by_id(faculty_id: int):
                 "faculty_id": int(faculty_id),
             }, 404
         return {"ok": True, "faculty": faculty}, 200
+    except ValueError as e:
+        return {"ok": False, "error": str(e)}, 400
     except Exception as e:
         logger.exception("GET /api/faculty/<faculty_id> failed")
         return {"ok": False, "error": f"{type(e).__name__}: {e}"}, 500
 
 
+@app.get("/api/faculty/by-email")
 @app.post("/api/faculty/by-email")
 def get_faculty_profile_by_email():
     body = request.get_json(silent=True) or {}
-    email = str(body.get("email") or "").strip().lower()
+    email = str(
+        body.get("email")
+        or request.args.get("email")
+        or ""
+    ).strip().lower()
+    publication_year_from = _to_optional_int(
+        body.get("publication_year_from")
+        or body.get("year_from")
+        or request.args.get("publication_year_from")
+        or request.args.get("year_from")
+    )
+    publication_year_to = _to_optional_int(
+        body.get("publication_year_to")
+        or body.get("year_to")
+        or request.args.get("publication_year_to")
+        or request.args.get("year_to")
+    )
 
     if not email:
         return {
@@ -934,7 +981,11 @@ def get_faculty_profile_by_email():
         from services.faculty.faculty_profile_service import FacultyProfileService
 
         service = FacultyProfileService()
-        faculty = service.get_faculty_profile(email=email)
+        faculty = service.get_faculty_profile(
+            email=email,
+            publication_year_from=publication_year_from,
+            publication_year_to=publication_year_to,
+        )
         if not faculty:
             return {
                 "ok": False,
@@ -942,8 +993,46 @@ def get_faculty_profile_by_email():
                 "email": email,
             }, 404
         return {"ok": True, "faculty": faculty}, 200
+    except ValueError as e:
+        return {"ok": False, "error": str(e)}, 400
     except Exception as e:
         logger.exception("POST /api/faculty/by-email failed")
+        return {"ok": False, "error": f"{type(e).__name__}: {e}"}, 500
+
+
+@app.patch("/api/faculty/by-email")
+def edit_faculty_profile_by_email():
+    body = request.get_json(silent=True) or {}
+    email = str(body.get("email") or "").strip().lower()
+    if not email:
+        return {
+            "ok": False,
+            "error": "email is required.",
+        }, 400
+
+    basic_info = body.get("basic_info") or {}
+    data_from = body.get("data_from") or {}
+    all_keywords = body.get("all_keywords") if "all_keywords" in body else None
+    keyword_source = body.get("keyword_source")
+
+    try:
+        from services.faculty.faculty_profile_service import FacultyProfileService
+
+        service = FacultyProfileService()
+        out = service.edit_faculty_profile(
+            email=email,
+            basic_info=basic_info,
+            data_from=data_from,
+            all_keywords=all_keywords,
+            keyword_source=keyword_source,
+        )
+        return {"ok": True, **out}, 200
+    except LookupError as e:
+        return {"ok": False, "error": str(e), "email": email}, 404
+    except ValueError as e:
+        return {"ok": False, "error": str(e), "email": email}, 400
+    except Exception as e:
+        logger.exception("PATCH /api/faculty/by-email failed")
         return {"ok": False, "error": f"{type(e).__name__}: {e}"}, 500
 
 
