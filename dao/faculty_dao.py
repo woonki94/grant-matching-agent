@@ -58,6 +58,36 @@ class FacultyDAO:
             return None
         return self._query_by_email(email).one_or_none()
 
+    def get_by_id(self, faculty_id: int) -> Optional[Faculty]:
+        """Fetch one faculty row by faculty_id."""
+        if not faculty_id:
+            return None
+        return self.session.query(Faculty).filter(Faculty.faculty_id == int(faculty_id)).one_or_none()
+
+    def get_with_relations_by_email(self, email: str) -> Optional[Faculty]:
+        """Fetch one faculty row by email with commonly used relations preloaded."""
+        if not email:
+            return None
+        q = self._with_common_relations(self._query_by_email(email))
+        return q.one_or_none()
+
+    def get_with_relations_by_id(self, faculty_id: int) -> Optional[Faculty]:
+        """Fetch one faculty row by faculty_id with commonly used relations preloaded."""
+        if not faculty_id:
+            return None
+        q = self._with_common_relations(
+            self.session.query(Faculty).filter(Faculty.faculty_id == int(faculty_id))
+        )
+        return q.one_or_none()
+
+    def list_with_relations(self, *, limit: int = 50, offset: int = 0) -> List[Faculty]:
+        """List faculty rows with commonly used relations preloaded."""
+        safe_limit = max(1, min(int(limit or 50), 200))
+        safe_offset = max(0, int(offset or 0))
+        q = self._with_common_relations(self.session.query(Faculty))
+        q = q.order_by(Faculty.faculty_id.asc()).offset(safe_offset).limit(safe_limit)
+        return q.all()
+
     def get_faculty_id_by_email(self, email: str) -> Optional[int]:
         """Fetch only faculty_id by email."""
         if not email:
