@@ -39,7 +39,7 @@ def print_faculty_recs(out: FacultyRecsOut, email: str, *, width: int = 92, show
 
 
 def main(email: str, k: int) -> None:
-    out = SingleJustificationGenerator().generate_faculty_recs(email=email, k=k)
+    out = SingleJustificationGenerator().run(email=email, k=k)
     print_faculty_recs(out, email, show_full_id=True)
 
 

@@ -462,7 +462,7 @@ class MatchingExecutionAgent:
             try:
                 from services.justification.single_justification_generator import SingleJustificationGenerator
 
-                rec_out = SingleJustificationGenerator().generate_faculty_recs_for_matches(
+                rec_out = SingleJustificationGenerator().run_specific_matches(
                     email=faculty_email,
                     matches=out,
                     k=requested_k,
@@ -631,7 +631,7 @@ class MatchingExecutionAgent:
 
             rec_out = SingleJustificationGenerator(
                 context_generator=self.context_generator,
-            ).generate_for_specific_grant(
+            ).run_specific_grant(
                 email=email,
                 opportunity_id=opp_id,
             )

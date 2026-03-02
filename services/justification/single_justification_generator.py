@@ -3,19 +3,17 @@ from __future__ import annotations
 import json
 import os
 import re
-import threading
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Dict, List, Optional, Tuple
 
-from sqlalchemy.orm import selectinload
-
 from config import get_llm_client
+from dao.faculty_dao import FacultyDAO
 from dao.match_dao import MatchDAO
 from db.db_conn import SessionLocal
 from db.models.faculty import Faculty
 from dto.llm_response_dto import FacultyOpportunityRec, FacultyRecsOut, GrantExplanationOut, WhyMatchOut
 from services.context.context_generator import ContextGenerator
 from services.prompts.justification_prompts import FACULTY_RECS_PROMPT, GRANT_EXPLANATION_PROMPT
+from utils.thread_pool import build_thread_local_getter, parallel_map, resolve_pool_size
 
 
 class SingleJustificationGenerator:
@@ -157,41 +155,26 @@ class SingleJustificationGenerator:
             configured_workers = int(raw_workers)
         except Exception:
             configured_workers = 4
-        workers = max(1, min(configured_workers, len(ordered_ids)))
-
-        out: Dict[str, str] = {}
-        if workers <= 1:
-            chain = self._build_grant_explanation_chain()
-            for oid in ordered_ids:
-                out[oid] = self._build_grant_explanation(
-                    chain=chain,
-                    grant_context=(grant_explanation_contexts or {}).get(oid) or {},
-                )
-            return out
-
-        thread_local = threading.local()
-
-        def _get_chain():
-            local_chain = getattr(thread_local, "chain", None)
-            if local_chain is None:
-                local_chain = self._build_grant_explanation_chain()
-                thread_local.chain = local_chain
-            return local_chain
+        get_chain = build_thread_local_getter(self._build_grant_explanation_chain)
 
         def _run_one(oid: str) -> Tuple[str, str]:
             return (
                 oid,
                 self._build_grant_explanation(
-                    chain=_get_chain(),
+                    chain=get_chain(),
                     grant_context=(grant_explanation_contexts or {}).get(oid) or {},
                 ),
             )
 
-        with ThreadPoolExecutor(max_workers=workers) as ex:
-            futures = [ex.submit(_run_one, oid) for oid in ordered_ids]
-            for fut in as_completed(futures):
-                oid, text = fut.result()
-                out[oid] = text
+        pairs = parallel_map(
+            ordered_ids,
+            max_workers=resolve_pool_size(
+                max_workers=configured_workers,
+                task_count=len(ordered_ids),
+            ),
+            run_item=_run_one,
+        )
+        out = {oid: text for oid, text in pairs}
         return out
 
     @staticmethod
@@ -316,13 +299,8 @@ class SingleJustificationGenerator:
         return out
 
     @staticmethod
-    def _get_faculty_by_email(sess, *, email: str) -> Faculty:
-        fac = (
-            sess.query(Faculty)
-            .options(selectinload(Faculty.keyword))
-            .filter(Faculty.email == email)
-            .one_or_none()
-        )
+    def _get_faculty_by_email(faculty_dao: FacultyDAO, *, email: str) -> Faculty:
+        fac = faculty_dao.get_with_relations_by_email(email)
         if not fac:
             raise ValueError(f"No faculty found with email: {email}")
         return fac
@@ -359,19 +337,10 @@ class SingleJustificationGenerator:
         size = max(1, int(batch_size))
         target_n = min(len(opp_payloads), max(1, int(k)))
         active_payloads = list(opp_payloads or [])[:target_n]
-        collected: List[FacultyOpportunityRec] = []
-
-        # Run per-grant explanations concurrently with recommendation generation.
-        explanation_executor = ThreadPoolExecutor(max_workers=1)
-        explanation_future = explanation_executor.submit(
-            self._build_grant_explanations_for_payloads,
-            opp_payloads=active_payloads,
-            grant_explanation_contexts=grant_explanation_contexts or {},
-        )
-
-        chunks: List[Tuple[int, List[Dict[str, Any]]]] = []
-        for chunk_idx, start in enumerate(range(0, target_n, size)):
-            chunks.append((chunk_idx, active_payloads[start : start + size]))
+        chunks: List[Tuple[int, List[Dict[str, Any]]]] = [
+            (chunk_idx, active_payloads[start : start + size])
+            for chunk_idx, start in enumerate(range(0, target_n, size))
+        ]
 
         raw_workers = os.getenv(
             "SINGLE_JUST_WORKERS",
@@ -381,137 +350,167 @@ class SingleJustificationGenerator:
             configured_workers = int(raw_workers)
         except Exception:
             configured_workers = self.DEFAULT_RECOMMENDATION_WORKERS
-        workers = max(1, min(configured_workers, len(chunks)))
+        workers = resolve_pool_size(
+            max_workers=configured_workers,
+            task_count=len(chunks),
+        )
+        get_chain = build_thread_local_getter(self._build_chain)
 
-        if workers <= 1:
-            for _, chunk in chunks:
-                chunk_recs = self._invoke_llm_recommendations(
-                    chain=chain,
-                    fac_ctx=fac_ctx,
-                    opp_payloads=chunk,
+        def _run_chunk(
+            task: Tuple[int, List[Dict[str, Any]]],
+        ) -> Tuple[List[FacultyOpportunityRec], Dict[str, str]]:
+            _, chunk = task
+
+            def _run_stage(stage: str) -> Tuple[str, Any]:
+                try:
+                    if stage == "recs":
+                        llm_recs = self._invoke_llm_recommendations(
+                            chain=(chain if workers <= 1 else get_chain()),
+                            fac_ctx=fac_ctx,
+                            opp_payloads=chunk,
+                        )
+                        return (
+                            "recs",
+                            self._merge_llm_with_db_payloads(
+                                llm_recs=llm_recs,
+                                payloads=chunk,
+                                faculty_name=faculty_name,
+                            ),
+                        )
+                    return (
+                        "expl",
+                        self._build_grant_explanations_for_payloads(
+                            opp_payloads=chunk,
+                            grant_explanation_contexts=grant_explanation_contexts or {},
+                        ),
+                    )
+                except Exception:
+                    if stage == "recs":
+                        return (
+                            "recs",
+                            self._merge_llm_with_db_payloads(
+                                llm_recs=[],
+                                payloads=chunk,
+                                faculty_name=faculty_name,
+                            ),
+                        )
+                    return "expl", {}
+
+            stage_outputs = dict(
+                parallel_map(
+                    ["recs", "expl"],
+                    max_workers=2,
+                    run_item=_run_stage,
                 )
-                merged_chunk = self._merge_llm_with_db_payloads(
-                    llm_recs=chunk_recs,
-                    payloads=chunk,
-                    faculty_name=faculty_name,
-                )
-                if merged_chunk:
-                    collected.extend(merged_chunk)
-        else:
-            thread_local = threading.local()
-
-            def _get_chain():
-                local_chain = getattr(thread_local, "chain", None)
-                if local_chain is None:
-                    local_chain = self._build_chain()
-                    thread_local.chain = local_chain
-                return local_chain
-
-            def _run_chunk(task: Tuple[int, List[Dict[str, Any]]]) -> Tuple[int, List[FacultyOpportunityRec]]:
-                chunk_idx, chunk = task
-                chunk_recs = self._invoke_llm_recommendations(
-                    chain=_get_chain(),
-                    fac_ctx=fac_ctx,
-                    opp_payloads=chunk,
-                )
-                merged_chunk = self._merge_llm_with_db_payloads(
-                    llm_recs=chunk_recs,
-                    payloads=chunk,
-                    faculty_name=faculty_name,
-                )
-                return chunk_idx, merged_chunk
-
-            merged_by_chunk: List[Tuple[int, List[FacultyOpportunityRec]]] = []
-            with ThreadPoolExecutor(max_workers=workers) as ex:
-                futures = [ex.submit(_run_chunk, task) for task in chunks]
-                for fut in as_completed(futures):
-                    merged_by_chunk.append(fut.result())
-            merged_by_chunk.sort(key=lambda x: x[0])
-            for _, merged in merged_by_chunk:
-                if merged:
-                    collected.extend(merged)
-
-        grant_explanations_by_opp: Dict[str, str] = {}
-        try:
-            grant_explanations_by_opp = dict(explanation_future.result() or {})
-        except Exception:
-            grant_explanations_by_opp = {}
-        finally:
-            explanation_executor.shutdown(wait=True)
-
-        if not collected:
-            fallback_out = self._fallback_recommendations_from_payloads(
-                faculty_name=faculty_name,
-                opp_payloads=active_payloads,
-                k=target_n,
             )
-            with_expl = self._attach_grant_explanations_to_recs(
-                list(fallback_out.recommendations or []),
+            recs = list(stage_outputs.get("recs") or [])
+            expl = dict(stage_outputs.get("expl") or {})
+            return recs, expl
+
+        chunk_outputs = parallel_map(
+            chunks,
+            max_workers=workers,
+            run_item=_run_chunk,
+        )
+        collected: List[FacultyOpportunityRec] = []
+        grant_explanations_by_opp: Dict[str, str] = {}
+        for merged, chunk_expl in chunk_outputs:
+            if merged:
+                collected.extend(merged)
+            if chunk_expl:
+                grant_explanations_by_opp.update(chunk_expl)
+
+        if collected:
+            collected = self._attach_grant_explanations_to_recs(
+                list(collected[:target_n]),
                 grant_explanations_by_opp=grant_explanations_by_opp,
             )
-            return fallback_out.model_copy(
-                update={
-                    "grant_explanation": self._top_grant_explanation_from_recs(with_expl),
-                    "recommendations": with_expl,
-                }
+            return FacultyRecsOut(
+                faculty_name=faculty_name,
+                grant_explanation=self._top_grant_explanation_from_recs(collected),
+                recommendations=collected,
             )
 
-        collected = self._attach_grant_explanations_to_recs(
-            list(collected[:target_n]),
+        fallback_out = self._fallback_recommendations_from_payloads(
+            faculty_name=faculty_name,
+            opp_payloads=active_payloads,
+            k=target_n,
+        )
+        with_expl = self._attach_grant_explanations_to_recs(
+            list(fallback_out.recommendations or []),
             grant_explanations_by_opp=grant_explanations_by_opp,
         )
-
-        return FacultyRecsOut(
-            faculty_name=faculty_name,
-            grant_explanation=self._top_grant_explanation_from_recs(collected),
-            recommendations=collected,
+        return fallback_out.model_copy(
+            update={
+                "grant_explanation": self._top_grant_explanation_from_recs(with_expl),
+                "recommendations": with_expl,
+            }
         )
 
-    def generate_faculty_recs(self, *, email: str, k: int) -> FacultyRecsOut:
+    def _generate_faculty_recs_from_top_rows(
+        self,
+        *,
+        sess,
+        email: str,
+        fac: Faculty,
+        top_rows: List[Tuple[str, float, float]],
+        k: int,
+        missing_payload_error: str,
+    ) -> FacultyRecsOut:
         chain = self._build_chain()
+        fac_ctx, opp_payloads = self.context_generator.build_faculty_recommendation_payloads(
+            sess=sess,
+            fac=fac,
+            top_rows=top_rows,
+        )
+        if not opp_payloads:
+            raise ValueError(missing_payload_error)
 
+        faculty_name = getattr(fac, "name", None) or email
+        grant_explanation_contexts = self.context_generator.build_opportunity_explanation_contexts(
+            sess=sess,
+            opportunity_ids=[
+                str(p.get("opportunity_id") or p.get("grant_id") or "").strip()
+                for p in (opp_payloads or [])
+            ],
+        )
+
+        return self._build_recommendations_from_payloads(
+            chain=chain,
+            fac_ctx=fac_ctx,
+            opp_payloads=opp_payloads,
+            grant_explanation_contexts=grant_explanation_contexts,
+            faculty_name=faculty_name,
+            k=k,
+            batch_size=3,
+        )
+
+    def run(self, *, email: str, k: int) -> FacultyRecsOut:
         with SessionLocal() as sess:
             match_dao = MatchDAO(sess)
-            fac = self._get_faculty_by_email(sess, email=email)
+            faculty_dao = FacultyDAO(sess)
+            fac = self._get_faculty_by_email(faculty_dao, email=email)
 
             rows = match_dao.top_matches_for_faculty(
                 faculty_id=fac.faculty_id,
                 k=k,
             )
-            opp_ids = [gid for (gid, _, _) in rows]
-            if not opp_ids:
+            if not rows:
                 raise ValueError(f"No matches found for {fac.name} ({email}).")
 
-            fac_ctx, opp_payloads = self.context_generator.build_faculty_recommendation_payloads(
+            return self._generate_faculty_recs_from_top_rows(
                 sess=sess,
+                email=email,
                 fac=fac,
-                top_rows=rows,
-            )
-            if not opp_payloads:
-                raise ValueError(
+                top_rows=list(rows),
+                k=k,
+                missing_payload_error=(
                     f"Top matches exist but opportunities are missing in DB for faculty {fac.faculty_id}. "
                     "Re-fetch opportunities or rebuild match_results."
-                )
-            faculty_name = getattr(fac, "name", None) or email
-            grant_explanation_contexts = self.context_generator.build_opportunity_explanation_contexts(
-                sess=sess,
-                opportunity_ids=[
-                    str(p.get("opportunity_id") or p.get("grant_id") or "").strip()
-                    for p in (opp_payloads or [])
-                ],
+                ),
             )
 
-            return self._build_recommendations_from_payloads(
-                chain=chain,
-                fac_ctx=fac_ctx,
-                opp_payloads=opp_payloads,
-                grant_explanation_contexts=grant_explanation_contexts,
-                faculty_name=faculty_name,
-                k=k,
-                batch_size=3,
-            )
-
-    def generate_faculty_recs_for_matches(
+    def run_specific_matches(
         self,
         *,
         email: str,
@@ -524,10 +523,9 @@ class SingleJustificationGenerator:
         if not top_matches:
             raise ValueError("No matches provided for recommendation generation.")
 
-        chain = self._build_chain()
-
         with SessionLocal() as sess:
-            fac = self._get_faculty_by_email(sess, email=email)
+            faculty_dao = FacultyDAO(sess)
+            fac = self._get_faculty_by_email(faculty_dao, email=email)
             top_rows = []
             for m in top_matches:
                 opp_id = str(m.get("opportunity_id") or m.get("grant_id") or "").strip()
@@ -544,34 +542,18 @@ class SingleJustificationGenerator:
             if not top_rows:
                 raise ValueError("No valid opportunity IDs found in provided matches.")
 
-            fac_ctx, opp_payloads = self.context_generator.build_faculty_recommendation_payloads(
+            return self._generate_faculty_recs_from_top_rows(
                 sess=sess,
+                email=email,
                 fac=fac,
                 top_rows=top_rows,
-            )
-            if not opp_payloads:
-                raise ValueError(
+                k=target_k,
+                missing_payload_error=(
                     "Match rows exist but opportunity payloads are missing in DB for recommendation generation."
-                )
-            faculty_name = getattr(fac, "name", None) or email
-            grant_explanation_contexts = self.context_generator.build_opportunity_explanation_contexts(
-                sess=sess,
-                opportunity_ids=[
-                    str(p.get("opportunity_id") or p.get("grant_id") or "").strip()
-                    for p in (opp_payloads or [])
-                ],
-            )
-            return self._build_recommendations_from_payloads(
-                chain=chain,
-                fac_ctx=fac_ctx,
-                opp_payloads=opp_payloads,
-                grant_explanation_contexts=grant_explanation_contexts,
-                faculty_name=faculty_name,
-                k=min(target_k, len(opp_payloads)),
-                batch_size=3,
+                ),
             )
 
-    def generate_for_specific_grant(self, *, email: str, opportunity_id: str) -> FacultyRecsOut:
+    def run_specific_grant(self, *, email: str, opportunity_id: str) -> FacultyRecsOut:
         """Generate one-to-one justification for exactly one opportunity."""
         opp_id = str(opportunity_id or "").strip()
         if not opp_id:
@@ -581,7 +563,8 @@ class SingleJustificationGenerator:
 
         with SessionLocal() as sess:
             match_dao = MatchDAO(sess)
-            fac = self._get_faculty_by_email(sess, email=email)
+            faculty_dao = FacultyDAO(sess)
+            fac = self._get_faculty_by_email(faculty_dao, email=email)
 
             pair_row = match_dao.get_match_for_faculty_opportunity(
                 faculty_id=int(fac.faculty_id),
