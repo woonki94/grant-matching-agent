@@ -72,7 +72,24 @@ class KeywordGenerator:
             out.append(token)
         return out
 
-    def classify_opportunity_category(
+    @staticmethod
+    def _apply_limit(iterable, limit: int):
+        if limit and limit > 0:
+            count = 0
+            for item in iterable:
+                yield item
+                count += 1
+                if count >= limit:
+                    break
+            return
+        yield from iterable
+
+    def _resolve_force(self, force_regenerate: Optional[bool]) -> bool:
+        if force_regenerate is None:
+            return self.force_regenerate
+        return bool(force_regenerate)
+
+    def _classify_opportunity_category(
         self,
         *,
         category_chain,
@@ -101,23 +118,6 @@ class KeywordGenerator:
                 "specific_categories": [],
                 "error": f"{type(e).__name__}: {e}",
             }
-
-    @staticmethod
-    def _apply_limit(iterable, limit: int):
-        if limit and limit > 0:
-            count = 0
-            for item in iterable:
-                yield item
-                count += 1
-                if count >= limit:
-                    break
-            return
-        yield from iterable
-
-    def _resolve_force(self, force_regenerate: Optional[bool]) -> bool:
-        if force_regenerate is None:
-            return self.force_regenerate
-        return bool(force_regenerate)
 
     def generate_keywords(
         self,
@@ -265,7 +265,7 @@ class KeywordGenerator:
                 weight_chain=opp_w_chain,
             )
             ctx_used = (opportunity_keywords_raw or {}).get("context_used") or self.context_generator.build_opportunity_basic_context(opp)
-            category = self.classify_opportunity_category(
+            category = self._classify_opportunity_category(
                 category_chain=opp_cat_chain,
                 context=ctx_used,
                 keywords=opportunity_keywords,
@@ -390,7 +390,7 @@ class KeywordGenerator:
                         weight_chain=opp_w_chain,
                     )
                     ctx_used = (opportunity_keywords_raw or {}).get("context_used") or self.context_generator.build_opportunity_basic_context(opp)
-                    category = self.classify_opportunity_category(
+                    category = self._classify_opportunity_category(
                         category_chain=opp_cat_chain,
                         context=ctx_used,
                         keywords=opportunity_keywords,
