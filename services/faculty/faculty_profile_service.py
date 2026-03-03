@@ -90,12 +90,14 @@ class FacultyProfileService:
         data_from: Optional[Dict[str, Any]] = None,
         all_keywords: Optional[Dict[str, Any]] = None,
         keyword_source: Optional[str] = None,
+        force_regenerate_keywords: Optional[bool] = None,
     ) -> Dict[str, Any]:
         """
         Edit faculty profile by immutable email.
 
         Mode 1: source edits (basic_info/data_from) -> regenerate keywords.
-        Mode 2: direct all_keywords edit -> write directly to faculty keyword tables.
+        Mode 2: direct all_keywords edit -> write directly to faculty keyword tables only.
+        Mode 3: force_regenerate_keywords=true -> regenerate from current sources.
         """
         normalized_email = (str(email or "").strip().lower() or None)
         if not normalized_email:
@@ -103,13 +105,21 @@ class FacultyProfileService:
 
         basic_info = basic_info or {}
         data_from = data_from or {}
-        has_source_payload = bool(basic_info) or bool(data_from)
         has_keyword_payload = all_keywords is not None
+        has_source_payload = bool(basic_info) or bool(data_from)
+        force_regeneration = bool(force_regenerate_keywords)
 
-        if has_source_payload and has_keyword_payload:
+        if has_keyword_payload and force_regeneration:
             raise ValueError(
-                "source update and all_keywords update cannot be sent together."
+                "all_keywords direct update cannot be combined with force_regenerate_keywords=true."
             )
+
+        # Keyword payload takes priority as a DB-only override path.
+        # Ignore source payload fields if they are sent together.
+        if has_keyword_payload:
+            basic_info = {}
+            data_from = {}
+            has_source_payload = False
 
         with self.session_factory() as sess:
             dao = FacultyDAO(sess)
@@ -166,19 +176,32 @@ class FacultyProfileService:
         keyword_update_mode = "none"
         if direct_keyword_applied:
             keyword_update_mode = "frontend_override"
-        elif source_changed:
+        elif source_changed or force_regeneration:
             try:
                 self._regenerate_faculty_keywords(faculty_id=faculty_id)
                 keyword_regenerated = True
-                keyword_update_mode = "regenerated_from_sources"
+                keyword_update_mode = (
+                    "forced_regeneration"
+                    if force_regeneration
+                    else "regenerated_from_sources"
+                )
             except Exception as e:
                 keyword_regeneration_error = f"{type(e).__name__}: {e}"
-                keyword_update_mode = "regeneration_failed"
+                keyword_update_mode = (
+                    "forced_regeneration_failed"
+                    if force_regeneration
+                    else "regeneration_failed"
+                )
+                if force_regeneration:
+                    raise RuntimeError(
+                        f"Forced keyword regeneration failed: {keyword_regeneration_error}"
+                    ) from e
 
         matches_rebuilt = False
         match_rows_upserted = 0
         match_rebuild_error = None
-        if direct_keyword_applied or keyword_regenerated:
+        # Direct keyword edits are DB-only and should not trigger downstream jobs.
+        if keyword_regenerated:
             try:
                 match_rows_upserted = int(
                     self._rebuild_faculty_matches(faculty_id=faculty_id)
@@ -195,6 +218,7 @@ class FacultyProfileService:
             "direct_keyword_applied": bool(direct_keyword_applied),
             "keyword_update_mode": keyword_update_mode,
             "keyword_regenerated": bool(keyword_regenerated),
+            "keyword_regeneration_forced": bool(force_regeneration),
             "keyword_regeneration_error": keyword_regeneration_error,
             "updated_keywords": ((updated or {}).get("all_keywords") or {}),
             "matches_rebuilt": bool(matches_rebuilt),

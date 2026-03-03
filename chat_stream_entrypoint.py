@@ -1009,11 +1009,17 @@ def edit_faculty_profile_by_email():
             "ok": False,
             "error": "email is required.",
         }, 400
-
+    print(body)
     basic_info = body.get("basic_info") or {}
     data_from = body.get("data_from") or {}
     all_keywords = body.get("all_keywords") if "all_keywords" in body else None
     keyword_source = body.get("keyword_source")
+    force_regenerate_keywords = _to_optional_bool(body.get("force_regenerate_keywords"))
+    if "force_regenerate_keywords" in body and force_regenerate_keywords is None:
+        return {
+            "ok": False,
+            "error": "force_regenerate_keywords must be a boolean.",
+        }, 400
 
     try:
         from services.faculty.faculty_profile_service import FacultyProfileService
@@ -1025,6 +1031,7 @@ def edit_faculty_profile_by_email():
             data_from=data_from,
             all_keywords=all_keywords,
             keyword_source=keyword_source,
+            force_regenerate_keywords=force_regenerate_keywords,
         )
         return {"ok": True, **out}, 200
     except LookupError as e:

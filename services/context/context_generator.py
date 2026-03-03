@@ -61,10 +61,10 @@ class ContextGenerator:
     # Faculty Context
     # ==============================
     def build_faculty_basic_context(self, fac: Faculty) -> Dict[str, Any]:
-        return self.faculty.build_faculty_basic_context(fac)
+        return self.faculty.build_faculty_context(fac, profile="basic")
 
     def build_faculty_keyword_context(self, fac: Faculty) -> Dict[str, Any]:
-        return self.faculty.build_faculty_keyword_context(fac)
+        return self.faculty.build_faculty_context(fac, profile="keyword")
 
     # ==============================
     # Matching Context
