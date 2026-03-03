@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Dict, List, Optional, Tuple
 
 from config import get_llm_client
@@ -17,6 +16,7 @@ from dto.llm_response_dto import (
 )
 from services.context.context_generator import ContextGenerator
 from utils.keyword_utils import extract_requirement_specs
+from utils.thread_pool import parallel_map
 from services.prompts.group_match_prompt import (
     GRANT_BRIEF_PROMPT,
     RECOMMENDER_PROMPT,
@@ -119,34 +119,37 @@ class GroupJustificationEngine:
                 "team": team_block,
                 "team_final_coverage": coverage_block,
             }
-            section_jobs = {
-                "grant_brief": (
+            section_jobs: List[Tuple[str, Any, Dict[str, str]]] = [
+                (
+                    "grant_brief",
                     self.grant_brief_chain,
                     {"input_json": self._safe_json(grant_brief_input)},
                 ),
-                "team_roles": (
+                (
+                    "team_roles",
                     self.team_role_chain,
                     {"input_json": self._safe_json(team_role_input)},
                 ),
-                "why_working": (
+                (
+                    "why_working",
                     self.why_working_chain,
                     {"input_json": self._safe_json(why_working_input)},
                 ),
-                "why_not_working": (
+                (
+                    "why_not_working",
                     self.why_not_working_chain,
                     {"input_json": self._safe_json(why_not_input)},
                 ),
-            }
+            ]
 
-            section_outputs: Dict[str, Any] = {}
-            with ThreadPoolExecutor(max_workers=self.INDEPENDENT_STAGE_WORKERS) as ex:
-                futures = {
-                    ex.submit(chain.invoke, payload): section_name
-                    for section_name, (chain, payload) in section_jobs.items()
-                }
-                for fut in as_completed(futures):
-                    section_name = futures[fut]
-                    section_outputs[section_name] = fut.result()
+            section_outputs = {
+                section_name: section_output
+                for section_name, section_output in parallel_map(
+                    section_jobs,
+                    max_workers=self.INDEPENDENT_STAGE_WORKERS,
+                    run_item=lambda job: (job[0], job[1].invoke(job[2])),
+                )
+            }
 
             grant_brief: GrantBriefOut = section_outputs["grant_brief"]
             team_roles: TeamRoleOut = section_outputs["team_roles"]

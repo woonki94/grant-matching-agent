@@ -1,8 +1,6 @@
 from __future__ import annotations
 
 import os
-import threading
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Dict, List, Optional, Union
 
 from dao.faculty_dao import FacultyDAO
@@ -11,6 +9,7 @@ from db.db_conn import SessionLocal
 from services.context.context_generator import ContextGenerator
 from services.justification.group_justification_engine import GroupJustificationEngine
 from services.matching.team_grant_matcher import TeamGrantMatcher
+from utils.thread_pool import build_thread_local_getter, parallel_map, resolve_pool_size
 
 
 class GroupJustificationGenerator:
@@ -225,19 +224,14 @@ class GroupJustificationGenerator:
                     }
                 )
 
-            thread_local = threading.local()
-
-            def _get_engine() -> GroupJustificationEngine:
-                engine = getattr(thread_local, "engine", None)
-                if engine is None:
+            get_engine = build_thread_local_getter(
+                lambda: GroupJustificationEngine(
                     # odao/fdao are not required by run_one; pass None to keep per-thread engine isolated.
-                    engine = GroupJustificationEngine(
-                        odao=None,  # type: ignore[arg-type]
-                        fdao=None,  # type: ignore[arg-type]
-                        context_generator=self.context_generator,
-                    )
-                    thread_local.engine = engine
-                return engine
+                    odao=None,  # type: ignore[arg-type]
+                    fdao=None,  # type: ignore[arg-type]
+                    context_generator=self.context_generator,
+                )
+            )
 
             def _run_item(item: Dict[str, Any]) -> Dict[str, Any]:
                 idx = int(item["index"])
@@ -245,7 +239,7 @@ class GroupJustificationGenerator:
                 team = list(item["team"])
                 row = dict(item["row"])
                 try:
-                    justification, trace = _get_engine().run_one(
+                    justification, trace = get_engine().run_one(
                         opp_ctx=dict(item["opp_ctx"]),
                         fac_ctxs=[dict(f) for f in list(item["fac_ctxs"])],
                         coverage=item["coverage"],
@@ -277,6 +271,18 @@ class GroupJustificationGenerator:
                         "error": f"{type(e).__name__}: {e}",
                     }
 
+            def _on_item_error(_index: int, item: Dict[str, Any], e: Exception) -> Dict[str, Any]:
+                idx = int(item["index"])
+                return {
+                    "index": idx,
+                    "grant_id": item["opp_id"],
+                    "grant_title": item["grant_title"],
+                    "agency_name": item["agency_name"],
+                    "grant_link": item["grant_link"],
+                    "team": item["team"],
+                    "error": f"{type(e).__name__}: {e}",
+                }
+
             max_workers = max(
                 1,
                 int(
@@ -286,33 +292,17 @@ class GroupJustificationGenerator:
                     )
                 ),
             )
-            pool_size = min(max_workers, len(work_items))
-
-            if pool_size <= 1:
-                for item in work_items:
-                    out = _run_item(item)
-                    results_by_index[int(item["index"])] = out
-            else:
-                with ThreadPoolExecutor(max_workers=pool_size) as ex:
-                    futures = {
-                        ex.submit(_run_item, item): int(item["index"])
-                        for item in work_items
-                    }
-                    for fut in as_completed(futures):
-                        idx = futures[fut]
-                        try:
-                            results_by_index[idx] = fut.result()
-                        except Exception as e:
-                            item = next(w for w in work_items if int(w["index"]) == idx)
-                            results_by_index[idx] = {
-                                "index": idx,
-                                "grant_id": item["opp_id"],
-                                "grant_title": item["grant_title"],
-                                "agency_name": item["agency_name"],
-                                "grant_link": item["grant_link"],
-                                "team": item["team"],
-                                "error": f"{type(e).__name__}: {e}",
-                            }
+            pool_size = resolve_pool_size(
+                max_workers=max_workers,
+                task_count=len(work_items),
+            )
+            for out in parallel_map(
+                work_items,
+                max_workers=pool_size,
+                run_item=_run_item,
+                on_error=_on_item_error,
+            ):
+                results_by_index[int(out["index"])] = out
 
             return [
                 results_by_index[i]

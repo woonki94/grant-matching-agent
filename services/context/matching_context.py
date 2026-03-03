@@ -8,6 +8,174 @@ from utils.keyword_utils import extract_specializations
 
 
 class MatchingContextBuilder:
+    PROFILE_FIELDS: Dict[str, Tuple[str, ...]] = {
+        "group": (
+            "grant",
+            "team",
+            "coverage",
+            "group_match",
+        ),
+        "group_grant": (
+            "id",
+            "title",
+            "agency",
+            "summary",
+            "keywords",
+        ),
+        "group_team_member": (
+            "faculty_id",
+            "name",
+            "email",
+            "covered",
+        ),
+        "group_team_member_covered": (
+            "application",
+            "research",
+        ),
+        "top_match": (
+            "opportunity_id",
+            "title",
+            "agency",
+            "domain_score",
+            "llm_score",
+        ),
+        "inputs": (
+            "faculty_ids",
+            "requirements",
+            "coverage",
+        ),
+        "inputs_requirements": (
+            "application",
+            "research",
+        ),
+    }
+
+    @staticmethod
+    def _select_fields(payload: Dict[str, Any], fields: Tuple[str, ...]) -> Dict[str, Any]:
+        return {k: payload.get(k) for k in fields}
+
+    def build_matching_retrievable_context(
+        self,
+        *,
+        profile: str,
+        opp_ctx: Optional[Dict[str, Any]] = None,
+        fac_ctxs: Optional[List[Dict[str, Any]]] = None,
+        coverage: Any = None,
+        member_coverages: Optional[Dict[int, Dict[str, Dict[int, float]]]] = None,
+        group_meta: Optional[Dict[str, Any]] = None,
+        top_row: Optional[Tuple[str, float, float]] = None,
+        faculty_ids: Optional[List[int]] = None,
+        requirements: Optional[Dict[str, Dict[int, float]]] = None,
+    ) -> Dict[str, Any]:
+        normalized = str(profile or "").strip().lower()
+
+        if normalized == "group":
+            source_opp = opp_ctx or {}
+            source_member_coverages = member_coverages or {}
+            grant_payload = {
+                "id": source_opp.get("opportunity_id") or source_opp.get("id"),
+                "title": source_opp.get("title"),
+                "agency": source_opp.get("agency"),
+                "summary": source_opp.get("summary"),
+                "keywords": source_opp.get("keywords"),
+            }
+
+            team_payload: List[Dict[str, Any]] = []
+            for f in fac_ctxs or []:
+                faculty_id = f.get("faculty_id") or f.get("id")
+                covered = {"application": {}, "research": {}}
+                if faculty_id is not None:
+                    covered = source_member_coverages.get(int(faculty_id), covered)
+                team_payload.append(
+                    {
+                        "faculty_id": faculty_id,
+                        "name": f.get("name"),
+                        "email": f.get("email"),
+                        "covered": covered,
+                    }
+                )
+
+            return {
+                "grant": grant_payload,
+                "team": team_payload,
+                "coverage": coverage,
+                "group_match": group_meta,
+            }
+
+        if normalized == "top_match":
+            source_opp = opp_ctx or {}
+            opp_id, domain_score, llm_score = top_row or ("", 0.0, 0.0)
+            return {
+                "opportunity_id": opp_id,
+                "title": source_opp.get("title"),
+                "agency": source_opp.get("agency"),
+                "domain_score": float(domain_score),
+                "llm_score": float(llm_score),
+            }
+
+        if normalized == "inputs":
+            return {
+                "faculty_ids": list(faculty_ids or []),
+                "requirements": requirements or {"application": {}, "research": {}},
+                "coverage": coverage or {},
+            }
+
+        raise ValueError(f"Unsupported matching context profile: {profile}")
+
+    def build_matching_context(
+        self,
+        *,
+        profile: str,
+        opp_ctx: Optional[Dict[str, Any]] = None,
+        fac_ctxs: Optional[List[Dict[str, Any]]] = None,
+        coverage: Any = None,
+        member_coverages: Optional[Dict[int, Dict[str, Dict[int, float]]]] = None,
+        group_meta: Optional[Dict[str, Any]] = None,
+        top_row: Optional[Tuple[str, float, float]] = None,
+        faculty_ids: Optional[List[int]] = None,
+        requirements: Optional[Dict[str, Dict[int, float]]] = None,
+    ) -> Dict[str, Any]:
+        normalized = str(profile or "").strip().lower()
+        fields = self.PROFILE_FIELDS.get(normalized)
+        if not fields:
+            raise ValueError(f"Unsupported matching context profile: {profile}")
+
+        full = self.build_matching_retrievable_context(
+            profile=normalized,
+            opp_ctx=opp_ctx,
+            fac_ctxs=fac_ctxs,
+            coverage=coverage,
+            member_coverages=member_coverages,
+            group_meta=group_meta,
+            top_row=top_row,
+            faculty_ids=faculty_ids,
+            requirements=requirements,
+        )
+        context = self._select_fields(full, fields)
+
+        if normalized == "group":
+            grant_fields = self.PROFILE_FIELDS.get("group_grant", ())
+            member_fields = self.PROFILE_FIELDS.get("group_team_member", ())
+            covered_fields = self.PROFILE_FIELDS.get("group_team_member_covered", ())
+            context["grant"] = self._select_fields(dict(full.get("grant") or {}), grant_fields)
+            filtered_team: List[Dict[str, Any]] = []
+            for member in list(full.get("team") or []):
+                m = self._select_fields(dict(member or {}), member_fields)
+                m["covered"] = self._select_fields(dict(m.get("covered") or {}), covered_fields)
+                filtered_team.append(m)
+            context["team"] = filtered_team
+            if not full.get("group_match"):
+                context.pop("group_match", None)
+
+        if normalized == "inputs":
+            req_fields = self.PROFILE_FIELDS.get("inputs_requirements", ())
+            context["requirements"] = self._select_fields(dict(full.get("requirements") or {}), req_fields)
+
+        return context
+
+    # ====================
+    # Group Matching Context
+    # ====================
     def build_group_matching_context(
         self,
         *,
@@ -17,35 +185,18 @@ class MatchingContextBuilder:
         member_coverages: Optional[Dict[int, Dict[str, Dict[int, float]]]] = None,
         group_meta: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
-        member_coverages = member_coverages or {}
-        payload: Dict[str, Any] = {
-            "grant": {
-                "id": opp_ctx.get("opportunity_id") or opp_ctx.get("id"),
-                "title": opp_ctx.get("title"),
-                "agency": opp_ctx.get("agency"),
-                "summary": opp_ctx.get("summary"),
-                "keywords": opp_ctx.get("keywords"),
-            },
-            "team": [
-                {
-                    "faculty_id": f.get("faculty_id") or f.get("id"),
-                    "name": f.get("name"),
-                    "email": f.get("email"),
-                    "covered": member_coverages.get(
-                        int(f.get("faculty_id") or f.get("id")),
-                        {"application": {}, "research": {}},
-                    )
-                    if (f.get("faculty_id") or f.get("id")) is not None
-                    else {"application": {}, "research": {}},
-                }
-                for f in fac_ctxs
-            ],
-            "coverage": coverage,
-        }
-        if group_meta:
-            payload["group_match"] = group_meta
-        return payload
+        return self.build_matching_context(
+            profile="group",
+            opp_ctx=opp_ctx,
+            fac_ctxs=fac_ctxs,
+            coverage=coverage,
+            member_coverages=member_coverages,
+            group_meta=group_meta,
+        )
 
+    # ====================
+    # Top Match Context
+    # ====================
     def build_top_match_payload(
         self,
         *,
@@ -54,19 +205,21 @@ class MatchingContextBuilder:
     ) -> List[Dict[str, Any]]:
         opp_dao = OpportunityDAO(sess)
         out: List[Dict[str, Any]] = []
-        for opp_id, domain_score, llm_score in top_rows or []:
+        for row in top_rows or []:
+            opp_id, domain_score, llm_score = row
             opp_ctx = opp_dao.read_opportunity_context(opp_id) or {}
             out.append(
-                {
-                    "opportunity_id": opp_id,
-                    "title": opp_ctx.get("title"),
-                    "agency": opp_ctx.get("agency"),
-                    "domain_score": float(domain_score),
-                    "llm_score": float(llm_score),
-                }
+                self.build_matching_context(
+                    profile="top_match",
+                    opp_ctx=opp_ctx,
+                    top_row=(opp_id, domain_score, llm_score),
+                )
             )
         return out
 
+    # ====================
+    # Input / Coverage Context
+    # ====================
     def build_inputs_for_opportunity(
         self,
         *,
@@ -97,8 +250,17 @@ class MatchingContextBuilder:
         if not coverage:
             raise ValueError("No match rows found.")
 
-        faculty_ids = sorted(coverage.keys())
-        return faculty_ids, requirements, coverage
+        ctx = self.build_matching_context(
+            profile="inputs",
+            faculty_ids=sorted(coverage.keys()),
+            requirements=requirements,
+            coverage=coverage,
+        )
+        return (
+            list(ctx.get("faculty_ids") or []),
+            dict(ctx.get("requirements") or {"application": {}, "research": {}}),
+            dict(ctx.get("coverage") or {}),
+        )
 
     def build_member_coverages_for_opportunity(
         self,

@@ -1,12 +1,38 @@
 from __future__ import annotations
 
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Tuple
 
 from db.models import Opportunity
 from utils.content_extractor import load_extracted_content
 
 
 class OpportunityContextBuilder:
+    PROFILE_FIELDS: Dict[str, Tuple[str, ...]] = {
+        "basic": (
+            "opportunity_title",
+            "agency_name",
+            "category",
+            "opportunity_status",
+            "summary_description",
+        ),
+        "keyword": (
+            "opportunity_id",
+            "opportunity_title",
+            "agency_name",
+            "opportunity_link",
+            "keywords",
+        ),
+        "explanation": (
+            "opportunity_id",
+            "opportunity_title",
+            "agency_name",
+            "category",
+            "opportunity_status",
+            "summary_description",
+            "keywords",
+        ),
+    }
+
     @staticmethod
     def _normalize_text(text: Any) -> str:
         return " ".join(str(text or "").split())
@@ -42,19 +68,51 @@ class OpportunityContextBuilder:
                 break
         return out
 
-    def build_opportunity_explanation_context(
+    @staticmethod
+    def _select_fields(payload: Dict[str, Any], fields: Tuple[str, ...]) -> Dict[str, Any]:
+        return {k: payload.get(k) for k in fields}
+
+    @staticmethod
+    def _first_additional_info_link(opp: Opportunity) -> Any:
+        infos = list(getattr(opp, "additional_info", None) or [])
+        if not infos:
+            return None
+        return getattr(infos[0], "additional_info_url", None)
+
+    def build_opportunity_retrievable_context(self, opp: Opportunity) -> Dict[str, Any]:
+        kw = (getattr(opp, "keyword", None) and getattr(opp.keyword, "keywords", None)) or {}
+        return {
+            "opportunity_id": getattr(opp, "opportunity_id", None),
+            "opportunity_title": getattr(opp, "opportunity_title", None),
+            "agency_name": getattr(opp, "agency_name", None),
+            "category": getattr(opp, "category", None),
+            "opportunity_status": getattr(opp, "opportunity_status", None),
+            "summary_description": getattr(opp, "summary_description", None),
+            "opportunity_link": self._first_additional_info_link(opp),
+            "keywords": kw,
+        }
+
+    def build_opportunity_context(
         self,
         opp: Opportunity,
         *,
+        profile: str = "basic",
         max_summary_chars: int = 420,
         max_item_chars: int = 240,
         max_additional_items: int = 2,
         max_attachment_items: int = 2,
         max_keywords_per_bucket: int = 6,
     ) -> Dict[str, Any]:
-        kw = (getattr(opp, "keyword", None) and getattr(opp.keyword, "keywords", None)) or {}
-        research_kw = kw.get("research") if isinstance(kw, dict) else {}
-        application_kw = kw.get("application") if isinstance(kw, dict) else {}
+        _ = max_summary_chars
+        full = self.build_opportunity_retrievable_context(opp)
+        normalized = str(profile or "").strip().lower()
+        fields = self.PROFILE_FIELDS.get(normalized)
+        if not fields:
+            raise ValueError(f"Unsupported opportunity context profile: {profile}")
+        context = self._select_fields(full, fields)
+
+        if normalized == "keyword":
+            return context
 
         additional_blocks = load_extracted_content(
             opp.additional_info,
@@ -66,18 +124,27 @@ class OpportunityContextBuilder:
             title_attr="file_name",
         )
 
-        additional_short = []
+        if normalized == "basic":
+            context["additional_info_extracted"] = additional_blocks
+            context["attachments_extracted"] = attachment_blocks
+            return context
+
+        kw = context.get("keywords") if isinstance(context, dict) else {}
+        research_kw = kw.get("research") if isinstance(kw, dict) else {}
+        application_kw = kw.get("application") if isinstance(kw, dict) else {}
+
+        additional_info_brief = []
         for item in list(additional_blocks or [])[:max_additional_items]:
-            additional_short.append(
+            additional_info_brief.append(
                 {
                     "url": item.get("url"),
                     "excerpt": self._short_text(item.get("content"), max_chars=max_item_chars),
                 }
             )
 
-        attachment_short = []
+        attachments_brief = []
         for item in list(attachment_blocks or [])[:max_attachment_items]:
-            attachment_short.append(
+            attachments_brief.append(
                 {
                     "title": item.get("title"),
                     "url": item.get("url"),
@@ -85,68 +152,55 @@ class OpportunityContextBuilder:
                 }
             )
 
-        return {
-            "opportunity_id": getattr(opp, "opportunity_id", None),
-            "opportunity_title": getattr(opp, "opportunity_title", None),
-            "agency_name": getattr(opp, "agency_name", None),
-            "category": getattr(opp, "category", None),
-            "opportunity_status": getattr(opp, "opportunity_status", None),
-            # Keep summary untruncated; brevity is enforced by the LLM prompt.
-            "summary_description": self._normalize_text(getattr(opp, "summary_description", None)),
-            "keywords": {
-                "research": {
-                    "domain": self._brief_keyword_bucket(
-                        (research_kw or {}).get("domain"),
-                        limit=max_keywords_per_bucket,
-                    ),
-                    "specialization": self._brief_keyword_bucket(
-                        (research_kw or {}).get("specialization"),
-                        limit=max_keywords_per_bucket,
-                    ),
-                },
-                "application": {
-                    "domain": self._brief_keyword_bucket(
-                        (application_kw or {}).get("domain"),
-                        limit=max_keywords_per_bucket,
-                    ),
-                    "specialization": self._brief_keyword_bucket(
-                        (application_kw or {}).get("specialization"),
-                        limit=max_keywords_per_bucket,
-                    ),
-                },
+        context["summary_description"] = self._normalize_text(context.get("summary_description"))
+        context["keywords"] = {
+            "research": {
+                "domain": self._brief_keyword_bucket(
+                    (research_kw or {}).get("domain"),
+                    limit=max_keywords_per_bucket,
+                ),
+                "specialization": self._brief_keyword_bucket(
+                    (research_kw or {}).get("specialization"),
+                    limit=max_keywords_per_bucket,
+                ),
             },
-            "additional_info_brief": additional_short,
-            "attachments_brief": attachment_short,
+            "application": {
+                "domain": self._brief_keyword_bucket(
+                    (application_kw or {}).get("domain"),
+                    limit=max_keywords_per_bucket,
+                ),
+                "specialization": self._brief_keyword_bucket(
+                    (application_kw or {}).get("specialization"),
+                    limit=max_keywords_per_bucket,
+                ),
+            },
         }
+        context["additional_info_brief"] = additional_info_brief
+        context["attachments_brief"] = attachments_brief
+        return context
 
     def build_opportunity_basic_context(self, opp: Opportunity) -> Dict[str, Any]:
-        return {
-            "opportunity_title": opp.opportunity_title,
-            "agency_name": opp.agency_name,
-            "category": opp.category,
-            "opportunity_status": opp.opportunity_status,
-            "summary_description": opp.summary_description,
-            "additional_info_extracted": load_extracted_content(
-                opp.additional_info,
-                url_attr="additional_info_url",
-            ),
-            "attachments_extracted": load_extracted_content(
-                opp.attachments,
-                url_attr="file_download_path",
-                title_attr="file_name",
-            ),
-        }
+        return self.build_opportunity_context(opp, profile="basic")
 
     def build_opportunity_keyword_context(self, opp: Opportunity) -> Dict[str, Any]:
-        kw = (getattr(opp, "keyword", None) and getattr(opp.keyword, "keywords", None)) or {}
-        first_link = None
-        infos = list(getattr(opp, "additional_info", None) or [])
-        if infos:
-            first_link = getattr(infos[0], "additional_info_url", None)
-        return {
-            "opportunity_id": opp.opportunity_id,
-            "opportunity_title": opp.opportunity_title,
-            "agency_name": opp.agency_name,
-            "opportunity_link": first_link,
-            "keywords": kw,
-        }
+        return self.build_opportunity_context(opp, profile="keyword")
+
+    def build_opportunity_explanation_context(
+        self,
+        opp: Opportunity,
+        *,
+        max_summary_chars: int = 420,
+        max_item_chars: int = 240,
+        max_additional_items: int = 2,
+        max_attachment_items: int = 2,
+        max_keywords_per_bucket: int = 6,
+    ) -> Dict[str, Any]:
+        return self.build_opportunity_context(
+            opp,
+            profile="explanation",
+            max_summary_chars=max_summary_chars,
+            max_item_chars=max_item_chars,
+            max_additional_items=max_additional_items,
+            max_attachment_items=max_attachment_items,
+            max_keywords_per_bucket=max_keywords_per_bucket,
+        )

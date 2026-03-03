@@ -22,26 +22,11 @@ class ContextGenerator:
             opportunity_builder=self.grant,
         )
 
+    # ==============================
+    # Opportunity Context
+    # ==============================
     def build_opportunity_basic_context(self, opp: Opportunity) -> Dict[str, Any]:
-        return self.grant.build_opportunity_basic_context(opp)
-
-    def build_opportunity_keyword_context(self, opp: Opportunity) -> Dict[str, Any]:
-        return self.grant.build_opportunity_keyword_context(opp)
-
-    def build_opportunity_explanation_context(
-        self,
-        *,
-        sess,
-        opportunity_id: str,
-    ) -> Dict[str, Any]:
-        opp_id = str(opportunity_id or "").strip()
-        if not opp_id:
-            return {}
-        odao = OpportunityDAO(sess)
-        opps = odao.read_opportunities_by_ids_with_relations([opp_id])
-        if not opps:
-            return {}
-        return self.grant.build_opportunity_explanation_context(opps[0])
+        return self.grant.build_opportunity_context(opp, profile="basic")
 
     def build_opportunity_explanation_contexts(
         self,
@@ -69,15 +54,21 @@ class ContextGenerator:
             opp = by_id.get(oid)
             if not opp:
                 continue
-            out[oid] = self.grant.build_opportunity_explanation_context(opp)
+            out[oid] = self.grant.build_opportunity_context(opp, profile="explanation")
         return out
 
+    # ==============================
+    # Faculty Context
+    # ==============================
     def build_faculty_basic_context(self, fac: Faculty) -> Dict[str, Any]:
-        return self.faculty.build_faculty_basic_context(fac)
+        return self.faculty.build_faculty_context(fac, profile="basic")
 
     def build_faculty_keyword_context(self, fac: Faculty) -> Dict[str, Any]:
-        return self.faculty.build_faculty_keyword_context(fac)
+        return self.faculty.build_faculty_context(fac, profile="keyword")
 
+    # ==============================
+    # Matching Context
+    # ==============================
     def build_matching_inputs_for_opportunity(
         self,
         *,
@@ -116,6 +107,9 @@ class ContextGenerator:
     ) -> List[Dict[str, Any]]:
         return self.matching.build_top_match_payload(sess=sess, top_rows=top_rows)
 
+    # ==============================
+    # Recommendation Context
+    # ==============================
     def build_faculty_recommendation_payloads(
         self,
         *,
