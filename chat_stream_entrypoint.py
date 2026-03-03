@@ -1009,7 +1009,7 @@ def edit_faculty_profile_by_email():
             "ok": False,
             "error": "email is required.",
         }, 400
-    print(body)
+    #print(body)
     basic_info = body.get("basic_info") or {}
     data_from = body.get("data_from") or {}
     all_keywords = body.get("all_keywords") if "all_keywords" in body else None

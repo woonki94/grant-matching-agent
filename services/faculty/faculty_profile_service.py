@@ -438,27 +438,25 @@ class FacultyProfileService:
 
         if fetch_from_year is not None:
             # Keep only publications on/after from_year.
-            deleted_older = (
-                sess.query(FacultyPublication)
-                .filter(
-                    FacultyPublication.faculty_id == int(faculty_id),
+            deleted_older = self._delete_publication_rows(
+                sess=sess,
+                faculty_id=int(faculty_id),
+                filters=(
                     FacultyPublication.year.isnot(None),
                     FacultyPublication.year < int(fetch_from_year),
-                )
-                .delete(synchronize_session=False)
+                ),
             )
             out["publications_deleted"] += int(deleted_older or 0)
 
         if fetch_upto_year is not None:
             # Keep only publications on/before upto_year.
-            deleted_newer = (
-                sess.query(FacultyPublication)
-                .filter(
-                    FacultyPublication.faculty_id == int(faculty_id),
+            deleted_newer = self._delete_publication_rows(
+                sess=sess,
+                faculty_id=int(faculty_id),
+                filters=(
                     FacultyPublication.year.isnot(None),
                     FacultyPublication.year > int(fetch_upto_year),
-                )
-                .delete(synchronize_session=False)
+                ),
             )
             out["publications_deleted"] += int(deleted_newer or 0)
 
@@ -478,17 +476,39 @@ class FacultyProfileService:
                 delete_id = FacultyProfileService._safe_int_or_none(delete_raw)
 
         if delete_id:
-            deleted_one = (
-                sess.query(FacultyPublication)
-                .filter(
-                    FacultyPublication.faculty_id == int(faculty_id),
-                    FacultyPublication.id == int(delete_id),
-                )
-                .delete(synchronize_session=False)
+            deleted_one = self._delete_publication_rows(
+                sess=sess,
+                faculty_id=int(faculty_id),
+                filters=(FacultyPublication.id == int(delete_id),),
             )
             out["publications_deleted"] += int(deleted_one or 0)
 
         return out
+
+    @staticmethod
+    def _delete_publication_rows(
+        *,
+        sess,
+        faculty_id: int,
+        filters: Tuple[Any, ...],
+    ) -> int:
+        """
+        Session-aware publication deletion.
+
+        Avoids ORM stale state when rows are loaded/updated in the same session
+        and then removed via bulk DELETE.
+        """
+        rows = (
+            sess.query(FacultyPublication)
+            .filter(
+                FacultyPublication.faculty_id == int(faculty_id),
+                *filters,
+            )
+            .all()
+        )
+        for row in rows:
+            sess.delete(row)
+        return len(rows)
 
     @staticmethod
     def _resolve_sync_range_bounds(
