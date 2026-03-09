@@ -19,6 +19,7 @@ import openpyxl
 
 from config import settings
 from utils.html_to_text import _HTMLToText
+from utils.thread_pool import build_thread_local_getter, parallel_map
 
 try:
     import xlrd  # for legacy .xls (use xlrd==1.2.0)
@@ -195,7 +196,7 @@ def extract_text_from_bytes(data: bytes, filename: str, content_type: Optional[s
 def fetch_and_extract_one(
     url: str,
     session: Optional[requests.Session] = None,
-    timeout: int = 60,
+    timeout: int = 10,
     user_agent: str = "GrantFetcher/1.0 (+https://example.org)",
 ) -> dict:
     """
@@ -282,6 +283,7 @@ def load_extracted_content(
     rows: List[Any],
     url_attr: str,
     title_attr: Optional[str] = None,
+    max_workers: int = 1,
 ) -> List[Dict[str, Any]]:
     """
     Loader for extracted content from DB rows.
@@ -303,12 +305,17 @@ def load_extracted_content(
     region = (settings.aws_region or "").strip()
     profile = settings.aws_profile
 
-    session = (
-        boto3.Session(profile_name=profile, region_name=region)
-        if profile
-        else boto3.Session(region_name=region)
-    )
-    s3 = session.client("s3")
+    safe_workers = max(1, int(max_workers or 1))
+
+    def _build_s3_client():
+        session = (
+            boto3.Session(profile_name=profile, region_name=region)
+            if profile
+            else boto3.Session(region_name=region)
+        )
+        return session.client("s3")
+
+    get_s3 = build_thread_local_getter(_build_s3_client)
 
     def _parse_bucket_key(content_path: str) -> Optional[Tuple[str, str]]:
         cp = (content_path or "").strip()
@@ -327,34 +334,35 @@ def load_extracted_content(
 
         return bucket_default, cp.lstrip("/")
 
-    for r in rows or []:
+    def _load_one(r: Any) -> Optional[Dict[str, Any]]:
         if getattr(r, "extract_status", None) not in ("done", "success"):
-            continue
+            return None
         if getattr(r, "extract_error", None):
-            continue
+            return None
 
         content_path = getattr(r, "content_path", None)
         if not content_path:
-            continue
+            return None
 
         parsed = _parse_bucket_key(str(content_path))
         if not parsed:
-            continue
+            return None
         use_bucket, key = parsed
 
         try:
+            s3 = get_s3()
             resp = s3.get_object(Bucket=use_bucket, Key=key)
             text = resp["Body"].read().decode("utf-8", errors="ignore").strip()
         except ClientError as e:
             code = e.response.get("Error", {}).get("Code")
             if code in ("NoSuchKey", "404"):
-                continue
+                return None
             raise
         except Exception:
-            continue
+            return None
 
         if not text:
-            continue
+            return None
 
         item: Dict[str, Any] = {
             "url": getattr(r, url_attr, None),
@@ -362,8 +370,21 @@ def load_extracted_content(
         }
         if title_attr:
             item["title"] = getattr(r, title_attr, None)
+        return item
 
-        out.append(item)
+    rows_list = list(rows or [])
+    if not rows_list:
+        return out
+
+    loaded = parallel_map(
+        rows_list,
+        max_workers=min(safe_workers, len(rows_list)),
+        run_item=_load_one,
+        on_error=lambda index, item, exc: None,
+    )
+    for item in loaded:
+        if item:
+            out.append(item)
 
     return out
 

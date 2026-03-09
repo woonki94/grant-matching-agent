@@ -221,6 +221,134 @@ class MatchDAO:
             return None
         return float(row.domain_sim or 0.0)
 
+    def opps_for_faculty_above_domain_threshold(
+        self,
+        *,
+        faculty_id: int,
+        min_domain: float,
+        limit: Optional[int] = None,
+    ) -> List[Tuple[str, float]]:
+        """
+        Return opportunities whose embedding-domain similarity with one faculty
+        is >= min_domain, ordered by similarity DESC.
+        """
+        sql = """
+            WITH scored AS (
+                SELECT
+                  oemb.opportunity_id AS opportunity_id,
+                  GREATEST(
+                    CASE WHEN femb.research_domain_vec IS NOT NULL AND oemb.research_domain_vec IS NOT NULL
+                      THEN 1 - (femb.research_domain_vec <=> oemb.research_domain_vec) END,
+                    CASE WHEN femb.application_domain_vec IS NOT NULL AND oemb.application_domain_vec IS NOT NULL
+                      THEN 1 - (femb.application_domain_vec <=> oemb.application_domain_vec) END,
+                    CASE WHEN femb.research_domain_vec IS NOT NULL AND oemb.application_domain_vec IS NOT NULL
+                      THEN 1 - (femb.research_domain_vec <=> oemb.application_domain_vec) END,
+                    CASE WHEN femb.application_domain_vec IS NOT NULL AND oemb.research_domain_vec IS NOT NULL
+                      THEN 1 - (femb.application_domain_vec <=> oemb.research_domain_vec) END
+                  ) AS domain_sim
+                FROM faculty_keyword_embedding femb
+                JOIN opportunity_keyword_embedding oemb ON TRUE
+                WHERE femb.faculty_id = :faculty_id
+            )
+            SELECT opportunity_id, domain_sim
+            FROM scored
+            WHERE domain_sim IS NOT NULL
+              AND domain_sim >= :min_domain
+            ORDER BY domain_sim DESC NULLS LAST
+        """
+        params: Dict[str, Any] = {
+            "faculty_id": int(faculty_id),
+            "min_domain": float(min_domain),
+        }
+        if limit is not None and int(limit) > 0:
+            sql += "\nLIMIT :lim"
+            params["lim"] = int(limit)
+
+        rows = self.session.execute(text(sql), params).all()
+        return self._rows_to_scored_pairs(rows)
+
+    def grant_ids_for_faculty_above_domain_threshold(
+        self,
+        *,
+        faculty_id: int,
+        min_domain: float,
+        limit: Optional[int] = None,
+    ) -> List[str]:
+        """
+        Return opportunity_ids whose embedding-domain similarity with one faculty
+        is >= min_domain.
+        """
+        pairs = self.opps_for_faculty_above_domain_threshold(
+            faculty_id=faculty_id,
+            min_domain=min_domain,
+            limit=limit,
+        )
+        return [opportunity_id for opportunity_id, _ in pairs]
+
+    def faculties_for_opportunity_above_domain_threshold(
+        self,
+        *,
+        opportunity_id: str,
+        min_domain: float,
+        limit: Optional[int] = None,
+    ) -> List[Tuple[int, float]]:
+        """
+        Return faculties whose embedding-domain similarity with one opportunity
+        is >= min_domain, ordered by similarity DESC.
+        """
+        sql = """
+            WITH scored AS (
+                SELECT
+                  femb.faculty_id AS faculty_id,
+                  GREATEST(
+                    CASE WHEN femb.research_domain_vec IS NOT NULL AND oemb.research_domain_vec IS NOT NULL
+                      THEN 1 - (femb.research_domain_vec <=> oemb.research_domain_vec) END,
+                    CASE WHEN femb.application_domain_vec IS NOT NULL AND oemb.application_domain_vec IS NOT NULL
+                      THEN 1 - (femb.application_domain_vec <=> oemb.application_domain_vec) END,
+                    CASE WHEN femb.research_domain_vec IS NOT NULL AND oemb.application_domain_vec IS NOT NULL
+                      THEN 1 - (femb.research_domain_vec <=> oemb.application_domain_vec) END,
+                    CASE WHEN femb.application_domain_vec IS NOT NULL AND oemb.research_domain_vec IS NOT NULL
+                      THEN 1 - (femb.application_domain_vec <=> oemb.research_domain_vec) END
+                  ) AS domain_sim
+                FROM opportunity_keyword_embedding oemb
+                JOIN faculty_keyword_embedding femb ON TRUE
+                WHERE oemb.opportunity_id = :opportunity_id
+            )
+            SELECT faculty_id, domain_sim
+            FROM scored
+            WHERE domain_sim IS NOT NULL
+              AND domain_sim >= :min_domain
+            ORDER BY domain_sim DESC NULLS LAST
+        """
+        params: Dict[str, Any] = {
+            "opportunity_id": str(opportunity_id),
+            "min_domain": float(min_domain),
+        }
+        if limit is not None and int(limit) > 0:
+            sql += "\nLIMIT :lim"
+            params["lim"] = int(limit)
+
+        rows = self.session.execute(text(sql), params).all()
+        return [(int(r.faculty_id), float(r.domain_sim or 0.0)) for r in rows]
+
+    def faculty_ids_for_opportunity_above_domain_threshold(
+        self,
+        *,
+        opportunity_id: str,
+        min_domain: float,
+        limit: Optional[int] = None,
+    ) -> List[int]:
+        """
+        Return faculty_ids whose embedding-domain similarity with one opportunity
+        is >= min_domain.
+        """
+        pairs = self.faculties_for_opportunity_above_domain_threshold(
+            opportunity_id=opportunity_id,
+            min_domain=min_domain,
+            limit=limit,
+        )
+        return [faculty_id for faculty_id, _ in pairs]
+
     # =============== Read Actions ===============
     def top_matches_for_faculty(self, faculty_id: int, k: int = 5):
         """Read top stored match results for one faculty ordered by LLM/domain score."""

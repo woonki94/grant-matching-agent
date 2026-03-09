@@ -48,6 +48,51 @@ class KeywordsOut(BaseModel):
         except Exception:
             return v
 
+
+class KeywordSpecEvidence(BaseModel):
+    t: str
+    e: Dict[str, float] = Field(default_factory=dict)
+
+    @field_validator("e", mode="before")
+    @classmethod
+    def _coerce_evidence_ids(cls, v):
+        if isinstance(v, dict):
+            out: Dict[str, float] = {}
+            for k, val in v.items():
+                sid = str(k or "").strip()
+                if not sid:
+                    continue
+                try:
+                    conf = float(val)
+                except Exception:
+                    conf = 0.8
+                out[sid] = max(0.0, min(1.0, conf))
+            return out
+        if isinstance(v, list):
+            out: Dict[str, float] = {}
+            for x in v:
+                sid = str(x or "").strip()
+                if not sid:
+                    continue
+                out[sid] = 0.8
+            return out
+        return {}
+
+
+class KeywordMentionSectionOut(BaseModel):
+    domain: List[str] = Field(default_factory=list)
+    specialization: List[KeywordSpecEvidence] = Field(default_factory=list)
+
+
+class KeywordMentionsOut(BaseModel):
+    research: KeywordMentionSectionOut = Field(default_factory=KeywordMentionSectionOut)
+    application: KeywordMentionSectionOut = Field(default_factory=KeywordMentionSectionOut)
+
+
+class KeywordMergeOut(BaseModel):
+    research: KeywordMentionSectionOut = Field(default_factory=KeywordMentionSectionOut)
+    application: KeywordMentionSectionOut = Field(default_factory=KeywordMentionSectionOut)
+
 class KeywordItem(BaseModel):
     t: str
     w: float = Field(1.0, ge=0.0, le=1.0)
@@ -55,6 +100,16 @@ class KeywordItem(BaseModel):
 class WeightedSpecsOut(BaseModel):
     research: List[KeywordItem] = Field(default_factory=list)
     application: List[KeywordItem] = Field(default_factory=list)
+
+
+class WeightedIdxItem(BaseModel):
+    idx: int
+    w: float = Field(1.0, ge=0.0, le=1.0)
+
+
+class WeightedSpecsIdxOut(BaseModel):
+    research: List[WeightedIdxItem] = Field(default_factory=list)
+    application: List[WeightedIdxItem] = Field(default_factory=list)
 
 class OpportunityCategoryOut(BaseModel):
     broad_category: Literal["basic_research", "applied_research", "educational", "unclear"] = "unclear"
