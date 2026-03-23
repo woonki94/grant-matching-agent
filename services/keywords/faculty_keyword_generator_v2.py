@@ -28,56 +28,41 @@ logger = logging.getLogger(__name__)
 FACULTY_V2_DOMAIN_MENTION_PROMPT = ChatPromptTemplate.from_messages([
     (
         "system",
-        "Extract faculty expertise domains from compact chunk rows.\n\n"
-        "Input:\n"
+        "Extract BROAD scientific domains represented by this faculty.\n\n"
+        "Input\n"
         "- chunks_json: JSON list [{{\"i\": 0, \"t\": \"chunk text\"}}, ...]\n\n"
-
-        "Output JSON schema:\n"
+        "Output JSON schema\n"
         "{{\n"
         "  \"domains\": [\n"
         "    {{\"t\": \"...\", \"e\": {{\"0\": 0.0}}}}\n"
         "  ]\n"
         "}}\n\n"
-
-        "Task:\n"
-        "Identify the major research domains represented in the provided chunks.\n\n"
-
-        "Rules:\n"
-        "- Use ONLY the provided chunks.\n"
-        "- t must be 2–6 words describing a single faculty expertise concept.\n"
-        "- Each domain must represent one atomic research concept.\n"
-        "- Domains should correspond to reusable research areas that could appear across many faculty.\n"
-        "- Prefer broader research areas rather than narrow technical subtopics.\n"
-        "- Avoid overly specific algorithmic components or techniques.\n"
-        "- Each domain should correspond to a single node in a knowledge graph.\n"
-        "- Do NOT combine multiple concepts in one domain.\n"
-        "- Avoid phrases containing 'and', 'for', 'with', or multiple fields.\n\n"
-
-        "Examples of good domains:\n"
-        "reinforcement learning\n"
-        "robotics\n"
-        "bipedal locomotion\n"
-        "explainable AI\n"
-        "anomaly detection\n"
-        "automated planning\n\n"
-
-        "Examples of bad domains:\n"
-        "reinforcement learning for robotics\n"
-        "robotics and locomotion\n"
-        "explainable AI systems\n"
-        "machine learning for agriculture\n"
-        "policy evaluation\n"
-        "tree search planning\n\n"
-
-        "Evidence rules:\n"
-        "- e must contain at least one chunk index.\n"
-        "- e maps chunk_index(string) -> confidence score in [0,1].\n"
-        "- chunk indices in e must be from the input i values only.\n\n"
-
-        "Additional constraints:\n"
-        "- Deduplicate similar domains.\n"
-        "- Keep the list concise (typically 2–5 domains).\n"
-        "- Prefer fewer high-quality domains rather than many granular ones.\n\n"
+        "Task\n"
+        "Identify broad expertise areas reflected in the chunks.\n\n"
+        "Domain Definition\n"
+        "A domain is a high-level scientific or engineering field that groups many specializations.\n\n"
+        "Examples\n"
+        "specialization -> domain\n"
+        "bipedal locomotion -> robotics\n"
+        "crop cold hardiness prediction -> agricultural engineering\n"
+        "genome sequence analysis -> bioinformatics\n"
+        "battery degradation modeling -> electrochemistry\n\n"
+        "Hard Rules\n"
+        "- Domains must be described with one word, two max.\n"
+        "- Domains should be reusable across many faculty and grants.\n"
+        "- Prefer established academic fields.\n"
+        "- Avoid narrow techniques, tasks, benchmarks, or datasets.\n"
+        "- Avoid combining multiple concepts in one domain.\n"
+        "- Avoid administrative or logistics topics.\n"
+        "- Deduplicate similar domains.\n\n"
+        "Evidence Mapping\n"
+        "- e maps chunk_index(string) -> confidence [0,1].\n"
+        "- Only use chunk indices from input.\n"
+        "- e must not be empty.\n\n"
+        "Quality Constraints\n"
+        "- Output only high-confidence domains.\n"
+        "- Prefer fewer high-quality domains over many weak ones.\n"
+        "- Maximum about 10 domains.\n"
         "- Return JSON only."
     ),
     ("human", "Chunks JSON:\n{chunks_json}"),
@@ -1402,6 +1387,6 @@ if __name__ == "__main__":
         faculty_id=103,
         max_context_chars=40_000,
         persist=False,
-        use_llm_merge=True,
+        use_llm_merge=False,
     )
     print(summary)

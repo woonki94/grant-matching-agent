@@ -166,6 +166,19 @@ FACULTY_SCHEMA_STATEMENTS: List[Tuple[str, str]] = [
     ),
 ]
 
+SHARED_SCHEMA_STATEMENTS: List[Tuple[str, str]] = [
+    (
+        "shared_domain_keyword_unique",
+        "CREATE CONSTRAINT shared_domain_keyword_unique IF NOT EXISTS "
+        "FOR (d:DomainKeywordShared) REQUIRE (d.value_norm, d.section, d.bucket) IS UNIQUE",
+    ),
+    (
+        "shared_domain_keyword_value_norm_index",
+        "CREATE INDEX shared_domain_keyword_value_norm IF NOT EXISTS "
+        "FOR (d:DomainKeywordShared) ON (d.value_norm)",
+    ),
+]
+
 
 def init_neo4j_schema(
     settings: Neo4jSettings,
@@ -178,6 +191,8 @@ def init_neo4j_schema(
         statements.extend(GRANT_SCHEMA_STATEMENTS)
     if include_faculty:
         statements.extend(FACULTY_SCHEMA_STATEMENTS)
+    if include_grant or include_faculty:
+        statements.extend(SHARED_SCHEMA_STATEMENTS)
 
     with GraphDatabase.driver(
         settings.uri,

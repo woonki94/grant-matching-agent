@@ -84,7 +84,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-neo4j-chunks", type=int, default=4000)
     parser.add_argument("--reserve-prompt-chars", type=int, default=3000)
     parser.add_argument("--embedding-batch-size", type=int, default=12, help="Embedding batch size for keyword nodes.")
-    parser.add_argument("--use-llm-merge", action="store_true", help="Enable domain merge LLM chain.")
+    parser.add_argument("--use-llm-merge", action="store_true", default=False, help="Enable domain merge LLM chain.")
     parser.add_argument("--stop-on-error", action="store_true", help="Stop on first failure.")
     parser.add_argument("--json-only", action="store_true", help="Print JSON only.")
     parser.add_argument("--uri", type=str, default="", help="Neo4j URI. Fallback: NEO4J_URI")

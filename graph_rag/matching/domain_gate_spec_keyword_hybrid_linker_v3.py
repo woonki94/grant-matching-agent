@@ -752,7 +752,7 @@ def _build_parser() -> argparse.ArgumentParser:
         )
     )
     parser.add_argument("--faculty-email", type=str, required=True, help="Faculty email for matching.")
-    parser.add_argument("--min-domain-sim", type=float, default=0.3, help="Domain gate cosine threshold.")
+    parser.add_argument("--min-domain-sim", type=float, default=0.2, help="Domain gate cosine threshold.")
     parser.add_argument(
         "--domain-top-n",
         type=int,

@@ -450,6 +450,54 @@ def sync_grant_keyword_links_to_neo4j(
             database_=database,
         )
 
+    # Shared domain nodes across faculty/grant keyword spaces.
+    shared_domain_rows = []
+    seen_shared_domain = set()
+    for row in domain_rows:
+        value_raw = str(row.get("value") or "").strip()
+        value_norm = _norm(value_raw)
+        section = _safe_section(row.get("section"), default="general")
+        if not value_norm:
+            continue
+        key = (value_norm, section)
+        if key in seen_shared_domain:
+            continue
+        seen_shared_domain.add(key)
+        shared_domain_rows.append(
+            {
+                "value": value_raw or value_norm,
+                "value_norm": value_norm,
+                "section": section,
+            }
+        )
+
+    if shared_domain_rows:
+        driver.execute_query(
+            """
+            UNWIND $rows AS row
+            MERGE (sd:DomainKeywordShared {
+                value_norm: row.value_norm,
+                section: row.section,
+                bucket: 'domain'
+            })
+            ON CREATE SET
+                sd.value = row.value,
+                sd.created_at = datetime()
+            SET
+                sd.updated_at = datetime()
+            WITH row, sd
+            MATCH (k:GrantKeyword {
+                value: row.value,
+                section: row.section,
+                bucket: 'domain'
+            })
+            MERGE (k)-[r:MAPS_TO_SHARED_DOMAIN]->(sd)
+            SET r.updated_at = datetime()
+            """,
+            parameters_={"rows": shared_domain_rows},
+            database_=database,
+        )
+
     domain_weight_by_key: Dict[Tuple[str, str], float] = {
         (_safe_section(row.get("section"), default="general"), _norm(row.get("value"))): _coerce_weight(row.get("weight"), default=0.5)
         for row in domain_rows

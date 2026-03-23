@@ -120,7 +120,7 @@ def _sync_all_faculties(
     stop_on_error: bool,
 ) -> Dict[str, Any]:
     rows = _load_faculties(
-        email="",
+        email="alan.fern@oregonstate.edu",
         sync_all=True,
         limit=max(0, int(limit or 0)),
         offset=max(0, int(offset or 0)),
@@ -279,7 +279,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--chunk-overlap-chars", type=int, default=150, help="Chunk overlap for additional-info text embeddings.")
     parser.add_argument("--max-chunks-per-source", type=int, default=24, help="Max chunks for each additional-info document.")
     parser.add_argument("--embedding-batch-size", type=int, default=12, help="Embedding batch size.")
-    parser.add_argument("--sync-workers", type=int, default=4, help="Parallel workers for per-faculty Neo4j sync.")
+    parser.add_argument("--sync-workers", type=int, default=8, help="Parallel workers for per-faculty Neo4j sync.")
     parser.add_argument("--s3-read-workers", type=int, default=8, help="Parallel S3 read workers for loading extracted text.")
     parser.add_argument("--skip-embeddings", action="store_true", help="Skip specialization/publication/chunk embeddings.")
 

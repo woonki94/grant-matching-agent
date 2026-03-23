@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from langchain_core.prompts import ChatPromptTemplate
-from pydantic import BaseModel, Field, field_validator
+from pydantic import AliasChoices, BaseModel, Field, field_validator
 
 # Ensure project root on sys.path for direct script execution.
 if __package__ is None or __package__ == "":
@@ -28,29 +28,41 @@ logger = logging.getLogger(__name__)
 GRANT_V2_DOMAIN_MENTION_PROMPT = ChatPromptTemplate.from_messages([
     (
         "system",
-        "Extract expert knowledge domains required by a grant.\n\n"
-
-        "Input:\n"
-        "- chunks_json: JSON list [{{chunk_id, text}}, ...]\n\n"
-
-        "Output JSON schema:\n"
+        "Extract BROAD scientific domains required to execute proposals for this grant.\n\n"
+        "Input\n"
+        "- chunks_json: JSON list [{{\"i\": 0, \"t\": \"chunk text\"}}, ...]\n\n"
+        "Output JSON schema\n"
         "{{\n"
         "  \"domains\": [\n"
-        "    {{\"t\": \"...\", \"e\": {{\"chunk_id\": 0.0}}}}\n"
+        "    {{\"t\": \"...\", \"e\": {{\"0\": 0.0}}}}\n"
         "  ]\n"
         "}}\n\n"
-
-        "Rules:\n"
-        "- Use ONLY information from the provided chunks.\n"
-        "- t must be a broad research or expertise domain (2-6 words).\n"
-        "- Domains represent fields of expertise, not specific tasks or programs.\n"
-        "- Good examples: artificial intelligence, robotics, planetary science, space exploration.\n"
-        "- Avoid overly specific phrases such as mission descriptions or program names.\n"
-        "- Deduplicate domains with similar meaning.\n"
-        "- Prefer canonical academic field names.\n"
-        "- e must contain at least one chunk_id with confidence in [0,1].\n"
-        "- Do NOT invent chunk ids.\n"
-        "- Keep the list concise (typically 5–10 domains).\n"
+        "Task\n"
+        "Identify broad expertise areas needed to pursue this grant.\n\n"
+        "Domain Definition\n"
+        "A domain is a highest-level scientific or engineering field that groups many specializations.\n\n"
+        "Examples\n"
+        "specialization -> domain\n"
+        "bipedal locomotion -> robotics\n"
+        "crop cold hardiness prediction -> agricultural\n"
+        "genome sequence analysis -> bioinformatics\n"
+        "battery degradation modeling -> electrochemistry\n\n"
+        "Hard Rules\n"
+        "- Domains must be described with one word, two max.\n"
+        "- Domains should be reusable across many grants.\n"
+        "- Prefer established academic fields.\n"
+        "- Avoid narrow techniques, tasks, or datasets.\n"
+        "- Avoid combining multiple concepts.\n"
+        "- Avoid proposal logistics or administrative topics.\n"
+        "- Deduplicate similar domains.\n\n"
+        "Evidence Mapping\n"
+        "- e maps chunk_index(string) -> confidence [0,1].\n"
+        "- Only use chunk indices from input.\n"
+        "- e must not be empty.\n\n"
+        "Quality Constraints\n"
+        "- Output only high-confidence domains.\n"
+        "- Prefer fewer high-quality domains over many weak ones.\n"
+        "- Maximum about 10 domains.\n"
         "- Return JSON only."
     ),
     ("human", "Chunks JSON:\n{chunks_json}"),
@@ -59,38 +71,32 @@ GRANT_V2_DOMAIN_MENTION_PROMPT = ChatPromptTemplate.from_messages([
 GRANT_V2_SPECIALIZATION_MENTION_PROMPT = ChatPromptTemplate.from_messages([
     (
         "system",
-        "Extract detailed research capabilities (specializations) required by the grant.\n\n"
-
+        "Extract detailed specialization capabilities required by this grant from compact chunk rows.\n\n"
         "Input:\n"
-        "- chunks_json: JSON list [{{chunk_id, text}}, ...]\n"
-        "\n"
-
+        "- chunks_json: JSON list [{{\"i\": 0, \"t\": \"chunk text\"}}, ...]\n\n"
         "Output JSON schema:\n"
         "{{\n"
         "  \"specializations\": [\n"
-        "    {{\"t\": \"...\", \"e\": {{\"chunk_id\": 0.0}}}}\n"
+        "    {{\"t\": \"...\", \"e\": {{\"0\": 0.0}}}}\n"
         "  ]\n"
         "}}\n\n"
-
         "Rules:\n"
-        "- Use ONLY the provided chunks.\n"
-        "- t must describe a concrete technical capability or research expertise.\n"
-        "- t must be 8–30 words.\n"
-        "- Focus on research methods, algorithms, modeling, scientific investigation, or engineering capabilities.\n"
-        "- Do NOT describe funding programs, agencies, proposal instructions, or administrative text.\n"
-        "- Good examples:\n"
-        "  • machine learning models for planetary surface analysis\n"
-        "  • autonomous navigation algorithms for lunar exploration robots\n"
-        "  • computational modeling of extraterrestrial environments\n"
-        "- Avoid vague phrases such as \"research funding programs\" or \"proposal submissions\".\n"
-        "- e must contain at least one chunk_id with confidence [0,1].\n"
-        "- Do NOT invent chunk ids.\n"
-        "- Deduplicate similar capabilities.\n"
-        "- Produce 6–20 specializations when possible.\n"
+        "- Use ONLY provided chunks.\n"
+        "- t must be 8-30 words and describe concrete capability requirements.\n"
+        "- Prefer method + system + task phrasing when possible.\n"
+        "- Exclude proposal instructions, eligibility, and administrative wording.\n"
+        "- e must be non-empty and map chunk index(string) -> confidence [0,1].\n"
+        "- chunk indices in e must be from input i values only.\n"
+        "- The caller provides chunkset_count and specialization limits.\n"
+        "- Produce between specialization_min and specialization_max specializations depending on evidence.\n"
+        "- If evidence is sparse, you may output fewer than specialization_min.\n"
         "- Return JSON only."
     ),
     (
         "human",
+        "Chunkset key: {chunkset_key}\n"
+        "Total chunksets: {chunkset_count}\n"
+        "Specialization limits: min={specialization_min}, max={specialization_max}\n\n"
         "Chunks JSON:\n{chunks_json}",
     ),
 ])
@@ -98,36 +104,17 @@ GRANT_V2_SPECIALIZATION_MENTION_PROMPT = ChatPromptTemplate.from_messages([
 GRANT_V2_DOMAIN_WEIGHT_PROMPT = ChatPromptTemplate.from_messages([
     (
         "system",
-        "Assign importance weights to domains for this grant.\n\n"
-
+        "Assign importance weights to grant domains.\n\n"
         "Input:\n"
-        "- domains_json: JSON list [{{\"idx\": 0, \"t\": \"...\", \"e\": [\"chunk_id\"]}}, ...]\n\n"
-
+        "- domains_json: JSON list [{{\"i\": 0, \"t\": \"...\", \"ec\": 3}}, ...]\n\n"
         "Output JSON schema:\n"
-        "{{\"items\": [{{\"idx\": 0, \"w\": 0.0}}]}}\n\n"
-
-        "Task:\n"
-        "Estimate how central each domain is to the grant's research goals based ONLY on the provided domain items and evidence ids.\n\n"
-
+        "{{\"items\": [{{\"i\": 0, \"w\": 0.0}}]}}\n\n"
         "Rules:\n"
-        "- Use ONLY the provided input data.\n"
-        "- Each domain idx must appear exactly once.\n"
-        "- w must be in the range [0,1].\n"
-        "- Weights represent the importance of the domain to the grant objectives.\n\n"
-
-        "Weight guidelines:\n"
-        "  0.85–1.00 → core scientific domain of the grant\n"
-        "  0.60–0.84 → important supporting domain\n"
-        "  0.35–0.59 → secondary domain\n"
-        "  0.10–0.34 → minor contextual domain\n\n"
-
-        "Additional guidance:\n"
-        "- Use the full range of weights when appropriate.\n"
-        "- Only a small number of domains should fall in the 0.85–1.00 range.\n"
-        "- Most domains should fall between 0.40 and 0.80.\n"
-        "- Domains supported by more chunks or stronger textual evidence should receive higher weights.\n"
-        "- Avoid assigning very similar high weights to many overlapping domains.\n\n"
-
+        "- Use ONLY input.\n"
+        "- Return each domain i exactly once.\n"
+        "- w in [0,1].\n"
+        "- Weight reflects how central the domain is to successful proposals.\n"
+        "- 0.85-1.00 core requirement, 0.60-0.84 major, 0.35-0.59 supporting, 0.10-0.34 minor.\n"
         "Return JSON only."
     ),
     (
@@ -138,49 +125,27 @@ GRANT_V2_DOMAIN_WEIGHT_PROMPT = ChatPromptTemplate.from_messages([
 GRANT_V2_SPECIALIZATION_WEIGHT_PROMPT = ChatPromptTemplate.from_messages([
     (
         "system",
-        "Assign importance weights to specialization capabilities required by the grant.\n\n"
-
+        "Assign importance weights for grant specialization capabilities.\n\n"
         "Input:\n"
-        "- domains_json: JSON list [{{\"idx\": 0, \"t\": \"...\"}}, ...]\n"
-        "- specializations_json: JSON list [{{\"idx\": 0, \"t\": \"...\", \"e\": [\"chunk_id\"]}}, ...]\n\n"
-
+        "- domains_json: JSON list [{{\"i\": 0, \"t\": \"...\"}}, ...]\n"
+        "- specializations_json: JSON list [{{\"i\": 0, \"t\": \"...\", \"ec\": 2}}, ...]\n\n"
         "Output JSON schema:\n"
-        "{{\"items\": [{{\"idx\": 0, \"w\": 0.0, \"d\": {{\"0\": 0.0}}}}]}}\n\n"
-
-        "Task:\n"
-        "Estimate how important each specialization capability is for projects funded by the grant.\n\n"
-
+        "{{\"items\": [{{\"i\": 0, \"w\": 0.0, \"d\": {{\"0\": 0.0}}}}]}}\n\n"
+        "Goal:\n"
+        "For each specialization, estimate:\n"
+        "1. importance to this grant (w)\n"
+        "2. domain membership strengths (d)\n\n"
         "Rules:\n"
-        "- Use ONLY the provided inputs.\n"
-        "- Each specialization idx must appear exactly once.\n"
-        "- w must be in the range [0,1].\n"
-        "- d maps domain_idx(string) -> relevance score in [0,1], representing how strongly the specialization belongs to that domain.\n"
-        "- Each specialization must link to at least one domain.\n"
-        "- Weights represent how central the capability is to the grant's scientific goals.\n\n"
-
-        "Weight guidelines:\n"
-        "  0.85–1.00 → core capability expected from funded projects\n"
-        "  0.60–0.84 → important capability\n"
-        "  0.35–0.59 → supporting capability\n"
-        "  0.10–0.34 → peripheral capability\n\n"
-
-        "Additional guidance:\n"
-        "- Re-evaluate domain-specialization links and return them in d.\n"
-        "- Interpret d as semantic association strength:\n"
-        "  1.00 -> specialization is essentially a pure instance of that domain\n"
-        "  0.80-0.95 -> domain is the primary method or topic of the capability\n"
-        "  0.60-0.79 -> domain is a major component of the capability\n"
-        "  0.40-0.59 -> domain is a secondary or contextual component\n"
-        "  0.10-0.39 -> weak but meaningful relation\n"
-        "- Most specializations should have 1-3 linked domains.\n"
-        "- Avoid assigning 1.00 unless specialization clearly belongs almost entirely to that domain.\n"
-        "- If capability combines a method and an application domain, both may receive high values.\n"
-        "- Specializations aligned with high-weight domains should generally receive higher weights.\n"
-        "- Capabilities clearly required or repeatedly emphasized in specialization text should receive higher weights.\n"
-        "- Avoid assigning very high weights to many similar or redundant specializations.\n"
-        "- Use the full range of weights when appropriate.\n\n"
-
-        "Return JSON only."
+        "- Use ONLY provided inputs.\n"
+        "- Every specialization i must appear exactly once.\n"
+        "- w in [0,1].\n"
+        "- d maps domain_i(string) -> relevance in [0,1].\n"
+        "- Each specialization must map to at least one domain.\n"
+        "- Most specializations should map to 1-3 domains.\n"
+        "- Use ec as a centrality signal: higher ec usually implies higher importance.\n"
+        "- 0.85-1.00 core capability, 0.60-0.84 major, 0.35-0.59 supporting, 0.10-0.34 minor.\n"
+        "- For d: 0.80-1.00 primary domain, 0.60-0.79 major component, 0.40-0.59 secondary, 0.10-0.39 weak but meaningful.\n"
+        "- Return JSON only."
     ),
     (
         "human",
@@ -193,16 +158,16 @@ GRANT_V2_MERGE_PROMPT = ChatPromptTemplate.from_messages([
         "system",
         "Merge near-duplicate domain keywords.\n\n"
         "Input:\n"
-        "- domains_json: JSON list [{{\"idx\": 0, \"t\": \"...\", \"e\": [\"chunk_id\"]}}, ...]\n\n"
+        "- domains_json: JSON list [{{\"i\": 0, \"t\": \"...\"}}, ...]\n\n"
         "Output JSON schema:\n"
         "{{\n"
-        "  \"domains\": [{{\"t\": \"...\", \"idxs\": [0, 2]}}]\n"
+        "  \"domains\": [{{\"t\": \"...\", \"ixs\": [0, 2]}}]\n"
         "}}\n\n"
         "Rules:\n"
         "- Merge only semantically equivalent or near-duplicate phrases.\n"
         "- Keep distinct concepts separate.\n"
-        "- For each output item, idxs must reference valid domain indices.\n"
-        "- Every input domain idx should appear in exactly one output item.\n"
+        "- For each output item, ixs must reference valid input i values.\n"
+        "- Every input domain i should appear in exactly one output item.\n"
         "- Choose concise canonical text for t.\n"
         "- Return JSON only."
     ),
@@ -278,7 +243,7 @@ class GrantV2SpecializationMentionOut(BaseModel):
 
 
 class _WeightedIdxItem(BaseModel):
-    idx: int = -1
+    i: int = Field(default=-1, validation_alias=AliasChoices("i", "idx"))
     w: float = Field(default=0.5, ge=0.0, le=1.0)
 
 
@@ -287,7 +252,7 @@ class _WeightedIdxOut(BaseModel):
 
 
 class _WeightedSpecItem(_DomainLinkMixin):
-    idx: int = -1
+    i: int = Field(default=-1, validation_alias=AliasChoices("i", "idx"))
     w: float = Field(default=0.5, ge=0.0, le=1.0)
 
 
@@ -297,7 +262,7 @@ class _WeightedSpecOut(BaseModel):
 
 class _MergeItem(BaseModel):
     t: str = ""
-    idxs: List[int] = Field(default_factory=list)
+    ixs: List[int] = Field(default_factory=list, validation_alias=AliasChoices("ixs", "idxs"))
 
 
 class _MergeOut(BaseModel):
@@ -515,24 +480,99 @@ class GrantKeywordGeneratorV2:
             return text
         return text[: max(0, int(max_chars) - 3)].rstrip() + "..."
 
+    @staticmethod
+    def _compute_specialization_limits(
+        *,
+        chunkset_count: int,
+        max_total_specializations: int = 24,
+        min_per_chunkset: int = 2,
+    ) -> Tuple[int, int]:
+        count = max(1, int(chunkset_count or 1))
+        max_total = max(1, int(max_total_specializations or 24))
+        min_per = max(1, int(min_per_chunkset or 2))
+        if count == 1:
+            return min_per, max_total
+        per_chunk_max = max(min_per, max_total // count)
+        per_chunk_max = min(6, per_chunk_max)
+        return min_per, per_chunk_max
+
+    @staticmethod
+    def _to_log_obj(value: Any) -> Any:
+        try:
+            if hasattr(value, "model_dump"):
+                return value.model_dump()
+        except Exception:
+            pass
+        return value
+
+    def _log_llm_io(self, *, step: str, llm_input: Dict[str, Any], llm_output: Any) -> None:
+        try:
+            logger.info(
+                "[grant_keyword_generator_v2][%s] input=%s",
+                step,
+                json.dumps(llm_input, ensure_ascii=False),
+            )
+        except Exception:
+            logger.info("[grant_keyword_generator_v2][%s] input=%s", step, str(llm_input))
+
+        out_obj = self._to_log_obj(llm_output)
+        try:
+            logger.info(
+                "[grant_keyword_generator_v2][%s] output=%s",
+                step,
+                json.dumps(out_obj, ensure_ascii=False),
+            )
+        except Exception:
+            logger.info("[grant_keyword_generator_v2][%s] output=%s", step, str(out_obj))
+
     def _extract_for_chunkset(
         self,
         *,
         chunkset_key: str,
+        chunkset_count: int,
+        specialization_min: int,
+        specialization_max: int,
         chunk_rows: List[Dict[str, Any]],
         domain_chain,
         specialization_chain,
     ) -> Dict[str, Any]:
-        valid_chunk_ids = {
-            str((row or {}).get("chunk_id") or "").strip()
-            for row in chunk_rows
-            if str((row or {}).get("chunk_id") or "").strip()
-        }
-        if not valid_chunk_ids:
+        compact_rows: List[Dict[str, Any]] = []
+        idx_to_chunk_id: Dict[str, str] = {}
+        valid_chunk_ids = set()
+        for row in chunk_rows:
+            chunk_id = str((row or {}).get("chunk_id") or "").strip()
+            text = str((row or {}).get("text") or "")
+            if not chunk_id or not text.strip():
+                continue
+            idx = len(compact_rows)
+            compact_rows.append({"i": idx, "t": text})
+            idx_to_chunk_id[str(idx)] = chunk_id
+            valid_chunk_ids.add(chunk_id)
+
+        if not compact_rows:
             return {"chunkset": chunkset_key, "domains": [], "specializations": []}
 
-        chunks_json = json.dumps(chunk_rows, ensure_ascii=False)
-        domain_out: GrantV2DomainMentionOut = domain_chain.invoke({"chunks_json": chunks_json})
+        def _resolve_evidence_chunk_id(raw_key: Any) -> str:
+            key = str(raw_key or "").strip()
+            if not key:
+                return ""
+            mapped = idx_to_chunk_id.get(key)
+            if mapped:
+                return mapped
+            try:
+                mapped = idx_to_chunk_id.get(str(int(float(key))))
+                if mapped:
+                    return mapped
+            except Exception:
+                pass
+            if key in valid_chunk_ids:
+                return key
+            return ""
+
+        chunks_json = json.dumps(compact_rows, ensure_ascii=False)
+        domain_input = {"chunks_json": chunks_json}
+        domain_out: GrantV2DomainMentionOut = domain_chain.invoke(domain_input)
+        self._log_llm_io(step=f"{chunkset_key}.domain_mention", llm_input=domain_input, llm_output=domain_out)
 
         domains: List[Dict[str, Any]] = []
         seen_domain = set()
@@ -542,8 +582,8 @@ class GrantKeywordGeneratorV2:
                 continue
             sid_map: Dict[str, float] = {}
             for sid_raw, conf_raw in dict(getattr(item, "e", {}) or {}).items():
-                sid = str(sid_raw or "").strip()
-                if sid not in valid_chunk_ids:
+                sid = _resolve_evidence_chunk_id(sid_raw)
+                if not sid:
                     continue
                 try:
                     conf = float(conf_raw)
@@ -558,9 +598,15 @@ class GrantKeywordGeneratorV2:
         if not domains:
             return {"chunkset": chunkset_key, "domains": [], "specializations": []}
 
-        spec_out: GrantV2SpecializationMentionOut = specialization_chain.invoke(
-            {"chunks_json": chunks_json}
-        )
+        spec_input = {
+            "chunkset_key": str(chunkset_key),
+            "chunkset_count": int(chunkset_count),
+            "specialization_min": int(specialization_min),
+            "specialization_max": int(specialization_max),
+            "chunks_json": chunks_json,
+        }
+        spec_out: GrantV2SpecializationMentionOut = specialization_chain.invoke(spec_input)
+        self._log_llm_io(step=f"{chunkset_key}.specialization_mention", llm_input=spec_input, llm_output=spec_out)
 
         specs: List[Dict[str, Any]] = []
         seen_spec = set()
@@ -573,8 +619,8 @@ class GrantKeywordGeneratorV2:
 
             sid_map: Dict[str, float] = {}
             for sid_raw, conf_raw in dict(getattr(item, "e", {}) or {}).items():
-                sid = str(sid_raw or "").strip()
-                if sid not in valid_chunk_ids:
+                sid = _resolve_evidence_chunk_id(sid_raw)
+                if not sid:
                     continue
                 try:
                     conf = float(conf_raw)
@@ -619,6 +665,19 @@ class GrantKeywordGeneratorV2:
         if not chunkset_items:
             return {"domains": [], "specializations": []}
 
+        chunkset_count = len(chunkset_items)
+        specialization_min, specialization_max = self._compute_specialization_limits(
+            chunkset_count=chunkset_count,
+            max_total_specializations=24,
+            min_per_chunkset=2,
+        )
+        logger.info(
+            "[grant_keyword_generator_v2] chunkset_count=%d specialization_limits=min:%d max:%d",
+            chunkset_count,
+            specialization_min,
+            specialization_max,
+        )
+
         workers = len(chunkset_items)
 
         def _run_one(item: Tuple[str, List[Dict[str, Any]]]) -> Dict[str, Any]:
@@ -627,6 +686,9 @@ class GrantKeywordGeneratorV2:
             s_chain = specialization_chain or self.build_specialization_mention_chain()
             return self._extract_for_chunkset(
                 chunkset_key=c_key,
+                chunkset_count=chunkset_count,
+                specialization_min=specialization_min,
+                specialization_max=specialization_max,
                 chunk_rows=c_rows,
                 domain_chain=d_chain,
                 specialization_chain=s_chain,
@@ -768,9 +830,8 @@ class GrantKeywordGeneratorV2:
 
         domains_json = [
             {
-                "idx": idx,
+                "i": idx,
                 "t": str(d.get("t") or "").strip(),
-                "e": sorted(str(x) for x in dict(d.get("snippet_ids") or {}).keys()),
             }
             for idx, d in enumerate(domains)
             if str(d.get("t") or "").strip()
@@ -780,11 +841,11 @@ class GrantKeywordGeneratorV2:
 
         chain = merge_chain or self.build_merge_chain()
         try:
-            out: _MergeOut = chain.invoke(
-                {
-                    "domains_json": json.dumps(domains_json, ensure_ascii=False),
-                }
-            )
+            merge_input = {
+                "domains_json": json.dumps(domains_json, ensure_ascii=False),
+            }
+            out: _MergeOut = chain.invoke(merge_input)
+            self._log_llm_io(step="merge_domains", llm_input=merge_input, llm_output=out)
         except Exception:
             logger.exception("[grant_keyword_generator_v2] merge_llm_failed; fallback=deterministic")
             return {"domains": domains, "specializations": specs}
@@ -792,7 +853,7 @@ class GrantKeywordGeneratorV2:
         merged_domains: List[Dict[str, Any]] = []
         for m in list(getattr(out, "domains", []) or []):
             t = self._norm(getattr(m, "t", ""))
-            idxs_raw = list(getattr(m, "idxs", []) or [])
+            idxs_raw = list(getattr(m, "ixs", []) or [])
             idxs: List[int] = []
             for x in idxs_raw:
                 try:
@@ -904,9 +965,9 @@ class GrantKeywordGeneratorV2:
         d_chain = domain_weight_chain or self.build_domain_weight_chain()
         domain_json_obj = [
             {
-                "idx": idx,
+                "i": idx,
                 "t": str(d.get("t") or "").strip(),
-                "e": sorted(str(x) for x in dict(d.get("snippet_ids") or {}).keys()),
+                "ec": len(dict(d.get("snippet_ids") or {})),
             }
             for idx, d in enumerate(domains)
             if str(d.get("t") or "").strip()
@@ -915,13 +976,13 @@ class GrantKeywordGeneratorV2:
         d_weights: Dict[int, float] = {}
         if domain_json_obj:
             try:
-                d_out: _WeightedIdxOut = d_chain.invoke(
-                    {
-                        "domains_json": json.dumps(domain_json_obj, ensure_ascii=False),
-                    }
-                )
+                d_input = {
+                    "domains_json": json.dumps(domain_json_obj, ensure_ascii=False),
+                }
+                d_out: _WeightedIdxOut = d_chain.invoke(d_input)
+                self._log_llm_io(step="domain_weight", llm_input=d_input, llm_output=d_out)
                 for it in list(getattr(d_out, "items", []) or []):
-                    idx = int(getattr(it, "idx", -1))
+                    idx = int(getattr(it, "i", -1))
                     if idx < 0:
                         continue
                     d_weights[idx] = max(0.0, min(1.0, float(getattr(it, "w", 0.5) or 0.5)))
@@ -938,9 +999,9 @@ class GrantKeywordGeneratorV2:
         s_chain = specialization_weight_chain or self.build_specialization_weight_chain()
         spec_json_obj = [
             {
-                "idx": idx,
+                "i": idx,
                 "t": str(s.get("t") or "").strip(),
-                "e": sorted(str(x) for x in dict(s.get("snippet_ids") or {}).keys()),
+                "ec": len(dict(s.get("snippet_ids") or {})),
             }
             for idx, s in enumerate(specs)
             if str(s.get("t") or "").strip()
@@ -950,17 +1011,17 @@ class GrantKeywordGeneratorV2:
         s_domain_links: Dict[int, Dict[str, float]] = {}
         if spec_json_obj:
             try:
-                s_out: _WeightedSpecOut = s_chain.invoke(
-                    {
-                        "domains_json": json.dumps(
-                            [{"idx": idx, "t": str(d.get("t") or "")} for idx, d in enumerate(domains)],
-                            ensure_ascii=False,
-                        ),
-                        "specializations_json": json.dumps(spec_json_obj, ensure_ascii=False),
-                    }
-                )
+                s_input = {
+                    "domains_json": json.dumps(
+                        [{"i": idx, "t": str(d.get("t") or "")} for idx, d in enumerate(domains)],
+                        ensure_ascii=False,
+                    ),
+                    "specializations_json": json.dumps(spec_json_obj, ensure_ascii=False),
+                }
+                s_out: _WeightedSpecOut = s_chain.invoke(s_input)
+                self._log_llm_io(step="specialization_weight", llm_input=s_input, llm_output=s_out)
                 for it in list(getattr(s_out, "items", []) or []):
-                    idx = int(getattr(it, "idx", -1))
+                    idx = int(getattr(it, "i", -1))
                     if idx < 0:
                         continue
                     s_weights[idx] = max(0.0, min(1.0, float(getattr(it, "w", 0.5) or 0.5)))
@@ -1245,5 +1306,6 @@ if __name__ == "__main__":
         opportunity_id="d328b689-058f-47a8-b290-fd3f7b36bafd",
         max_context_chars=30_000,
         persist=False,
+        use_llm_merge=True
     )
     print(summary)
