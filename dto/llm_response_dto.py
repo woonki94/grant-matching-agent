@@ -56,6 +56,23 @@ class WeightedSpecsOut(BaseModel):
     research: List[KeywordItem] = Field(default_factory=list)
     application: List[KeywordItem] = Field(default_factory=list)
 
+
+class SpecializationSourceRefOut(BaseModel):
+    id: int
+    type: str
+    score: float = Field(0.5, ge=0.0, le=1.0)
+
+
+class SpecializationSourcesItemOut(BaseModel):
+    t: str
+    sources: List[SpecializationSourceRefOut] = Field(default_factory=list)
+
+
+class SpecializationSourcesOut(BaseModel):
+    research: List[SpecializationSourcesItemOut] = Field(default_factory=list)
+    application: List[SpecializationSourcesItemOut] = Field(default_factory=list)
+
+
 class OpportunityCategoryOut(BaseModel):
     broad_category: Literal["basic_research", "applied_research", "educational", "unclear"] = "unclear"
     specific_categories: List[str] = Field(default_factory=list)

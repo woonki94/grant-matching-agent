@@ -4,8 +4,8 @@ from typing import Any, Dict, List, Tuple
 
 from dao.opportunity_dao import OpportunityDAO
 from db.models import Faculty
-from services.context.faculty_context import FacultyContextBuilder
-from services.context.opportunity_context import OpportunityContextBuilder
+from services.context_retrieval.faculty_context import FacultyContextBuilder
+from services.context_retrieval.opportunity_context import OpportunityContextBuilder
 
 
 class JustificationContextBuilder:

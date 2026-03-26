@@ -11,7 +11,7 @@ from dao.match_dao import MatchDAO
 from db.db_conn import SessionLocal
 from db.models.faculty import Faculty
 from dto.llm_response_dto import FacultyOpportunityRec, FacultyRecsOut, GrantExplanationOut, WhyMatchOut
-from services.context.context_generator import ContextGenerator
+from services.context_retrieval.context_generator import ContextGenerator
 from services.prompts.justification_prompts import FACULTY_RECS_PROMPT, GRANT_EXPLANATION_PROMPT
 from utils.thread_pool import build_thread_local_getter, parallel_map, resolve_pool_size
 

@@ -5,6 +5,35 @@ SCRIPT_DIR="$(cd -- "$(dirname "$0")" && pwd)"
 PROJECT_ROOT="$(cd -- "${SCRIPT_DIR}/.." && pwd)"
 cd "$PROJECT_ROOT"
 
+print_usage() {
+  cat <<'EOF'
+Usage:
+  ./scripts/generate_keywords.sh [mode] [limit] [force]
+
+Arguments:
+  mode   : all | faculty | opp
+           default: all
+  limit  : max rows to process (integer)
+           default: empty (no limit)
+  force  : true/false flag for regenerating existing keywords
+           accepted true values: true, 1, yes, force, --force-regenerate
+           default: false
+
+Examples:
+  ./scripts/generate_keywords.sh
+  ./scripts/generate_keywords.sh faculty 50
+  ./scripts/generate_keywords.sh opp 100 true
+  ./scripts/generate_keywords.sh all 0 --force-regenerate
+EOF
+}
+
+case "${1:-}" in
+  -h|--help|help)
+    print_usage
+    exit 0
+    ;;
+esac
+
 if [ -f "$PROJECT_ROOT/.env" ]; then
   echo "Loading .env..."
   set -a
@@ -43,6 +72,8 @@ case "$MODE" in
   opp) EXTRA_ARGS+=(--opp-only) ;;
   *)
     echo "Error: invalid mode '$MODE' (use: all | faculty | opp)" >&2
+    echo >&2
+    print_usage >&2
     exit 1
     ;;
 esac
@@ -52,6 +83,8 @@ case "$FORCE_MODE" in
   true|1|yes|force|--force-regenerate) EXTRA_ARGS+=(--force-regenerate) ;;
   *)
     echo "Error: invalid force flag '$FORCE_MODE' (use: true|false or force)" >&2
+    echo >&2
+    print_usage >&2
     exit 1
     ;;
 esac

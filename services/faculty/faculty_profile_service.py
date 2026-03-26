@@ -732,10 +732,10 @@ class FacultyProfileService:
 
     def _regenerate_faculty_keywords(self, *, faculty_id: int) -> None:
         # Lazy import so retrieval path does not require keyword-stack deps.
-        from services.context.context_generator import ContextGenerator
-        from services.keywords.keyword_generator import KeywordGenerator
+        from services.context_retrieval.context_generator import ContextGenerator
+        from services.keywords.keyword_generator import FacultyKeywordGenerator
 
-        keyword_generator = KeywordGenerator(context_generator=ContextGenerator())
+        keyword_generator = FacultyKeywordGenerator(context_generator=ContextGenerator())
         keyword_generator.generate_faculty_keywords_for_id(
             int(faculty_id),
             force_regenerate=True,

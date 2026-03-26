@@ -8,10 +8,10 @@ from dao.match_dao import MatchDAO
 from dao.opportunity_dao import OpportunityDAO
 from db.db_conn import SessionLocal
 from db.models.faculty import Faculty
-from services.context.context_generator import ContextGenerator
+from services.context_retrieval.context_generator import ContextGenerator
 from services.justification.group_justification_engine import GroupJustificationEngine
 from services.justification.group_justification_generator import GroupJustificationGenerator
-from services.keywords.keyword_generator import KeywordGenerator
+from services.keywords.keyword_generator import FacultyKeywordGenerator, OpportunityKeywordGenerator
 from services.matching.faculty_grant_matcher import FacultyGrantMatcher
 from services.matching.super_faculty_selector import SuperFacultySelector
 
@@ -27,7 +27,8 @@ class MatchingExecutionAgent:
     def __init__(self, *, session_factory=SessionLocal, context_generator: Optional[ContextGenerator] = None):
         self.session_factory = session_factory
         self.context_generator = context_generator or ContextGenerator()
-        self.keyword_generator = KeywordGenerator(context_generator=self.context_generator)
+        self.faculty_keyword_generator = FacultyKeywordGenerator(context_generator=self.context_generator)
+        self.opportunity_keyword_generator = OpportunityKeywordGenerator(context_generator=self.context_generator)
         self.faculty_matcher = FacultyGrantMatcher(session_factory=session_factory)
         self.super_faculty_selector = SuperFacultySelector()
         self.group_justification_generator = GroupJustificationGenerator(
@@ -249,7 +250,7 @@ class MatchingExecutionAgent:
                     if fac_dao.has_keyword_row(fid_int):
                         skipped_existing += 1
                         continue
-                    if self.keyword_generator.generate_faculty_keywords_for_id(fid_int):
+                    if self.faculty_keyword_generator.generate_faculty_keywords_for_id(fid_int):
                         generated += 1
         except Exception as e:
             return {
@@ -284,13 +285,13 @@ class MatchingExecutionAgent:
                     if fac_dao.has_keyword_row(fid_int):
                         fac_skipped_existing += 1
                         continue
-                    if self.keyword_generator.generate_faculty_keywords_for_id(fid_int):
+                    if self.faculty_keyword_generator.generate_faculty_keywords_for_id(fid_int):
                         fac_generated += 1
 
                 if opp_dao.has_keyword_row(opportunity_id):
                     opp_skipped_existing = True
                 else:
-                    opp_kw = self.keyword_generator.generate_opportunity_keywords_for_id(opportunity_id)
+                    opp_kw = self.opportunity_keyword_generator.generate_opportunity_keywords_for_id(opportunity_id)
                     opp_generated = bool(opp_kw)
         except Exception as e:
             return {
@@ -432,7 +433,7 @@ class MatchingExecutionAgent:
                     fac_dao = FacultyDAO(sess)
                     has_faculty_keywords = fac_dao.has_keyword_row(int(faculty_id))
                 if not has_faculty_keywords:
-                    self.keyword_generator.generate_faculty_keywords_for_id(int(faculty_id))
+                    self.faculty_keyword_generator.generate_faculty_keywords_for_id(int(faculty_id))
                 self.faculty_matcher.run_for_faculty(
                     faculty_id=int(faculty_id),
                     k=max(prefilter_k, 20),
@@ -543,9 +544,9 @@ class MatchingExecutionAgent:
                     fac_dao = FacultyDAO(sess)
                     opp_dao = OpportunityDAO(sess)
                     if not fac_dao.has_keyword_row(int(faculty_id)):
-                        self.keyword_generator.generate_faculty_keywords_for_id(int(faculty_id))
+                        self.faculty_keyword_generator.generate_faculty_keywords_for_id(int(faculty_id))
                     if not opp_dao.has_keyword_row(opp_id):
-                        self.keyword_generator.generate_opportunity_keywords_for_id(opp_id)
+                        self.opportunity_keyword_generator.generate_opportunity_keywords_for_id(opp_id)
 
                 # Generate match rows for this exact grant only.
                 self.faculty_matcher.run_for_opportunity(
@@ -786,7 +787,7 @@ class MatchingExecutionAgent:
         """Generate opportunity keywords+embedding if not already present."""
         with self.session_factory() as sess:
             if not OpportunityDAO(sess).has_keyword_row(opportunity_id):
-                self.keyword_generator.generate_opportunity_keywords_for_id(opportunity_id)
+                self.opportunity_keyword_generator.generate_opportunity_keywords_for_id(opportunity_id)
 
     # LLM pre-filter pool multiplier: score this many candidates via LLM, keep top-N
     LLM_POOL_MULTIPLIER = 4
@@ -901,7 +902,7 @@ class MatchingExecutionAgent:
         candidate_ids: List[int],
     ) -> Dict[int, Dict[str, Any]]:
         """
-        Score candidates against one opportunity using FacultyGrantMatcher (LLM-backed).
+        Score candidates against one opportunity using FacultyGrantMatcher (cross-encoder-backed).
 
         Optimised three-step flow:
           1. Batch-fetch already-cached match rows — no LLM needed for these.
@@ -909,6 +910,7 @@ class MatchingExecutionAgent:
           3. Batch-fetch the newly computed rows.
 
         Returns {faculty_id: {llm_score, domain_score, reason, covered, missing}}.
+        (Key name llm_score is kept for backward compatibility.)
         """
         if not candidate_ids:
             return {}

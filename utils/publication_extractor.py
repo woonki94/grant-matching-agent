@@ -2,7 +2,7 @@
 Publication extraction pipeline — CV-based, no external author-search APIs.
 
 Pipeline:
-  1. extract_pdf_bytes()              — raw text from uploaded CV PDF
+  1. extract_text_from_file_bytes()   — raw text from uploaded CV PDF via Unstructured
   2. extract_publications_from_cv_text() — LLM parses {title, url, year} list
   3. enrich_with_abstracts()          — for each entry, tries in order:
        a. arXiv title search  (fast, free, great for CS/ML)
@@ -25,7 +25,7 @@ import requests
 from langchain_core.messages import HumanMessage
 
 from dto.faculty_dto import FacultyPublicationDTO
-from utils.content_extractor import extract_pdf_bytes, fetch_and_extract_one
+from utils.content_extractor import extract_text_from_file_bytes, fetch_and_extract_one
 
 logger = logging.getLogger(__name__)
 
@@ -228,7 +228,11 @@ def extract_publications_from_cv_bytes(
     FacultyDAO.upsert_publications_by_title().
     """
     try:
-        cv_text = extract_pdf_bytes(cv_bytes)
+        cv_text = extract_text_from_file_bytes(
+            cv_bytes,
+            filename="faculty_cv.pdf",
+            content_type="application/pdf",
+        )
     except Exception:
         logger.exception("Failed to extract text from CV PDF bytes")
         return []

@@ -4,9 +4,9 @@ from langchain_core.prompts import ChatPromptTemplate
 
 FACULTY_CANDIDATE_PROMPT = ChatPromptTemplate.from_messages([
     ("system",
-     "You extract candidate keyword phrases from faculty context for later structuring.\n\n"
+     "You extract candidate keyword phrases from faculty context_retrieval for later structuring.\n\n"
      "Rules:\n"
-     "- Use ONLY the provided context.\n"
+     "- Use ONLY the provided context_retrieval.\n"
      "- Return a single JSON object with key `candidates` = list[str].\n"
      "- Include TWO kinds of candidates:\n"
      "  (A) AREA terms: 1–3 words, broad research fields or domains.\n"
@@ -23,9 +23,9 @@ FACULTY_CANDIDATE_PROMPT = ChatPromptTemplate.from_messages([
 
 OPP_CANDIDATE_PROMPT = ChatPromptTemplate.from_messages([
     ("system",
-     "You extract candidate keyword phrases from a funding opportunity context for later structuring.\n\n"
+     "You extract candidate keyword phrases from a funding opportunity context_retrieval for later structuring.\n\n"
      "Rules:\n"
-     "- Use ONLY the provided context.\n"
+     "- Use ONLY the provided context_retrieval.\n"
      "- Return a single JSON object with key `candidates` = list[str].\n"
      "- Include TWO kinds of candidates:\n"
      "  (A) AREA terms: 1–3 words, broad research or technical areas targeted.\n"
@@ -41,7 +41,7 @@ OPP_CANDIDATE_PROMPT = ChatPromptTemplate.from_messages([
 
 FACULTY_KEYWORDS_PROMPT = ChatPromptTemplate.from_messages([
     ("system",
-     "You generate structured keywords from faculty context.\n\n"
+     "You generate structured keywords from faculty context_retrieval.\n\n"
      "Output must match this JSON schema:\n"
      "{{\n"
      "  \"research\": {{\"domain\": [], \"specialization\": []}},\n"
@@ -51,7 +51,7 @@ FACULTY_KEYWORDS_PROMPT = ChatPromptTemplate.from_messages([
      "- domain: 1–3 words, broad fields defining the faculty’s work.\n"
      "- specialization: 8–25 words describing expertise, methods, or systems the faculty HAS.\n\n"
      "Rules:\n"
-     "- Use ONLY the provided context and candidate phrases.\n"
+     "- Use ONLY the provided context_retrieval and candidate phrases.\n"
      "- Do NOT invent new topics.\n"
      "- Lowercase unless proper nouns.\n"
      "- Deduplicate.\n"
@@ -70,7 +70,7 @@ FACULTY_KEYWORDS_PROMPT = ChatPromptTemplate.from_messages([
 
 OPP_KEYWORDS_PROMPT = ChatPromptTemplate.from_messages([
     ("system",
-     "You generate structured keywords from a funding opportunity context.\n\n"
+     "You generate structured keywords from a funding opportunity context_retrieval.\n\n"
      "Output must match this JSON schema:\n"
      "{{\n"
      "  \"research\": {{\"domain\": [], \"specialization\": []}},\n"
@@ -80,7 +80,7 @@ OPP_KEYWORDS_PROMPT = ChatPromptTemplate.from_messages([
      "- domain: 1–3 words, broad research or technical areas.\n"
      "- specialization: 8–25 words describing expertise, methods, or capabilities the project EXPECTS investigators to have.\n\n"
      "Rules:\n"
-     "- Use ONLY the provided context and candidate phrases.\n"
+     "- Use ONLY the provided context_retrieval and candidate phrases.\n"
      "- Do NOT invent requirements not present in the text.\n"
      "- Lowercase unless proper nouns.\n"
      "- Deduplicate.\n"
@@ -100,7 +100,7 @@ FACULTY_SPECIALIZATION_WEIGHT_PROMPT = ChatPromptTemplate.from_messages([
     ("system",
      "You assign expertise weights to specialization phrases for a faculty member.\n\n"
      "You will be given:\n"
-     "- faculty context (JSON)\n"
+     "- faculty context_retrieval (JSON)\n"
      "- specialization lists for research and application\n\n"
      "Important clarification:\n"
      "- The given specialization phrases represent areas that the faculty member is professionally experienced in.\n\n"
@@ -109,7 +109,7 @@ FACULTY_SPECIALIZATION_WEIGHT_PROMPT = ChatPromptTemplate.from_messages([
      "  - t: the exact original specialization text (unchanged)\n"
      "  - w: a number in [0,1] representing the faculty's level of expertise/proficiency in that specialization\n\n"
      "Weight guidance:\n"
-     "- 0.85–1.00: primary expertise, strong evidence in context\n"
+     "- 0.85–1.00: primary expertise, strong evidence in context_retrieval\n"
      "- 0.60–0.84: strong working expertise\n"
      "- 0.35–0.59: some experience / occasional involvement\n"
      "- 0.10–0.34: weak/unclear evidence (use if mentioned but not supported)\n\n"
@@ -130,7 +130,7 @@ OPP_SPECIALIZATION_WEIGHT_PROMPT = ChatPromptTemplate.from_messages([
     ("system",
      "You assign importance weights to specialization requirements for a funding opportunity.\n\n"
      "You will be given:\n"
-     "- opportunity context (JSON)\n"
+     "- opportunity context_retrieval (JSON)\n"
      "- specialization lists for research and application\n\n"
      "Important clarification:\n"
      "- The given specialization phrases represent capabilities that the opportunity REQUIRES faculty investigators to have.\n\n"
@@ -146,7 +146,7 @@ OPP_SPECIALIZATION_WEIGHT_PROMPT = ChatPromptTemplate.from_messages([
      "Rules:\n"
      "- Do NOT invent new specialization phrases.\n"
      "- Keep the text exactly the same as input for t.\n"
-     "- Base weights ONLY on evidence in the provided opportunity context.\n"
+     "- Base weights ONLY on evidence in the provided opportunity context_retrieval.\n"
      "- If importance is unclear, be conservative (assign a lower weight).\n"
      "- Do NOT include administrative, eligibility, or submission criteria.\n"
      "- Return ONLY JSON in the specified output format."
@@ -155,6 +155,60 @@ OPP_SPECIALIZATION_WEIGHT_PROMPT = ChatPromptTemplate.from_messages([
      "OPPORTUNITY CONTEXT (JSON):\n{context_json}\n\n"
      "SPECIALIZATIONS INPUT (JSON):\n{spec_json}\n\n"
      "Return weighted specializations JSON."
+    )
+])
+
+FACULTY_SPECIALIZATION_SOURCE_PROMPT = ChatPromptTemplate.from_messages([
+    ("system",
+     "You map faculty specialization keywords to supporting sources.\n\n"
+     "Input:\n"
+     "- weighted specialization keywords (research/application)\n"
+     "- source catalog (additional-info chunks and publications)\n\n"
+     "Output JSON schema:\n"
+     "{{\n"
+     "  \"research\": [{{\"t\": \"exact specialization text\", \"sources\": [{{\"id\": 123, \"type\": \"publication\", \"score\": 0.0}}]}}],\n"
+     "  \"application\": [{{\"t\": \"exact specialization text\", \"sources\": [{{\"id\": 123, \"type\": \"additional_info_chunk\", \"score\": 0.0}}]}}]\n"
+     "}}\n\n"
+     "Rules:\n"
+     "- Keep t exactly as provided in input specializations.\n"
+     "- For each source, return only id, type, score.\n"
+     "- Use ONLY ids and types that exist in source catalog.\n"
+     "- Pick up to 4 sources per specialization.\n"
+     "- score is confidence in [0,1].\n"
+     "- If no support exists, return empty sources for that specialization.\n"
+     "- Return ONLY JSON."
+    ),
+    ("human",
+     "SPECIALIZATIONS INPUT (JSON):\n{spec_json}\n\n"
+     "SOURCE CATALOG (JSON):\n{source_catalog_json}\n\n"
+     "Return specialization-to-source mapping JSON."
+    )
+])
+
+OPP_SPECIALIZATION_SOURCE_PROMPT = ChatPromptTemplate.from_messages([
+    ("system",
+     "You map opportunity specialization requirements to supporting sources.\n\n"
+     "Input:\n"
+     "- weighted specialization keywords (research/application)\n"
+     "- source catalog (additional-info chunks and attachment chunks)\n\n"
+     "Output JSON schema:\n"
+     "{{\n"
+     "  \"research\": [{{\"t\": \"exact specialization text\", \"sources\": [{{\"id\": 123, \"type\": \"attachment_chunk\", \"score\": 0.0}}]}}],\n"
+     "  \"application\": [{{\"t\": \"exact specialization text\", \"sources\": [{{\"id\": 123, \"type\": \"additional_info_chunk\", \"score\": 0.0}}]}}]\n"
+     "}}\n\n"
+     "Rules:\n"
+     "- Keep t exactly as provided in input specializations.\n"
+     "- For each source, return only id, type, score.\n"
+     "- Use ONLY ids and types that exist in source catalog.\n"
+     "- Pick up to 4 sources per specialization.\n"
+     "- score is confidence in [0,1].\n"
+     "- If no support exists, return empty sources for that specialization.\n"
+     "- Return ONLY JSON."
+    ),
+    ("human",
+     "SPECIALIZATIONS INPUT (JSON):\n{spec_json}\n\n"
+     "SOURCE CATALOG (JSON):\n{source_catalog_json}\n\n"
+     "Return specialization-to-source mapping JSON."
     )
 ])
 
@@ -173,7 +227,7 @@ OPP_CATEGORY_PROMPT = ChatPromptTemplate.from_messages([
      "  \"specific_categories\": [\"snake_case_code\", \"...\"]\n"
      "}}\n\n"
      "Rules:\n"
-     "- Use ONLY provided opportunity context and extracted keywords.\n"
+     "- Use ONLY provided opportunity context_retrieval and extracted keywords.\n"
      "- specific_categories must be short snake_case codes.\n"
      "- Include one scope marker in specific_categories when possible: broad_area or specialized.\n"
      "- Add extra topic codes when clear (e.g., k12, teacher_pd, climate_resilience).\n"
@@ -191,7 +245,7 @@ QUERY_CANDIDATE_PROMPT = ChatPromptTemplate.from_messages([
     ("system",
      "You extract candidate keyword phrases from a user research query for later structuring.\n\n"
      "Rules:\n"
-     "- Use ONLY the provided context.\n"
+     "- Use ONLY the provided context_retrieval.\n"
      "- Return a single JSON object with key `candidates` = list[str].\n"
      "- Include TWO kinds of candidates:\n"
      "  (A) AREA terms: 1–3 words, broad research fields or domains.\n"
@@ -218,7 +272,7 @@ QUERY_KEYWORDS_PROMPT = ChatPromptTemplate.from_messages([
      "- domain: 1–3 words, broad fields defining the query topic.\n"
      "- specialization: 8–25 words describing expertise, methods, or systems relevant to the query.\n\n"
      "Rules:\n"
-     "- Use ONLY the provided context and candidate phrases.\n"
+     "- Use ONLY the provided context_retrieval and candidate phrases.\n"
      "- Do NOT invent new topics.\n"
      "- Lowercase unless proper nouns.\n"
      "- Deduplicate.\n"
@@ -238,7 +292,7 @@ QUERY_SPECIALIZATION_WEIGHT_PROMPT = ChatPromptTemplate.from_messages([
     ("system",
      "You assign importance weights to specialization phrases for a user research query.\n\n"
      "You will be given:\n"
-     "- query context (JSON)\n"
+     "- query context_retrieval (JSON)\n"
      "- specialization lists for research and application\n\n"
      "Important clarification:\n"
      "- The given specialization phrases represent capabilities that are IMPORTANT for the query topic.\n\n"
@@ -254,7 +308,7 @@ QUERY_SPECIALIZATION_WEIGHT_PROMPT = ChatPromptTemplate.from_messages([
      "Rules:\n"
      "- Do NOT invent new specialization phrases.\n"
      "- Keep the text exactly the same as input for t.\n"
-     "- Base weights ONLY on evidence in the provided query context.\n"
+     "- Base weights ONLY on evidence in the provided query context_retrieval.\n"
      "- If importance is unclear, be conservative (assign a lower weight).\n"
      "- Return ONLY JSON in the specified output format."
     ),

@@ -8,12 +8,13 @@ import boto3
 
 from config import get_llm_client, settings
 from db.db_conn import SessionLocal
-from db.models.faculty import Faculty, FacultyAdditionalInfo
+from db.models.faculty import Faculty, FacultyAdditionalInfo,  FacultyPublication
 from services.faculty.profile_parser import parse_profile
 from services.extract_content import short_hash
 from utils.content_extractor import fetch_and_extract_one
 from dao.faculty_dao import FacultyDAO
 from mappers.page_to_faculty import map_faculty_profile_to_dto
+from services.faculty.scholar_scraper import scrape_scholar_publications
 
 
 logger = logging.getLogger(__name__)
@@ -49,6 +50,50 @@ def _build_personal_key(item_id: int, url: str) -> str:
     if prefix:
         return f"{prefix}/{_PERSONAL_SUBDIR}/{fname}"
     return f"{_PERSONAL_SUBDIR}/{fname}"
+
+
+def _enrich_from_scholar(faculty_id: int, google_scholar: str) -> None:
+    if not google_scholar:
+        return
+    try:
+        scholar_id, pubs = scrape_scholar_publications(
+            google_scholar,
+            user_agent=settings.scraper_user_agent,
+        )
+    except Exception:
+        logger.exception("Failed to scrape Google Scholar", extra={"faculty_id": faculty_id})
+        return
+
+    if not pubs:
+        return
+
+    with SessionLocal() as sess:
+        existing_titles = {
+            (p.title or "").strip().lower()
+            for p in sess.query(FacultyPublication)
+            .filter(FacultyPublication.faculty_id == faculty_id)
+            .all()
+        }
+
+        for pub in pubs:
+            title = (pub.title or "").strip()
+            if not title:
+                continue
+            if title.lower() in existing_titles:
+                continue
+            existing_titles.add(title.lower())
+            row = FacultyPublication(
+                faculty_id=faculty_id,
+                openalex_work_id=None,
+                scholar_author_id=scholar_id,
+                title=title,
+                abstract=None,
+                year=pub.year,
+            )
+            sess.add(row)
+        sess.commit()
+
+
 
 
 def _enrich_from_osu_profile(faculty_id: int, osu_webpage: str) -> None:
@@ -157,6 +202,7 @@ def enrich_new_faculty(
     faculty_id: int,
     osu_webpage: Optional[str],
     personal_website: Optional[str],
+    google_scholar: Optional[str],
 ) -> None:
     """
     Enrich a newly inserted faculty record from available profile sources.
@@ -172,11 +218,15 @@ def enrich_new_faculty(
     if personal_website:
         _enrich_from_personal_website(faculty_id, personal_website)
 
+    if google_scholar:
+        _enrich_from_scholar(faculty_id, google_scholar)
+
     logger.info(
         "Profile enrichment completed",
         extra={
             "email": email,
             "osu_used": bool(osu_webpage),
+            "scholar_used": bool(google_scholar),
             "personal_used": bool(personal_website),
         },
     )

@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Any, Dict, List, Tuple
 
 from db.models import Opportunity
+from services.context_retrieval.rag_chunk_retriever import retrieve_opportunity_supporting_chunks
 from utils.content_extractor import load_extracted_content
 
 
@@ -114,15 +115,29 @@ class OpportunityContextBuilder:
         if normalized == "keyword":
             return context
 
-        additional_blocks = load_extracted_content(
-            opp.additional_info,
-            url_attr="additional_info_url",
+        rag = retrieve_opportunity_supporting_chunks(
+            opp,
+            top_k_per_additional_source=4,
+            top_k_per_attachment_source=4,
         )
-        attachment_blocks = load_extracted_content(
-            opp.attachments,
-            url_attr="file_download_path",
-            title_attr="file_name",
-        )
+        additional_blocks = list(rag.get("additional_info_chunks") or [])
+        attachment_blocks = list(rag.get("attachment_chunks") or [])
+
+        if not additional_blocks:
+            additional_blocks = load_extracted_content(
+                opp.additional_info,
+                url_attr="additional_info_url",
+                group_chunks=False,
+                include_row_meta=True,
+            )
+        if not attachment_blocks:
+            attachment_blocks = load_extracted_content(
+                opp.attachments,
+                url_attr="file_download_path",
+                title_attr="file_name",
+                group_chunks=False,
+                include_row_meta=True,
+            )
 
         if normalized == "basic":
             context["additional_info_extracted"] = additional_blocks

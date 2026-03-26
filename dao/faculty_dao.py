@@ -97,7 +97,7 @@ class FacultyDAO:
         return row.faculty_id if row else None
 
     def get_faculty_keyword_context(self, faculty_id: int) -> Optional[Dict[str, Any]]:
-        """Fetch lightweight keyword context for matching/justification."""
+        """Fetch lightweight keyword context_retrieval for matching/justification."""
         fac = (
             self.session.query(Faculty)
             .options(selectinload(Faculty.keyword))
@@ -155,6 +155,7 @@ class FacultyDAO:
                 .filter(
                     FacultyAdditionalInfo.faculty_id == faculty_id,
                     FacultyAdditionalInfo.additional_info_url == info.additional_info_url,
+                    FacultyAdditionalInfo.chunk_index == 0,
                 )
                 .one_or_none()
             )
@@ -163,6 +164,7 @@ class FacultyDAO:
                 obj = FacultyAdditionalInfo(
                     faculty_id=faculty_id,
                     additional_info_url=info.additional_info_url,
+                    chunk_index=0,
                     extract_status=info.extract_status or "pending",
                 )
                 self.session.add(obj)
@@ -277,10 +279,56 @@ class FacultyDAO:
         )
         self.session.execute(stmt)
 
+    def upsert_publications_by_title(self, faculty_id: int, items: List[FacultyPublicationDTO]) -> int:
+        """
+        Insert or update faculty publication rows keyed by normalised title.
+
+        Used for CV-based ingestion where no external work ID is available.
+        Deduplication is done in Python (normalised lowercase title) because the
+        DB unique constraint is on openalex_work_id which will be NULL for all
+        CV-sourced publications.
+        """
+        existing_titles = {
+            (row.title or "").strip().lower()
+            for row in self.session.query(FacultyPublication.title)
+            .filter(FacultyPublication.faculty_id == faculty_id)
+            .all()
+        }
+
+        count = 0
+        for pub in items:
+            title = (pub.title or "").strip()
+            if not title:
+                continue
+            if title.lower() in existing_titles:
+                continue
+
+            obj = FacultyPublication(
+                faculty_id=faculty_id,
+                openalex_work_id=None,
+                scholar_author_id=None,
+                title=title,
+                abstract=pub.abstract,
+                year=pub.year,
+            )
+            self.session.add(obj)
+            existing_titles.add(title.lower())
+            count += 1
+
+        return count
+
     # =============== Iteration Actions ===============
-    def iter_faculty_with_relations(self, batch_size: int = 200, stream: bool = True) -> Iterator[Faculty]:
+    def iter_faculty_with_relations(
+        self,
+        batch_size: int = 200,
+        stream: bool = True,
+        limit: int = 0,
+    ) -> Iterator[Faculty] | List[Faculty]:
         """Iterate faculty rows with common relations preloaded."""
         q = self._with_common_relations(self.session.query(Faculty))
+        safe_limit = max(0, int(limit or 0))
+        if safe_limit > 0:
+            q = q.limit(safe_limit)
 
         if stream:
             q = q.yield_per(batch_size)
@@ -299,13 +347,17 @@ class FacultyDAO:
         self,
         batch_size: int = 200,
         stream: bool = True,
-    ) -> Iterator[Faculty]:
+        limit: int = 0,
+    ) -> Iterator[Faculty] | List[Faculty]:
         """Iterate faculty rows that do not yet have keyword rows."""
         q = self._with_common_relations(
             self.session.query(Faculty)
             .outerjoin(FacultyKeyword, FacultyKeyword.faculty_id == Faculty.faculty_id)
             .filter(FacultyKeyword.faculty_id.is_(None))
         )
+        safe_limit = max(0, int(limit or 0))
+        if safe_limit > 0:
+            q = q.limit(safe_limit)
 
         if stream:
             q = q.yield_per(batch_size)

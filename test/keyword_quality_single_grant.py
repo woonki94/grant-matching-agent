@@ -195,7 +195,7 @@ def run_keyword_quality_for_opp(
             summary = str(getattr(opp, "summary_description", "") or "").strip()
             fallback = f"{title}\n\n{summary}".strip()
             if not fallback:
-                raise ValueError("No grant context found (summary/extracted docs missing).")
+                raise ValueError("No grant context_retrieval found (summary/extracted docs missing).")
             context_docs = [fallback]
 
         chunks: List[str] = []
@@ -233,7 +233,7 @@ def run_keyword_quality_for_opp(
         print(f"Context documents used: {len(context_docs)}")
         print(f"Context chunks used: {len(chunks)}")
         print("")
-        print("Relevance (keyword phrase -> grant context chunks, max cosine)")
+        print("Relevance (keyword phrase -> grant context_retrieval chunks, max cosine)")
         print(f"- strong (>= 0.75): {strong} ({_percent(strong, n):.1f}%)")
         print(f"- medium (0.50 - 0.75): {medium} ({_percent(medium, n):.1f}%)")
         print(f"- weak (0.35 - 0.50): {weak} ({_percent(weak, n):.1f}%)")
@@ -296,7 +296,7 @@ if __name__ == '__main__':
         "--words-per-chunk",
         type=int,
         default=220,
-        help="Approximate words per context chunk (default: 220).",
+        help="Approximate words per context_retrieval chunk (default: 220).",
     )
     args = parser.parse_args()
 

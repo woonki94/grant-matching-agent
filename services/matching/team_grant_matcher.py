@@ -8,7 +8,7 @@ from typing import Dict, List, Optional
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from services.context.context_generator import ContextGenerator
+from services.context_retrieval.context_generator import ContextGenerator
 from dao.faculty_dao import FacultyDAO
 from dao.match_dao import MatchDAO
 from db.db_conn import SessionLocal

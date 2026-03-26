@@ -141,6 +141,7 @@ class MatchDAO:
                 "reason": stmt.excluded.reason,
                 "covered": stmt.excluded.covered,
                 "missing": stmt.excluded.missing,
+                "evidence": stmt.excluded.evidence,
             },
         )
         self.session.execute(stmt)

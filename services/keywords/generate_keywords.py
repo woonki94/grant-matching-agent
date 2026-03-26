@@ -7,8 +7,8 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from services.context.context_generator import ContextGenerator
-from services.keywords.keyword_generator import KeywordGenerator
+from services.context_retrieval.context_generator import ContextGenerator
+from services.keywords.keyword_generator import FacultyKeywordGenerator, OpportunityKeywordGenerator
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Generate keywords for faculty/opportunities (Bedrock-only)")
@@ -25,13 +25,21 @@ if __name__ == "__main__":
     run_faculty = not args.opp_only
     run_opp = not args.faculty_only
     context_generator = ContextGenerator()
-    keyword_service = KeywordGenerator(
+    faculty_keyword_service = FacultyKeywordGenerator(
         context_generator=context_generator,
         force_regenerate=args.force_regenerate,
     )
-    keyword_service.run_batch(
-        run_faculty=run_faculty,
-        run_opp=run_opp,
-        limit=args.limit,
+    opportunity_keyword_service = OpportunityKeywordGenerator(
+        context_generator=context_generator,
         force_regenerate=args.force_regenerate,
     )
+    if run_faculty:
+        faculty_keyword_service.run_batch(
+            limit=args.limit,
+            force_regenerate=args.force_regenerate,
+        )
+    if run_opp:
+        opportunity_keyword_service.run_batch(
+            limit=args.limit,
+            force_regenerate=args.force_regenerate,
+        )

@@ -90,9 +90,11 @@ class OpportunityAdditionalInfo(Base):
         UniqueConstraint(
             "opportunity_id",
             "additional_info_url",
+            "chunk_index",
             name="ux_opportunity_additional_info_opp_url",
         ),
         Index("ix_additional_info_opportunity_id", "opportunity_id"),
+        Index("ix_additional_info_chunk_index", "chunk_index"),
         Index("ix_additional_info_extracted_at", "extracted_at"),
     )
 
@@ -106,11 +108,13 @@ class OpportunityAdditionalInfo(Base):
     )
 
     additional_info_url = Column(String, nullable=False)
+    chunk_index = Column(Integer, nullable=False, default=0)
 
     # extracted content
     content_path = Column(String(1024))
     detected_type = Column(String(32))       # pdf, html, docx, etc
     content_char_count = Column(Integer)
+    content_embedding = Column(Vector(EMBED_DIM), nullable=True)
     extracted_at = Column(DateTime)
     extract_status = Column(String(32), nullable=False, default="pending")
     extract_error = Column(Text)
@@ -124,9 +128,10 @@ class OpportunityAdditionalInfo(Base):
 class OpportunityAttachment(Base):
     __tablename__ = "opportunity_attachment"
     __table_args__ = (
-        UniqueConstraint("opportunity_id", "file_name", name="ux_attachment_opportunity_file"),
-        UniqueConstraint("opportunity_id", "file_download_path", name="ux_attachment_opportunity_download"),
+        UniqueConstraint("opportunity_id", "file_name", "chunk_index", name="ux_attachment_opportunity_file"),
+        UniqueConstraint("opportunity_id", "file_download_path", "chunk_index", name="ux_attachment_opportunity_download"),
         Index("ix_attachment_opp", "opportunity_id"),
+        Index("ix_attachment_chunk_index", "chunk_index"),
         Index("ix_attachment_detected_type", "detected_type"),
         Index("ix_attachment_extracted_at", "extracted_at"),
     )
@@ -140,8 +145,10 @@ class OpportunityAttachment(Base):
 
     file_name = Column(String, nullable=False)
     file_download_path = Column(Text, nullable=False)
+    chunk_index = Column(Integer, nullable=False, default=0)
 
     content_path = Column(String(1024))
+    content_embedding = Column(Vector(EMBED_DIM), nullable=True)
 
     detected_type = Column(String(32))
     content_char_count = Column(Integer)

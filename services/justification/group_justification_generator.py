@@ -6,7 +6,7 @@ from typing import Any, Dict, List, Optional, Union
 from dao.faculty_dao import FacultyDAO
 from dao.opportunity_dao import OpportunityDAO
 from db.db_conn import SessionLocal
-from services.context.context_generator import ContextGenerator
+from services.context_retrieval.context_generator import ContextGenerator
 from services.justification.group_justification_engine import GroupJustificationEngine
 from services.matching.team_grant_matcher import TeamGrantMatcher
 from utils.thread_pool import build_thread_local_getter, parallel_map, resolve_pool_size

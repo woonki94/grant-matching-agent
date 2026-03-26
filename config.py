@@ -151,6 +151,11 @@ class Settings(BaseSettings):
     university_name: str = "Oregon State University"
 
     # =========================
+    # OpenAlex: fetching publications
+    # =========================
+    openalex_base_url: str = "https://api.openalex.org"
+
+    # =========================
     # LOG Config
     # =========================
     log_level: str = "INFO"
@@ -161,6 +166,7 @@ class Settings(BaseSettings):
         case_sensitive=False,
         extra="ignore",
     )
+
 
 
 settings = Settings()

@@ -12,7 +12,7 @@ FACULTY_RECS_PROMPT = ChatPromptTemplate.from_messages([
      "\n"
      "ABOUT SCORES (mention naturally in content):\n"
      "- domain_score: cosine similarity of domain embeddings (fast topical overlap filter).\n"
-     "- llm_score: an LLM judgment score based on detailed fit between faculty context and opportunity context.\n"
+     "- llm_score: an LLM judgment score based on detailed fit between faculty context_retrieval and opportunity context_retrieval.\n"
      "- llm_score matters more than domain_score when interpreting fit.\n"
      "\n"
      "QUALITATIVE LABELS (based on llm_score; return in fit_label):\n"
@@ -56,7 +56,7 @@ FACULTY_RECS_PROMPT = ChatPromptTemplate.from_messages([
 GRANT_EXPLANATION_PROMPT = ChatPromptTemplate.from_messages([
     (
         "system",
-        "You write a concise grant explanation using ONLY provided JSON context.\n"
+        "You write a concise grant explanation using ONLY provided JSON context_retrieval.\n"
         "Do not invent facts.\n"
         "Return JSON matching this schema exactly:\n"
         "{ \"grant_explanation\": string }.\n"
@@ -65,7 +65,7 @@ GRANT_EXPLANATION_PROMPT = ChatPromptTemplate.from_messages([
         "- Keep it very brief: 1-2 short sentences (about 18-40 words total).\n"
         "- Sentence 1: what the grant funds.\n"
         "- Optional sentence 2: key priority themes/capabilities.\n"
-        "- Prefer plain, plausible language; avoid niche jargon unless explicitly in context.\n"
+        "- Prefer plain, plausible language; avoid niche jargon unless explicitly in context_retrieval.\n"
         "- Never output ellipses ('...') or clipped text fragments.\n"
         "- Each sentence must be complete and grammatical.\n"
         "- Do not mention embeddings, cosine, vectors, or internal scoring pipelines.\n"

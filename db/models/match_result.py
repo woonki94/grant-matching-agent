@@ -26,15 +26,15 @@ class MatchResult(Base):
     # Stage-1 fast filter score (embedding cosine)
     domain_score = Column(Float, nullable=False)
 
-    # Stage-2 LLM judgment score
+    # Stage-2 specialization coverage score
     llm_score = Column(Float, nullable=False)
 
-    # One-sentence, brief explanation (log-level)
+    # Optional free-form explanation (currently not generated)
     reason = Column(String(256), nullable=False)
 
-    covered = Column(JSONB, nullable=False, default=list)  # ["topic1", "topic2", ...]
-    missing = Column(JSONB, nullable=False, default=list)  # ["topicX", ...]
-    evidence = Column(JSONB, nullable=False, default=dict)  # {"grant_kw": ["faculty_kw", ...]}
+    covered = Column(JSONB, nullable=False, default=dict)  # {"application": {"0": 0.83}, "research": {...}}
+    missing = Column(JSONB, nullable=False, default=dict)  # {"application": [1, 2], "research": [...]}
+    evidence = Column(JSONB, nullable=False, default=dict)  # scorer metadata / trace details
 
     grant = relationship("Opportunity", backref="match_results")
     faculty = relationship("Faculty", backref="match_results")

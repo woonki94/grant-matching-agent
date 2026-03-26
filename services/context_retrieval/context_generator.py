@@ -4,14 +4,14 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from dao.opportunity_dao import OpportunityDAO
 from db.models import Faculty, Opportunity
-from services.context.faculty_context import FacultyContextBuilder
-from services.context.justification_context import JustificationContextBuilder
-from services.context.matching_context import MatchingContextBuilder
-from services.context.opportunity_context import OpportunityContextBuilder
+from services.context_retrieval.faculty_context import FacultyContextBuilder
+from services.context_retrieval.justification_context import JustificationContextBuilder
+from services.context_retrieval.matching_context import MatchingContextBuilder
+from services.context_retrieval.opportunity_context import OpportunityContextBuilder
 
 
 class ContextGenerator:
-    """Facade that composes faculty and grant context builders."""
+    """Facade that composes faculty and grant context_retrieval builders."""
 
     def __init__(self):
         self.faculty = FacultyContextBuilder()

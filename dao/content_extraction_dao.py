@@ -18,13 +18,13 @@ class ContentExtractionDAO:
         self.session = session
 
     def fetch_pending(self, model: Type[Any], limit: int = 200) -> List[Any]:
-        return (
-            self.session.query(model)
-            .filter((model.extract_status == "pending") | (model.extract_status.is_(None)))
-            .order_by(model.id.asc())
-            .limit(limit)
-            .all()
+        query = self.session.query(model).filter(
+            (model.extract_status == "pending") | (model.extract_status.is_(None))
         )
+        # Process only base rows; chunk rows are extraction outputs.
+        if hasattr(model, "chunk_index"):
+            query = query.filter(model.chunk_index == 0)
+        return query.order_by(model.id.asc()).limit(limit).all()
 
     def bulk_update(self, model: Type[Any], updates: List[Dict[str, Any]]) -> None:
         if not updates:

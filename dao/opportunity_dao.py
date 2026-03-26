@@ -80,6 +80,7 @@ class OpportunityDAO:
                 .filter(
                     OpportunityAttachment.opportunity_id == opportunity_id,
                     OpportunityAttachment.file_name == a.file_name,
+                    OpportunityAttachment.chunk_index == 0,
                 )
                 .one_or_none()
             )
@@ -89,6 +90,7 @@ class OpportunityDAO:
                     opportunity_id=opportunity_id,
                     file_name=a.file_name,
                     file_download_path=a.file_download_path,
+                    chunk_index=0,
                     extract_status=a.extract_status or "pending",
                 )
                 self.session.add(obj)
@@ -106,6 +108,7 @@ class OpportunityDAO:
                 .filter(
                     OpportunityAdditionalInfo.opportunity_id == opportunity_id,
                     OpportunityAdditionalInfo.additional_info_url == info.additional_info_url,
+                    OpportunityAdditionalInfo.chunk_index == 0,
                 )
                 .one_or_none()
             )
@@ -114,6 +117,7 @@ class OpportunityDAO:
                 obj = OpportunityAdditionalInfo(
                     opportunity_id=opportunity_id,
                     additional_info_url=info.additional_info_url,
+                    chunk_index=0,
                     extract_status=info.extract_status or "pending",
                 )
                 self.session.add(obj)
@@ -306,15 +310,28 @@ class OpportunityDAO:
         )
 
     # =============== Iteration Actions ===============
-    def iter_opportunities_with_relations(self, batch_size: int = 200) -> Iterator[Opportunity]:
+    def iter_opportunities_with_relations(
+        self,
+        batch_size: int = 200,
+        stream: bool = True,
+        limit: int = 0,
+    ) -> Iterator[Opportunity] | List[Opportunity]:
         """Iterate all opportunities with common relations preloaded."""
-        q = (
-            self._with_common_relations(self.session.query(Opportunity))
-            .yield_per(batch_size)
-        )
-        yield from q
+        q = self._with_common_relations(self.session.query(Opportunity))
+        safe_limit = max(0, int(limit or 0))
+        if safe_limit > 0:
+            q = q.limit(safe_limit)
+        if stream:
+            q = q.yield_per(batch_size)
+            return q
+        return q.all()
 
-    def iter_opportunity_missing_keywords(self, batch_size: int = 200) -> Iterator[Opportunity]:
+    def iter_opportunity_missing_keywords(
+        self,
+        batch_size: int = 200,
+        stream: bool = True,
+        limit: int = 0,
+    ) -> Iterator[Opportunity] | List[Opportunity]:
         """
         Iterate over grants that has not yet generated keywords.
         """
@@ -322,6 +339,11 @@ class OpportunityDAO:
             self._with_common_relations(self.session.query(Opportunity))
             .outerjoin(OpportunityKeyword, OpportunityKeyword.opportunity_id == Opportunity.opportunity_id)
             .filter(OpportunityKeyword.opportunity_id.is_(None))
-            .yield_per(batch_size)
         )
-        yield from q
+        safe_limit = max(0, int(limit or 0))
+        if safe_limit > 0:
+            q = q.limit(safe_limit)
+        if stream:
+            q = q.yield_per(batch_size)
+            return q
+        return q.all()

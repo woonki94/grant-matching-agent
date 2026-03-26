@@ -14,7 +14,7 @@ from dto.llm_response_dto import (
     WhyNotWorkingOut,
     WhyWorkingOut,
 )
-from services.context.context_generator import ContextGenerator
+from services.context_retrieval.context_generator import ContextGenerator
 from utils.keyword_utils import extract_requirement_specs
 from utils.thread_pool import parallel_map
 from services.prompts.group_match_prompt import (

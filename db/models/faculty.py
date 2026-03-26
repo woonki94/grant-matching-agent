@@ -10,6 +10,7 @@ from sqlalchemy import (
     UniqueConstraint,
     Index,
     DateTime,
+    text as sa_text,
 )
 from sqlalchemy.orm import relationship
 from sqlalchemy.dialects.postgresql import JSONB
@@ -43,7 +44,7 @@ class Faculty(Base):
     # text blocks
     address = Column(Text)        # keep newlines
     biography = Column(Text)
-    profile_last_refreshed_at = Column(DateTime)
+    profile_last_refreshed_at = Column(DateTime(timezone=True), server_default=sa_text("CURRENT_TIMESTAMP"))
 
     # collapsed arrays (store as JSON)
     degrees = Column(JSONB)         # list[str] (ordered)
@@ -88,9 +89,11 @@ class FacultyAdditionalInfo(Base):
         UniqueConstraint(
             "faculty_id",
             "additional_info_url",
+            "chunk_index",
             name="ux_faculty_additional_info_opp_url",
         ),
         Index("ix_faculty_additional_info_faculty_id", "faculty_id"),
+        Index("ix_faculty_additional_info_chunk_index", "chunk_index"),
         Index("ix_faculty_additional_info_extracted_at", "extracted_at"),
     )
 
@@ -104,11 +107,13 @@ class FacultyAdditionalInfo(Base):
     )
 
     additional_info_url = Column(String, nullable=False)
+    chunk_index = Column(Integer, nullable=False, default=0)
 
     # extracted content
     content_path = Column(String(1024))
     detected_type = Column(String(32))       # pdf, html, docx, etc
     content_char_count = Column(Integer)
+    content_embedding = Column(Vector(EMBED_DIM), nullable=True)
     extracted_at = Column(DateTime)
     extract_status = Column(String(32), nullable=False, default="pending")
     extract_error = Column(Text)

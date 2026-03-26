@@ -1,270 +1,249 @@
 from __future__ import annotations
 
-import argparse
-import json
 import logging
 import os
-import threading
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Dict, List, Optional, Tuple
 
-from config import get_llm_client
 from dao.faculty_dao import FacultyDAO
 from dao.match_dao import MatchDAO
 from dao.opportunity_dao import OpportunityDAO
 from db.db_conn import SessionLocal
 from db.models.faculty import Faculty
+from services.matching.specialization_cross_encoder import SpecializationCrossEncoderScorer
 from sqlalchemy.orm import selectinload
-from dto.llm_response_dto import LLMMatchOut, MissingItem, ScoredCoveredItem
-from services.prompts.matching_prompt import MATCH_PROMPT
-from utils.keyword_utils import keywords_for_matching, requirements_indexed
+from utils.keyword_utils import extract_specializations
 
 logger = logging.getLogger(__name__)
 
 
-
 class FacultyGrantMatcher:
-    """One-to-one faculty↔grant matching service using vector retrieval + LLM scoring."""
-    DEFAULT_SCORE_WORKERS = 4
+    """One-to-one faculty↔grant matcher using cross-encoder specialization coverage."""
 
-    def __init__(self, *, session_factory=SessionLocal):
-        self.session_factory = session_factory
+    DEFAULT_COVERED_THRESHOLD = 0.40
 
-    @staticmethod
-    def _build_chain():
-        llm = get_llm_client().build()
-        return MATCH_PROMPT | llm.with_structured_output(LLMMatchOut)
-
-    @staticmethod
-    def _covered_to_grouped(items: List[ScoredCoveredItem]):
-        out = {"application": {}, "research": {}}
-        for it in items or []:
-            sec = it.section
-            idx = str(int(it.idx))
-            c = float(it.c)
-            prev = out[sec].get(idx)
-            out[sec][idx] = c if prev is None else max(prev, c)
-        return out
-
-    @staticmethod
-    def _missing_to_grouped(items: List[MissingItem]):
-        out = {"application": [], "research": []}
-        for it in items or []:
-            out[it.section].append(int(it.idx))
-        for sec in out:
-            seen = set()
-            out[sec] = [x for x in out[sec] if not (x in seen or seen.add(x))]
-        return out
-
-    @staticmethod
-    def _faculty_keywords_json(fac: Faculty) -> str:
-        fac_kw = keywords_for_matching(getattr(fac.keyword, "keywords", {}) or {})
-        return json.dumps(fac_kw, ensure_ascii=False)
-
-    @staticmethod
-    def _opportunity_requirements_json(opp) -> str:
-        opp_kw = keywords_for_matching(getattr(opp.keyword, "keywords", {}) or {})
-        req_idx = requirements_indexed(opp_kw)
-        return json.dumps(req_idx, ensure_ascii=False)
-
-    @staticmethod
-    def _score_pair(
-        *,
-        chain,
-        fac_json: str,
-        opp_req_idx_json: str,
-    ) -> LLMMatchOut:
-        return chain.invoke(
-            {
-                "faculty_kw_json": fac_json,
-                "requirements_indexed": opp_req_idx_json,
-            }
-        )
-
-    def _build_match_row(
+    def __init__(
         self,
+        *,
+        session_factory=SessionLocal,
+        spec_scorer: Optional[SpecializationCrossEncoderScorer] = None,
+    ):
+        self.session_factory = session_factory
+        self.spec_scorer = spec_scorer or SpecializationCrossEncoderScorer()
+
+    @staticmethod
+    def _safe_weight(value: Any) -> float:
+        try:
+            w = float(value)
+        except Exception:
+            w = 1.0
+        if w < 0.0:
+            return 0.0
+        return w
+
+    @classmethod
+    def _resolve_covered_threshold(cls) -> float:
+        raw = os.getenv("MATCH_COVERED_THRESHOLD", str(cls.DEFAULT_COVERED_THRESHOLD))
+        try:
+            val = float(raw)
+        except Exception:
+            val = cls.DEFAULT_COVERED_THRESHOLD
+        if val < 0.0:
+            return 0.0
+        if val > 1.0:
+            return 1.0
+        return float(val)
+
+    @staticmethod
+    def _faculty_specs_by_section(fac: Faculty) -> Dict[str, List[str]]:
+        kw = getattr(getattr(fac, "keyword", None), "keywords", {}) or {}
+        specs = extract_specializations(kw)
+        out: Dict[str, List[str]] = {"application": [], "research": []}
+        for sec in ("application", "research"):
+            for item in specs.get(sec, []):
+                text = str(item.get("t") or "").strip()
+                if text:
+                    out[sec].append(text)
+        return out
+
+    def _opportunity_requirements_by_section(self, opp) -> Dict[str, List[Dict[str, Any]]]:
+        kw = getattr(getattr(opp, "keyword", None), "keywords", {}) or {}
+        specs = extract_specializations(kw)
+        out: Dict[str, List[Dict[str, Any]]] = {"application": [], "research": []}
+        for sec in ("application", "research"):
+            for idx, item in enumerate(specs.get(sec, [])):
+                text = str(item.get("t") or "").strip()
+                if not text:
+                    continue
+                out[sec].append(
+                    {
+                        "idx": int(idx),
+                        "text": text,
+                        "weight": self._safe_weight(item.get("w", 1.0)),
+                    }
+                )
+        return out
+
+    def _score_specialization_coverage(
+        self,
+        *,
+        requirements: Dict[str, List[Dict[str, Any]]],
+        faculty_specs: Dict[str, List[str]],
+        covered_threshold: float,
+    ) -> Dict[str, Any]:
+        covered: Dict[str, Dict[str, float]] = {"application": {}, "research": {}}
+        missing: Dict[str, List[int]] = {"application": [], "research": []}
+
+        evidence_sections: Dict[str, Dict[str, Dict[str, Any]]] = {"application": {}, "research": {}}
+        weighted_sum = 0.0
+        total_weight = 0.0
+
+        for sec in ("application", "research"):
+            req_rows = list(requirements.get(sec) or [])
+            fac_rows = list(faculty_specs.get(sec) or [])
+
+            best_by_req: Dict[int, Tuple[float, Optional[int]]] = {}
+            if req_rows and fac_rows:
+                pairs: List[Tuple[str, str]] = []
+                pair_index_meta: List[Tuple[int, int]] = []
+                for req in req_rows:
+                    req_idx = int(req["idx"])
+                    req_text = str(req.get("text") or "").strip()
+                    if not req_text:
+                        continue
+                    for fac_idx, fac_text in enumerate(fac_rows):
+                        ftxt = str(fac_text or "").strip()
+                        if not ftxt:
+                            continue
+                        pairs.append((req_text, ftxt))
+                        pair_index_meta.append((req_idx, int(fac_idx)))
+
+                pair_scores = self.spec_scorer.score_pairs(pairs)
+                for (req_idx, fac_idx), score in zip(pair_index_meta, pair_scores):
+                    prev = best_by_req.get(req_idx)
+                    if prev is None or float(score) > float(prev[0]):
+                        best_by_req[req_idx] = (float(score), int(fac_idx))
+
+            for req in req_rows:
+                req_idx = int(req["idx"])
+                weight = self._safe_weight(req.get("weight", 1.0))
+                best_score, best_fac_idx = best_by_req.get(req_idx, (0.0, None))
+                c = max(0.0, min(1.0, float(best_score)))
+
+                if weight > 0.0:
+                    weighted_sum += float(weight) * c
+                    total_weight += float(weight)
+
+                if c >= float(covered_threshold):
+                    covered[sec][str(req_idx)] = float(round(c, 6))
+                else:
+                    missing[sec].append(int(req_idx))
+
+                evidence_sections[sec][str(req_idx)] = {
+                    "score": float(round(c, 6)),
+                    "best_faculty_spec_idx": int(best_fac_idx) if best_fac_idx is not None else None,
+                }
+
+        spec_score = (weighted_sum / total_weight) if total_weight > 0.0 else 0.0
+        evidence = {
+            "method": "cross_encoder_spec_coverage",
+            "model_dir": self.spec_scorer.resolved_model_dir,
+            "score_summary": {
+                "weighted_sum": float(round(weighted_sum, 6)),
+                "total_weight": float(round(total_weight, 6)),
+                "normalized_score": float(round(spec_score, 6)),
+            },
+            "sections": evidence_sections,
+        }
+        return {
+            "llm_score": float(round(spec_score, 6)),
+            "covered": covered,
+            "missing": missing,
+            "evidence": evidence,
+        }
+
+    @staticmethod
+    def _build_match_row(
         *,
         grant_id: str,
         faculty_id: int,
         domain_sim: float,
-        scored: LLMMatchOut,
-    ) -> dict:
+        spec_score_payload: Dict[str, Any],
+    ) -> Dict[str, Any]:
         return {
             "grant_id": str(grant_id),
             "faculty_id": int(faculty_id),
             "domain_score": float(domain_sim),
-            "llm_score": float(scored.llm_score),
-            "reason": (scored.reason or "").strip(),
-            "covered": self._covered_to_grouped(scored.covered),
-            "missing": self._missing_to_grouped(scored.missing),
+            # Kept as llm_score column for compatibility with existing readers.
+            "llm_score": float(spec_score_payload.get("llm_score") or 0.0),
+            # Reason generation is intentionally removed in cross-encoder mode.
+            "reason": "",
+            "covered": spec_score_payload.get("covered") or {"application": {}, "research": {}},
+            "missing": spec_score_payload.get("missing") or {"application": [], "research": []},
+            "evidence": spec_score_payload.get("evidence") or {},
         }
-
-    def _resolve_score_workers(self, n_tasks: int) -> int:
-        if n_tasks <= 0:
-            return 1
-        raw = os.getenv("FACULTY_MATCHER_WORKERS", str(self.DEFAULT_SCORE_WORKERS))
-        try:
-            val = int(raw)
-        except Exception:
-            val = self.DEFAULT_SCORE_WORKERS
-        return max(1, min(val, int(n_tasks)))
 
     def _build_rows_for_faculty_candidates(
         self,
         *,
-        chain,
         fac: Faculty,
         faculty_id: int,
-        candidates: List[tuple[str, float]],
-        opp_map: dict,
-    ) -> List[dict]:
-        fac_json = self._faculty_keywords_json(fac)
-        indexed_items: List[Tuple[int, str, float, str]] = []
-        for idx, (opp_id, domain_sim) in enumerate(candidates):
-            opp = opp_map.get(opp_id)
+        candidates: List[Tuple[str, float]],
+        opp_map: Dict[str, Any],
+    ) -> List[Dict[str, Any]]:
+        faculty_specs = self._faculty_specs_by_section(fac)
+        covered_threshold = self._resolve_covered_threshold()
+        out_rows: List[Dict[str, Any]] = []
+
+        for opp_id, domain_sim in candidates:
+            opp = opp_map.get(str(opp_id))
             if not opp:
                 continue
-            indexed_items.append(
-                (
-                    idx,
-                    str(opp_id),
-                    float(domain_sim),
-                    self._opportunity_requirements_json(opp),
+            reqs = self._opportunity_requirements_by_section(opp)
+            spec_score_payload = self._score_specialization_coverage(
+                requirements=reqs,
+                faculty_specs=faculty_specs,
+                covered_threshold=covered_threshold,
+            )
+            out_rows.append(
+                self._build_match_row(
+                    grant_id=str(opp_id),
+                    faculty_id=int(faculty_id),
+                    domain_sim=float(domain_sim),
+                    spec_score_payload=spec_score_payload,
                 )
             )
-
-        if not indexed_items:
-            return []
-
-        workers = self._resolve_score_workers(len(indexed_items))
-        if workers <= 1:
-            out_rows: List[dict] = []
-            for _, opp_id, domain_sim, req_json in indexed_items:
-                scored = self._score_pair(
-                    chain=chain,
-                    fac_json=fac_json,
-                    opp_req_idx_json=req_json,
-                )
-                out_rows.append(
-                    self._build_match_row(
-                        grant_id=opp_id,
-                        faculty_id=faculty_id,
-                        domain_sim=domain_sim,
-                        scored=scored,
-                    )
-                )
-            return out_rows
-
-        thread_local = threading.local()
-
-        def _get_chain():
-            local_chain = getattr(thread_local, "chain", None)
-            if local_chain is None:
-                local_chain = self._build_chain()
-                thread_local.chain = local_chain
-            return local_chain
-
-        def _score_item(item: Tuple[int, str, float, str]) -> Tuple[int, dict]:
-            idx, opp_id, domain_sim, req_json = item
-            scored = self._score_pair(
-                chain=_get_chain(),
-                fac_json=fac_json,
-                opp_req_idx_json=req_json,
-            )
-            row = self._build_match_row(
-                grant_id=opp_id,
-                faculty_id=faculty_id,
-                domain_sim=domain_sim,
-                scored=scored,
-            )
-            return idx, row
-
-        indexed_rows: List[Tuple[int, dict]] = []
-        with ThreadPoolExecutor(max_workers=workers) as ex:
-            futures = [ex.submit(_score_item, item) for item in indexed_items]
-            for fut in as_completed(futures):
-                indexed_rows.append(fut.result())
-
-        indexed_rows.sort(key=lambda x: x[0])
-        return [row for _, row in indexed_rows]
+        return out_rows
 
     def _build_rows_for_opportunity_candidates(
         self,
         *,
-        chain,
         opportunity_id: str,
-        candidates: List[tuple[int, float]],
+        candidates: List[Tuple[int, float]],
         fac_map: Dict[int, Faculty],
-        opp_req_idx_json: str,
-    ) -> List[dict]:
-        indexed_items: List[Tuple[int, int, float, str]] = []
-        for idx, (fid, domain_sim) in enumerate(candidates):
+        opportunity_requirements: Dict[str, List[Dict[str, Any]]],
+    ) -> List[Dict[str, Any]]:
+        covered_threshold = self._resolve_covered_threshold()
+        out_rows: List[Dict[str, Any]] = []
+
+        for fid, domain_sim in candidates:
             fac = fac_map.get(int(fid))
             if not fac:
                 continue
-            indexed_items.append(
-                (
-                    idx,
-                    int(fid),
-                    float(domain_sim),
-                    self._faculty_keywords_json(fac),
+            faculty_specs = self._faculty_specs_by_section(fac)
+            spec_score_payload = self._score_specialization_coverage(
+                requirements=opportunity_requirements,
+                faculty_specs=faculty_specs,
+                covered_threshold=covered_threshold,
+            )
+            out_rows.append(
+                self._build_match_row(
+                    grant_id=str(opportunity_id),
+                    faculty_id=int(fid),
+                    domain_sim=float(domain_sim),
+                    spec_score_payload=spec_score_payload,
                 )
             )
-
-        if not indexed_items:
-            return []
-
-        workers = self._resolve_score_workers(len(indexed_items))
-        if workers <= 1:
-            out_rows: List[dict] = []
-            for _, fid, domain_sim, fac_json in indexed_items:
-                scored = self._score_pair(
-                    chain=chain,
-                    fac_json=fac_json,
-                    opp_req_idx_json=opp_req_idx_json,
-                )
-                out_rows.append(
-                    self._build_match_row(
-                        grant_id=str(opportunity_id),
-                        faculty_id=int(fid),
-                        domain_sim=float(domain_sim),
-                        scored=scored,
-                    )
-                )
-            return out_rows
-
-        thread_local = threading.local()
-
-        def _get_chain():
-            local_chain = getattr(thread_local, "chain", None)
-            if local_chain is None:
-                local_chain = self._build_chain()
-                thread_local.chain = local_chain
-            return local_chain
-
-        def _score_item(item: Tuple[int, int, float, str]) -> Tuple[int, dict]:
-            idx, fid, domain_sim, fac_json = item
-            scored = self._score_pair(
-                chain=_get_chain(),
-                fac_json=fac_json,
-                opp_req_idx_json=opp_req_idx_json,
-            )
-            row = self._build_match_row(
-                grant_id=str(opportunity_id),
-                faculty_id=int(fid),
-                domain_sim=float(domain_sim),
-                scored=scored,
-            )
-            return idx, row
-
-        indexed_rows: List[Tuple[int, dict]] = []
-        with ThreadPoolExecutor(max_workers=workers) as ex:
-            futures = [ex.submit(_score_item, item) for item in indexed_items]
-            for fut in as_completed(futures):
-                indexed_rows.append(fut.result())
-
-        indexed_rows.sort(key=lambda x: x[0])
-        return [row for _, row in indexed_rows]
+        return out_rows
 
     def run(
         self,
@@ -274,8 +253,6 @@ class FacultyGrantMatcher:
         limit_faculty: int = 100,
         commit_every: int = 30,
     ) -> int:
-        chain = self._build_chain()
-
         with self.session_factory() as sess:
             fac_dao = FacultyDAO(sess)
             opp_dao = OpportunityDAO(sess)
@@ -299,7 +276,6 @@ class FacultyGrantMatcher:
                 opp_map = {o.opportunity_id: o for o in opps}
 
                 out_rows = self._build_rows_for_faculty_candidates(
-                    chain=chain,
                     fac=fac,
                     faculty_id=int(fac.faculty_id),
                     candidates=candidates,
@@ -332,8 +308,6 @@ class FacultyGrantMatcher:
         if not faculty_id:
             return 0
 
-        chain = self._build_chain()
-
         with self.session_factory() as sess:
             opp_dao = OpportunityDAO(sess)
             match_dao = MatchDAO(sess)
@@ -351,7 +325,6 @@ class FacultyGrantMatcher:
             opp_map = {o.opportunity_id: o for o in opps}
 
             out_rows = self._build_rows_for_faculty_candidates(
-                chain=chain,
                 fac=fac,
                 faculty_id=int(faculty_id),
                 candidates=candidates,
@@ -381,8 +354,6 @@ class FacultyGrantMatcher:
         if not opportunity_id:
             return 0
 
-        chain = self._build_chain()
-
         with self.session_factory() as sess:
             opp_dao = OpportunityDAO(sess)
             match_dao = MatchDAO(sess)
@@ -391,10 +362,9 @@ class FacultyGrantMatcher:
             if not opps:
                 return 0
             opp = opps[0]
+            opportunity_requirements = self._opportunity_requirements_by_section(opp)
 
-            opp_req_idx_json = self._opportunity_requirements_json(opp)
-
-            candidates: List[tuple[int, float]] = []
+            candidates: List[Tuple[int, float]] = []
             if faculty_ids:
                 for fid in sorted({int(x) for x in faculty_ids if x is not None}):
                     sim = match_dao.domain_similarity_for_faculty_opportunity(
@@ -425,11 +395,10 @@ class FacultyGrantMatcher:
             fac_map = {int(f.faculty_id): f for f in fac_rows}
 
             out_rows = self._build_rows_for_opportunity_candidates(
-                chain=chain,
                 opportunity_id=str(opportunity_id),
                 candidates=candidates,
                 fac_map=fac_map,
-                opp_req_idx_json=opp_req_idx_json,
+                opportunity_requirements=opportunity_requirements,
             )
 
             if out_rows:

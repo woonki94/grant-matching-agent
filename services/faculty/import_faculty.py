@@ -20,6 +20,8 @@ from mappers.page_to_faculty import map_faculty_profile_to_dto
 from services.extract_content import run_extraction_pipeline
 from services.faculty.faculty_page_crawler import crawl
 from services.faculty.profile_parser import parse_profile
+from utils.publication_enricher import get_publication_dtos_for_faculty
+
 # Publication ingestion is no longer done via OpenAlex during bulk import.
 # Publications are now ingested at query time from a user-uploaded CV PDF
 # using utils/publication_extractor.py.
@@ -30,14 +32,16 @@ setup_logging()
 UNIV_NAME = settings.university_name
 
 
-def import_faculty(max_pages: int, max_faculty: int) -> None:
+def import_faculty(max_pages: int, max_faculty: int, years_back: int) -> None:
     # -------------------------
     # 1) Fetch links
     # -------------------------
     logger.info(
-        "Starting faculty import: max_pages=%s, max_faculty=%s",
+        "Starting faculty import: max_pages=%s, max_faculty=%s, publications from last %s years",
         max_pages,
         max_faculty,
+        years_back,
+
     )
 
     links = crawl(max_pages=max_pages, max_links=max_faculty)
@@ -64,6 +68,16 @@ def import_faculty(max_pages: int, max_faculty: int) -> None:
                     )
                     # Publications are now ingested from user-provided CV PDFs at
                     # query time. No publication fetch happens during bulk import.
+                    #TODO: WTF? we need those for keyword generation
+                    _author_id, pubs = get_publication_dtos_for_faculty(
+                        full_name=faculty.name,
+                        university=UNIV_NAME,
+                        years_back=years_back,
+                    )
+                    fac_dao.upsert_publications(faculty.faculty_id, pubs)
+
+
+
 
                 except Exception:
                     logger.exception("Failed processing faculty link: %s", link)
@@ -103,6 +117,13 @@ if __name__ == "__main__":
         default=0,
         help="Number of pages to crawl (0 = first page only, depending on your crawler)",
     )
+    parser.add_argument(
+        "--years-back",
+        type=int,
+        default=5,
+        help="How many years back to fetch publications from OpenAlex",
+    )
+
 
     parser.add_argument(
         "--max-faculty",
@@ -115,5 +136,6 @@ if __name__ == "__main__":
 
     import_faculty(
         max_pages=args.max_pages,
+        years_back=args.years_back,
         max_faculty=args.max_faculty,
     )

@@ -38,6 +38,16 @@ pandas~=3.0.0
 tabulate~=0.9.0
 
 boto3~=1.42.32
+langchain-aws
 langgraph~=1.0.9
 beautifulsoup4>=4.12.0
 lxml>=5.0.0
+
+# Document extraction / browser rendering
+unstructured[all-docs]
+playwright
+
+# Cross-encoder specialization matching
+transformers>=4.51.0
+huggingface-hub>=0.30.0,<1.0
+torch
