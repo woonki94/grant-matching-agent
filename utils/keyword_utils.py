@@ -75,6 +75,57 @@ def requirements_indexed(kw: dict) -> dict:
     return out
 
 
+def keyword_inventory_for_rerank(kw: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Build a flat keyword inventory for rerank payloads.
+
+    Output shape:
+    {
+      "domain": [str, ...],
+      "specialization": { "<keyword>": "<weight_str_2dp>", ... }
+    }
+
+    Rules:
+    - Domain has no weights.
+    - Specialization missing weights default to 0.0.
+    """
+    kw_norm = coerce_keyword_sections(dict(kw or {}))
+    r_domains, a_domains = extract_domains_from_keywords(kw_norm)
+
+    domain: List[str] = []
+    seen_domain = set()
+    for item in list(r_domains or []) + list(a_domains or []):
+        text = " ".join(str(item or "").split()).strip()
+        if not text or text in seen_domain:
+            continue
+        seen_domain.add(text)
+        domain.append(text)
+
+    spec_map: Dict[str, str] = {}
+    seen_spec = set()
+    for sec in ("research", "application"):
+        specs = ((kw_norm.get(sec) or {}).get("specialization") or [])
+        for item in list(specs):
+            if isinstance(item, dict):
+                text = str(item.get("t") if item.get("t") is not None else item.get("text") or "").strip()
+                try:
+                    weight = float(item.get("w", 0.0))
+                except Exception:
+                    weight = 0.0
+            else:
+                text = str(item or "").strip()
+                weight = 0.0
+            if not text or text in seen_spec:
+                continue
+            seen_spec.add(text)
+            spec_map[text] = f"{weight:.2f}"
+
+    return {
+        "domain": domain,
+        "specialization": spec_map,
+    }
+
+
 
 def extract_requirement_specs(opp_ctx: Dict[str, Any]) -> Dict[str, Dict[int, Dict[str, Any]]]:
     """Extract requirement text/weight by section/index from opportunity keyword payload."""

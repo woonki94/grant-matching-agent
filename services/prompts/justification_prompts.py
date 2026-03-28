@@ -1,77 +1,59 @@
 from langchain_core.prompts import ChatPromptTemplate
 
 FACULTY_RECS_PROMPT = ChatPromptTemplate.from_messages([
-    ("system",
-     "You write faculty-facing recommendations for funding opportunities.\n"
-     "Return ONLY JSON matching this schema:\n"
-     "{{ \"faculty_name\": string, \"recommendations\": FacultyOpportunityRec[] }}.\n"
-     "\n"
-     "INPUT CONTEXT LIMITATION:\n"
-     "- You only get faculty metadata+keywords and opportunity metadata+keywords.\n"
-     "- Infer fit from keyword overlap and score fields; do not assume missing details.\n"
-     "\n"
-     "ABOUT SCORES (mention naturally in content):\n"
-     "- domain_score: cosine similarity of domain embeddings (fast topical overlap filter).\n"
-     "- llm_score: an LLM judgment score based on detailed fit between faculty context_retrieval and opportunity context_retrieval.\n"
-     "- llm_score matters more than domain_score when interpreting fit.\n"
-     "\n"
-     "QUALITATIVE LABELS (based on llm_score; return in fit_label):\n"
-     "- llm_score < 0.15: 'mismatch' (weak fit)\n"
-     "- 0.15–0.49: 'bad' (mostly mismatch)\n"
-     "- 0.50–0.69: 'good' (reasonable fit)\n"
-     "- 0.70–0.84: 'great' (strong fit; 'greate' is accepted and normalized)\n"
-     "- >= 0.85: 'fantastic' (excellent fit)\n"
-     "\n"
-     "NO-MATCH POLICY:\n"
-     "- If llm_score < 0.15, treat it as no match.\n"
-     "- In that case, fit_label MUST be 'mismatch'.\n"
-     "- In that case, why_match.summary MUST be exactly: 'No match found.'\n"
-     "- In that case, suggested_pitch MUST be exactly: 'Do not pursue.'\n"
-     "\n"
-     "REQUIRED CONTENT PER OPPORTUNITY:\n"
-     "- Include domain_score and llm_score in the output fields.\n"
-     "- Include fit_label exactly as one of: mismatch, bad, good, great, fantastic.\n"
-     "- Include why_match object with fields:\n"
-     "  (1) summary: one sentence with fit interpretation,\n"
-     "  (2) alignment_points: 1-3 concrete topical alignment bullets,\n"
-     "  (3) risk_gaps: 1-2 risk or missing-capability bullets.\n"
-     "\n"
-     "STYLE + CONSTRAINTS:\n"
-     "- Use ONLY the provided contexts.\n"
-     "- If TOP OPPORTUNITIES is non-empty, recommendations MUST contain at least one item.\n"
-     "- why_match.summary: 8–20 words.\n"
-     "- why_match.alignment_points items: each 8–18 words.\n"
-     "- why_match.risk_gaps items: each 8–18 words.\n"
-     "- suggested_pitch: 1–2 sentences, <= 220 characters total.\n"
-     "- Exception: for no-match policy cases, suggested_pitch is exactly 'Do not pursue.'\n"
-     "- Do not mention embeddings, cosine, vector databases, or OpenAI/OpenRouter.\n"
-     "- You MAY mention that 'domain score is a topical overlap estimate' and 'LLM score is a deeper fit judgment'.\n"
+    (
+        "system",
+        "You write a single narrative explanation of why a faculty member matches a grant.\n"
+        "Use only the provided context.\n"
+        "Write naturally in paragraph form, with concrete evidence from publications/profile chunks when available.\n"
+        "Focus on the match reasoning only.\n"
+        "Strict prohibition: do NOT include requirement labels/text, and do NOT include any numeric scores/weights/percentages.\n"
+        "Return plain text explanation only.\n"
     ),
-    ("human",
-     "FACULTY CONTEXT (JSON):\n{faculty_json}\n\n"
-     "TOP OPPORTUNITIES (JSON list):\n{opps_json}\n")
+    (
+        "human",
+        "JUSTIFICATION CONTEXT:\n{context_text}\n",
+    ),
 ])
 
 
 GRANT_EXPLANATION_PROMPT = ChatPromptTemplate.from_messages([
     (
         "system",
-        "You write a concise grant explanation using ONLY provided JSON context_retrieval.\n"
-        "Do not invent facts.\n"
-        "Return JSON matching this schema exactly:\n"
-        "{ \"grant_explanation\": string }.\n"
+        "You write a grant explanation from grant context JSON.\n"
+        "Return ONLY valid JSON with this schema:\n"
+        "{{ \"grant_explanation\": string }}\n"
         "\n"
         "Rules:\n"
-        "- Keep it very brief: 1-2 short sentences (about 18-40 words total).\n"
-        "- Sentence 1: what the grant funds.\n"
-        "- Optional sentence 2: key priority themes/capabilities.\n"
-        "- Prefer plain, plausible language; avoid niche jargon unless explicitly in context_retrieval.\n"
-        "- Never output ellipses ('...') or clipped text fragments.\n"
-        "- Each sentence must be complete and grammatical.\n"
-        "- Do not mention embeddings, cosine, vectors, or internal scoring pipelines.\n"
+        "- Use only the provided context.\n"
+        "- Explain what the grant is about, what it emphasizes, and what capabilities it expects.\n"
+        "- Keep it clear and concrete.\n"
+        "- Do not output anything outside JSON.\n"
     ),
     (
         "human",
         "GRANT CONTEXT (JSON):\n{grant_json}\n",
+    ),
+])
+
+
+FACULTY_TOP_GRANT_RERANK_PROMPT = ChatPromptTemplate.from_messages([
+    (
+        "system",
+        "You rerank top grant candidates for ONE faculty.\n"
+        "Return ONLY valid JSON with this schema:\n"
+        "{{ \"ranked_opportunity_ids\": [string, ...], \"reranked_grants\": [{{\"opportunity_id\": string, \"llm_score\": float}}] }}\n"
+        "\n"
+        "Rules:\n"
+        "- Use only the provided faculty and grant keyword inventories.\n"
+        "- Rerank by domain + specialization fit quality.\n"
+        "- Recompute llm_score between 0.0 and 1.0 for each grant.\n"
+        "- ranked_opportunity_ids and reranked_grants must contain the same grant IDs exactly once.\n"
+        "- Do not output text outside JSON.\n"
+    ),
+    (
+        "human",
+        "FACULTY (JSON):\n{faculty_json}\n\n"
+        "GRANTS (JSON list):\n{grants_json}\n",
     ),
 ])

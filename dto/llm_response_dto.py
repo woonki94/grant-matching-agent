@@ -122,7 +122,7 @@ class FacultyOpportunityRec(BaseModel):
     fit_label: FitLabel = "mismatch"
 
     why_match: WhyMatchOut = Field(default_factory=WhyMatchOut)
-    suggested_pitch: str = Field(min_length=1, max_length=500)
+    suggested_pitch: str = Field(min_length=1)
 
     @field_validator("fit_label", mode="before")
     @classmethod
@@ -196,3 +196,23 @@ class GroupJustificationOut(BaseModel):
 class TeamCandidateSelectionOut(BaseModel):
     selected_candidate_indices: List[int] = Field(default_factory=list)
     reason: Optional[str] = None
+
+
+class GrantFacultyRerankCandidateOut(BaseModel):
+    faculty_id: int
+    llm_score: float = Field(..., ge=0.0, le=1.0)
+
+
+class GrantFacultyRerankOut(BaseModel):
+    ranked_faculty_ids: List[int] = Field(default_factory=list)
+    reranked_candidates: List[GrantFacultyRerankCandidateOut] = Field(default_factory=list)
+
+
+class FacultyGrantRerankCandidateOut(BaseModel):
+    opportunity_id: str
+    llm_score: float = Field(..., ge=0.0, le=1.0)
+
+
+class FacultyGrantRerankOut(BaseModel):
+    ranked_opportunity_ids: List[str] = Field(default_factory=list)
+    reranked_grants: List[FacultyGrantRerankCandidateOut] = Field(default_factory=list)

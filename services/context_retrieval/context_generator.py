@@ -57,6 +57,45 @@ class ContextGenerator:
             out[oid] = self.grant.build_opportunity_context(opp, profile="explanation")
         return out
 
+    def build_grant_context_only(
+        self,
+        *,
+        sess,
+        opportunity_id: str,
+        preview_chars: int = 700,
+    ) -> Dict[str, Any]:
+        return self.justification.build_grant_context_only(
+            sess=sess,
+            opportunity_id=opportunity_id,
+            preview_chars=preview_chars,
+        )
+
+    def build_rerank_keyword_inventory_for_opportunity(
+        self,
+        *,
+        sess,
+        opportunity_id: str,
+        k: int = 10,
+    ) -> Dict[str, Any]:
+        return self.justification.build_rerank_keyword_inventory_for_opportunity(
+            sess=sess,
+            opportunity_id=opportunity_id,
+            k=k,
+        )
+
+    def build_rerank_keyword_inventory_for_faculty(
+        self,
+        *,
+        sess,
+        faculty_id: int,
+        k: int = 10,
+    ) -> Dict[str, Any]:
+        return self.justification.build_rerank_keyword_inventory_for_faculty(
+            sess=sess,
+            faculty_id=faculty_id,
+            k=k,
+        )
+
     # ==============================
     # Faculty Context
     # ==============================
@@ -121,6 +160,38 @@ class ContextGenerator:
             sess=sess,
             fac=fac,
             top_rows=top_rows,
+        )
+
+    def build_faculty_recommendation_source_linked_payload(
+        self,
+        *,
+        sess,
+        fac: Faculty,
+        top_rows: List[Tuple[str, float, float]],
+    ) -> Dict[str, Any]:
+        return self.justification.build_faculty_recommendation_source_linked_payload(
+            sess=sess,
+            fac=fac,
+            top_rows=top_rows,
+        )
+
+    def build_faculty_recommendation_source_linked_text(
+        self,
+        *,
+        sess,
+        fac: Faculty,
+        top_rows: List[Tuple[str, float, float]],
+        max_requirements: int = 5,
+        grant_evidence_per_requirement: int = 3,
+        faculty_evidence_per_requirement: int = 3,
+    ) -> str:
+        return self.justification.build_faculty_recommendation_source_linked_text(
+            sess=sess,
+            fac=fac,
+            top_rows=top_rows,
+            max_requirements=max_requirements,
+            grant_evidence_per_requirement=grant_evidence_per_requirement,
+            faculty_evidence_per_requirement=faculty_evidence_per_requirement,
         )
 
     def build_member_coverages_for_opportunity(

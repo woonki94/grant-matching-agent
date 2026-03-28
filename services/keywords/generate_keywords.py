@@ -16,6 +16,12 @@ if __name__ == "__main__":
     parser.add_argument("--faculty-only", action="store_true", help="Only generate faculty keywords")
     parser.add_argument("--opp-only", action="store_true", help="Only generate opportunity keywords")
     parser.add_argument(
+        "--workers",
+        type=int,
+        default=4,
+        help="Thread workers per batch (faculty/opportunity).",
+    )
+    parser.add_argument(
         "--force-regenerate",
         action="store_true",
         help="Regenerate keywords for rows that already have keyword rows.",
@@ -37,9 +43,11 @@ if __name__ == "__main__":
         faculty_keyword_service.run_batch(
             limit=args.limit,
             force_regenerate=args.force_regenerate,
+            workers=args.workers,
         )
     if run_opp:
         opportunity_keyword_service.run_batch(
             limit=args.limit,
             force_regenerate=args.force_regenerate,
+            workers=args.workers,
         )

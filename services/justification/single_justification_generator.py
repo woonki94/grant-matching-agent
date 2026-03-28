@@ -1,514 +1,602 @@
 from __future__ import annotations
 
 import json
-import os
+import logging
 import re
 from typing import Any, Dict, List, Optional, Tuple
 
-from config import get_llm_client
+from config import get_llm_client, settings
 from dao.faculty_dao import FacultyDAO
 from dao.match_dao import MatchDAO
 from db.db_conn import SessionLocal
 from db.models.faculty import Faculty
-from dto.llm_response_dto import FacultyOpportunityRec, FacultyRecsOut, GrantExplanationOut, WhyMatchOut
+from dto.llm_response_dto import FacultyGrantRerankOut, GrantExplanationOut
 from services.context_retrieval.context_generator import ContextGenerator
-from services.prompts.justification_prompts import FACULTY_RECS_PROMPT, GRANT_EXPLANATION_PROMPT
+from services.prompts.justification_prompts import (
+    FACULTY_RECS_PROMPT,
+    FACULTY_TOP_GRANT_RERANK_PROMPT,
+    GRANT_EXPLANATION_PROMPT,
+)
 from utils.thread_pool import build_thread_local_getter, parallel_map, resolve_pool_size
+
+logger = logging.getLogger(__name__)
 
 
 class SingleJustificationGenerator:
-    DEFAULT_RECOMMENDATION_WORKERS = 4
+    """Single-justification helper with per-match final generation.
+
+    Supported flows:
+    - Grant explanation from grant context
+    - Faculty top-k grant rerank (email -> faculty_id -> top-k grants -> save reranked llm_score)
+    - Final recommendation generation: one match == one LLM call, append all results
+    """
+    FINAL_JUSTIFICATION_WORKERS = 8
+    GRANT_EXPLANATION_WORKERS = 8
 
     def __init__(self, *, context_generator: Optional[ContextGenerator] = None):
+        """Inject context generator dependency (defaults to the standard ContextGenerator)."""
         self.context_generator = context_generator or ContextGenerator()
 
     @staticmethod
-    def _build_chain():
-        llm = get_llm_client().build()
-        return FACULTY_RECS_PROMPT | llm.with_structured_output(FacultyRecsOut)
+    def _norm(text: Any) -> str:
+        """Normalize whitespace to keep prompt/output text compact and consistent."""
+        return " ".join(str(text or "").split()).strip()
+
+    @staticmethod
+    def _safe_float(value: Any, default: float = 0.0) -> float:
+        """Parse a float safely, falling back to a default on bad or missing values."""
+        try:
+            return float(value)
+        except Exception:
+            return float(default)
+
+    @staticmethod
+    def _sanitize_context_text_for_final_llm(text: str) -> str:
+        """Strip explicit numeric score fragments from context before final justification LLM."""
+        s = str(text or "")
+        # Remove explicit score markers from context lines.
+        s = re.sub(r"\(\s*score\s*=\s*[-+]?\d*\.?\d+\s*\)", "", s, flags=re.IGNORECASE)
+        s = re.sub(r",\s*src\s*=\s*[-+]?\d*\.?\d+", "", s, flags=re.IGNORECASE)
+        return s
+
+    @staticmethod
+    def _sanitize_final_justification_text(text: str) -> str:
+        """Post-process final justification text to remove score wording and normalize phrasing."""
+        s = " ".join(str(text or "").split()).strip()
+        # Remove explicit score notations.
+        s = re.sub(r"\(\s*score\s*=\s*[-+]?\d*\.?\d+\s*\)", "", s, flags=re.IGNORECASE)
+        s = re.sub(r"\b(?:score|scored|scoring)\b\s*[:=]?\s*[-+]?\d*\.?\d+%?", "", s, flags=re.IGNORECASE)
+        s = re.sub(r"\bat\s+[-+]?\d*\.?\d+%?\b", "", s, flags=re.IGNORECASE)
+        s = re.sub(r"\bhighest[-\s]?scoring\b", "strong", s, flags=re.IGNORECASE)
+        # Replace explicit requirement wording.
+        s = re.sub(r"\brequirements?\b", "priority areas", s, flags=re.IGNORECASE)
+        s = re.sub(r"\balignment\b", "fit", s, flags=re.IGNORECASE)
+        return " ".join(s.split()).strip()
+
+    @staticmethod
+    def _faculty_name(fac: Optional[Faculty], *, email: str) -> str:
+        """Best-effort faculty display name, falling back to email when name is missing."""
+        return str(getattr(fac, "name", None) or email).strip()
 
     @staticmethod
     def _build_grant_explanation_chain():
-        llm = get_llm_client().build()
+        """Build the LLM chain used for grant-only explanation generation."""
+        model_id = (settings.sonnet or settings.haiku or settings.opus or "").strip()
+        llm = get_llm_client(model_id=model_id).build()
         return GRANT_EXPLANATION_PROMPT | llm.with_structured_output(GrantExplanationOut)
 
     @staticmethod
-    def _llm_label(llm_score: float) -> str:
-        if llm_score < 0.15:
-            return "mismatch"
-        if llm_score < 0.50:
-            return "bad"
-        if llm_score < 0.70:
-            return "good"
-        if llm_score < 0.85:
-            return "great"
-        return "fantastic"
+    def _build_grant_rerank_chain():
+        """Build the structured-output LLM chain used to rerank top grants for a faculty."""
+        model_id = (settings.sonnet or settings.haiku or settings.opus or "").strip()
+        llm = get_llm_client(model_id=model_id).build()
+        return FACULTY_TOP_GRANT_RERANK_PROMPT | llm.with_structured_output(FacultyGrantRerankOut)
 
     @staticmethod
-    def _first_sentence(text: Any) -> str:
-        s = " ".join(str(text or "").split()).strip()
-        if not s:
-            return ""
-        m = re.search(r"[.!?]", s)
-        if not m:
-            return s
-        return s[: m.end()].strip()
+    def _build_final_justification_chain():
+        """Build the free-form LLM chain for final one-match justification writing."""
+        model_id = (settings.opus or settings.sonnet or settings.haiku or "").strip()
+        llm = get_llm_client(model_id=model_id).build()
+        return FACULTY_RECS_PROMPT | llm
 
-    @staticmethod
-    def _clean_grant_explanation(text: Any) -> str:
-        s = str(text or "").replace("\u2026", "...")
-        s = re.sub(r"\.\s*\.\s*\.", ".", s)
-        s = re.sub(r"\.{2,}", ".", s)
-        s = " ".join(s.split()).strip()
-        return s
-
-    def _fallback_grant_explanation_from_context(
+    def _generate_grant_explanation(
         self,
         *,
-        grant_context: Optional[Dict[str, Any]],
-    ) -> str:
-        ctx = dict(grant_context or {})
-        if not ctx:
-            return ""
+        opportunity_id: str,
+        preview_chars: int = 50_000,
+    ) -> Dict[str, Any]:
+        """Generate one grant explanation from grant-context payload only."""
+        logger.info(
+            "JUSTIFICATION_STEP grant_explanation_start opportunity_id=%s",
+            str(opportunity_id),
+        )
+        with SessionLocal() as sess:
+            grant_context = self.context_generator.build_grant_context_only(
+                sess=sess,
+                opportunity_id=str(opportunity_id),
+                preview_chars=int(preview_chars),
+            )
 
-        title = str(ctx.get("opportunity_title") or ctx.get("title") or "Grant opportunity").strip()
-        agency = str(ctx.get("agency_name") or ctx.get("agency") or "").strip()
-        summary = self._first_sentence(ctx.get("summary_description"))
-
-        keywords = ctx.get("keywords") if isinstance(ctx.get("keywords"), dict) else {}
-        r = (keywords.get("research") or {}) if isinstance(keywords, dict) else {}
-        a = (keywords.get("application") or {}) if isinstance(keywords, dict) else {}
-        themes: List[str] = []
-        for v in list((r.get("domain") or [])) + list((a.get("domain") or [])):
-            s = str(v).strip()
-            if not s or s in themes:
-                continue
-            themes.append(s)
-            if len(themes) >= 3:
-                break
-
-        if title and agency:
-            lead = f"{title} from {agency} supports targeted research and development priorities."
-        elif title:
-            lead = f"{title} supports targeted research and development priorities."
+        chain = self._build_grant_explanation_chain()
+        grant_json = json.dumps(dict(grant_context or {}), ensure_ascii=False)
+        out = chain.invoke({"grant_json": grant_json})
+        if isinstance(out, GrantExplanationOut):
+            explanation = self._norm(out.grant_explanation)
+        elif isinstance(out, dict):
+            explanation = self._norm(out.get("grant_explanation"))
         else:
-            lead = "This opportunity supports targeted research and development priorities."
+            explanation = self._norm(getattr(out, "grant_explanation", None) or str(out or ""))
+        logger.info(
+            "JUSTIFICATION_STEP grant_explanation_done opportunity_id=%s chars=%s",
+            str(opportunity_id),
+            len(self._norm(explanation)),
+        )
+        return {
+            "grant_context": grant_context,
+            "grant_explanation": explanation,
+        }
 
-        parts: List[str] = [lead]
-        if summary:
-            parts.append(summary)
-        if themes:
-            parts.append(f"Priority themes include {', '.join(themes)}.")
-
-        return self._clean_grant_explanation(" ".join(parts))
-
-    def _build_grant_explanation(
+    def _rerank_top_grants_for_faculty(
         self,
         *,
-        chain,
-        grant_context: Optional[Dict[str, Any]],
-    ) -> str:
-        ctx = dict(grant_context or {})
-        if not ctx:
-            return ""
-        try:
-            out: GrantExplanationOut = chain.invoke(
-                {"grant_json": json.dumps(ctx, ensure_ascii=False)}
-            )
-            text = str(getattr(out, "grant_explanation", "") or "").strip()
-            if text:
-                cleaned = self._clean_grant_explanation(text)
-                if cleaned:
-                    return cleaned
-        except Exception:
-            pass
-        return self._clean_grant_explanation(
-            self._fallback_grant_explanation_from_context(grant_context=ctx)
+        email: str,
+        k: int = 10,
+    ) -> Dict[str, Any]:
+        """Rerank faculty top-k grants and persist reranked llm_score into match rows."""
+        target_k = max(1, int(k))
+        logger.info(
+            "JUSTIFICATION_STEP rerank_start email=%s k=%s",
+            str(email or "").strip(),
+            target_k,
         )
+        with SessionLocal() as sess:
+            fdao = FacultyDAO(sess)
+            faculty_id = fdao.get_faculty_id_by_email(str(email or "").strip())
+            if not faculty_id:
+                raise ValueError(f"No faculty found with email: {email}")
 
-    @staticmethod
-    def _top_grant_explanation_from_recs(recs: List[FacultyOpportunityRec]) -> str:
-        if not recs:
-            return ""
-        text = str(getattr(recs[0], "grant_explanation", "") or "").strip()
-        return text
-
-    def _build_grant_explanations_for_payloads(
-        self,
-        *,
-        opp_payloads: List[Dict[str, Any]],
-        grant_explanation_contexts: Dict[str, Dict[str, Any]],
-    ) -> Dict[str, str]:
-        ordered_ids: List[str] = []
-        seen = set()
-        for p in opp_payloads or []:
-            oid = str(p.get("opportunity_id") or p.get("grant_id") or "").strip()
-            if not oid or oid in seen:
-                continue
-            seen.add(oid)
-            ordered_ids.append(oid)
-        if not ordered_ids:
-            return {}
-
-        raw_workers = os.getenv("SINGLE_JUST_EXPL_WORKERS", "4")
-        try:
-            configured_workers = int(raw_workers)
-        except Exception:
-            configured_workers = 4
-        get_chain = build_thread_local_getter(self._build_grant_explanation_chain)
-
-        def _run_one(oid: str) -> Tuple[str, str]:
-            return (
-                oid,
-                self._build_grant_explanation(
-                    chain=get_chain(),
-                    grant_context=(grant_explanation_contexts or {}).get(oid) or {},
-                ),
+            inventory = self.context_generator.build_rerank_keyword_inventory_for_faculty(
+                sess=sess,
+                faculty_id=int(faculty_id),
+                k=target_k,
             )
 
-        pairs = parallel_map(
-            ordered_ids,
-            max_workers=resolve_pool_size(
-                max_workers=configured_workers,
-                task_count=len(ordered_ids),
-            ),
-            run_item=_run_one,
-        )
-        out = {oid: text for oid, text in pairs}
-        return out
+        faculty_json = json.dumps(dict(inventory.get("faculty") or {}), ensure_ascii=False)
+        grants = [dict(x or {}) for x in list(inventory.get("grants") or [])]
+        grants_json = json.dumps(grants, ensure_ascii=False)
 
-    @staticmethod
-    def _attach_grant_explanations_to_recs(
-        recs: List[FacultyOpportunityRec],
-        *,
-        grant_explanations_by_opp: Dict[str, str],
-    ) -> List[FacultyOpportunityRec]:
-        out: List[FacultyOpportunityRec] = []
-        for rec in recs or []:
-            oid = str(getattr(rec, "opportunity_id", "") or "").strip()
-            text = str((grant_explanations_by_opp or {}).get(oid) or "").strip()
-            out.append(rec.model_copy(update={"grant_explanation": text}))
-        return out
-
-    def _fallback_recommendations_from_payloads(
-        self,
-        *,
-        faculty_name: str,
-        opp_payloads: List[Dict[str, Any]],
-        k: int,
-    ) -> FacultyRecsOut:
-        recs: List[FacultyOpportunityRec] = []
-        for p in (opp_payloads or [])[: max(1, int(k))]:
-            llm_score = float(p.get("llm_score") or 0.0)
-            domain_score = float(p.get("domain_score") or 0.0)
-            title = str(p.get("opportunity_title") or p.get("title") or "Untitled opportunity")
-            agency = p.get("agency_name") or p.get("agency")
-            if llm_score < 0.15:
-                recs.append(
-                    FacultyOpportunityRec(
-                        opportunity_id=str(p.get("opportunity_id") or p.get("grant_id") or ""),
-                        title=title,
-                        agency=str(agency) if agency else None,
-                        domain_score=domain_score,
-                        llm_score=llm_score,
-                        fit_label="mismatch",
-                        why_match=WhyMatchOut(
-                            summary="No match found.",
-                            alignment_points=[],
-                            risk_gaps=[
-                                f"LLM score {llm_score:.2f} indicates a fundamental topical mismatch.",
-                                f"Domain overlap estimate is {domain_score:.2f}, which is insufficient for pursuit.",
-                            ],
-                        ),
-                        suggested_pitch="Do not pursue.",
-                    )
-                )
-                continue
-            recs.append(
-                FacultyOpportunityRec(
-                    opportunity_id=str(p.get("opportunity_id") or p.get("grant_id") or ""),
-                    title=title,
-                    agency=str(agency) if agency else None,
-                    domain_score=domain_score,
-                    llm_score=llm_score,
-                    fit_label=self._llm_label(llm_score),
-                    why_match=WhyMatchOut(
-                        summary=(
-                            f"Fit is {self._llm_label(llm_score)} by LLM score {llm_score:.2f}; "
-                            f"domain overlap estimate is {domain_score:.2f}."
-                        ),
-                        alignment_points=[
-                            "Keyword overlap between faculty and opportunity indicates practical topical alignment.",
-                        ],
-                        risk_gaps=[
-                            "Potential gaps likely remain; tighten scope and add a targeted collaborator to reduce execution risk.",
-                        ],
-                    ),
-                    suggested_pitch=(
-                        "Frame your prior work directly against this program's scope and milestones. "
-                        "Highlight one concrete deliverable and one measurable outcome in year one."
-                    ),
-                )
-            )
-        return FacultyRecsOut(
-            faculty_name=faculty_name or "Unknown Faculty",
-            recommendations=recs,
-        )
-
-    def _merge_llm_with_db_payloads(
-        self,
-        *,
-        llm_recs: List[FacultyOpportunityRec],
-        payloads: List[Dict[str, Any]],
-        faculty_name: str,
-    ) -> List[FacultyOpportunityRec]:
-        fallback = self._fallback_recommendations_from_payloads(
-            faculty_name=faculty_name,
-            opp_payloads=payloads,
-            k=len(payloads),
-        ).recommendations
-
-        out: List[FacultyOpportunityRec] = []
-        for i, fb in enumerate(fallback):
-            llm_rec = llm_recs[i] if i < len(llm_recs) else None
-            if llm_rec is None:
-                out.append(fb)
-                continue
-            fit_label = llm_rec.fit_label or fb.fit_label
-            why_match = llm_rec.why_match
-            if not (
-                why_match.summary.strip()
-                or list(why_match.alignment_points or [])
-                or list(why_match.risk_gaps or [])
-            ):
-                why_match = fb.why_match
-            suggested_pitch = (llm_rec.suggested_pitch or "").strip() or fb.suggested_pitch
-            if fit_label == "mismatch":
-                suggested_pitch = "Do not pursue."
-                if not (why_match.summary or "").strip():
-                    why_match = why_match.model_copy(update={"summary": "No match found."})
-            out.append(
-                fb.model_copy(
-                    update={
-                        "fit_label": fit_label,
-                        "why_match": why_match,
-                        "suggested_pitch": suggested_pitch,
-                    }
-                )
-            )
-        return out
-
-    @staticmethod
-    def _get_faculty_by_email(faculty_dao: FacultyDAO, *, email: str) -> Faculty:
-        fac = faculty_dao.get_with_relations_by_email(email)
-        if not fac:
-            raise ValueError(f"No faculty found with email: {email}")
-        return fac
-
-    @staticmethod
-    def _invoke_llm_recommendations(
-        *,
-        chain,
-        fac_ctx: Dict[str, Any],
-        opp_payloads: List[Dict[str, Any]],
-    ) -> List[FacultyOpportunityRec]:
-        try:
-            out: FacultyRecsOut = chain.invoke(
-                {
-                    "faculty_json": json.dumps(fac_ctx, ensure_ascii=False),
-                    "opps_json": json.dumps(opp_payloads, ensure_ascii=False),
-                }
-            )
-            return list(getattr(out, "recommendations", None) or [])
-        except Exception:
-            return []
-
-    def _build_recommendations_from_payloads(
-        self,
-        *,
-        chain,
-        fac_ctx: Dict[str, Any],
-        opp_payloads: List[Dict[str, Any]],
-        grant_explanation_contexts: Dict[str, Dict[str, Any]],
-        faculty_name: str,
-        k: int,
-        batch_size: int,
-    ) -> FacultyRecsOut:
-        size = max(1, int(batch_size))
-        target_n = min(len(opp_payloads), max(1, int(k)))
-        active_payloads = list(opp_payloads or [])[:target_n]
-        chunks: List[Tuple[int, List[Dict[str, Any]]]] = [
-            (chunk_idx, active_payloads[start : start + size])
-            for chunk_idx, start in enumerate(range(0, target_n, size))
-        ]
-
-        raw_workers = os.getenv(
-            "SINGLE_JUST_WORKERS",
-            str(self.DEFAULT_RECOMMENDATION_WORKERS),
-        )
-        try:
-            configured_workers = int(raw_workers)
-        except Exception:
-            configured_workers = self.DEFAULT_RECOMMENDATION_WORKERS
-        workers = resolve_pool_size(
-            max_workers=configured_workers,
-            task_count=len(chunks),
-        )
-        get_chain = build_thread_local_getter(self._build_chain)
-
-        def _run_chunk(
-            task: Tuple[int, List[Dict[str, Any]]],
-        ) -> Tuple[List[FacultyOpportunityRec], Dict[str, str]]:
-            _, chunk = task
-
-            def _run_stage(stage: str) -> Tuple[str, Any]:
-                try:
-                    if stage == "recs":
-                        llm_recs = self._invoke_llm_recommendations(
-                            chain=(chain if workers <= 1 else get_chain()),
-                            fac_ctx=fac_ctx,
-                            opp_payloads=chunk,
-                        )
-                        return (
-                            "recs",
-                            self._merge_llm_with_db_payloads(
-                                llm_recs=llm_recs,
-                                payloads=chunk,
-                                faculty_name=faculty_name,
-                            ),
-                        )
-                    return (
-                        "expl",
-                        self._build_grant_explanations_for_payloads(
-                            opp_payloads=chunk,
-                            grant_explanation_contexts=grant_explanation_contexts or {},
-                        ),
-                    )
-                except Exception:
-                    if stage == "recs":
-                        return (
-                            "recs",
-                            self._merge_llm_with_db_payloads(
-                                llm_recs=[],
-                                payloads=chunk,
-                                faculty_name=faculty_name,
-                            ),
-                        )
-                    return "expl", {}
-
-            stage_outputs = dict(
-                parallel_map(
-                    ["recs", "expl"],
-                    max_workers=2,
-                    run_item=_run_stage,
-                )
-            )
-            recs = list(stage_outputs.get("recs") or [])
-            expl = dict(stage_outputs.get("expl") or {})
-            return recs, expl
-
-        chunk_outputs = parallel_map(
-            chunks,
-            max_workers=workers,
-            run_item=_run_chunk,
-        )
-        collected: List[FacultyOpportunityRec] = []
-        grant_explanations_by_opp: Dict[str, str] = {}
-        for merged, chunk_expl in chunk_outputs:
-            if merged:
-                collected.extend(merged)
-            if chunk_expl:
-                grant_explanations_by_opp.update(chunk_expl)
-
-        if collected:
-            collected = self._attach_grant_explanations_to_recs(
-                list(collected[:target_n]),
-                grant_explanations_by_opp=grant_explanations_by_opp,
-            )
-            return FacultyRecsOut(
-                faculty_name=faculty_name,
-                grant_explanation=self._top_grant_explanation_from_recs(collected),
-                recommendations=collected,
-            )
-
-        fallback_out = self._fallback_recommendations_from_payloads(
-            faculty_name=faculty_name,
-            opp_payloads=active_payloads,
-            k=target_n,
-        )
-        with_expl = self._attach_grant_explanations_to_recs(
-            list(fallback_out.recommendations or []),
-            grant_explanations_by_opp=grant_explanations_by_opp,
-        )
-        return fallback_out.model_copy(
-            update={
-                "grant_explanation": self._top_grant_explanation_from_recs(with_expl),
-                "recommendations": with_expl,
+        chain = self._build_grant_rerank_chain()
+        out = chain.invoke(
+            {
+                "faculty_json": faculty_json,
+                "grants_json": grants_json,
             }
         )
 
-    def _generate_faculty_recs_from_top_rows(
+        if isinstance(out, FacultyGrantRerankOut):
+            parsed = out
+        elif isinstance(out, dict):
+            parsed = FacultyGrantRerankOut.model_validate(out)
+        elif hasattr(out, "model_dump"):
+            parsed = FacultyGrantRerankOut.model_validate(out.model_dump())
+        else:
+            parsed = FacultyGrantRerankOut(ranked_opportunity_ids=[], reranked_grants=[])
+
+        base_by_id = {
+            self._norm(g.get("opportunity_id")): dict(g)
+            for g in grants
+            if self._norm(g.get("opportunity_id"))
+        }
+        score_by_id = {
+            self._norm(getattr(r, "opportunity_id", None)): float(getattr(r, "llm_score", 0.0))
+            for r in list(parsed.reranked_grants or [])
+            if self._norm(getattr(r, "opportunity_id", None))
+        }
+
+        ranked_ids = [self._norm(x) for x in list(parsed.ranked_opportunity_ids or []) if self._norm(x)]
+        if not ranked_ids:
+            ranked_ids = [
+                self._norm(getattr(r, "opportunity_id", None))
+                for r in list(parsed.reranked_grants or [])
+                if self._norm(getattr(r, "opportunity_id", None))
+            ]
+        if not ranked_ids:
+            ranked_ids = list(base_by_id.keys())
+
+        reranked_grants: List[Dict[str, Any]] = []
+        for oid in ranked_ids:
+            base = dict(base_by_id.get(oid) or {"opportunity_id": oid})
+            base["reranked_llm_score"] = float(score_by_id.get(oid, base.get("llm_score", 0.0) or 0.0))
+            reranked_grants.append(base)
+
+        grant_scores = {
+            self._norm(g.get("opportunity_id")): float(g.get("reranked_llm_score") or 0.0)
+            for g in list(reranked_grants or [])
+            if self._norm(g.get("opportunity_id"))
+        }
+
+        updated_rows = 0
+        if grant_scores:
+            with SessionLocal() as sess:
+                mdao = MatchDAO(sess)
+                updated_rows = mdao.update_llm_scores_for_faculty(
+                    faculty_id=int(faculty_id),
+                    grant_scores=grant_scores,
+                )
+                sess.commit()
+
+        logger.info(
+            "JUSTIFICATION_STEP rerank_done faculty_id=%s grants=%s updated_rows=%s",
+            int(faculty_id),
+            len(reranked_grants),
+            int(updated_rows),
+        )
+        return {
+            "faculty": inventory.get("faculty") or {},
+            "ranked_opportunity_ids": ranked_ids,
+            "reranked_grants": reranked_grants,
+            "updated_match_rows": int(updated_rows),
+            "rerank_raw": parsed.model_dump(),
+        }
+
+    def _invoke_final_one_match(
         self,
         *,
-        sess,
+        chain,
+        context_text: str,
+        one_match_payload: Dict[str, Any],
+        opportunity_id: str,
+    ) -> Dict[str, Any]:
+        """Invoke final justification LLM for a single grant-faculty match payload."""
+        def _fallback(text: str = "") -> Dict[str, Any]:
+            return {
+                "justification": str(text or "").strip() or "No match explanation generated.",
+            }
+
+        context_text = str(context_text or "")
+
+        try:
+            out = chain.invoke({"context_text": context_text})
+        except Exception:
+            logger.exception(
+                "LLM_CALL_FAILED[faculty_recommendations_one_match] meta=%s",
+                json.dumps({"opportunity_id": str(opportunity_id)}, ensure_ascii=False),
+            )
+            return _fallback()
+
+        if isinstance(out, str):
+            text = out
+        elif hasattr(out, "content"):
+            text = getattr(out, "content", "")
+        elif isinstance(out, dict):
+            text = out.get("text") or out.get("output") or json.dumps(out, ensure_ascii=False)
+        else:
+            text = str(out or "")
+        parsed = _fallback(text=self._norm(text))
+
+        return parsed
+
+    def _justification_pipeline(
+        self,
+        *,
         email: str,
-        fac: Faculty,
-        top_rows: List[Tuple[str, float, float]],
         k: int,
-        missing_payload_error: str,
-    ) -> FacultyRecsOut:
-        chain = self._build_chain()
-        fac_ctx, opp_payloads = self.context_generator.build_faculty_recommendation_payloads(
-            sess=sess,
-            fac=fac,
-            top_rows=top_rows,
-        )
-        if not opp_payloads:
-            raise ValueError(missing_payload_error)
+        preview_chars: int = 50_000,
+        specific_matches: Optional[List[Dict[str, Any]]] = None,
+        specific_opportunity_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Run the full justification pipeline and return merged per-grant outputs.
 
-        faculty_name = getattr(fac, "name", None) or email
-        grant_explanation_contexts = self.context_generator.build_opportunity_explanation_contexts(
-            sess=sess,
-            opportunity_ids=[
-                str(p.get("opportunity_id") or p.get("grant_id") or "").strip()
-                for p in (opp_payloads or [])
-            ],
-        )
+        Broad stages:
+        1) Build candidate grants (default rerank, provided matches, or one specific grant).
+        2) Generate grant explanations in parallel.
+        3) Generate final one-match justifications in parallel.
+        4) Merge and return a stable response payload for callers/scripts.
+        """
+        target_k = max(1, int(k))
+        email_norm = str(email or "").strip()
+        if not email_norm:
+            raise ValueError("email is required")
+        if specific_matches is not None and specific_opportunity_id is not None:
+            raise ValueError("Provide either specific_matches or specific_opportunity_id, not both.")
 
-        return self._build_recommendations_from_payloads(
-            chain=chain,
-            fac_ctx=fac_ctx,
-            opp_payloads=opp_payloads,
-            grant_explanation_contexts=grant_explanation_contexts,
-            faculty_name=faculty_name,
-            k=k,
-            batch_size=3,
+        logger.info(
+            "JUSTIFICATION_STEP combined_start email=%s k=%s mode=%s",
+            email_norm,
+            target_k,
+            "specific_grant"
+            if specific_opportunity_id is not None
+            else ("specific_matches" if specific_matches is not None else "default"),
         )
 
-    def run(self, *, email: str, k: int) -> FacultyRecsOut:
+        ranked_ids: List[str] = []
+        ordered_grants: List[Dict[str, Any]] = []
+        rerank_meta: Dict[str, Any] = {}
+
+        # Stage 1: pick/prepare grant candidates.
+        # Mode A: default full path (includes rerank stage)
+        if specific_matches is None and specific_opportunity_id is None:
+            rerank_out = self._rerank_top_grants_for_faculty(email=email_norm, k=target_k)
+            ranked_ids = [
+                self._norm(x) for x in list(rerank_out.get("ranked_opportunity_ids") or []) if self._norm(x)
+            ][:target_k]
+            reranked_grants = [dict(x or {}) for x in list(rerank_out.get("reranked_grants") or [])]
+            by_id = {
+                self._norm(g.get("opportunity_id")): dict(g)
+                for g in reranked_grants
+                if self._norm(g.get("opportunity_id"))
+            }
+            ordered_grants = [dict(by_id[oid]) for oid in ranked_ids if oid in by_id]
+            rerank_meta = {
+                "source": "reranked",
+                "ranked_opportunity_ids": ranked_ids,
+                "updated_match_rows": int(rerank_out.get("updated_match_rows") or 0),
+            }
+
+        # Mode B: explicit provided matches
+        elif specific_matches is not None:
+            provided = list(specific_matches or [])[:target_k]
+            for row in provided:
+                oid = self._norm((row or {}).get("opportunity_id") or (row or {}).get("grant_id"))
+                if not oid:
+                    continue
+                merged = dict(row or {})
+                merged["opportunity_id"] = oid
+                ordered_grants.append(merged)
+                ranked_ids.append(oid)
+            rerank_meta = {
+                "source": "provided_matches",
+                "ranked_opportunity_ids": ranked_ids,
+                "updated_match_rows": 0,
+            }
+
+        # Mode C: one specific grant
+        else:
+            oid = self._norm(specific_opportunity_id)
+            if not oid:
+                raise ValueError("specific_opportunity_id is required")
+            with SessionLocal() as sess:
+                fdao = FacultyDAO(sess)
+                mdao = MatchDAO(sess)
+                faculty_id = fdao.get_faculty_id_by_email(email_norm)
+                if not faculty_id:
+                    raise ValueError(f"No faculty found with email: {email_norm}")
+                pair_row = mdao.get_match_for_faculty_opportunity(
+                    faculty_id=int(faculty_id),
+                    opportunity_id=oid,
+                )
+                if not pair_row:
+                    raise ValueError(
+                        f"No match row found for faculty_id={faculty_id}, opportunity_id={oid}"
+                    )
+                payload = self.context_generator.build_top_match_payload(
+                    sess=sess,
+                    top_rows=[
+                        (
+                            oid,
+                            self._safe_float(pair_row.get("domain_score")),
+                            self._safe_float(pair_row.get("llm_score")),
+                        )
+                    ],
+                )
+            first = dict((payload or [{}])[0] or {})
+            first["opportunity_id"] = oid
+            ordered_grants = [first]
+            ranked_ids = [oid]
+            rerank_meta = {
+                "source": "specific_grant",
+                "ranked_opportunity_ids": ranked_ids,
+                "updated_match_rows": 0,
+            }
+
+        by_id = {
+            self._norm(g.get("opportunity_id")): dict(g)
+            for g in ordered_grants
+            if self._norm(g.get("opportunity_id"))
+        }
+
+        if not ordered_grants:
+            logger.info("JUSTIFICATION_STEP combined_done no_ranked_grants")
+            return {
+                "email": email_norm,
+                "k": target_k,
+                "rerank": rerank_meta,
+                "results": [],
+            }
+
+        explanation_map: Dict[str, str] = {}
+        expl_ids = [self._norm(x) for x in list(ranked_ids or []) if self._norm(x)]
+        # Stage 2: generate grant explanations concurrently.
+        if expl_ids:
+            expl_pool = resolve_pool_size(
+                max_workers=int(self.GRANT_EXPLANATION_WORKERS),
+                task_count=len(expl_ids),
+            )
+            logger.info(
+                "JUSTIFICATION_STEP grant_explanation_parallel_start jobs=%s workers=%s",
+                len(expl_ids),
+                expl_pool,
+            )
+
+            def _run_expl(oid: str) -> Dict[str, str]:
+                out = self._generate_grant_explanation(
+                    opportunity_id=oid,
+                    preview_chars=int(preview_chars),
+                )
+                return {
+                    "opportunity_id": oid,
+                    "grant_explanation": self._norm(out.get("grant_explanation")),
+                }
+
+            def _on_expl_error(_index: int, oid: str, exc: Exception) -> Dict[str, str]:
+                logger.exception(
+                    "GRANT_EXPLANATION_FAILED meta=%s error=%s",
+                    json.dumps({"opportunity_id": oid}, ensure_ascii=False),
+                    f"{type(exc).__name__}: {exc}",
+                )
+                return {"opportunity_id": oid, "grant_explanation": ""}
+
+            expl_rows = parallel_map(
+                expl_ids,
+                max_workers=expl_pool,
+                run_item=_run_expl,
+                on_error=_on_expl_error,
+            )
+            for row in list(expl_rows or []):
+                oid = self._norm((row or {}).get("opportunity_id"))
+                if not oid:
+                    continue
+                explanation_map[oid] = self._norm((row or {}).get("grant_explanation"))
+
+        logger.info(
+            "JUSTIFICATION_STEP combined_justification_stage_start grants=%s",
+            len(ordered_grants),
+        )
+        # Stage 3: build one-match final justifications concurrently.
+        top_rows: List[Tuple[str, float, float]] = []
+        for oid in ranked_ids:
+            row = dict(by_id.get(oid) or {})
+            top_rows.append(
+                (
+                    oid,
+                    self._safe_float(row.get("domain_score")),
+                    self._safe_float(row.get("reranked_llm_score", row.get("llm_score"))),
+                )
+            )
+
+        justifications_by_id: Dict[str, str] = {}
         with SessionLocal() as sess:
-            match_dao = MatchDAO(sess)
-            faculty_dao = FacultyDAO(sess)
-            fac = self._get_faculty_by_email(faculty_dao, email=email)
+            fdao = FacultyDAO(sess)
+            fac = fdao.get_with_relations_by_email(email_norm)
+            if not fac:
+                raise ValueError(f"No faculty found with email: {email_norm}")
 
-            rows = match_dao.top_matches_for_faculty(
-                faculty_id=fac.faculty_id,
-                k=k,
-            )
-            if not rows:
-                raise ValueError(f"No matches found for {fac.name} ({email}).")
-
-            return self._generate_faculty_recs_from_top_rows(
+            source_payload = self.context_generator.build_faculty_recommendation_source_linked_payload(
                 sess=sess,
-                email=email,
                 fac=fac,
-                top_rows=list(rows),
-                k=k,
-                missing_payload_error=(
-                    f"Top matches exist but opportunities are missing in DB for faculty {fac.faculty_id}. "
-                    "Re-fetch opportunities or rebuild match_results."
-                ),
+                top_rows=top_rows,
             )
+            opp_payloads = [dict(x or {}) for x in list(source_payload.get("opportunity_payloads") or [])]
+            opp_payload_by_id = {
+                self._norm(o.get("opportunity_id")): dict(o)
+                for o in list(opp_payloads or [])
+                if self._norm(o.get("opportunity_id"))
+            }
+            jobs: List[Dict[str, Any]] = []
+            for oid, domain_score, llm_score in top_rows:
+                one_match_payload = dict(opp_payload_by_id.get(oid) or by_id.get(oid) or {})
+                if not one_match_payload:
+                    logger.info(
+                        "JUSTIFICATION_STEP final_justification_skip_missing_payload opportunity_id=%s",
+                        oid,
+                    )
+                    justifications_by_id[oid] = ""
+                    continue
+                one_match_text = self.context_generator.build_faculty_recommendation_source_linked_text(
+                    sess=sess,
+                    fac=fac,
+                    top_rows=[(oid, self._safe_float(domain_score), self._safe_float(llm_score))],
+                )
+                jobs.append(
+                    {
+                        "opportunity_id": oid,
+                        "context_text": self._sanitize_context_text_for_final_llm(one_match_text),
+                        "payload": one_match_payload,
+                    }
+                )
+
+        if jobs:
+            pool_size = resolve_pool_size(
+                max_workers=int(self.FINAL_JUSTIFICATION_WORKERS),
+                task_count=len(jobs),
+            )
+            logger.info(
+                "JUSTIFICATION_STEP final_justification_parallel_start jobs=%s workers=%s",
+                len(jobs),
+                pool_size,
+            )
+            get_chain = build_thread_local_getter(self._build_final_justification_chain)
+
+            def _run_job(job: Dict[str, Any]) -> Dict[str, Any]:
+                oid = self._norm(job.get("opportunity_id"))
+                logger.info(
+                    "JUSTIFICATION_STEP final_justification_one_match_start opportunity_id=%s",
+                    oid,
+                )
+                parsed = self._invoke_final_one_match(
+                    chain=get_chain(),
+                    context_text=str(job.get("context_text") or ""),
+                    one_match_payload=dict(job.get("payload") or {}),
+                    opportunity_id=oid,
+                )
+                jtext = self._sanitize_final_justification_text(parsed.get("justification"))
+                return {
+                    "opportunity_id": oid,
+                    "justification": self._norm(jtext),
+                }
+
+            def _on_job_error(_index: int, job: Dict[str, Any], exc: Exception) -> Dict[str, Any]:
+                oid = self._norm((job or {}).get("opportunity_id"))
+                logger.exception(
+                    "JUSTIFICATION_STEP final_justification_one_match_failed opportunity_id=%s error=%s",
+                    oid,
+                    f"{type(exc).__name__}: {exc}",
+                )
+                return {"opportunity_id": oid, "justification": ""}
+
+            job_results = parallel_map(
+                jobs,
+                max_workers=pool_size,
+                run_item=_run_job,
+                on_error=_on_job_error,
+            )
+            for row in list(job_results or []):
+                oid = self._norm((row or {}).get("opportunity_id"))
+                text = self._norm((row or {}).get("justification"))
+                if oid:
+                    justifications_by_id[oid] = text
+                logger.info(
+                    "JUSTIFICATION_STEP final_justification_one_match_done opportunity_id=%s chars=%s",
+                    oid,
+                    len(text),
+                )
+
+        merged_results: List[Dict[str, Any]] = []
+        # Stage 4: merge all artifacts into final response rows.
+        for oid in ranked_ids:
+            grant_row = dict(by_id.get(oid) or {})
+            merged_results.append(
+                {
+                    "opportunity_id": oid,
+                    "title": grant_row.get("title") or grant_row.get("opportunity_title"),
+                    "agency": grant_row.get("agency") or grant_row.get("agency_name"),
+                    "domain_score": self._safe_float(grant_row.get("domain_score")),
+                    "llm_score": self._safe_float(
+                        grant_row.get("reranked_llm_score", grant_row.get("llm_score"))
+                    ),
+                    "grant_explanation": explanation_map.get(oid, ""),
+                    "justification": justifications_by_id.get(oid, ""),
+                }
+            )
+
+        logger.info(
+            "JUSTIFICATION_STEP combined_done results=%s",
+            len(merged_results),
+        )
+        return {
+            "email": email_norm,
+            "k": target_k,
+            "rerank": rerank_meta,
+            "results": merged_results,
+        }
+
+    def run(self, *, email: str, k: int, preview_chars: int = 50_000) -> Dict[str, Any]:
+        """Public entrypoint for the default end-to-end justification pipeline."""
+        return self._justification_pipeline(
+            email=email,
+            k=k,
+            preview_chars=preview_chars,
+        )
 
     def run_specific_matches(
         self,
@@ -516,92 +604,32 @@ class SingleJustificationGenerator:
         email: str,
         matches: List[Dict[str, Any]],
         k: int,
-    ) -> FacultyRecsOut:
-        """Generate recommendations for an explicit ordered match list (already filtered/ranked)."""
-        target_k = max(1, int(k))
-        top_matches = list(matches or [])[:target_k]
-        if not top_matches:
-            raise ValueError("No matches provided for recommendation generation.")
+    ) -> Dict[str, Any]:
+        """Public entrypoint when caller already has explicit match rows."""
+        logger.info(
+            "JUSTIFICATION_STEP run_specific_matches_start email=%s k=%s provided_matches=%s",
+            str(email or "").strip(),
+            max(1, int(k)),
+            len(list(matches or [])),
+        )
+        return self._justification_pipeline(
+            email=email,
+            k=k,
+            specific_matches=matches,
+        )
 
-        with SessionLocal() as sess:
-            faculty_dao = FacultyDAO(sess)
-            fac = self._get_faculty_by_email(faculty_dao, email=email)
-            top_rows = []
-            for m in top_matches:
-                opp_id = str(m.get("opportunity_id") or m.get("grant_id") or "").strip()
-                if not opp_id:
-                    continue
-                top_rows.append(
-                    (
-                        opp_id,
-                        float(m.get("domain_score") or 0.0),
-                        float(m.get("llm_score") or 0.0),
-                    )
-                )
-
-            if not top_rows:
-                raise ValueError("No valid opportunity IDs found in provided matches.")
-
-            return self._generate_faculty_recs_from_top_rows(
-                sess=sess,
-                email=email,
-                fac=fac,
-                top_rows=top_rows,
-                k=target_k,
-                missing_payload_error=(
-                    "Match rows exist but opportunity payloads are missing in DB for recommendation generation."
-                ),
-            )
-
-    def run_specific_grant(self, *, email: str, opportunity_id: str) -> FacultyRecsOut:
-        """Generate one-to-one justification for exactly one opportunity."""
-        opp_id = str(opportunity_id or "").strip()
-        if not opp_id:
+    def run_specific_grant(self, *, email: str, opportunity_id: str) -> Dict[str, Any]:
+        """Public entrypoint for one faculty + one explicitly provided grant id."""
+        oid = self._norm(opportunity_id)
+        if not oid:
             raise ValueError("opportunity_id is required")
-
-        chain = self._build_chain()
-
-        with SessionLocal() as sess:
-            match_dao = MatchDAO(sess)
-            faculty_dao = FacultyDAO(sess)
-            fac = self._get_faculty_by_email(faculty_dao, email=email)
-
-            pair_row = match_dao.get_match_for_faculty_opportunity(
-                faculty_id=int(fac.faculty_id),
-                opportunity_id=opp_id,
-            )
-            if not pair_row:
-                raise ValueError(
-                    f"No match row found for faculty_id={fac.faculty_id}, opportunity_id={opp_id}"
-                )
-
-            fac_ctx, opp_payloads = self.context_generator.build_faculty_recommendation_payloads(
-                sess=sess,
-                fac=fac,
-                top_rows=[
-                    (
-                        str(pair_row.get("grant_id") or opp_id),
-                        float(pair_row.get("domain_score") or 0.0),
-                        float(pair_row.get("llm_score") or 0.0),
-                    )
-                ],
-            )
-            if not opp_payloads:
-                raise ValueError(
-                    f"Match row exists but opportunity payload is missing for opportunity_id={opp_id}"
-                )
-            faculty_name = getattr(fac, "name", None) or email
-            grant_explanation_contexts = self.context_generator.build_opportunity_explanation_contexts(
-                sess=sess,
-                opportunity_ids=[opp_id],
-            )
-
-            return self._build_recommendations_from_payloads(
-                chain=chain,
-                fac_ctx=fac_ctx,
-                opp_payloads=opp_payloads[:1],
-                grant_explanation_contexts=grant_explanation_contexts,
-                faculty_name=faculty_name,
-                k=1,
-                batch_size=1,
-            )
+        logger.info(
+            "JUSTIFICATION_STEP run_specific_grant_start email=%s opportunity_id=%s",
+            str(email or "").strip(),
+            oid,
+        )
+        return self._justification_pipeline(
+            email=email,
+            k=1,
+            specific_opportunity_id=oid,
+        )

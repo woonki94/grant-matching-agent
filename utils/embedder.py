@@ -1,17 +1,21 @@
 from __future__ import annotations
 import numpy as np
-from typing import List, Optional
+from typing import Any, List, Optional
 
 from config import get_embedding_client
 
 
-def embed_texts(texts: List[str]) -> np.ndarray:
+def embed_texts(
+    texts: List[str],
+    *,
+    embedding_client: Optional[Any] = None,
+) -> np.ndarray:
     clean = [(t or "").strip() for t in texts]
     if not clean:
         return np.zeros((0, 0), dtype=np.float32)
 
-    embedding_client = get_embedding_client().build()
-    vecs = embedding_client.embed_documents(clean)
+    client = embedding_client or get_embedding_client().build()
+    vecs = client.embed_documents(clean)
 
     return np.array(vecs, dtype=np.float32)
 
@@ -23,12 +27,16 @@ def cosine_sim_matrix(A: np.ndarray, B: np.ndarray) -> np.ndarray:
     return A @ B.T
 
 
-def embed_domain_bucket(domains: List[str]) -> Optional[List[float]]:
+def embed_domain_bucket(
+    domains: List[str],
+    *,
+    embedding_client: Optional[Any] = None,
+) -> Optional[List[float]]:
     """Embed joined domain labels using the configured embedding client."""
     domains = [d.strip() for d in (domains or []) if d and str(d).strip()]
     if not domains:
         return None
-    emb = get_embedding_client().build()
+    emb = embedding_client or get_embedding_client().build()
     text = " ; ".join(domains)
     vec = emb.embed_query(text)
     return vec if vec else None

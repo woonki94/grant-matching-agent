@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
@@ -10,9 +11,217 @@ from db.models.opportunity import Opportunity
 from utils.content_extractor import load_extracted_content
 from utils.embedder import embed_texts
 
+WORD_RE = re.compile(r"[a-z0-9]+")
+STOP_WORDS = {
+    "a", "an", "and", "are", "as", "at", "be", "by", "for", "from", "in", "is", "it",
+    "of", "on", "or", "that", "the", "to", "with", "using", "use",
+}
+
 
 def _normalize_text(text: Any) -> str:
     return " ".join(str(text or "").split()).strip()
+
+
+def _normalize_text_lower(text: Any) -> str:
+    return _normalize_text(text).lower()
+
+
+def _tokenize_for_keyword_match(text: Any) -> List[str]:
+    tokens = [t for t in WORD_RE.findall(_normalize_text_lower(text)) if t]
+    return [t for t in tokens if t not in STOP_WORDS and len(t) > 2]
+
+
+def _query_match_score(*, query_text: str, chunk_text: str) -> float:
+    q_norm = _normalize_text_lower(query_text)
+    c_norm = _normalize_text_lower(chunk_text)
+    if not q_norm or not c_norm:
+        return 0.0
+
+    q_tokens = _tokenize_for_keyword_match(q_norm)
+    if not q_tokens:
+        return 0.0
+    c_tokens = set(_tokenize_for_keyword_match(c_norm))
+    if not c_tokens:
+        return 0.0
+
+    overlap = sum(1 for tok in q_tokens if tok in c_tokens)
+    overlap_ratio = float(overlap) / float(len(q_tokens))
+
+    phrase_bonus = 0.0
+    if q_norm in c_norm:
+        phrase_bonus = 0.30
+    elif len(q_tokens) >= 3:
+        first_phrase = " ".join(q_tokens[: min(5, len(q_tokens))])
+        if first_phrase and first_phrase in c_norm:
+            phrase_bonus = 0.15
+
+    score = overlap_ratio + phrase_bonus
+    return max(0.0, min(1.0, float(score)))
+
+
+def _score_block_against_spec_queries(
+    *,
+    block: Dict[str, Any],
+    spec_queries: List[Dict[str, Any]],
+) -> Tuple[float, Optional[Dict[str, Any]]]:
+    text = str(block.get("content") or "")
+    if not text.strip():
+        return 0.0, None
+    best_score = 0.0
+    best_meta: Optional[Dict[str, Any]] = None
+    for q in list(spec_queries or []):
+        q_text = str(q.get("text") or "").strip()
+        if not q_text:
+            continue
+        lexical = _query_match_score(query_text=q_text, chunk_text=text)
+        if lexical <= 0.0:
+            continue
+        coverage = float(q.get("coverage_score") or 0.0)
+        weighted = lexical * (0.65 + (0.35 * max(0.0, min(1.0, coverage))))
+        if weighted > best_score:
+            best_score = float(weighted)
+            best_meta = {
+                "text": q_text,
+                "section": str(q.get("section") or ""),
+                "idx": int(q.get("idx") or 0),
+                "coverage_score": float(round(coverage, 6)),
+                "lexical_score": float(round(lexical, 6)),
+            }
+    return best_score, best_meta
+
+
+def _build_source_key(block: Dict[str, Any], *, use_title: bool) -> str:
+    url = str(block.get("url") or "").strip()
+    title = str(block.get("title") or "").strip() if use_title else ""
+    key = f"{url}||{title}".strip("|")
+    if key:
+        return key
+    return f"row:{int(block.get('id') or 0)}"
+
+
+def _rank_blocks_by_specializations(
+    *,
+    blocks: List[Dict[str, Any]],
+    spec_queries: List[Dict[str, Any]],
+    top_k_per_source: int,
+    max_total: int,
+    min_score: float,
+    use_title_in_source_key: bool,
+) -> List[Dict[str, Any]]:
+    grouped: Dict[str, List[Dict[str, Any]]] = {}
+    for block in list(blocks or []):
+        score, match_meta = _score_block_against_spec_queries(
+            block=block,
+            spec_queries=spec_queries,
+        )
+        if score < float(min_score):
+            continue
+        row = dict(block)
+        row["specialization_match_score"] = float(round(score, 6))
+        if match_meta:
+            row["matched_specialization"] = match_meta
+        key = _build_source_key(row, use_title=use_title_in_source_key)
+        grouped.setdefault(key, []).append(row)
+
+    picked: List[Dict[str, Any]] = []
+    per_source = max(1, int(top_k_per_source or 1))
+    for _, rows in grouped.items():
+        rows.sort(
+            key=lambda b: (
+                float(b.get("specialization_match_score") or 0.0),
+                -int(b.get("chunk_index") or 0),
+            ),
+            reverse=True,
+        )
+        picked.extend(rows[:per_source])
+
+    picked.sort(
+        key=lambda b: float(b.get("specialization_match_score") or 0.0),
+        reverse=True,
+    )
+    safe_total = max(0, int(max_total or 0))
+    if safe_total > 0:
+        return picked[:safe_total]
+    return picked
+
+
+def retrieve_opportunity_supporting_chunks_by_specializations(
+    opp: Opportunity,
+    *,
+    specialization_queries: List[Dict[str, Any]],
+    top_k_per_additional_source: int = 2,
+    top_k_per_attachment_source: int = 2,
+    max_total_additional_chunks: int = 8,
+    max_total_attachment_chunks: int = 8,
+    min_score: float = 0.10,
+) -> Dict[str, Any]:
+    additional_rows = list(getattr(opp, "additional_info", None) or [])
+    attachment_rows = list(getattr(opp, "attachments", None) or [])
+
+    additional_blocks = load_extracted_content(
+        additional_rows,
+        url_attr="additional_info_url",
+        group_chunks=False,
+        include_row_meta=True,
+    )
+    attachment_blocks = load_extracted_content(
+        attachment_rows,
+        url_attr="file_download_path",
+        title_attr="file_name",
+        group_chunks=False,
+        include_row_meta=True,
+    )
+
+    additional_ranked = _rank_blocks_by_specializations(
+        blocks=additional_blocks,
+        spec_queries=list(specialization_queries or []),
+        top_k_per_source=top_k_per_additional_source,
+        max_total=max_total_additional_chunks,
+        min_score=min_score,
+        use_title_in_source_key=False,
+    )
+    attachment_ranked = _rank_blocks_by_specializations(
+        blocks=attachment_blocks,
+        spec_queries=list(specialization_queries or []),
+        top_k_per_source=top_k_per_attachment_source,
+        max_total=max_total_attachment_chunks,
+        min_score=min_score,
+        use_title_in_source_key=True,
+    )
+    return {
+        "specialization_queries": list(specialization_queries or []),
+        "additional_info_chunks": additional_ranked,
+        "attachment_chunks": attachment_ranked,
+    }
+
+
+def retrieve_faculty_additional_info_chunks_by_specializations(
+    fac: Faculty,
+    *,
+    specialization_queries: List[Dict[str, Any]],
+    top_k_per_source: int = 2,
+    max_total_chunks: int = 8,
+    min_score: float = 0.10,
+) -> Dict[str, Any]:
+    rows: List[FacultyAdditionalInfo] = list(getattr(fac, "additional_info", None) or [])
+    blocks = load_extracted_content(
+        rows,
+        url_attr="additional_info_url",
+        group_chunks=False,
+        include_row_meta=True,
+    )
+    ranked = _rank_blocks_by_specializations(
+        blocks=blocks,
+        spec_queries=list(specialization_queries or []),
+        top_k_per_source=top_k_per_source,
+        max_total=max_total_chunks,
+        min_score=min_score,
+        use_title_in_source_key=False,
+    )
+    return {
+        "specialization_queries": list(specialization_queries or []),
+        "additional_info_chunks": ranked,
+    }
 
 
 def _to_vector(value: Any) -> Optional[np.ndarray]:

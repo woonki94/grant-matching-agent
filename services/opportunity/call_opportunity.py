@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import logging
 from typing import List, Optional, Dict, Any
 import requests
 from requests.adapters import HTTPAdapter, Retry
 
 from config import settings, Grant_API_KEY
+from utils.thread_pool import parallel_map, resolve_pool_size
 
 # Request DTOs
 from dto.opportunity_request_dto import (
@@ -126,6 +128,7 @@ class OpportunitySearchService:
         agencies: Optional[List[str]] = None,
         q: Optional[str] = None,
         include_files: bool = True,
+        fetch_workers: int = 8,
     ) -> List[OpportunityDTO]:
         # Exact-by-id path: retrieve full detail payload and map to one DTO.
         if opportunity_id:
@@ -146,12 +149,28 @@ class OpportunitySearchService:
         search_payload = self.search_opportunities(req)
         opportunities: List[OpportunityDTO] = map_portal_search_response(search_payload)
 
-        if include_files:
-            for opp in opportunities:
+        if include_files and opportunities:
+            logger = logging.getLogger(__name__)
+            pool_size = resolve_pool_size(max_workers=fetch_workers, task_count=len(opportunities))
+
+            def _load_attachments(opp: OpportunityDTO) -> OpportunityDTO:
                 try:
                     attachments = self.fetch_opportunity_detail(opp.opportunity_id)
                     opp.attachments = map_portal_attachments_response(attachments)
-                except Exception:
+                except Exception as exc:
+                    logger.warning(
+                        "Attachment enrichment failed for opportunity_id=%s: %s",
+                        opp.opportunity_id,
+                        exc,
+                    )
                     opp.attachments = opp.attachments or []
+                return opp
+
+            opportunities = parallel_map(
+                opportunities,
+                max_workers=pool_size,
+                run_item=_load_attachments,
+                on_error=lambda _i, opp, _e: opp,
+            )
 
         return opportunities

@@ -19,7 +19,7 @@ logger = logging.getLogger(__name__)
 class FacultyGrantMatcher:
     """One-to-one faculty↔grant matcher using cross-encoder specialization coverage."""
 
-    DEFAULT_COVERED_THRESHOLD = 0.40
+    DEFAULT_COVERED_THRESHOLD = 0.30
 
     def __init__(
         self,
@@ -94,14 +94,15 @@ class FacultyGrantMatcher:
         missing: Dict[str, List[int]] = {"application": [], "research": []}
 
         evidence_sections: Dict[str, Dict[str, Dict[str, Any]]] = {"application": {}, "research": {}}
-        weighted_sum = 0.0
-        total_weight = 0.0
+        weighted_pair_sum = 0.0
+        total_pair_weight = 0.0
+        pair_count = 0
 
         for sec in ("application", "research"):
             req_rows = list(requirements.get(sec) or [])
             fac_rows = list(faculty_specs.get(sec) or [])
 
-            best_by_req: Dict[int, Tuple[float, Optional[int]]] = {}
+            pair_scores_by_req: Dict[int, List[Tuple[int, float]]] = {}
             if req_rows and fac_rows:
                 pairs: List[Tuple[str, str]] = []
                 pair_index_meta: List[Tuple[int, int]] = []
@@ -119,37 +120,54 @@ class FacultyGrantMatcher:
 
                 pair_scores = self.spec_scorer.score_pairs(pairs)
                 for (req_idx, fac_idx), score in zip(pair_index_meta, pair_scores):
-                    prev = best_by_req.get(req_idx)
-                    if prev is None or float(score) > float(prev[0]):
-                        best_by_req[req_idx] = (float(score), int(fac_idx))
+                    score_val = max(0.0, min(1.0, float(score)))
+                    pair_scores_by_req.setdefault(req_idx, []).append((int(fac_idx), score_val))
 
             for req in req_rows:
                 req_idx = int(req["idx"])
+                req_text = str(req.get("text") or "").strip()
                 weight = self._safe_weight(req.get("weight", 1.0))
-                best_score, best_fac_idx = best_by_req.get(req_idx, (0.0, None))
-                c = max(0.0, min(1.0, float(best_score)))
+                req_pair_scores = list(pair_scores_by_req.get(req_idx) or [])
 
-                if weight > 0.0:
-                    weighted_sum += float(weight) * c
-                    total_weight += float(weight)
+                if req_pair_scores:
+                    c = sum(float(s) for _, s in req_pair_scores) / float(len(req_pair_scores))
+                else:
+                    c = 0.0
 
                 if c >= float(covered_threshold):
                     covered[sec][str(req_idx)] = float(round(c, 6))
                 else:
                     missing[sec].append(int(req_idx))
 
+                if weight > 0.0 and req_pair_scores:
+                    for _, score_val in req_pair_scores:
+                        weighted_pair_sum += float(weight) * float(score_val)
+                        total_pair_weight += float(weight)
+                        pair_count += 1
+
                 evidence_sections[sec][str(req_idx)] = {
+                    "text": req_text,
+                    "weight": float(round(weight, 6)),
                     "score": float(round(c, 6)),
-                    "best_faculty_spec_idx": int(best_fac_idx) if best_fac_idx is not None else None,
+                    "pair_count": int(len(req_pair_scores)),
+                    "pair_scores": [
+                        {
+                            "fac_spec_idx": int(fac_idx),
+                            "fac_spec": str(fac_rows[fac_idx]) if 0 <= fac_idx < len(fac_rows) else "",
+                            "score": float(round(score_val, 6)),
+                        }
+                        for fac_idx, score_val in req_pair_scores
+                    ],
                 }
 
-        spec_score = (weighted_sum / total_weight) if total_weight > 0.0 else 0.0
+        spec_score = (weighted_pair_sum / total_pair_weight) if total_pair_weight > 0.0 else 0.0
         evidence = {
-            "method": "cross_encoder_spec_coverage",
+            "method": "cross_encoder_pairwise_weighted_average",
             "model_dir": self.spec_scorer.resolved_model_dir,
             "score_summary": {
-                "weighted_sum": float(round(weighted_sum, 6)),
-                "total_weight": float(round(total_weight, 6)),
+                "weighted_pair_sum": float(round(weighted_pair_sum, 6)),
+                "total_pair_weight": float(round(total_pair_weight, 6)),
+                "pair_count": int(pair_count),
                 "normalized_score": float(round(spec_score, 6)),
             },
             "sections": evidence_sections,
@@ -169,17 +187,32 @@ class FacultyGrantMatcher:
         domain_sim: float,
         spec_score_payload: Dict[str, Any],
     ) -> Dict[str, Any]:
+        cross_score = float(spec_score_payload.get("llm_score") or 0.0)
+        cross_score = max(0.0, min(1.0, cross_score))
+
+        domain_score_for_penalty = float(domain_sim)
+        domain_score_for_penalty = max(0.0, min(1.0, domain_score_for_penalty))
+
+        final_score = float(round(cross_score * domain_score_for_penalty, 6))
+
+        evidence = dict(spec_score_payload.get("evidence") or {})
+        score_summary = dict(evidence.get("score_summary") or {})
+        score_summary["cross_score"] = float(round(cross_score, 6))
+        score_summary["domain_similarity"] = float(round(domain_score_for_penalty, 6))
+        score_summary["final_score"] = float(round(final_score, 6))
+        evidence["score_summary"] = score_summary
+
         return {
             "grant_id": str(grant_id),
             "faculty_id": int(faculty_id),
             "domain_score": float(domain_sim),
             # Kept as llm_score column for compatibility with existing readers.
-            "llm_score": float(spec_score_payload.get("llm_score") or 0.0),
+            "llm_score": final_score,
             # Reason generation is intentionally removed in cross-encoder mode.
             "reason": "",
             "covered": spec_score_payload.get("covered") or {"application": {}, "research": {}},
             "missing": spec_score_payload.get("missing") or {"application": [], "research": []},
-            "evidence": spec_score_payload.get("evidence") or {},
+            "evidence": evidence,
         }
 
     def _build_rows_for_faculty_candidates(
@@ -405,19 +438,3 @@ class FacultyGrantMatcher:
                 match_dao.upsert_matches(out_rows)
                 sess.commit()
             return len(out_rows)
-
-    def run_for_opp(
-        self,
-        *,
-        opportunity_id: str,
-        faculty_ids: Optional[List[int]] = None,
-        k: int = 200,
-        min_domain: float = 0.30,
-    ) -> int:
-        """Compatibility alias. Use run_for_opportunity for new code."""
-        return self.run_for_opportunity(
-            opportunity_id=opportunity_id,
-            faculty_ids=faculty_ids,
-            k=k,
-            min_domain=min_domain,
-        )

@@ -468,7 +468,12 @@ class MatchingExecutionAgent:
                     matches=out,
                     k=requested_k,
                 )
-                recommendation = rec_out.model_dump()
+                if hasattr(rec_out, "model_dump"):
+                    recommendation = rec_out.model_dump()
+                elif isinstance(rec_out, dict):
+                    recommendation = rec_out
+                else:
+                    recommendation = {"raw_output": str(rec_out)}
             except Exception as e:
                 recommendation_error = f"{type(e).__name__}: {e}"
 
@@ -636,7 +641,12 @@ class MatchingExecutionAgent:
                 email=email,
                 opportunity_id=opp_id,
             )
-            out["recommendation"] = rec_out.model_dump()
+            if hasattr(rec_out, "model_dump"):
+                out["recommendation"] = rec_out.model_dump()
+            elif isinstance(rec_out, dict):
+                out["recommendation"] = rec_out
+            else:
+                out["recommendation"] = {"raw_output": str(rec_out)}
             out["grant_explanation"] = self._extract_grant_explanation(out["recommendation"])
             out["recommendation_error"] = None
             out["justification_source"] = "specific_grant_llm"

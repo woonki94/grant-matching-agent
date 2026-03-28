@@ -243,7 +243,7 @@ class MatchDAO:
         row = self.session.execute(
             text(
                 """
-                SELECT grant_id, faculty_id, domain_score, llm_score, covered, missing, reason
+                SELECT grant_id, faculty_id, domain_score, llm_score, covered, missing, reason, evidence
                 FROM match_results
                 WHERE faculty_id = :faculty_id AND grant_id = :opportunity_id
                 LIMIT 1
@@ -256,16 +256,21 @@ class MatchDAO:
         ).mappings().first()
         return dict(row) if row else None
 
-    def list_matches_for_opportunity(self, opportunity_id: str, limit: int = 200):
+    def list_matches_for_opportunity(self, opportunity_id: str, limit: Optional[int] = 200):
         """List stored faculty match rows for a given opportunity, ordered by llm_score DESC."""
-        q = text("""
-            SELECT faculty_id, domain_score, llm_score, reason, covered, missing
+        base_sql = """
+            SELECT faculty_id, domain_score, llm_score, reason, covered, missing, evidence
             FROM match_results
             WHERE grant_id = :oid
             ORDER BY llm_score DESC, domain_score DESC
-            LIMIT :lim
-        """)
-        rows = self.session.execute(q, {"oid": opportunity_id, "lim": limit}).mappings().all()
+        """
+        params = {"oid": opportunity_id}
+        if limit is not None and int(limit) > 0:
+            q = text(base_sql + "\nLIMIT :lim")
+            params["lim"] = int(limit)
+        else:
+            q = text(base_sql)
+        rows = self.session.execute(q, params).mappings().all()
         return [dict(r) for r in rows]
 
     def list_matches_for_opportunity_by_faculty_ids(
@@ -330,3 +335,38 @@ class MatchDAO:
             q = q.limit(limit)
 
         return [row.grant_id for row in q.all()]
+
+    def update_llm_scores_for_faculty(
+        self,
+        *,
+        faculty_id: int,
+        grant_scores: Dict[str, float],
+    ) -> int:
+        """Update llm_score for existing (faculty_id, grant_id) rows only."""
+        if not grant_scores:
+            return 0
+
+        updated = 0
+        stmt = text(
+            """
+            UPDATE match_results
+            SET llm_score = :llm_score
+            WHERE faculty_id = :faculty_id
+              AND grant_id = :grant_id
+            """
+        )
+        for grant_id, score in list(grant_scores.items()):
+            gid = str(grant_id or "").strip()
+            if not gid:
+                continue
+            llm_score = float(score or 0.0)
+            self.session.execute(
+                stmt,
+                {
+                    "faculty_id": int(faculty_id),
+                    "grant_id": gid,
+                    "llm_score": llm_score,
+                },
+            )
+            updated += 1
+        return updated

@@ -7,13 +7,12 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from services.matching.faculty_grant_matcher import (
-    FacultyGrantMatcher
-)
+from services.matching.faculty_grant_matcher import FacultyGrantMatcher
 
-def main(k: int, min_domain: float, limit_faculty: int, commit_every: int = 30):
+
+def main(k: int, min_domain: float, limit_faculty: int, commit_every: int = 30) -> int:
     service = FacultyGrantMatcher()
-    service.run(
+    return service.run(
         k=k,
         min_domain=min_domain,
         limit_faculty=limit_faculty,
@@ -22,16 +21,19 @@ def main(k: int, min_domain: float, limit_faculty: int, commit_every: int = 30):
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Legacy entrypoint. Use faculty_grant_matcher.py.")
-    parser.add_argument("--k", type=int, default=10)
-    parser.add_argument("--min-domain", type=float, default=0.30)
+    parser = argparse.ArgumentParser(
+        description="Run one-to-one faculty-grant matching."
+    )
+    parser.add_argument("--k", type=int, default=100)
+    parser.add_argument("--min-domain", type=float, default=0.0)
     parser.add_argument("--limit-faculty", type=int, default=100)
     parser.add_argument("--commit-every", type=int, default=30)
     args = parser.parse_args()
 
-    main(
+    processed = main(
         k=args.k,
         min_domain=args.min_domain,
         limit_faculty=args.limit_faculty,
         commit_every=args.commit_every,
     )
+    print(f"Matching completed. Faculty processed: {processed}")
