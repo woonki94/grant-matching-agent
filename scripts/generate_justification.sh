@@ -7,7 +7,7 @@ cd "$PROJECT_ROOT"
 
 print_usage() {
   cat <<'EOF'
-Generate combined output (rerank + grant explanation + final justification) for one faculty.
+Generate combined output (grant explanation + final justification) for one faculty.
 
 Usage:
   ./scripts/generate_justification.sh [email] [k]

@@ -90,7 +90,7 @@ class ContextGenerator:
         faculty_id: int,
         k: int = 10,
     ) -> Dict[str, Any]:
-        return self.justification.build_rerank_keyword_inventory_for_faculty(
+        return self.matching.build_rerank_keyword_inventory_for_faculty(
             sess=sess,
             faculty_id=faculty_id,
             k=k,
@@ -147,7 +147,7 @@ class ContextGenerator:
         return self.matching.build_top_match_payload(sess=sess, top_rows=top_rows)
 
     # ==============================
-    # Recommendation Context
+    # Justification Context
     # ==============================
     def build_faculty_recommendation_payloads(
         self,

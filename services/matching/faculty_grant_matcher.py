@@ -9,6 +9,7 @@ from dao.match_dao import MatchDAO
 from dao.opportunity_dao import OpportunityDAO
 from db.db_conn import SessionLocal
 from db.models.faculty import Faculty
+from services.matching.single_match_llm_reranker import OneToOneLLMReranker
 from services.matching.specialization_cross_encoder import SpecializationCrossEncoderScorer
 from sqlalchemy.orm import selectinload
 from utils.keyword_utils import extract_specializations
@@ -26,9 +27,11 @@ class FacultyGrantMatcher:
         *,
         session_factory=SessionLocal,
         spec_scorer: Optional[SpecializationCrossEncoderScorer] = None,
+        llm_reranker: Optional[OneToOneLLMReranker] = None,
     ):
         self.session_factory = session_factory
         self.spec_scorer = spec_scorer or SpecializationCrossEncoderScorer()
+        self.llm_reranker = llm_reranker or OneToOneLLMReranker(session_factory=session_factory)
 
     @staticmethod
     def _safe_weight(value: Any) -> float:
@@ -78,7 +81,7 @@ class FacultyGrantMatcher:
                     {
                         "idx": int(idx),
                         "text": text,
-                        "weight": self._safe_weight(item.get("w", 1.0)),
+                        "weight": self._safe_weight(item.get("w", 0.0)),
                     }
                 )
         return out
@@ -278,6 +281,56 @@ class FacultyGrantMatcher:
             )
         return out_rows
 
+    @staticmethod
+    def _extract_reranked_scores(rerank_result: Dict[str, Any]) -> Dict[str, float]:
+        scores: Dict[str, float] = {}
+        for row in list((rerank_result or {}).get("reranked_grants") or []):
+            oid = str((row or {}).get("opportunity_id") or "").strip()
+            if not oid:
+                continue
+            try:
+                scores[oid] = float((row or {}).get("llm_score") or 0.0)
+            except Exception:
+                continue
+        return scores
+
+    def _apply_reranked_scores_for_faculty(
+        self,
+        *,
+        sess,
+        match_dao: MatchDAO,
+        faculty_id: int,
+    ) -> int:
+        try:
+            rerank_result = self.llm_reranker.rerank_for_faculty(faculty_id=int(faculty_id))
+        except Exception as exc:
+            logger.exception(
+                "LLM reranker failed for faculty_id=%s: %s",
+                int(faculty_id),
+                f"{type(exc).__name__}: {exc}",
+            )
+            return 0
+
+        grant_scores = self._extract_reranked_scores(rerank_result)
+        if not grant_scores:
+            logger.info(
+                "LLM reranker returned no scores for faculty_id=%s status=%s",
+                int(faculty_id),
+                str((rerank_result or {}).get("status") or ""),
+            )
+            return 0
+
+        updated = match_dao.update_llm_scores_for_faculty(
+            faculty_id=int(faculty_id),
+            grant_scores=grant_scores,
+        )
+        logger.info(
+            "Applied LLM reranked scores for faculty_id=%s updated_rows=%s",
+            int(faculty_id),
+            int(updated),
+        )
+        return int(updated)
+
     def run(
         self,
         *,
@@ -317,6 +370,13 @@ class FacultyGrantMatcher:
 
                 if out_rows:
                     match_dao.upsert_matches(out_rows)
+                    # Commit first so reranker (separate session) can read the fresh rows.
+                    sess.commit()
+                    self._apply_reranked_scores_for_faculty(
+                        sess=sess,
+                        match_dao=match_dao,
+                        faculty_id=int(fac.faculty_id),
+                    )
 
                 processed += 1
                 if commit_every and processed % commit_every == 0:
@@ -366,6 +426,13 @@ class FacultyGrantMatcher:
 
             if out_rows:
                 match_dao.upsert_matches(out_rows)
+                # Commit first so reranker (separate session) can read the fresh rows.
+                sess.commit()
+                self._apply_reranked_scores_for_faculty(
+                    sess=sess,
+                    match_dao=match_dao,
+                    faculty_id=int(faculty_id),
+                )
                 sess.commit()
 
             return len(out_rows)
@@ -436,5 +503,14 @@ class FacultyGrantMatcher:
 
             if out_rows:
                 match_dao.upsert_matches(out_rows)
+                # Commit first so reranker (separate session) can read the fresh rows.
+                sess.commit()
+                rerank_faculty_ids = sorted({int(row.get("faculty_id")) for row in out_rows if row.get("faculty_id") is not None})
+                for fid in rerank_faculty_ids:
+                    self._apply_reranked_scores_for_faculty(
+                        sess=sess,
+                        match_dao=match_dao,
+                        faculty_id=int(fid),
+                    )
                 sess.commit()
             return len(out_rows)

@@ -10,11 +10,10 @@ from dao.faculty_dao import FacultyDAO
 from dao.match_dao import MatchDAO
 from db.db_conn import SessionLocal
 from db.models.faculty import Faculty
-from dto.llm_response_dto import FacultyGrantRerankOut, GrantExplanationOut
+from dto.llm_response_dto import GrantExplanationOut
 from services.context_retrieval.context_generator import ContextGenerator
 from services.prompts.justification_prompts import (
     FACULTY_RECS_PROMPT,
-    FACULTY_TOP_GRANT_RERANK_PROMPT,
     GRANT_EXPLANATION_PROMPT,
 )
 from utils.thread_pool import build_thread_local_getter, parallel_map, resolve_pool_size
@@ -27,7 +26,6 @@ class SingleJustificationGenerator:
 
     Supported flows:
     - Grant explanation from grant context
-    - Faculty top-k grant rerank (email -> faculty_id -> top-k grants -> save reranked llm_score)
     - Final recommendation generation: one match == one LLM call, append all results
     """
     FINAL_JUSTIFICATION_WORKERS = 8
@@ -86,13 +84,6 @@ class SingleJustificationGenerator:
         return GRANT_EXPLANATION_PROMPT | llm.with_structured_output(GrantExplanationOut)
 
     @staticmethod
-    def _build_grant_rerank_chain():
-        """Build the structured-output LLM chain used to rerank top grants for a faculty."""
-        model_id = (settings.sonnet or settings.haiku or settings.opus or "").strip()
-        llm = get_llm_client(model_id=model_id).build()
-        return FACULTY_TOP_GRANT_RERANK_PROMPT | llm.with_structured_output(FacultyGrantRerankOut)
-
-    @staticmethod
     def _build_final_justification_chain():
         """Build the free-form LLM chain for final one-match justification writing."""
         model_id = (settings.opus or settings.sonnet or settings.haiku or "").strip()
@@ -136,107 +127,41 @@ class SingleJustificationGenerator:
             "grant_explanation": explanation,
         }
 
-    def _rerank_top_grants_for_faculty(
+    def _load_top_grants_for_faculty(
         self,
         *,
         email: str,
         k: int = 10,
     ) -> Dict[str, Any]:
-        """Rerank faculty top-k grants and persist reranked llm_score into match rows."""
+        """Load stored top-k grant matches for a faculty (no reranking)."""
         target_k = max(1, int(k))
-        logger.info(
-            "JUSTIFICATION_STEP rerank_start email=%s k=%s",
-            str(email or "").strip(),
-            target_k,
-        )
         with SessionLocal() as sess:
             fdao = FacultyDAO(sess)
+            mdao = MatchDAO(sess)
             faculty_id = fdao.get_faculty_id_by_email(str(email or "").strip())
             if not faculty_id:
                 raise ValueError(f"No faculty found with email: {email}")
 
-            inventory = self.context_generator.build_rerank_keyword_inventory_for_faculty(
+            top_rows = mdao.top_matches_for_faculty(int(faculty_id), k=target_k)
+            payload = self.context_generator.build_top_match_payload(
                 sess=sess,
-                faculty_id=int(faculty_id),
-                k=target_k,
+                top_rows=[(str(oid), float(d), float(l)) for (oid, d, l) in list(top_rows or [])],
             )
 
-        faculty_json = json.dumps(dict(inventory.get("faculty") or {}), ensure_ascii=False)
-        grants = [dict(x or {}) for x in list(inventory.get("grants") or [])]
-        grants_json = json.dumps(grants, ensure_ascii=False)
+        ranked_ids: List[str] = []
+        ordered_grants: List[Dict[str, Any]] = []
+        for row in list(payload or []):
+            merged = dict(row or {})
+            oid = self._norm(merged.get("opportunity_id") or merged.get("grant_id"))
+            if not oid:
+                continue
+            merged["opportunity_id"] = oid
+            ordered_grants.append(merged)
+            ranked_ids.append(oid)
 
-        chain = self._build_grant_rerank_chain()
-        out = chain.invoke(
-            {
-                "faculty_json": faculty_json,
-                "grants_json": grants_json,
-            }
-        )
-
-        if isinstance(out, FacultyGrantRerankOut):
-            parsed = out
-        elif isinstance(out, dict):
-            parsed = FacultyGrantRerankOut.model_validate(out)
-        elif hasattr(out, "model_dump"):
-            parsed = FacultyGrantRerankOut.model_validate(out.model_dump())
-        else:
-            parsed = FacultyGrantRerankOut(ranked_opportunity_ids=[], reranked_grants=[])
-
-        base_by_id = {
-            self._norm(g.get("opportunity_id")): dict(g)
-            for g in grants
-            if self._norm(g.get("opportunity_id"))
-        }
-        score_by_id = {
-            self._norm(getattr(r, "opportunity_id", None)): float(getattr(r, "llm_score", 0.0))
-            for r in list(parsed.reranked_grants or [])
-            if self._norm(getattr(r, "opportunity_id", None))
-        }
-
-        ranked_ids = [self._norm(x) for x in list(parsed.ranked_opportunity_ids or []) if self._norm(x)]
-        if not ranked_ids:
-            ranked_ids = [
-                self._norm(getattr(r, "opportunity_id", None))
-                for r in list(parsed.reranked_grants or [])
-                if self._norm(getattr(r, "opportunity_id", None))
-            ]
-        if not ranked_ids:
-            ranked_ids = list(base_by_id.keys())
-
-        reranked_grants: List[Dict[str, Any]] = []
-        for oid in ranked_ids:
-            base = dict(base_by_id.get(oid) or {"opportunity_id": oid})
-            base["reranked_llm_score"] = float(score_by_id.get(oid, base.get("llm_score", 0.0) or 0.0))
-            reranked_grants.append(base)
-
-        grant_scores = {
-            self._norm(g.get("opportunity_id")): float(g.get("reranked_llm_score") or 0.0)
-            for g in list(reranked_grants or [])
-            if self._norm(g.get("opportunity_id"))
-        }
-
-        updated_rows = 0
-        if grant_scores:
-            with SessionLocal() as sess:
-                mdao = MatchDAO(sess)
-                updated_rows = mdao.update_llm_scores_for_faculty(
-                    faculty_id=int(faculty_id),
-                    grant_scores=grant_scores,
-                )
-                sess.commit()
-
-        logger.info(
-            "JUSTIFICATION_STEP rerank_done faculty_id=%s grants=%s updated_rows=%s",
-            int(faculty_id),
-            len(reranked_grants),
-            int(updated_rows),
-        )
         return {
-            "faculty": inventory.get("faculty") or {},
             "ranked_opportunity_ids": ranked_ids,
-            "reranked_grants": reranked_grants,
-            "updated_match_rows": int(updated_rows),
-            "rerank_raw": parsed.model_dump(),
+            "grants": ordered_grants,
         }
 
     def _invoke_final_one_match(
@@ -288,7 +213,7 @@ class SingleJustificationGenerator:
         """Run the full justification pipeline and return merged per-grant outputs.
 
         Broad stages:
-        1) Build candidate grants (default rerank, provided matches, or one specific grant).
+        1) Build candidate grants (stored top matches, provided matches, or one specific grant).
         2) Generate grant explanations in parallel.
         3) Generate final one-match justifications in parallel.
         4) Merge and return a stable response payload for callers/scripts.
@@ -314,13 +239,13 @@ class SingleJustificationGenerator:
         rerank_meta: Dict[str, Any] = {}
 
         # Stage 1: pick/prepare grant candidates.
-        # Mode A: default full path (includes rerank stage)
+        # Mode A: default path (uses stored top matches only)
         if specific_matches is None and specific_opportunity_id is None:
-            rerank_out = self._rerank_top_grants_for_faculty(email=email_norm, k=target_k)
+            rerank_out = self._load_top_grants_for_faculty(email=email_norm, k=target_k)
             ranked_ids = [
                 self._norm(x) for x in list(rerank_out.get("ranked_opportunity_ids") or []) if self._norm(x)
             ][:target_k]
-            reranked_grants = [dict(x or {}) for x in list(rerank_out.get("reranked_grants") or [])]
+            reranked_grants = [dict(x or {}) for x in list(rerank_out.get("grants") or [])]
             by_id = {
                 self._norm(g.get("opportunity_id")): dict(g)
                 for g in reranked_grants
@@ -328,9 +253,8 @@ class SingleJustificationGenerator:
             }
             ordered_grants = [dict(by_id[oid]) for oid in ranked_ids if oid in by_id]
             rerank_meta = {
-                "source": "reranked",
+                "source": "stored_top_matches",
                 "ranked_opportunity_ids": ranked_ids,
-                "updated_match_rows": int(rerank_out.get("updated_match_rows") or 0),
             }
 
         # Mode B: explicit provided matches
@@ -400,7 +324,7 @@ class SingleJustificationGenerator:
             return {
                 "email": email_norm,
                 "k": target_k,
-                "rerank": rerank_meta,
+                "selection": rerank_meta,
                 "results": [],
             }
 
@@ -586,7 +510,7 @@ class SingleJustificationGenerator:
         return {
             "email": email_norm,
             "k": target_k,
-            "rerank": rerank_meta,
+            "selection": rerank_meta,
             "results": merged_results,
         }
 

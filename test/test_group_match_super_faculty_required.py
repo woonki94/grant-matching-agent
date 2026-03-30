@@ -5,7 +5,7 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from services.matching.group_match_llm_selector import GroupMatchLLMSelector
+from services.matching.group_match_llm_reranker import GroupMatchLLMSelector
 from services.matching.super_faculty_selector import SuperFacultySelector
 
 super_faculty_selector = SuperFacultySelector()

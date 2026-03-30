@@ -2,14 +2,15 @@ from langchain_core.prompts import ChatPromptTemplate
 
 GRANT_BRIEF_PROMPT = ChatPromptTemplate.from_messages([
     ("system",
-     "You summarize a grant opportunity from provided JSON only.\n"
+     "You summarize a grant opportunity from provided grant_context JSON only.\n"
      "Do not invent facts.\n"
      "Return GrantBriefOut JSON only."),
     ("user",
      "Input JSON:\n{input_json}\n\n"
      "Task:\n"
-     "- grant_title: concise title.\n"
-     "- grant_link: use provided link.\n"
+     "- Read grant data from the grant_context object.\n"
+     "- grant_title: concise title from grant_context.title.\n"
+     "- grant_link: use grant_context.opportunity_link when available.\n"
      "- grant_quick_explanation: 3-5 sentences explaining what this grant is about.\n"
      "- priority_themes: 3-6 concise bullets about high-priority themes.")
 ])
@@ -18,6 +19,7 @@ TEAM_ROLE_DECIDER_PROMPT = ChatPromptTemplate.from_messages([
     ("system",
      "You assign concise role labels for each faculty in a grant team.\n"
      "Use only provided JSON. Do not invent facts.\n"
+     "When evidence_text is present, ground each role in concrete evidence snippets.\n"
      "Return TeamRoleOut JSON only."),
     ("user",
      "Input JSON:\n{input_json}\n\n"
@@ -30,6 +32,7 @@ TEAM_ROLE_DECIDER_PROMPT = ChatPromptTemplate.from_messages([
 WHY_WORKING_DECIDER_PROMPT = ChatPromptTemplate.from_messages([
     ("system",
      "You analyze why this team matches a grant.\n"
+     "Use evidence_text when present to support claims.\n"
      "Use only provided JSON and return WhyWorkingOut JSON only."),
     ("user",
      "Input JSON:\n{input_json}\n\n"
@@ -46,6 +49,7 @@ WHY_WORKING_DECIDER_PROMPT = ChatPromptTemplate.from_messages([
 WHY_NOT_WORKING_DECIDER_PROMPT = ChatPromptTemplate.from_messages([
     ("system",
      "You analyze why a team may not work for a grant.\n"
+     "Use evidence_text when present to identify concrete missing capabilities.\n"
      "Use only provided JSON and return WhyNotWorkingOut JSON only."),
     ("user",
      "Input JSON:\n{input_json}\n\n"
@@ -59,6 +63,7 @@ WHY_NOT_WORKING_DECIDER_PROMPT = ChatPromptTemplate.from_messages([
 RECOMMENDER_PROMPT = ChatPromptTemplate.from_messages([
     ("system",
      "You provide the final recommendation for a grant-team match.\n"
+     "Ground decisions in the provided evidence-derived analysis.\n"
      "Use only provided JSON and return RecommendationOut JSON only."),
     ("user",
      "Input JSON:\n{input_json}\n\n"

@@ -2,9 +2,10 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Optional, Tuple
 
+from dao.faculty_dao import FacultyDAO
 from dao.match_dao import MatchDAO
 from dao.opportunity_dao import OpportunityDAO
-from utils.keyword_utils import extract_specializations
+from utils.keyword_utils import extract_specializations, keyword_inventory_for_rerank
 
 
 class MatchingContextBuilder:
@@ -53,6 +54,10 @@ class MatchingContextBuilder:
     @staticmethod
     def _select_fields(payload: Dict[str, Any], fields: Tuple[str, ...]) -> Dict[str, Any]:
         return {k: payload.get(k) for k in fields}
+
+    @staticmethod
+    def _norm(text: Any) -> str:
+        return " ".join(str(text or "").split()).strip()
 
     def build_matching_retrievable_context(
         self,
@@ -292,3 +297,58 @@ class MatchingContextBuilder:
                     coverage[fid][sec][idx] = max(prev, cval)
 
         return coverage
+
+    # ====================
+    # Rerank Context
+    # ====================
+    def build_rerank_keyword_inventory_for_faculty(
+        self,
+        *,
+        sess,
+        faculty_id: int,
+        k: int = 10,
+    ) -> Dict[str, Any]:
+        """Keyword-only inventory payload for one faculty against top-k matched grants."""
+        fid = int(faculty_id)
+        top_k = max(1, int(k))
+
+        fdao = FacultyDAO(sess)
+        mdao = MatchDAO(sess)
+        odao = OpportunityDAO(sess)
+
+        fac_ctx = fdao.get_faculty_keyword_context(fid)
+        if not fac_ctx:
+            raise ValueError(f"Faculty not found: {fid}")
+
+        fkw = keyword_inventory_for_rerank(dict((fac_ctx or {}).get("keywords") or {}))
+        rows = mdao.top_matches_for_faculty(fid, k=top_k)
+
+        grants: List[Dict[str, Any]] = []
+        for grant_id, domain_score, llm_score in list(rows or []):
+            oid = self._norm(grant_id)
+            if not oid:
+                continue
+            grant_ctx = odao.read_opportunity_context(oid)
+            if not grant_ctx:
+                continue
+            gkw = keyword_inventory_for_rerank(dict(grant_ctx.get("keywords") or {}))
+            grants.append(
+                {
+                    "opportunity_id": grant_ctx.get("opportunity_id"),
+                    "title": grant_ctx.get("title"),
+                    "domain_score": float(domain_score or 0.0),
+                    "llm_score": float(llm_score or 0.0),
+                    "grant_domain_keywords": gkw.get("domain") or [],
+                    "grant_specialization_keywords": gkw.get("specialization") or {},
+                }
+            )
+
+        return {
+            "faculty": {
+                "faculty_id": fid,
+                "name": fac_ctx.get("name"),
+                "domain_keywords": fkw.get("domain") or [],
+                "specialization_keywords": fkw.get("specialization") or {},
+            },
+            "grants": grants,
+        }

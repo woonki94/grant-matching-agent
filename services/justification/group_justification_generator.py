@@ -4,6 +4,7 @@ import os
 from typing import Any, Dict, List, Optional, Union
 
 from dao.faculty_dao import FacultyDAO
+from dao.match_dao import MatchDAO
 from dao.opportunity_dao import OpportunityDAO
 from db.db_conn import SessionLocal
 from services.context_retrieval.context_generator import ContextGenerator
@@ -86,6 +87,44 @@ class GroupJustificationGenerator:
             for f in fac_ctxs
         ]
 
+    @staticmethod
+    def _short(text: Any, max_chars: int = 12_000) -> str:
+        s = " ".join(str(text or "").split()).strip()
+        if len(s) <= int(max_chars):
+            return s
+        return s[: int(max_chars)].rstrip()
+
+    def _build_group_evidence_text(
+        self,
+        *,
+        sess,
+        opp_id: str,
+        team: List[int],
+        fac_obj_cache: Dict[int, Any],
+        opp_match_cache: Dict[str, Dict[int, Dict[str, Any]]],
+    ) -> str:
+        lines: List[str] = [f"GROUP EVIDENCE PACK: opportunity_id={opp_id}"]
+        per_opp = dict(opp_match_cache.get(str(opp_id)) or {})
+
+        for fid in list(team or []):
+            fac = fac_obj_cache.get(int(fid))
+            if not fac:
+                continue
+            score_row = dict(per_opp.get(int(fid)) or {})
+            domain_score = float(score_row.get("domain_score") or 0.0)
+            llm_score = float(score_row.get("llm_score") or 0.0)
+            member_text = self.context_generator.build_faculty_recommendation_source_linked_text(
+                sess=sess,
+                fac=fac,
+                top_rows=[(str(opp_id), float(domain_score), float(llm_score))],
+                max_requirements=3,
+                grant_evidence_per_requirement=2,
+                faculty_evidence_per_requirement=2,
+            )
+            lines.append(f"\nMEMBER {int(fid)} EVIDENCE\n{self._short(member_text, max_chars=12_000)}")
+
+        return "\n".join(lines).strip()
+
     def run_justifications_from_group_results(
         self,
         *,
@@ -98,6 +137,7 @@ class GroupJustificationGenerator:
         with self.session_factory() as sess:
             odao = OpportunityDAO(sess)
             fdao = FacultyDAO(sess)
+            mdao = MatchDAO(sess)
 
             email_list = [faculty_emails] if isinstance(faculty_emails, str) else list(faculty_emails)
             group_results = self.team_grant_matcher.run_group_match(
@@ -111,8 +151,11 @@ class GroupJustificationGenerator:
                 raise ValueError(f"No group matches found for {faculty_emails}")
 
             opp_cache: Dict[str, Dict[str, Any]] = {}
+            grant_brief_ctx_cache: Dict[str, Dict[str, Any]] = {}
             fac_cache: Dict[int, Dict[str, Any]] = {}
+            fac_obj_cache: Dict[int, Any] = {}
             opp_member_cov_cache: Dict[str, Dict[int, Dict[str, Dict[int, float]]]] = {}
+            opp_match_cache: Dict[str, Dict[int, Dict[str, Any]]] = {}
             results_by_index: Dict[int, Dict[str, Any]] = {}
             work_items: List[Dict[str, Any]] = []
 
@@ -133,13 +176,23 @@ class GroupJustificationGenerator:
 
             for opp_id in opp_ids:
                 opp_cache[opp_id] = odao.read_opportunity_context(opp_id) or {}
+                grant_brief_ctx_cache[opp_id] = self.context_generator.build_grant_context_only(
+                    sess=sess,
+                    opportunity_id=opp_id,
+                    preview_chars=50_000,
+                )
             for fid in team_fids:
                 fac_cache[fid] = fdao.get_faculty_keyword_context(fid) or {}
+                fac_obj_cache[fid] = fdao.get_with_relations_by_id(fid)
             for opp_id in opp_ids:
                 opp_member_cov_cache[opp_id] = self.context_generator.build_member_coverages_for_opportunity(
                     sess=sess,
                     opportunity_id=opp_id,
                     limit_rows=limit_rows,
+                )
+                opp_match_cache[opp_id] = mdao.list_matches_for_opportunity_by_faculty_ids(
+                    opportunity_id=opp_id,
+                    faculty_ids=team_fids,
                 )
 
             for idx, row in enumerate(normalized_rows):
@@ -206,6 +259,13 @@ class GroupJustificationGenerator:
                     "redundancy": row.get("redundancy"),
                     "meta": row.get("meta"),
                 }
+                evidence_text = self._build_group_evidence_text(
+                    sess=sess,
+                    opp_id=opp_id,
+                    team=team,
+                    fac_obj_cache=fac_obj_cache,
+                    opp_match_cache=opp_match_cache,
+                )
 
                 work_items.append(
                     {
@@ -213,6 +273,7 @@ class GroupJustificationGenerator:
                         "row": row,
                         "opp_id": opp_id,
                         "opp_ctx": dict(opp_ctx),
+                        "grant_brief_context": dict(grant_brief_ctx_cache.get(opp_id) or {}),
                         "grant_title": grant_title,
                         "agency_name": agency_name,
                         "team": team,
@@ -220,6 +281,7 @@ class GroupJustificationGenerator:
                         "coverage": coverage,
                         "member_coverages": member_coverages,
                         "group_meta": group_meta,
+                        "evidence_text": evidence_text,
                         "grant_link": grant_link,
                     }
                 )
@@ -241,10 +303,12 @@ class GroupJustificationGenerator:
                 try:
                     justification, trace = get_engine().run_one(
                         opp_ctx=dict(item["opp_ctx"]),
+                        grant_brief_context=dict(item.get("grant_brief_context") or {}),
                         fac_ctxs=[dict(f) for f in list(item["fac_ctxs"])],
                         coverage=item["coverage"],
                         member_coverages=dict(item["member_coverages"] or {}),
                         group_meta=dict(item["group_meta"] or {}),
+                        evidence_text=str(item.get("evidence_text") or ""),
                         trace={"index": idx, "opp_id": opp_id, "team": team},
                     )
                     out = {

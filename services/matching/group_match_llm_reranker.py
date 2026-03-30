@@ -4,7 +4,7 @@ import json
 import logging
 from typing import Any, Dict, List
 
-from config import get_llm_client
+from config import get_llm_client, settings
 from dto.llm_response_dto import TeamCandidateSelectionOut
 from logging_setup import setup_logging
 from services.prompts.team_selection_prompt import TEAM_CANDIDATE_SELECTION_PROMPT
@@ -14,6 +14,12 @@ logger = logging.getLogger(__name__)
 
 
 class GroupMatchLLMSelector:
+    @staticmethod
+    def _build_team_candidate_selection_chain():
+        model_id = (settings.sonnet or settings.haiku or settings.opus or "").strip()
+        llm = get_llm_client(model_id=model_id).build()
+        return TEAM_CANDIDATE_SELECTION_PROMPT | llm.with_structured_output(TeamCandidateSelectionOut)
+
     @staticmethod
     def _normalize_indices(indices: List[int], size: int) -> List[int]:
         out: List[int] = []
@@ -65,8 +71,7 @@ class GroupMatchLLMSelector:
         fallback_indices = list(range(desired))
 
         try:
-            llm = get_llm_client().build()
-            chain = TEAM_CANDIDATE_SELECTION_PROMPT | llm.with_structured_output(TeamCandidateSelectionOut)
+            chain = self._build_team_candidate_selection_chain()
             out: TeamCandidateSelectionOut = chain.invoke(
                 {"report_json": json.dumps(report, ensure_ascii=False)}
             )

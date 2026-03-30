@@ -223,15 +223,35 @@ class MatchDAO:
         return float(row.domain_sim or 0.0)
 
     # =============== Read Actions ===============
-    def top_matches_for_faculty(self, faculty_id: int, k: int = 5):
-        """Read top stored match results for one faculty ordered by LLM/domain score."""
+    def top_matches_for_faculty(self, faculty_id: int, k: Optional[int] = 5):
+        """Read stored match results for one faculty ordered by LLM/domain score."""
         q = (
             self.session.query(MatchResult.grant_id, MatchResult.domain_score, MatchResult.llm_score)
             .filter(MatchResult.faculty_id == faculty_id)
             .order_by(MatchResult.llm_score.desc(), MatchResult.domain_score.desc())
-            .limit(k)
         )
+        if k is not None and int(k) > 0:
+            q = q.limit(int(k))
         return [(gid, float(d), float(l)) for (gid, d, l) in q.all()]
+
+    def list_faculty_ids_with_matches(self, *, limit: Optional[int] = None) -> List[int]:
+        """List faculty ids that have at least one stored one-to-one match row."""
+        q = (
+            self.session.query(MatchResult.faculty_id)
+            .distinct()
+            .order_by(MatchResult.faculty_id.asc())
+        )
+        if limit is not None and int(limit) > 0:
+            q = q.limit(int(limit))
+        return [int(fid) for (fid,) in q.all()]
+
+    def count_matches_for_faculty(self, *, faculty_id: int) -> int:
+        """Count stored one-to-one match rows for a given faculty id."""
+        return int(
+            self.session.query(MatchResult.id)
+            .filter(MatchResult.faculty_id == int(faculty_id))
+            .count()
+        )
 
     def get_match_for_faculty_opportunity(
         self,

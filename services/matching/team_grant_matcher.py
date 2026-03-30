@@ -12,7 +12,7 @@ from services.context_retrieval.context_generator import ContextGenerator
 from dao.faculty_dao import FacultyDAO
 from dao.match_dao import MatchDAO
 from db.db_conn import SessionLocal
-from services.matching.group_match_llm_selector import GroupMatchLLMSelector
+from services.matching.group_match_llm_reranker import GroupMatchLLMSelector
 from services.matching.super_faculty_selector import SuperFacultySelector
 
 

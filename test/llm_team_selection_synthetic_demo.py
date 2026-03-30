@@ -5,7 +5,7 @@ from typing import Any, Dict, List
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from services.matching.group_match_llm_selector import GroupMatchLLMSelector
+from services.matching.group_match_llm_reranker import GroupMatchLLMSelector
 
 group_match_llm_selector = GroupMatchLLMSelector()
 

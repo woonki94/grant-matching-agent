@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import json
+import logging
 from typing import Any, Dict, List, Optional, Tuple
 
-from config import get_llm_client
+from config import get_llm_client, settings
 from dao.faculty_dao import FacultyDAO
 from dao.opportunity_dao import OpportunityDAO
 from dto.llm_response_dto import (
@@ -25,6 +26,8 @@ from services.prompts.group_match_prompt import (
     WHY_WORKING_DECIDER_PROMPT,
 )
 
+logger = logging.getLogger(__name__)
+
 
 class GroupJustificationEngine:
     INDEPENDENT_STAGE_WORKERS = 4
@@ -39,26 +42,51 @@ class GroupJustificationEngine:
         self.odao = odao
         self.fdao = fdao
         self.context_generator = context_generator or ContextGenerator()
-        self.llm = get_llm_client().build()
-
-        self.grant_brief_chain = GRANT_BRIEF_PROMPT | self.llm.with_structured_output(GrantBriefOut)
-        self.team_role_chain = TEAM_ROLE_DECIDER_PROMPT | self.llm.with_structured_output(TeamRoleOut)
-        self.why_working_chain = WHY_WORKING_DECIDER_PROMPT | self.llm.with_structured_output(WhyWorkingOut)
-        self.why_not_working_chain = WHY_NOT_WORKING_DECIDER_PROMPT | self.llm.with_structured_output(WhyNotWorkingOut)
-        self.recommender_chain = RECOMMENDER_PROMPT | self.llm.with_structured_output(RecommendationOut)
 
     @staticmethod
     def _safe_json(obj: Any) -> str:
         return json.dumps(obj, ensure_ascii=False, indent=2)
 
+    @staticmethod
+    def _build_grant_brief_chain():
+        model_id = (settings.haiku or settings.sonnet or settings.opus or "").strip()
+        llm = get_llm_client(model_id=model_id).build()
+        return GRANT_BRIEF_PROMPT | llm.with_structured_output(GrantBriefOut)
+
+    @staticmethod
+    def _build_team_role_chain():
+        model_id = (settings.opus or settings.sonnet or settings.haiku or "").strip()
+        llm = get_llm_client(model_id=model_id).build()
+        return TEAM_ROLE_DECIDER_PROMPT | llm.with_structured_output(TeamRoleOut)
+
+    @staticmethod
+    def _build_why_working_chain():
+        model_id = (settings.sonnet or settings.haiku or settings.opus or "").strip()
+        llm = get_llm_client(model_id=model_id).build()
+        return WHY_WORKING_DECIDER_PROMPT | llm.with_structured_output(WhyWorkingOut)
+
+    @staticmethod
+    def _build_why_not_working_chain():
+        model_id = (settings.sonnet or settings.haiku or settings.opus or "").strip()
+        llm = get_llm_client(model_id=model_id).build()
+        return WHY_NOT_WORKING_DECIDER_PROMPT | llm.with_structured_output(WhyNotWorkingOut)
+
+    @staticmethod
+    def _build_recommender_chain():
+        model_id = (settings.sonnet or settings.opus or settings.haiku or "").strip()
+        llm = get_llm_client(model_id=model_id).build()
+        return RECOMMENDER_PROMPT | llm.with_structured_output(RecommendationOut)
+
     def run_one(
         self,
         *,
         opp_ctx: Dict[str, Any],
+        grant_brief_context: Optional[Dict[str, Any]] = None,
         fac_ctxs: List[Dict[str, Any]],
         coverage: Any,
         member_coverages: Optional[Dict[int, Dict[str, Dict[int, float]]]] = None,
         group_meta: Optional[Dict[str, Any]] = None,
+        evidence_text: str = "",
         trace: Optional[Dict[str, Any]] = None,
     ) -> Tuple[GroupJustificationOut, Dict[str, Any]]:
         trace = trace or {}
@@ -76,19 +104,41 @@ class GroupJustificationEngine:
         team_block = context.get("team") or []
         coverage_block = context.get("coverage") or {}
         grant_link = f"https://simpler.grants.gov/opportunity/{grant_block.get('id')}" if grant_block.get("id") else ""
+        grant_ctx = dict(grant_brief_context or {})
 
+        logger.info(
+            "GROUP_EVIDENCE_INPUT meta=%s payload=%s",
+            json.dumps(
+                {
+                    "opportunity_id": grant_block.get("id"),
+                    "team_size": len(team_block),
+                    "team_faculty_ids": [m.get("faculty_id") for m in list(team_block or [])],
+                    "evidence_chars": len(str(evidence_text or "")),
+                },
+                ensure_ascii=False,
+            ),
+            str(evidence_text or ""),
+        )
 
         try:
+            grant_brief_chain = self._build_grant_brief_chain()
+            team_role_chain = self._build_team_role_chain()
+            why_working_chain = self._build_why_working_chain()
+            why_not_working_chain = self._build_why_not_working_chain()
+            recommender_chain = self._build_recommender_chain()
+
             grant_brief_input = {
-                "grant": {
-                    "id": grant_block.get("id"),
-                    "title": grant_block.get("title"),
-                    "agency": grant_block.get("agency"),
-                    "summary": grant_block.get("summary"),
-                    "link": grant_link,
-                    "keywords": grant_block.get("keywords"),
-                },
-                "requirements": requirements,
+                "grant_context": (
+                    grant_ctx
+                    if grant_ctx
+                    else {
+                        "opportunity_id": grant_block.get("id"),
+                        "title": grant_block.get("title"),
+                        "agency": grant_block.get("agency"),
+                        "opportunity_link": grant_link,
+                        "summary": grant_block.get("summary"),
+                    }
+                ),
             }
             team_role_input = {
                 "grant": {
@@ -98,6 +148,7 @@ class GroupJustificationEngine:
                 },
                 "requirements": requirements,
                 "team": team_block,
+                "evidence_text": str(evidence_text or ""),
             }
             why_working_input = {
                 "grant": {
@@ -108,6 +159,7 @@ class GroupJustificationEngine:
                 "requirements": requirements,
                 "team": team_block,
                 "team_final_coverage": coverage_block,
+                "evidence_text": str(evidence_text or ""),
             }
             why_not_input = {
                 "grant": {
@@ -118,26 +170,27 @@ class GroupJustificationEngine:
                 "requirements": requirements,
                 "team": team_block,
                 "team_final_coverage": coverage_block,
+                "evidence_text": str(evidence_text or ""),
             }
             section_jobs: List[Tuple[str, Any, Dict[str, str]]] = [
                 (
                     "grant_brief",
-                    self.grant_brief_chain,
+                    grant_brief_chain,
                     {"input_json": self._safe_json(grant_brief_input)},
                 ),
                 (
                     "team_roles",
-                    self.team_role_chain,
+                    team_role_chain,
                     {"input_json": self._safe_json(team_role_input)},
                 ),
                 (
                     "why_working",
-                    self.why_working_chain,
+                    why_working_chain,
                     {"input_json": self._safe_json(why_working_input)},
                 ),
                 (
                     "why_not_working",
-                    self.why_not_working_chain,
+                    why_not_working_chain,
                     {"input_json": self._safe_json(why_not_input)},
                 ),
             ]
@@ -176,6 +229,25 @@ class GroupJustificationEngine:
                 "input": why_not_input,
                 "output": why_not.model_dump(),
             }
+            logger.info(
+                "GROUP_EVIDENCE_OUTPUT meta=%s output=%s",
+                json.dumps(
+                    {
+                        "opportunity_id": grant_block.get("id"),
+                        "team_size": len(team_block),
+                    },
+                    ensure_ascii=False,
+                ),
+                json.dumps(
+                    {
+                        "grant_brief": grant_brief.model_dump(),
+                        "team_roles": team_roles.model_dump(),
+                        "why_working": why_working.model_dump(),
+                        "why_not_working": why_not.model_dump(),
+                    },
+                    ensure_ascii=False,
+                ),
+            )
 
             rec_input = {
                 "grant": {
@@ -187,7 +259,7 @@ class GroupJustificationEngine:
                 "why_working": why_working.model_dump(),
                 "why_not_working": why_not.model_dump(),
             }
-            recommendation = self.recommender_chain.invoke({"input_json": self._safe_json(rec_input)})
+            recommendation = recommender_chain.invoke({"input_json": self._safe_json(rec_input)})
             trace["steps"]["recommendation"] = {
                 "status": "ok",
                 "input": rec_input,
@@ -208,6 +280,16 @@ class GroupJustificationEngine:
             )
             return justification, trace
         except Exception as e:
+            logger.exception(
+                "GROUP_EVIDENCE_PIPELINE_FAILED meta=%s",
+                json.dumps(
+                    {
+                        "opportunity_id": grant_block.get("id"),
+                        "team_size": len(team_block),
+                    },
+                    ensure_ascii=False,
+                ),
+            )
             trace["steps"]["error"] = {
                 "status": "error",
                 "error": f"{type(e).__name__}: {e}",

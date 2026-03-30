@@ -257,58 +257,6 @@ class JustificationContextBuilder:
             "matches": matches,
         }
 
-    def build_rerank_keyword_inventory_for_faculty(
-        self,
-        *,
-        sess,
-        faculty_id: int,
-        k: int = 10,
-    ) -> Dict[str, Any]:
-        """Keyword-only inventory payload for one faculty against top-k matched grants."""
-        fid = int(faculty_id)
-        top_k = max(1, int(k))
-
-        fdao = FacultyDAO(sess)
-        mdao = MatchDAO(sess)
-        odao = OpportunityDAO(sess)
-
-        fac_ctx = fdao.get_faculty_keyword_context(fid)
-        if not fac_ctx:
-            raise ValueError(f"Faculty not found: {fid}")
-
-        fkw = keyword_inventory_for_rerank(dict((fac_ctx or {}).get("keywords") or {}))
-        rows = mdao.top_matches_for_faculty(fid, k=top_k)
-
-        grants: List[Dict[str, Any]] = []
-        for grant_id, domain_score, llm_score in list(rows or []):
-            oid = self._norm(grant_id)
-            if not oid:
-                continue
-            grant_ctx = odao.read_opportunity_context(oid)
-            if not grant_ctx:
-                continue
-            gkw = keyword_inventory_for_rerank(dict(grant_ctx.get("keywords") or {}))
-            grants.append(
-                {
-                    "opportunity_id": grant_ctx.get("opportunity_id"),
-                    "title": grant_ctx.get("title"),
-                    "domain_score": float(domain_score or 0.0),
-                    "llm_score": float(llm_score or 0.0),
-                    "grant_domain_keywords": gkw.get("domain") or [],
-                    "grant_specialization_keywords": gkw.get("specialization") or {},
-                }
-            )
-
-        return {
-            "faculty": {
-                "faculty_id": fid,
-                "name": fac_ctx.get("name"),
-                "domain_keywords": fkw.get("domain") or [],
-                "specialization_keywords": fkw.get("specialization") or {},
-            },
-            "grants": grants,
-        }
-
     @classmethod
     def _build_faculty_spec_index(cls, fac_keywords: Dict[str, Any]) -> Dict[str, Dict[int, Dict[str, Any]]]:
         out: Dict[str, Dict[int, Dict[str, Any]]] = {"research": {}, "application": {}}

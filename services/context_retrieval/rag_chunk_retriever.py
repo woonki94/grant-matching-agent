@@ -534,7 +534,7 @@ def retrieve_opportunity_supporting_chunks(
 def retrieve_faculty_additional_info_chunks(
     fac: Faculty,
     *,
-    top_k_per_source: int = 4,
+    top_k_per_source: int = 5,
     max_recent_pub_titles: int = 5,
 ) -> Dict[str, Any]:
     """

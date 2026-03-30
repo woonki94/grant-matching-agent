@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import argparse
+import sys
 from pathlib import Path
+
+PROJECT_ROOT = Path(__file__).resolve().parents[2]  # .../root
+sys.path.insert(0, str(PROJECT_ROOT))
 
 from services.justification.group_justification_generator import GroupJustificationGenerator
 from utils.report_renderer import write_markdown_report, render_markdown_report
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 
 def main() -> None:

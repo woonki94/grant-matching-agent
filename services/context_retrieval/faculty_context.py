@@ -8,7 +8,7 @@ from utils.content_extractor import load_extracted_content
 
 
 class FacultyContextBuilder:
-    DEFAULT_ADDITIONAL_INFO_CHUNKS_PER_SOURCE = 4
+    DEFAULT_ADDITIONAL_INFO_CHUNKS_PER_SOURCE = 5
     DEFAULT_RECENT_PUB_TITLES_FOR_QUERY = 5
 
     PROFILE_FIELDS: Dict[str, Tuple[str, ...]] = {

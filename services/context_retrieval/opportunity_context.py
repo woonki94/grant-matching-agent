@@ -100,9 +100,9 @@ class OpportunityContextBuilder:
         profile: str = "basic",
         max_summary_chars: int = 420,
         max_item_chars: int = 240,
-        max_additional_items: int = 2,
-        max_attachment_items: int = 2,
-        max_keywords_per_bucket: int = 6,
+        max_additional_items: int = 10,
+        max_attachment_items: int = 10,
+        max_keywords_per_bucket: int = 20,
     ) -> Dict[str, Any]:
         _ = max_summary_chars
         full = self.build_opportunity_retrievable_context(opp)
@@ -117,8 +117,8 @@ class OpportunityContextBuilder:
 
         rag = retrieve_opportunity_supporting_chunks(
             opp,
-            top_k_per_additional_source=4,
-            top_k_per_attachment_source=4,
+            top_k_per_additional_source=5,
+            top_k_per_attachment_source=5,
         )
         additional_blocks = list(rag.get("additional_info_chunks") or [])
         attachment_blocks = list(rag.get("attachment_chunks") or [])

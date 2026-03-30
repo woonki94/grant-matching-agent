@@ -60,7 +60,8 @@ class _KeywordGeneratorBase:
         keywords_prompt: ChatPromptTemplate,
         weight_prompt: ChatPromptTemplate,
     ):
-        llm = get_llm_client().build()
+        model_id = (settings.haiku or settings.sonnet or settings.opus or "").strip()
+        llm = get_llm_client(model_id=model_id).build()
         candidates_chain = candidate_prompt | llm.with_structured_output(CandidatesOut)
         keywords_chain = keywords_prompt | llm.with_structured_output(KeywordsOut)
         weight_chain = weight_prompt | llm.with_structured_output(WeightedSpecsOut)
@@ -68,13 +69,15 @@ class _KeywordGeneratorBase:
 
     @staticmethod
     def build_opportunity_category_chain():
-        llm = get_llm_client().build()
+        model_id = (settings.haiku or settings.sonnet or settings.opus or "").strip()
+        llm = get_llm_client(model_id=model_id).build()
         return OPP_CATEGORY_PROMPT | llm.with_structured_output(OpportunityCategoryOut)
 
     #TODO: can be in the main chain.
     @staticmethod
     def build_specialization_source_chain(source_prompt: ChatPromptTemplate):
-        llm = get_llm_client().build()
+        model_id = (settings.haiku or settings.sonnet or settings.opus or "").strip()
+        llm = get_llm_client(model_id=model_id).build()
         return source_prompt | llm.with_structured_output(SpecializationSourcesOut)
 
     @staticmethod
