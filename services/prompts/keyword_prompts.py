@@ -6,6 +6,7 @@ FACULTY_CANDIDATE_PROMPT = ChatPromptTemplate.from_messages([
     ("system",
      "You extract candidate keyword phrases from faculty context_retrieval for later structuring.\n\n"
      "Rules:\n"
+     "- Do not retrieve anything if you don't have enough sources.\n"
      "- Use ONLY the provided context_retrieval.\n"
      "- Return a single JSON object with key `candidates` = list[str].\n"
      "- Include TWO kinds of candidates:\n"
@@ -162,7 +163,7 @@ FACULTY_SPECIALIZATION_SOURCE_PROMPT = ChatPromptTemplate.from_messages([
     ("system",
      "You map faculty specialization keywords to supporting sources.\n\n"
      "Input:\n"
-     "- weighted specialization keywords (research/application)\n"
+     "- specialization keywords (research/application)\n"
      "- source catalog (additional-info chunks and publications)\n\n"
      "Output JSON schema:\n"
      "{{\n"
@@ -173,7 +174,8 @@ FACULTY_SPECIALIZATION_SOURCE_PROMPT = ChatPromptTemplate.from_messages([
      "- Keep t exactly as provided in input specializations.\n"
      "- For each source, return only id, type, score.\n"
      "- Use ONLY ids and types that exist in source catalog.\n"
-     "- Pick up to 4 sources per specialization.\n"
+     "- Pick up at least one source per specialization.\n"
+     "- Usually multiple sources per specialization but not hard rule.\n"
      "- score is confidence in [0,1].\n"
      "- If no support exists, return empty sources for that specialization.\n"
      "- Return ONLY JSON."
@@ -189,7 +191,7 @@ OPP_SPECIALIZATION_SOURCE_PROMPT = ChatPromptTemplate.from_messages([
     ("system",
      "You map opportunity specialization requirements to supporting sources.\n\n"
      "Input:\n"
-     "- weighted specialization keywords (research/application)\n"
+     "- specialization keywords (research/application)\n"
      "- source catalog (additional-info chunks and attachment chunks)\n\n"
      "Output JSON schema:\n"
      "{{\n"

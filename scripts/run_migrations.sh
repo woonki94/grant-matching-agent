@@ -53,8 +53,8 @@ CREATE TABLE IF NOT EXISTS schema_migrations (
 SQL
 
 echo "Running SQL migrations..."
-shopt -s nullglob
-files=("$PROJECT_ROOT/db/migrations/"*.sql)
+MIGRATIONS_ROOT="$PROJECT_ROOT/db/migrations"
+mapfile -t files < <(find "$MIGRATIONS_ROOT" -type f -name '*.sql' | sort)
 
 if [[ ${#files[@]} -eq 0 ]]; then
   echo "No SQL migrations found."
@@ -62,15 +62,19 @@ if [[ ${#files[@]} -eq 0 ]]; then
 fi
 
 for f in "${files[@]}"; do
-  fname="$(basename "$f")"
-  already_applied="$(psql "$DATABASE_URL" -tAc "SELECT 1 FROM schema_migrations WHERE filename = '$fname' LIMIT 1;")"
+  # Use migration path relative to db/migrations as unique migration key.
+  # This avoids collisions if different subfolders contain same basename.
+  fname="${f#"$MIGRATIONS_ROOT"/}"
+  fname_sql="${fname//\'/\'\'}"
+  already_applied="$(psql "$DATABASE_URL" -tAc "SELECT 1 FROM schema_migrations WHERE filename = '$fname_sql' LIMIT 1;")"
   if [[ "$already_applied" == "1" ]]; then
     echo "  skipping ${fname} (already applied)"
     continue
   fi
   echo "  applying ${fname}"
-  psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f "$f"
-  psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -c "INSERT INTO schema_migrations (filename) VALUES ('$fname');"
+  # Apply each file in a single transaction for safer partial-failure handling.
+  psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -1 -f "$f"
+  psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -c "INSERT INTO schema_migrations (filename) VALUES ('$fname_sql');"
 done
 
 echo "Migrations complete."

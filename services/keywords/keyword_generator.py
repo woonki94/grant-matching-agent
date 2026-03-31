@@ -41,6 +41,7 @@ from utils.keyword_utils import (
     build_specialization_source_catalog,
     coerce_keyword_sections,
     extract_domains_from_keywords,
+    specialization_text_sections,
 )
 from utils.payload_sanitizer import sanitize_for_postgres
 from utils.thread_pool import build_thread_local_getter, parallel_map, resolve_pool_size
@@ -214,15 +215,10 @@ class _KeywordGeneratorBase:
         if source_catalog:
             if source_chain is not None:
                 try:
+                    source_spec_input = specialization_text_sections(kw_weighted)
                     source_out: SpecializationSourcesOut = source_chain.invoke(
                         {
-                            "spec_json": json.dumps(
-                                {
-                                    "research": (kw_weighted.get("research") or {}).get("specialization") or [],
-                                    "application": (kw_weighted.get("application") or {}).get("specialization") or [],
-                                },
-                                ensure_ascii=False,
-                            ),
+                            "spec_json": json.dumps(source_spec_input, ensure_ascii=False),
                             "source_catalog_json": json.dumps(source_catalog, ensure_ascii=False),
                         }
                     )

@@ -1,188 +1,60 @@
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
-from dao.faculty_dao import FacultyDAO
-from dao.match_dao import MatchDAO
-from dao.opportunity_dao import OpportunityDAO
-from utils.keyword_utils import extract_specializations, keyword_inventory_for_rerank
+from utils.keyword_utils import extract_specializations
 
 
 class MatchingContextBuilder:
-    PROFILE_FIELDS: Dict[str, Tuple[str, ...]] = {
-        "group": (
-            "grant",
-            "team",
-            "coverage",
-            "group_match",
-        ),
-        "group_grant": (
-            "id",
-            "title",
-            "agency",
-            "summary",
-            "keywords",
-        ),
-        "group_team_member": (
-            "faculty_id",
-            "name",
-            "email",
-            "covered",
-        ),
-        "group_team_member_covered": (
-            "application",
-            "research",
-        ),
-        "top_match": (
-            "opportunity_id",
-            "title",
-            "agency",
-            "domain_score",
-            "llm_score",
-        ),
-        "inputs": (
-            "faculty_ids",
-            "requirements",
-            "coverage",
-        ),
-        "inputs_requirements": (
-            "application",
-            "research",
-        ),
-    }
+    """Pure matching context builder.
+
+    This builder only shapes payloads from already-prepared contexts/data.
+    It does not fetch DB rows or call faculty/opportunity context builders.
+    """
 
     @staticmethod
-    def _select_fields(payload: Dict[str, Any], fields: Tuple[str, ...]) -> Dict[str, Any]:
-        return {k: payload.get(k) for k in fields}
+    def _to_float(value: Any, default: float = 0.0) -> float:
+        try:
+            return float(value)
+        except Exception:
+            return float(default)
 
     @staticmethod
-    def _norm(text: Any) -> str:
-        return " ".join(str(text or "").split()).strip()
+    def _ordered_unique(values: List[str]) -> List[str]:
+        out: List[str] = []
+        seen = set()
+        for value in list(values or []):
+            v = str(value or "").strip()
+            if not v or v in seen:
+                continue
+            seen.add(v)
+            out.append(v)
+        return out
 
-    def build_matching_retrievable_context(
-        self,
-        *,
-        profile: str,
-        opp_ctx: Optional[Dict[str, Any]] = None,
-        fac_ctxs: Optional[List[Dict[str, Any]]] = None,
-        coverage: Any = None,
-        member_coverages: Optional[Dict[int, Dict[str, Dict[int, float]]]] = None,
-        group_meta: Optional[Dict[str, Any]] = None,
-        top_row: Optional[Tuple[str, float, float]] = None,
-        faculty_ids: Optional[List[int]] = None,
-        requirements: Optional[Dict[str, Dict[int, float]]] = None,
-    ) -> Dict[str, Any]:
-        normalized = str(profile or "").strip().lower()
+    @staticmethod
+    def _opportunity_map(opportunities: List[Any]) -> Dict[str, Any]:
+        out: Dict[str, Any] = {}
+        for opp in list(opportunities or []):
+            oid = str(getattr(opp, "opportunity_id", "") or "").strip()
+            if not oid:
+                continue
+            out[oid] = opp
+        return out
 
-        if normalized == "group":
-            source_opp = opp_ctx or {}
-            source_member_coverages = member_coverages or {}
-            grant_payload = {
-                "id": source_opp.get("opportunity_id") or source_opp.get("id"),
-                "title": source_opp.get("title"),
-                "agency": source_opp.get("agency"),
-                "summary": source_opp.get("summary"),
-                "keywords": source_opp.get("keywords"),
-            }
+    @staticmethod
+    def _faculty_map(faculties: List[Any]) -> Dict[int, Any]:
+        out: Dict[int, Any] = {}
+        for fac in list(faculties or []):
+            try:
+                fid = int(getattr(fac, "faculty_id"))
+            except Exception:
+                continue
+            out[fid] = fac
+        return out
 
-            team_payload: List[Dict[str, Any]] = []
-            for f in fac_ctxs or []:
-                faculty_id = f.get("faculty_id") or f.get("id")
-                covered = {"application": {}, "research": {}}
-                if faculty_id is not None:
-                    covered = source_member_coverages.get(int(faculty_id), covered)
-                team_payload.append(
-                    {
-                        "faculty_id": faculty_id,
-                        "name": f.get("name"),
-                        "email": f.get("email"),
-                        "covered": covered,
-                    }
-                )
-
-            return {
-                "grant": grant_payload,
-                "team": team_payload,
-                "coverage": coverage,
-                "group_match": group_meta,
-            }
-
-        if normalized == "top_match":
-            source_opp = opp_ctx or {}
-            opp_id, domain_score, llm_score = top_row or ("", 0.0, 0.0)
-            return {
-                "opportunity_id": opp_id,
-                "title": source_opp.get("title"),
-                "agency": source_opp.get("agency"),
-                "domain_score": float(domain_score),
-                "llm_score": float(llm_score),
-            }
-
-        if normalized == "inputs":
-            return {
-                "faculty_ids": list(faculty_ids or []),
-                "requirements": requirements or {"application": {}, "research": {}},
-                "coverage": coverage or {},
-            }
-
-        raise ValueError(f"Unsupported matching context profile: {profile}")
-
-    def build_matching_context(
-        self,
-        *,
-        profile: str,
-        opp_ctx: Optional[Dict[str, Any]] = None,
-        fac_ctxs: Optional[List[Dict[str, Any]]] = None,
-        coverage: Any = None,
-        member_coverages: Optional[Dict[int, Dict[str, Dict[int, float]]]] = None,
-        group_meta: Optional[Dict[str, Any]] = None,
-        top_row: Optional[Tuple[str, float, float]] = None,
-        faculty_ids: Optional[List[int]] = None,
-        requirements: Optional[Dict[str, Dict[int, float]]] = None,
-    ) -> Dict[str, Any]:
-        normalized = str(profile or "").strip().lower()
-        fields = self.PROFILE_FIELDS.get(normalized)
-        if not fields:
-            raise ValueError(f"Unsupported matching context profile: {profile}")
-
-        full = self.build_matching_retrievable_context(
-            profile=normalized,
-            opp_ctx=opp_ctx,
-            fac_ctxs=fac_ctxs,
-            coverage=coverage,
-            member_coverages=member_coverages,
-            group_meta=group_meta,
-            top_row=top_row,
-            faculty_ids=faculty_ids,
-            requirements=requirements,
-        )
-        context = self._select_fields(full, fields)
-
-        if normalized == "group":
-            grant_fields = self.PROFILE_FIELDS.get("group_grant", ())
-            member_fields = self.PROFILE_FIELDS.get("group_team_member", ())
-            covered_fields = self.PROFILE_FIELDS.get("group_team_member_covered", ())
-            context["grant"] = self._select_fields(dict(full.get("grant") or {}), grant_fields)
-            filtered_team: List[Dict[str, Any]] = []
-            for member in list(full.get("team") or []):
-                m = self._select_fields(dict(member or {}), member_fields)
-                m["covered"] = self._select_fields(dict(m.get("covered") or {}), covered_fields)
-                filtered_team.append(m)
-            context["team"] = filtered_team
-            if not full.get("group_match"):
-                context.pop("group_match", None)
-
-        if normalized == "inputs":
-            req_fields = self.PROFILE_FIELDS.get("inputs_requirements", ())
-            context["requirements"] = self._select_fields(dict(full.get("requirements") or {}), req_fields)
-
-        return context
-
-    # ====================
-    # Group Matching Context
-    # ====================
+    @classmethod
     def build_group_matching_context(
-        self,
+        cls,
         *,
         opp_ctx: Dict[str, Any],
         fac_ctxs: List[Dict[str, Any]],
@@ -190,165 +62,294 @@ class MatchingContextBuilder:
         member_coverages: Optional[Dict[int, Dict[str, Dict[int, float]]]] = None,
         group_meta: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
-        return self.build_matching_context(
-            profile="group",
-            opp_ctx=opp_ctx,
-            fac_ctxs=fac_ctxs,
-            coverage=coverage,
-            member_coverages=member_coverages,
-            group_meta=group_meta,
-        )
+        """Build group matching payload from prepared grant/faculty contexts."""
+        source_opp = dict(opp_ctx or {})
+        source_member_coverages = dict(member_coverages or {})
 
-    # ====================
-    # Top Match Context
-    # ====================
-    def build_top_match_payload(
-        self,
-        *,
-        sess,
-        top_rows: List[Tuple[str, float, float]],
-    ) -> List[Dict[str, Any]]:
-        opp_dao = OpportunityDAO(sess)
-        out: List[Dict[str, Any]] = []
-        for row in top_rows or []:
-            opp_id, domain_score, llm_score = row
-            opp_ctx = opp_dao.read_opportunity_context(opp_id) or {}
-            out.append(
-                self.build_matching_context(
-                    profile="top_match",
-                    opp_ctx=opp_ctx,
-                    top_row=(opp_id, domain_score, llm_score),
-                )
+        grant_payload = {
+            "opportunity_id": source_opp.get("opportunity_id"),
+            "opportunity_title": source_opp.get("opportunity_title") or source_opp.get("title"),
+            "agency_name": source_opp.get("agency_name") or source_opp.get("agency"),
+            "summary_description": source_opp.get("summary_description") or source_opp.get("summary"),
+            "keywords": source_opp.get("keywords") or {},
+        }
+
+        team_payload: List[Dict[str, Any]] = []
+        for fctx in list(fac_ctxs or []):
+            fid_raw = fctx.get("faculty_id") if isinstance(fctx, dict) else None
+            try:
+                fid = int(fid_raw)
+            except Exception:
+                fid = None
+            covered = {"application": {}, "research": {}}
+            if fid is not None:
+                covered = dict(source_member_coverages.get(fid) or covered)
+            team_payload.append(
+                {
+                    "faculty_id": fid,
+                    "name": (fctx or {}).get("name"),
+                    "email": (fctx or {}).get("email"),
+                    "covered": {
+                        "application": dict((covered or {}).get("application") or {}),
+                        "research": dict((covered or {}).get("research") or {}),
+                    },
+                }
             )
-        return out
 
-    # ====================
-    # Input / Coverage Context
-    # ====================
-    def build_inputs_for_opportunity(
-        self,
+        return {
+            "grant": grant_payload,
+            "team": team_payload,
+            "coverage": coverage,
+            "group_match": dict(group_meta or {}),
+        }
+
+
+    @classmethod
+    def build_top_match_payload_row(
+        cls,
         *,
-        sess,
-        opportunity_id: str,
-        limit_rows: int = 500,
-    ) -> Tuple[List[int], Dict[str, Dict[int, float]], Dict[int, Dict[str, Dict[int, float]]]]:
-        opp_dao = OpportunityDAO(sess)
+        opp_ctx: Dict[str, Any],
+        top_row: Tuple[str, float, float],
+    ) -> Dict[str, Any]:
+        """Build one top-match row for ranking/justification views."""
+        source_opp = dict(opp_ctx or {})
+        opportunity_id, domain_score, llm_score = top_row
+        return {
+            "opportunity_id": str(opportunity_id),
+            "opportunity_title": source_opp.get("opportunity_title") or source_opp.get("title"),
+            "agency_name": source_opp.get("agency_name") or source_opp.get("agency"),
+            "domain_score": cls._to_float(domain_score),
+            "llm_score": cls._to_float(llm_score),
+        }
 
-        opps = opp_dao.read_opportunities_by_ids_with_relations([opportunity_id])
-        if not opps:
-            raise ValueError(f"Opportunity not found: {opportunity_id}")
-        opp = opps[0]
-
-        kw_raw = getattr(opp.keyword, "keywords", {}) or {}
-        spec_items = extract_specializations(kw_raw)
-
+    @classmethod
+    def build_requirements_from_opportunity_keywords(
+        cls,
+        *,
+        opportunity_keywords: Dict[str, Any],
+    ) -> Dict[str, Dict[int, float]]:
+        """Convert opportunity specialization keywords to weighted requirement map."""
+        spec_items = extract_specializations(dict(opportunity_keywords or {}))
         requirements: Dict[str, Dict[int, float]] = {"application": {}, "research": {}}
         for sec in ("application", "research"):
-            for idx, item in enumerate(spec_items[sec]):
-                requirements[sec][idx] = float(item.get("w", 1.0))
+            for idx, item in enumerate(list(spec_items.get(sec) or [])):
+                requirements[sec][int(idx)] = cls._to_float((item or {}).get("w"), default=1.0)
+        return requirements
 
-        coverage = self.build_member_coverages_for_opportunity(
-            sess=sess,
-            opportunity_id=opportunity_id,
-            limit_rows=limit_rows,
-        )
-        if not coverage:
-            raise ValueError("No match rows found.")
-
-        ctx = self.build_matching_context(
-            profile="inputs",
-            faculty_ids=sorted(coverage.keys()),
-            requirements=requirements,
-            coverage=coverage,
-        )
-        return (
-            list(ctx.get("faculty_ids") or []),
-            dict(ctx.get("requirements") or {"application": {}, "research": {}}),
-            dict(ctx.get("coverage") or {}),
-        )
-
-    def build_member_coverages_for_opportunity(
-        self,
+    @classmethod
+    def build_member_coverages_from_match_rows(
+        cls,
         *,
-        sess,
-        opportunity_id: str,
-        limit_rows: int = 500,
+        match_rows: List[Dict[str, Any]],
     ) -> Dict[int, Dict[str, Dict[int, float]]]:
-        match_dao = MatchDAO(sess)
-        match_rows = match_dao.list_matches_for_opportunity(opportunity_id, limit=limit_rows) or []
-        if not match_rows:
-            return {}
-
+        """Aggregate per-faculty coverage from stored one-to-one match rows."""
         coverage: Dict[int, Dict[str, Dict[int, float]]] = {}
-        for row in match_rows:
-            fid = int(row["faculty_id"])
+        for row in list(match_rows or []):
+            try:
+                fid = int((row or {}).get("faculty_id"))
+            except Exception:
+                continue
+
             if fid not in coverage:
                 coverage[fid] = {"application": {}, "research": {}}
-            cov = row.get("covered") or {}
+
+            covered = dict((row or {}).get("covered") or {})
             for sec in ("application", "research"):
-                sec_map = cov.get(sec) or {}
+                sec_map = dict(covered.get(sec) or {})
                 for k, v in sec_map.items():
                     try:
                         idx = int(k)
-                        cval = float(v)
                     except Exception:
                         continue
-                    prev = coverage[fid][sec].get(idx, 0.0)
-                    coverage[fid][sec][idx] = max(prev, cval)
+                    prev = cls._to_float(coverage[fid][sec].get(idx), default=0.0)
+                    cur = cls._to_float(v, default=0.0)
+                    coverage[fid][sec][idx] = max(prev, cur)
 
         return coverage
 
-    # ====================
-    # Rerank Context
-    # ====================
-    def build_rerank_keyword_inventory_for_faculty(
-        self,
+    @staticmethod
+    def build_matching_inputs_payload(
         *,
-        sess,
-        faculty_id: int,
-        k: int = 10,
+        faculty_ids: List[int],
+        requirements: Dict[str, Dict[int, float]],
+        coverage: Dict[int, Dict[str, Dict[int, float]]],
     ) -> Dict[str, Any]:
-        """Keyword-only inventory payload for one faculty against top-k matched grants."""
-        fid = int(faculty_id)
-        top_k = max(1, int(k))
+        """Build compact input payload used by team matching optimization."""
+        return {
+            "faculty_ids": [int(x) for x in list(faculty_ids or [])],
+            "requirements": {
+                "application": dict((requirements or {}).get("application") or {}),
+                "research": dict((requirements or {}).get("research") or {}),
+            },
+            "coverage": dict(coverage or {}),
+        }
 
-        fdao = FacultyDAO(sess)
-        mdao = MatchDAO(sess)
-        odao = OpportunityDAO(sess)
+    @classmethod
+    def build_matching_inputs_payload_from_opportunity_and_match_rows(
+        cls,
+        *,
+        opp: Any,
+        match_rows: List[Dict[str, Any]],
+        build_opportunity_keyword_context: Callable[[Any], Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        """Build matching inputs payload from one opportunity entity and stored match rows."""
+        opp_kw_ctx = dict(build_opportunity_keyword_context(opp) or {})
+        requirements = cls.build_requirements_from_opportunity_keywords(
+            opportunity_keywords=dict(opp_kw_ctx.get("keywords") or {}),
+        )
+        coverage = cls.build_member_coverages_from_match_rows(match_rows=match_rows)
+        return cls.build_matching_inputs_payload(
+            faculty_ids=sorted(list(coverage.keys())),
+            requirements=requirements,
+            coverage=coverage,
+        )
 
-        fac_ctx = fdao.get_faculty_keyword_context(fid)
-        if not fac_ctx:
-            raise ValueError(f"Faculty not found: {fid}")
-
-        fkw = keyword_inventory_for_rerank(dict((fac_ctx or {}).get("keywords") or {}))
-        rows = mdao.top_matches_for_faculty(fid, k=top_k)
+    @classmethod
+    def build_rerank_keyword_inventory(
+        cls,
+        *,
+        faculty_keyword_inventory: Dict[str, Any],
+        grant_keyword_rows: List[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        """Build rerank inventory from prepared faculty/grant keyword inventories."""
+        fac_inv = dict(faculty_keyword_inventory or {})
 
         grants: List[Dict[str, Any]] = []
-        for grant_id, domain_score, llm_score in list(rows or []):
-            oid = self._norm(grant_id)
-            if not oid:
-                continue
-            grant_ctx = odao.read_opportunity_context(oid)
-            if not grant_ctx:
-                continue
-            gkw = keyword_inventory_for_rerank(dict(grant_ctx.get("keywords") or {}))
+        for row in list(grant_keyword_rows or []):
+            opp_inv = dict((row or {}).get("opportunity_keyword_inventory") or {})
             grants.append(
                 {
-                    "opportunity_id": grant_ctx.get("opportunity_id"),
-                    "title": grant_ctx.get("title"),
-                    "domain_score": float(domain_score or 0.0),
-                    "llm_score": float(llm_score or 0.0),
-                    "grant_domain_keywords": gkw.get("domain") or [],
-                    "grant_specialization_keywords": gkw.get("specialization") or {},
+                    "opportunity_id": opp_inv.get("opportunity_id"),
+                    "opportunity_title": opp_inv.get("opportunity_title") or opp_inv.get("title"),
+                    "domain_score": cls._to_float((row or {}).get("domain_score"), default=0.0),
+                    "llm_score": cls._to_float((row or {}).get("llm_score"), default=0.0),
+                    "grant_domain_keywords": list(opp_inv.get("grant_domain_keywords") or []),
+                    "grant_specialization_keywords": dict(opp_inv.get("grant_specialization_keywords") or {}),
                 }
             )
 
         return {
             "faculty": {
-                "faculty_id": fid,
-                "name": fac_ctx.get("name"),
-                "domain_keywords": fkw.get("domain") or [],
-                "specialization_keywords": fkw.get("specialization") or {},
+                "faculty_id": fac_inv.get("faculty_id"),
+                "name": fac_inv.get("name"),
+                "domain_keywords": list(fac_inv.get("domain_keywords") or []),
+                "specialization_keywords": dict(fac_inv.get("specialization_keywords") or {}),
             },
             "grants": grants,
+        }
+
+    @classmethod
+    def build_top_match_payload_from_entities(
+        cls,
+        *,
+        top_rows: List[Tuple[str, float, float]],
+        opportunities: List[Any],
+        build_opportunity_matching_context: Callable[[Any], Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        """Build top-match payload list from top rows and opportunity entities."""
+        by_id = cls._opportunity_map(opportunities)
+        out: List[Dict[str, Any]] = []
+        for oid, domain_score, llm_score in list(top_rows or []):
+            oid_norm = str(oid or "").strip()
+            opp = by_id.get(oid_norm)
+            if not opp:
+                continue
+            opp_ctx = dict(build_opportunity_matching_context(opp) or {})
+            out.append(
+                cls.build_top_match_payload_row(
+                    opp_ctx=opp_ctx,
+                    top_row=(oid_norm, float(domain_score or 0.0), float(llm_score or 0.0)),
+                )
+            )
+        return out
+
+    @classmethod
+    def build_rerank_keyword_inventory_from_entities(
+        cls,
+        *,
+        faculty: Any,
+        top_rows: List[Tuple[str, float, float]],
+        opportunities: List[Any],
+        build_faculty_keyword_inventory: Callable[[Any], Dict[str, Any]],
+        build_opportunity_keyword_inventory: Callable[[Any], Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        """Build rerank inventory from faculty + top-row opportunities using side inventories."""
+        fac_kw_inv = dict(build_faculty_keyword_inventory(faculty) or {})
+        by_id = cls._opportunity_map(opportunities)
+
+        grant_keyword_rows: List[Dict[str, Any]] = []
+        for oid, domain_score, llm_score in list(top_rows or []):
+            oid_norm = str(oid or "").strip()
+            opp = by_id.get(oid_norm)
+            if not opp:
+                continue
+            grant_keyword_rows.append(
+                {
+                    "domain_score": float(domain_score or 0.0),
+                    "llm_score": float(llm_score or 0.0),
+                    "opportunity_keyword_inventory": dict(build_opportunity_keyword_inventory(opp) or {}),
+                }
+            )
+
+        return cls.build_rerank_keyword_inventory(
+            faculty_keyword_inventory=fac_kw_inv,
+            grant_keyword_rows=grant_keyword_rows,
+        )
+
+    @classmethod
+    def build_rerank_keyword_inventory_for_opportunity_from_entities(
+        cls,
+        *,
+        opp: Any,
+        match_rows: List[Dict[str, Any]],
+        faculties: List[Any],
+        build_opportunity_keyword_inventory: Callable[[Any], Dict[str, Any]],
+        build_faculty_keyword_inventory: Callable[[Any], Dict[str, Any]],
+        k: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """Build grant-vs-faculty keyword inventory from entities using side inventories."""
+        grant_kw_inv = dict(build_opportunity_keyword_inventory(opp) or {})
+        fac_by_id = cls._faculty_map(faculties)
+
+        limit = int(k) if k is not None and int(k) > 0 else None
+        source_rows = list(match_rows or [])
+        if limit is not None:
+            source_rows = source_rows[:limit]
+
+        faculty_keyword_rows: List[Dict[str, Any]] = []
+        for row in source_rows:
+            try:
+                fid = int((row or {}).get("faculty_id"))
+            except Exception:
+                continue
+            fac = fac_by_id.get(fid)
+            if fac is None:
+                continue
+            faculty_keyword_rows.append(
+                {
+                    "domain_score": cls._to_float((row or {}).get("domain_score"), default=0.0),
+                    "llm_score": cls._to_float((row or {}).get("llm_score"), default=0.0),
+                    "faculty_keyword_inventory": dict(build_faculty_keyword_inventory(fac) or {}),
+                }
+            )
+        matches: List[Dict[str, Any]] = []
+        for row in faculty_keyword_rows:
+            fac_inv = dict((row or {}).get("faculty_keyword_inventory") or {})
+            matches.append(
+                {
+                    "domain_score": cls._to_float((row or {}).get("domain_score"), default=0.0),
+                    "llm_score": cls._to_float((row or {}).get("llm_score"), default=0.0),
+                    "domain_keywords": list(fac_inv.get("domain_keywords") or []),
+                    "specialization_keywords": dict(fac_inv.get("specialization_keywords") or {}),
+                }
+            )
+
+        return {
+            "grant": {
+                "opportunity_id": grant_kw_inv.get("opportunity_id"),
+                "title": grant_kw_inv.get("opportunity_title") or grant_kw_inv.get("title"),
+                "grant_domain_keywords": list(grant_kw_inv.get("grant_domain_keywords") or []),
+                "grant_specialization_keywords": dict(grant_kw_inv.get("grant_specialization_keywords") or {}),
+            },
+            "matches": matches,
         }

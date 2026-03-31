@@ -1,52 +1,15 @@
 from __future__ import annotations
 
-import re
-from typing import Any, Dict, Iterable, List, Tuple
+from typing import Any, Callable, Dict, List, Tuple
 
-from dao.faculty_dao import FacultyDAO
-from dao.match_dao import MatchDAO
-from dao.opportunity_dao import OpportunityDAO
-from db.models import Faculty
-from services.context_retrieval.faculty_context import FacultyContextBuilder
-from services.context_retrieval.opportunity_context import OpportunityContextBuilder
-from utils.content_extractor import load_extracted_content
-from utils.keyword_utils import keyword_inventory_for_rerank
-
-TOKEN_RE = re.compile(r"[A-Za-z0-9]+")
 
 
 class JustificationContextBuilder:
-    PROFILE_FIELDS: Dict[str, Tuple[str, ...]] = {
-        "faculty_recommendation_faculty": (
-            "faculty_id",
-            "name",
-            "email",
-            "profile_url",
-            "keywords",
-        ),
-        "faculty_recommendation_opportunity": (
-            "opportunity_id",
-            "opportunity_title",
-            "agency_name",
-            "opportunity_link",
-            "keywords",
-            "domain_score",
-            "llm_score",
-        ),
-    }
+    """Pure justification context builder.
 
-    def __init__(
-        self,
-        *,
-        faculty_builder: FacultyContextBuilder | None = None,
-        opportunity_builder: OpportunityContextBuilder | None = None,
-    ):
-        self.faculty = faculty_builder or FacultyContextBuilder()
-        self.opportunity = opportunity_builder or OpportunityContextBuilder()
-
-    @staticmethod
-    def _select_fields(payload: Dict[str, Any], fields: Tuple[str, ...]) -> Dict[str, Any]:
-        return {k: payload.get(k) for k in fields}
+    This builder shapes payloads from already-fetched entities/rows. It does not
+    instantiate DAOs or call other context generators directly.
+    """
 
     @staticmethod
     def _norm(text: Any) -> str:
@@ -65,6 +28,29 @@ class JustificationContextBuilder:
         if len(s) <= int(max_chars):
             return s
         return s[: int(max_chars)].rstrip()
+
+    @staticmethod
+    def _ordered_unique(values: List[str]) -> List[str]:
+        out: List[str] = []
+        seen = set()
+        for value in list(values or []):
+            v = str(value or "").strip()
+            if not v or v in seen:
+                continue
+            seen.add(v)
+            out.append(v)
+        return out
+
+    @staticmethod
+    def _index_by_id(rows: List[Dict[str, Any]]) -> Dict[int, Dict[str, Any]]:
+        out: Dict[int, Dict[str, Any]] = {}
+        for row in list(rows or []):
+            rid = row.get("id", row.get("row_id"))
+            try:
+                out[int(rid)] = dict(row)
+            except Exception:
+                continue
+        return out
 
     @classmethod
     def _normalize_source_type(cls, value: Any) -> str:
@@ -104,158 +90,6 @@ class JustificationContextBuilder:
             )
         out.sort(key=lambda x: float(x.get("score") or 0.0), reverse=True)
         return out
-
-    @staticmethod
-    def _index_by_id(rows: List[Dict[str, Any]]) -> Dict[int, Dict[str, Any]]:
-        out: Dict[int, Dict[str, Any]] = {}
-        for row in list(rows or []):
-            rid = row.get("id", row.get("row_id"))
-            try:
-                out[int(rid)] = dict(row)
-            except Exception:
-                continue
-        return out
-
-    @classmethod
-    def _build_opportunity_contexts_source_linked(
-        cls,
-        *,
-        sess,
-        opportunity_ids: List[str],
-    ) -> Dict[str, Dict[str, Any]]:
-        ids = [cls._norm(x) for x in list(opportunity_ids or []) if cls._norm(x)]
-        if not ids:
-            return {}
-        odao = OpportunityDAO(sess)
-        opps = odao.read_opportunities_by_ids_with_relations(ids)
-        out: Dict[str, Dict[str, Any]] = {}
-        for opp in list(opps or []):
-            oid = cls._norm(getattr(opp, "opportunity_id", None))
-            if not oid:
-                continue
-            out[oid] = {
-                "opportunity_id": oid,
-                "summary_description": cls._norm(getattr(opp, "summary_description", None)),
-                "additional_info_extracted": load_extracted_content(
-                    list(getattr(opp, "additional_info", None) or []),
-                    url_attr="additional_info_url",
-                    group_chunks=False,
-                    include_row_meta=True,
-                ),
-                "attachments_extracted": load_extracted_content(
-                    list(getattr(opp, "attachments", None) or []),
-                    url_attr="file_download_path",
-                    title_attr="file_name",
-                    group_chunks=False,
-                    include_row_meta=True,
-                ),
-            }
-        return out
-
-    def build_grant_context_only(
-        self,
-        *,
-        sess,
-        opportunity_id: str,
-        preview_chars: int = 700,
-    ) -> Dict[str, Any]:
-        """Fetch one grant context with extracted additional-link and attachment chunks.
-
-        This is grant-only context (no faculty dependency), intended for grant explanation.
-        """
-        oid = self._norm(opportunity_id)
-        if not oid:
-            raise ValueError("opportunity_id is required")
-
-        odao = OpportunityDAO(sess)
-        opps = odao.read_opportunities_by_ids_with_relations([oid])
-        opp = opps[0] if opps else None
-        if not opp:
-            raise ValueError(f"Opportunity not found: {oid}")
-
-        add_rows = load_extracted_content(
-            list(getattr(opp, "additional_info", None) or []),
-            url_attr="additional_info_url",
-            group_chunks=False,
-            include_row_meta=True,
-        )
-        att_rows = load_extracted_content(
-            list(getattr(opp, "attachments", None) or []),
-            url_attr="file_download_path",
-            title_attr="file_name",
-            group_chunks=False,
-            include_row_meta=True,
-        )
-
-        def _trim_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-            out: List[Dict[str, Any]] = []
-            for row in list(rows or []):
-                item = dict(row or {})
-                if "content" in item:
-                    item["content"] = self._short(item.get("content"), max_chars=int(preview_chars))
-                out.append(item)
-            return out
-
-        return {
-            "opportunity_id": getattr(opp, "opportunity_id", None),
-            "title": getattr(opp, "opportunity_title", None),
-            "agency": getattr(opp, "agency_name", None),
-            "status": getattr(opp, "opportunity_status", None),
-            "opportunity_link": None,
-            "summary": self._norm(getattr(opp, "summary_description", None)),
-            "additional_info_count": len(add_rows),
-            "attachment_count": len(att_rows),
-            "additional_info_extracted": _trim_rows(add_rows),
-            "attachments_extracted": _trim_rows(att_rows),
-        }
-
-    def build_rerank_keyword_inventory_for_opportunity(
-        self,
-        *,
-        sess,
-        opportunity_id: str,
-        k: int = 10,
-    ) -> Dict[str, Any]:
-        """Keyword-only inventory payload for one grant against top-k matched faculty."""
-        oid = self._norm(opportunity_id)
-        if not oid:
-            raise ValueError("opportunity_id is required")
-        top_k = max(1, int(k))
-
-        odao = OpportunityDAO(sess)
-        mdao = MatchDAO(sess)
-        fdao = FacultyDAO(sess)
-
-        grant_ctx = odao.read_opportunity_context(oid)
-        if not grant_ctx:
-            raise ValueError(f"Opportunity not found: {oid}")
-
-        gkw = keyword_inventory_for_rerank(dict(grant_ctx.get("keywords") or {}))
-        rows = mdao.list_matches_for_opportunity(oid, limit=top_k)
-
-        matches: List[Dict[str, Any]] = []
-        for row in list(rows or []):
-            fid = int(row.get("faculty_id"))
-            fac_ctx = fdao.get_faculty_keyword_context(fid) or {}
-            fkw = keyword_inventory_for_rerank(dict((fac_ctx or {}).get("keywords") or {}))
-            matches.append(
-                {
-                    "domain_score": float(row.get("domain_score") or 0.0),
-                    "llm_score": float(row.get("llm_score") or 0.0),
-                    "domain_keywords": fkw.get("domain") or [],
-                    "specialization_keywords": fkw.get("specialization") or {},
-                }
-            )
-
-        return {
-            "grant": {
-                "opportunity_id": grant_ctx.get("opportunity_id"),
-                "title": grant_ctx.get("title"),
-                "grant_domain_keywords": gkw.get("domain") or [],
-                "grant_specialization_keywords": gkw.get("specialization") or {},
-            },
-            "matches": matches,
-        }
 
     @classmethod
     def _build_faculty_spec_index(cls, fac_keywords: Dict[str, Any]) -> Dict[str, Dict[int, Dict[str, Any]]]:
@@ -301,7 +135,9 @@ class JustificationContextBuilder:
                     spec_item = specs[req_idx]
                     if isinstance(spec_item, dict):
                         if not req_text:
-                            req_text = cls._norm(spec_item.get("t") if spec_item.get("t") is not None else spec_item.get("text"))
+                            req_text = cls._norm(
+                                spec_item.get("t") if spec_item.get("t") is not None else spec_item.get("text")
+                            )
                         req_sources = list(spec_item.get("sources") or [])
                 if not req_text:
                     continue
@@ -327,138 +163,128 @@ class JustificationContextBuilder:
         return rows[: max(1, int(max_requirements))]
 
 
-    def build_justification_retrievable_context(
-        self,
+    @classmethod
+    def build_faculty_recommendation_payloads_from_entities(
+        cls,
         *,
-        sess,
-        fac: Faculty,
+        fac: Any,
+        opportunities: List[Any],
         top_rows: List[Tuple[str, float, float]],
-    ) -> Dict[str, Any]:
-        fac_ctx = self.faculty.build_faculty_context(fac, profile="keyword")
+        build_faculty_keyword_context: Callable[[Any], Dict[str, Any]],
+        build_opportunity_keyword_context: Callable[[Any], Dict[str, Any]],
+    ) -> Tuple[Dict[str, object], List[Dict[str, object]]]:
+        """Build faculty + top-opportunity payloads for recommendation prompting."""
+        fac_ctx = dict(build_faculty_keyword_context(fac) or {})
+        opp_by_id: Dict[str, Any] = {}
+        for opp in list(opportunities or []):
+            oid = str(getattr(opp, "opportunity_id", "") or "").strip()
+            if not oid:
+                continue
+            opp_by_id[oid] = opp
 
-        opp_ids = [gid for (gid, _, _) in (top_rows or [])]
         score_map = {
-            gid: {"domain_score": domain_score, "llm_score": llm_score}
-            for (gid, domain_score, llm_score) in (top_rows or [])
+            str(oid): {"domain_score": float(domain_score), "llm_score": float(llm_score)}
+            for oid, domain_score, llm_score in list(top_rows or [])
         }
-        if not opp_ids:
-            return {
-                "faculty": fac_ctx,
-                "opportunities": [],
-            }
 
-        opp_dao = OpportunityDAO(sess)
-        opps = opp_dao.read_opportunities_by_ids_for_keyword_context(opp_ids)
-        opp_map = {o.opportunity_id: o for o in opps}
-
-        opp_payloads: List[Dict[str, object]] = []
-        for oid in opp_ids:
-            opp = opp_map.get(oid)
+        payloads: List[Dict[str, object]] = []
+        ordered_ids = cls._ordered_unique([str(oid) for oid, _, _ in list(top_rows or [])])
+        for oid in ordered_ids:
+            opp = opp_by_id.get(oid)
             if not opp:
                 continue
-            opp_ctx = self.opportunity.build_opportunity_keyword_context(opp)
-            scores = score_map.get(oid, {"domain_score": None, "llm_score": None})
-            payload: Dict[str, object] = {
-                "opportunity_id": opp_ctx.get("opportunity_id") or oid,
-                "opportunity_title": opp_ctx.get("opportunity_title"),
-                "agency_name": opp_ctx.get("agency_name"),
-                "opportunity_link": opp_ctx.get("opportunity_link"),
-                "keywords": opp_ctx.get("keywords") or {},
-                "domain_score": float(scores["domain_score"] or 0.0),
-                "llm_score": float(scores["llm_score"] or 0.0),
-            }
-            opp_payloads.append(payload)
-
-        return {
-            "faculty": fac_ctx,
-            "opportunities": opp_payloads,
-        }
-
-    def build_justification_context(
-        self,
-        *,
-        profile: str,
-        sess,
-        fac: Faculty,
-        top_rows: List[Tuple[str, float, float]],
-    ) -> Dict[str, Any]:
-        normalized = str(profile or "").strip().lower()
-        faculty_fields = self.PROFILE_FIELDS.get(f"{normalized}_faculty")
-        opportunity_fields = self.PROFILE_FIELDS.get(f"{normalized}_opportunity")
-        if not faculty_fields or not opportunity_fields:
-            raise ValueError(f"Unsupported justification context profile: {profile}")
-        full = self.build_justification_retrievable_context(
-            sess=sess,
-            fac=fac,
-            top_rows=top_rows,
-        )
-        return {
-            "faculty": self._select_fields(dict(full.get("faculty") or {}), faculty_fields),
-            "opportunities": [
-                self._select_fields(dict(payload or {}), opportunity_fields)
-                for payload in list(full.get("opportunities") or [])
-            ],
-        }
-
-    def build_faculty_recommendation_payloads(
-        self,
-        *,
-        sess,
-        fac: Faculty,
-        top_rows: List[Tuple[str, float, float]],
-    ) -> Tuple[Dict[str, object], List[Dict[str, object]]]:
-        ctx = self.build_justification_context(
-            profile="faculty_recommendation",
-            sess=sess,
-            fac=fac,
-            top_rows=top_rows,
-        )
-        return (
-            dict(ctx.get("faculty") or {}),
-            list(ctx.get("opportunities") or []),
-        )
-
-    def build_faculty_recommendation_source_linked_payload(
-        self,
-        *,
-        sess,
-        fac: Faculty,
-        top_rows: List[Tuple[str, float, float]],
-    ) -> Dict[str, Any]:
-        fac_ctx, opp_payloads = self.build_faculty_recommendation_payloads(
-            sess=sess,
-            fac=fac,
-            top_rows=top_rows,
-        )
-
-        opp_ids = [str(oid) for oid, _, _ in list(top_rows or [])]
-        opp_contexts = self._build_opportunity_contexts_source_linked(
-            sess=sess,
-            opportunity_ids=opp_ids,
-        )
-
-        mdao = MatchDAO(sess)
-        match_rows_by_opp: Dict[str, Dict[str, Any]] = {}
-        for oid in list(opp_ids or []):
-            row = mdao.get_match_for_faculty_opportunity(
-                faculty_id=int(getattr(fac, "faculty_id")),
-                opportunity_id=str(oid),
+            opp_ctx = dict(build_opportunity_keyword_context(opp) or {})
+            scores = score_map.get(oid, {"domain_score": 0.0, "llm_score": 0.0})
+            payloads.append(
+                {
+                    "opportunity_id": opp_ctx.get("opportunity_id") or oid,
+                    "opportunity_title": opp_ctx.get("opportunity_title"),
+                    "agency_name": opp_ctx.get("agency_name"),
+                    "opportunity_link": opp_ctx.get("opportunity_link"),
+                    "keywords": opp_ctx.get("keywords") or {},
+                    "domain_score": cls._safe_float(scores.get("domain_score"), 0.0),
+                    "llm_score": cls._safe_float(scores.get("llm_score"), 0.0),
+                }
             )
-            if row:
-                match_rows_by_opp[str(oid)] = dict(row)
 
-        fac_profile_chunks = load_extracted_content(
-            list(getattr(fac, "additional_info", None) or []),
-            url_attr="additional_info_url",
-            group_chunks=False,
-            include_row_meta=True,
+        return fac_ctx, payloads
+
+    @classmethod
+    def build_opportunity_source_contexts_from_entities(
+        cls,
+        *,
+        opportunities: List[Any],
+        build_opportunity_source_linked_context: Callable[[Any], Dict[str, Any]],
+    ) -> Dict[str, Dict[str, Any]]:
+        """Build source-linked opportunity contexts with extracted chunk blocks."""
+        out: Dict[str, Dict[str, Any]] = {}
+        for opp in list(opportunities or []):
+            oid = cls._norm(getattr(opp, "opportunity_id", None))
+            if not oid:
+                continue
+            full = dict(build_opportunity_source_linked_context(opp) or {})
+            out[oid] = {
+                "opportunity_id": oid,
+                "summary_description": cls._norm(full.get("summary_description")),
+                "additional_info_extracted": list(full.get("additional_info_extracted") or []),
+                "attachments_extracted": list(full.get("attachments_extracted") or []),
+            }
+        return out
+
+    @classmethod
+    def build_match_rows_by_opp_from_rows(
+        cls,
+        *,
+        rows: List[Dict[str, Any]],
+    ) -> Dict[str, Dict[str, Any]]:
+        """Index match rows by opportunity/grant id."""
+        out: Dict[str, Dict[str, Any]] = {}
+        for row in list(rows or []):
+            oid = cls._norm((row or {}).get("grant_id") or (row or {}).get("opportunity_id"))
+            if not oid:
+                continue
+            out[oid] = dict(row or {})
+        return out
+
+    @classmethod
+    def build_faculty_recommendation_source_linked_payload_from_entities(
+        cls,
+        *,
+        fac: Any,
+        opportunities: List[Any],
+        top_rows: List[Tuple[str, float, float]],
+        match_rows: List[Dict[str, Any]],
+        build_faculty_keyword_context: Callable[[Any], Dict[str, Any]],
+        build_opportunity_keyword_context: Callable[[Any], Dict[str, Any]],
+        build_faculty_source_linked_context: Callable[[Any], Dict[str, Any]],
+        build_opportunity_source_linked_context: Callable[[Any], Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        """Build source-linked recommendation payload from entities + match rows."""
+        fac_ctx, opp_payloads = cls.build_faculty_recommendation_payloads_from_entities(
+            fac=fac,
+            opportunities=opportunities,
+            top_rows=top_rows,
+            build_faculty_keyword_context=build_faculty_keyword_context,
+            build_opportunity_keyword_context=build_opportunity_keyword_context,
         )
-        fac_profile_chunk_by_id = self._index_by_id(fac_profile_chunks)
-        fac_publication_by_id = {
-            int(getattr(p, "id")): p
-            for p in list(getattr(fac, "publications", None) or [])
-            if getattr(p, "id", None) is not None
-        }
+
+        opp_contexts = cls.build_opportunity_source_contexts_from_entities(
+            opportunities=opportunities,
+            build_opportunity_source_linked_context=build_opportunity_source_linked_context,
+        )
+        match_rows_by_opp = cls.build_match_rows_by_opp_from_rows(rows=match_rows)
+
+        fac_source_ctx = dict(build_faculty_source_linked_context(fac) or {})
+        fac_profile_chunks = list(fac_source_ctx.get("additional_info_extracted") or [])
+        fac_publication_rows = list(fac_source_ctx.get("publications") or [])
+        fac_profile_chunk_by_id = cls._index_by_id(fac_profile_chunks)
+        fac_publication_by_id: Dict[int, Dict[str, Any]] = {}
+        for p in list(fac_publication_rows or []):
+            try:
+                pid = int((p or {}).get("id"))
+            except Exception:
+                continue
+            fac_publication_by_id[pid] = dict(p or {})
 
         return {
             "faculty_context": dict(fac_ctx or {}),
@@ -469,24 +295,19 @@ class JustificationContextBuilder:
             "faculty_publications_by_id": fac_publication_by_id,
         }
 
-    def build_faculty_recommendation_source_linked_text(
-        self,
+    @classmethod
+    def build_faculty_recommendation_source_linked_text_from_payload(
+        cls,
         *,
-        sess,
-        fac: Faculty,
-        top_rows: List[Tuple[str, float, float]],
+        payload: Dict[str, Any],
         max_requirements: int = 5,
         grant_evidence_per_requirement: int = 3,
         faculty_evidence_per_requirement: int = 3,
     ) -> str:
-        payload = self.build_faculty_recommendation_source_linked_payload(
-            sess=sess,
-            fac=fac,
-            top_rows=top_rows,
-        )
+        """Render source-linked recommendation payload into compact evidence text."""
         fac_ctx = dict(payload.get("faculty_context") or {})
         fac_keywords = dict((fac_ctx or {}).get("keywords") or {})
-        fac_specs = self._build_faculty_spec_index(fac_keywords)
+        fac_specs = cls._build_faculty_spec_index(fac_keywords)
         fac_publications = dict(payload.get("faculty_publications_by_id") or {})
         fac_profile_chunk_by_id = dict(payload.get("faculty_profile_chunks_by_id") or {})
         opp_payloads = list(payload.get("opportunity_payloads") or [])
@@ -496,15 +317,15 @@ class JustificationContextBuilder:
         lines: List[str] = [
             "FACULTY",
             f"- ID: {fac_ctx.get('faculty_id')}",
-            f"- Name: {self._norm(fac_ctx.get('name'))}",
-            f"- Email: {self._norm(fac_ctx.get('email'))}",
+            f"- Name: {cls._norm(fac_ctx.get('name'))}",
+            f"- Email: {cls._norm(fac_ctx.get('email'))}",
         ]
 
         for i, opp in enumerate(list(opp_payloads or []), start=1):
-            oid = self._norm(opp.get("opportunity_id"))
+            oid = cls._norm(opp.get("opportunity_id"))
             opp_ctx = dict(opp_contexts.get(oid) or {})
-            add_by_id = self._index_by_id(list(opp_ctx.get("additional_info_extracted") or []))
-            att_by_id = self._index_by_id(list(opp_ctx.get("attachments_extracted") or []))
+            add_by_id = cls._index_by_id(list(opp_ctx.get("additional_info_extracted") or []))
+            att_by_id = cls._index_by_id(list(opp_ctx.get("attachments_extracted") or []))
             match_row = dict(match_rows_by_opp.get(oid) or {})
 
             lines.extend(
@@ -512,13 +333,13 @@ class JustificationContextBuilder:
                     "",
                     f"GRANT #{i}",
                     f"- ID: {oid}",
-                    f"- Title: {self._norm(opp.get('opportunity_title'))}",
-                    f"- Agency: {self._norm(opp.get('agency_name'))}",
-                    f"- Summary: {self._short(opp_ctx.get('summary_description') or opp.get('summary_description'), 700)}",
+                    f"- Title: {cls._norm(opp.get('opportunity_title'))}",
+                    f"- Agency: {cls._norm(opp.get('agency_name'))}",
+                    f"- Summary: {cls._short(opp_ctx.get('summary_description') or opp.get('summary_description'), 700)}",
                 ]
             )
 
-            req_rows = self._build_requirement_rows(
+            req_rows = cls._build_requirement_rows(
                 opp_payload=dict(opp or {}),
                 match_row=match_row,
                 max_requirements=max_requirements,
@@ -529,10 +350,10 @@ class JustificationContextBuilder:
 
             lines.append("EVIDENCE-ALIGNED REQUIREMENTS")
             for ridx, req in enumerate(req_rows, start=1):
-                lines.append(f"{ridx}) Requirement: {req['text']} (score={self._safe_float(req.get('score')):.2f})")
+                lines.append(f"{ridx}) Requirement: {req['text']} (score={cls._safe_float(req.get('score')):.2f})")
 
                 lines.append("   Grant evidence (source-linked chunks):")
-                grant_refs = self._extract_sources(
+                grant_refs = cls._extract_sources(
                     req.get("sources"),
                     allowed_types={"additional_info_chunk", "attachment_chunk"},
                 )
@@ -542,10 +363,10 @@ class JustificationContextBuilder:
                     if not row:
                         continue
                     if ref["type"] == "additional_info_chunk":
-                        label = f"Additional link ({self._norm(row.get('url')) or 'N/A'})"
+                        label = f"Additional link ({cls._norm(row.get('url')) or 'N/A'})"
                     else:
-                        label = f"Attachment ({self._norm(row.get('title')) or self._norm(row.get('url')) or 'N/A'})"
-                    grant_lines.append(f"{label}, src={ref['score']:.2f}: {self._short(row.get('content'))}")
+                        label = f"Attachment ({cls._norm(row.get('title')) or cls._norm(row.get('url')) or 'N/A'})"
+                    grant_lines.append(f"{label}, src={ref['score']:.2f}: {cls._short(row.get('content'))}")
                     if len(grant_lines) >= int(grant_evidence_per_requirement):
                         break
                 if not grant_lines:
@@ -556,7 +377,7 @@ class JustificationContextBuilder:
                 lines.append("   Faculty evidence (source-linked):")
                 pair_scores = sorted(
                     list(req.get("pair_scores") or []),
-                    key=lambda x: self._safe_float((x or {}).get("score")),
+                    key=lambda x: cls._safe_float((x or {}).get("score")),
                     reverse=True,
                 )
                 fac_refs: List[Dict[str, Any]] = []
@@ -569,7 +390,7 @@ class JustificationContextBuilder:
                     if not fac_spec:
                         continue
                     fac_refs.extend(
-                        self._extract_sources(
+                        cls._extract_sources(
                             fac_spec.get("sources"),
                             allowed_types={"publication", "additional_info_chunk"},
                         )
@@ -587,19 +408,24 @@ class JustificationContextBuilder:
                         pub = fac_publications.get(ref["id"])
                         if not pub:
                             continue
-                        title = self._norm(getattr(pub, "title", None))
-                        abstract = self._norm(getattr(pub, "abstract", None))
-                        year = getattr(pub, "year", None)
+                        if isinstance(pub, dict):
+                            title = cls._norm(pub.get("title"))
+                            abstract = cls._norm(pub.get("abstract"))
+                            year = pub.get("year")
+                        else:
+                            title = cls._norm(getattr(pub, "title", None))
+                            abstract = cls._norm(getattr(pub, "abstract", None))
+                            year = getattr(pub, "year", None)
                         fac_lines.append(
-                            f"Publication ({year}) {title}, src={ref['score']:.2f}: {self._short(abstract or title)}"
+                            f"Publication ({year}) {title}, src={ref['score']:.2f}: {cls._short(abstract or title)}"
                         )
                     elif ref["type"] == "additional_info_chunk":
                         row = fac_profile_chunk_by_id.get(ref["id"])
                         if not row:
                             continue
                         fac_lines.append(
-                            f"Profile chunk ({self._norm(row.get('url')) or 'N/A'}), src={ref['score']:.2f}: "
-                            f"{self._short(row.get('content'))}"
+                            f"Profile chunk ({cls._norm(row.get('url')) or 'N/A'}), src={ref['score']:.2f}: "
+                            f"{cls._short(row.get('content'))}"
                         )
 
                     if len(fac_lines) >= int(faculty_evidence_per_requirement):

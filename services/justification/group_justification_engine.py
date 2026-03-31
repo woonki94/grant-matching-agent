@@ -92,7 +92,7 @@ class GroupJustificationEngine:
         trace = trace or {}
         trace.setdefault("steps", {})
 
-        context = self.context_generator.build_group_matching_context(
+        context = self.context_generator.build_group_matching_context_from_contexts(
             opp_ctx=opp_ctx,
             fac_ctxs=fac_ctxs,
             coverage=coverage,
@@ -103,14 +103,19 @@ class GroupJustificationEngine:
         grant_block = context.get("grant") or {}
         team_block = context.get("team") or []
         coverage_block = context.get("coverage") or {}
-        grant_link = f"https://simpler.grants.gov/opportunity/{grant_block.get('id')}" if grant_block.get("id") else ""
+        grant_id = grant_block.get("id") or grant_block.get("opportunity_id")
+        grant_title = grant_block.get("title") or grant_block.get("opportunity_title")
+        grant_agency = grant_block.get("agency") or grant_block.get("agency_name")
+        grant_summary = grant_block.get("summary") or grant_block.get("summary_description")
+        grant_keywords = grant_block.get("keywords") or {}
+        grant_link = f"https://simpler.grants.gov/opportunity/{grant_id}" if grant_id else ""
         grant_ctx = dict(grant_brief_context or {})
 
         logger.info(
             "GROUP_EVIDENCE_INPUT meta=%s payload=%s",
             json.dumps(
                 {
-                    "opportunity_id": grant_block.get("id"),
+                    "opportunity_id": grant_id,
                     "team_size": len(team_block),
                     "team_faculty_ids": [m.get("faculty_id") for m in list(team_block or [])],
                     "evidence_chars": len(str(evidence_text or "")),
@@ -132,19 +137,19 @@ class GroupJustificationEngine:
                     grant_ctx
                     if grant_ctx
                     else {
-                        "opportunity_id": grant_block.get("id"),
-                        "title": grant_block.get("title"),
-                        "agency": grant_block.get("agency"),
+                        "opportunity_id": grant_id,
+                        "title": grant_title,
+                        "agency": grant_agency,
                         "opportunity_link": grant_link,
-                        "summary": grant_block.get("summary"),
+                        "summary": grant_summary,
                     }
                 ),
             }
             team_role_input = {
                 "grant": {
-                    "id": grant_block.get("id"),
-                    "title": grant_block.get("title"),
-                    "keywords": grant_block.get("keywords"),
+                    "id": grant_id,
+                    "title": grant_title,
+                    "keywords": grant_keywords,
                 },
                 "requirements": requirements,
                 "team": team_block,
@@ -152,9 +157,9 @@ class GroupJustificationEngine:
             }
             why_working_input = {
                 "grant": {
-                    "id": grant_block.get("id"),
-                    "title": grant_block.get("title"),
-                    "keywords": grant_block.get("keywords"),
+                    "id": grant_id,
+                    "title": grant_title,
+                    "keywords": grant_keywords,
                 },
                 "requirements": requirements,
                 "team": team_block,
@@ -163,9 +168,9 @@ class GroupJustificationEngine:
             }
             why_not_input = {
                 "grant": {
-                    "id": grant_block.get("id"),
-                    "title": grant_block.get("title"),
-                    "keywords": grant_block.get("keywords"),
+                    "id": grant_id,
+                    "title": grant_title,
+                    "keywords": grant_keywords,
                 },
                 "requirements": requirements,
                 "team": team_block,
@@ -233,7 +238,7 @@ class GroupJustificationEngine:
                 "GROUP_EVIDENCE_OUTPUT meta=%s output=%s",
                 json.dumps(
                     {
-                        "opportunity_id": grant_block.get("id"),
+                        "opportunity_id": grant_id,
                         "team_size": len(team_block),
                     },
                     ensure_ascii=False,
@@ -251,8 +256,8 @@ class GroupJustificationEngine:
 
             rec_input = {
                 "grant": {
-                    "id": grant_block.get("id"),
-                    "title": grant_block.get("title"),
+                    "id": grant_id,
+                    "title": grant_title,
                     "link": grant_link,
                 },
                 "team_roles": team_roles.model_dump(),
@@ -284,7 +289,7 @@ class GroupJustificationEngine:
                 "GROUP_EVIDENCE_PIPELINE_FAILED meta=%s",
                 json.dumps(
                     {
-                        "opportunity_id": grant_block.get("id"),
+                        "opportunity_id": grant_id,
                         "team_size": len(team_block),
                     },
                     ensure_ascii=False,

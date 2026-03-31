@@ -29,9 +29,6 @@ class MatchResult(Base):
     # Stage-2 specialization coverage score
     llm_score = Column(Float, nullable=False)
 
-    # Optional free-form explanation (currently not generated)
-    reason = Column(String(256), nullable=False)
-
     covered = Column(JSONB, nullable=False, default=dict)  # {"application": {"0": 0.83}, "research": {...}}
     missing = Column(JSONB, nullable=False, default=dict)  # {"application": [1, 2], "research": [...]}
     evidence = Column(JSONB, nullable=False, default=dict)  # scorer metadata / trace details

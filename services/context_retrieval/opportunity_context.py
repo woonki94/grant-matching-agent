@@ -1,221 +1,194 @@
 from __future__ import annotations
 
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List
 
 from db.models import Opportunity
 from services.context_retrieval.rag_chunk_retriever import retrieve_opportunity_supporting_chunks
 from utils.content_extractor import load_extracted_content
+from utils.keyword_utils import keyword_inventory_for_rerank
 
 
 class OpportunityContextBuilder:
-    PROFILE_FIELDS: Dict[str, Tuple[str, ...]] = {
-        "basic": (
-            "opportunity_title",
-            "agency_name",
-            "category",
-            "opportunity_status",
-            "summary_description",
-        ),
-        "keyword": (
-            "opportunity_id",
-            "opportunity_title",
-            "agency_name",
-            "opportunity_link",
-            "keywords",
-        ),
-        "explanation": (
-            "opportunity_id",
-            "opportunity_title",
-            "agency_name",
-            "category",
-            "opportunity_status",
-            "summary_description",
-            "keywords",
-        ),
-    }
+    """Standardized opportunity context builder.
+
+    This builder is isolated from legacy opportunity context logic so we can
+    evolve schema and retrieval behavior safely before replacement.
+    """
+
+    DEFAULT_TOP_K_PER_ADDITIONAL_SOURCE = 10
+    DEFAULT_TOP_K_PER_ATTACHMENT_SOURCE = 10
 
     @staticmethod
-    def _normalize_text(text: Any) -> str:
-        return " ".join(str(text or "").split())
-
-    @staticmethod
-    def _short_text(text: Any, *, max_chars: int) -> str:
-        s = OpportunityContextBuilder._normalize_text(text)
-        if not s:
-            return ""
-        cap = max(int(max_chars), 0)
-        if cap == 0:
-            return ""
-        if len(s) <= cap:
-            return s
-        clipped = s[:cap].rstrip()
-        sentence_end = max(clipped.rfind("."), clipped.rfind("!"), clipped.rfind("?"))
-        if sentence_end >= int(cap * 0.5):
-            return clipped[: sentence_end + 1].rstrip()
-        word_end = clipped.rfind(" ")
-        if word_end >= int(cap * 0.6):
-            return clipped[:word_end].rstrip()
-        return clipped
-
-    @staticmethod
-    def _brief_keyword_bucket(values: Any, *, limit: int) -> List[str]:
-        out: List[str] = []
-        for x in list(values or []):
-            s = str(x).strip()
-            if not s:
-                continue
-            out.append(s)
-            if len(out) >= limit:
-                break
-        return out
-
-    @staticmethod
-    def _select_fields(payload: Dict[str, Any], fields: Tuple[str, ...]) -> Dict[str, Any]:
-        return {k: payload.get(k) for k in fields}
+    def _to_keywords(opp: Opportunity) -> Dict[str, Any]:
+        """Read persisted opportunity keywords (or empty payload if missing)."""
+        return (getattr(opp, "keyword", None) and getattr(opp.keyword, "keywords", None)) or {}
 
     @staticmethod
     def _first_additional_info_link(opp: Opportunity) -> Any:
+        """Use the first additional-info URL as the opportunity link when available."""
         infos = list(getattr(opp, "additional_info", None) or [])
         if not infos:
             return None
         return getattr(infos[0], "additional_info_url", None)
 
-    def build_opportunity_retrievable_context(self, opp: Opportunity) -> Dict[str, Any]:
-        kw = (getattr(opp, "keyword", None) and getattr(opp.keyword, "keywords", None)) or {}
-        return {
-            "opportunity_id": getattr(opp, "opportunity_id", None),
-            "opportunity_title": getattr(opp, "opportunity_title", None),
-            "agency_name": getattr(opp, "agency_name", None),
-            "category": getattr(opp, "category", None),
-            "opportunity_status": getattr(opp, "opportunity_status", None),
-            "summary_description": getattr(opp, "summary_description", None),
-            "opportunity_link": self._first_additional_info_link(opp),
-            "keywords": kw,
-        }
-
-    def build_opportunity_context(
-        self,
+    @staticmethod
+    def _extracted_rows(
         opp: Opportunity,
         *,
-        profile: str = "basic",
-        max_summary_chars: int = 420,
-        max_item_chars: int = 240,
-        max_additional_items: int = 10,
-        max_attachment_items: int = 10,
-        max_keywords_per_bucket: int = 20,
-    ) -> Dict[str, Any]:
-        _ = max_summary_chars
-        full = self.build_opportunity_retrievable_context(opp)
-        normalized = str(profile or "").strip().lower()
-        fields = self.PROFILE_FIELDS.get(normalized)
-        if not fields:
-            raise ValueError(f"Unsupported opportunity context profile: {profile}")
-        context = self._select_fields(full, fields)
+        use_rag: bool,
+        top_k_per_additional_source: int,
+        top_k_per_attachment_source: int,
+    ) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+        """Load additional-link and attachment chunks via RAG, then fallback to all chunks."""
+        additional_blocks: List[Dict[str, Any]] = []
+        attachment_blocks: List[Dict[str, Any]] = []
 
-        if normalized == "keyword":
-            return context
-
-        rag = retrieve_opportunity_supporting_chunks(
-            opp,
-            top_k_per_additional_source=5,
-            top_k_per_attachment_source=5,
-        )
-        additional_blocks = list(rag.get("additional_info_chunks") or [])
-        attachment_blocks = list(rag.get("attachment_chunks") or [])
+        if use_rag:
+            rag = retrieve_opportunity_supporting_chunks(
+                opp,
+                top_k_per_additional_source=max(1, int(top_k_per_additional_source)),
+                top_k_per_attachment_source=max(1, int(top_k_per_attachment_source)),
+            )
+            additional_blocks = list(rag.get("additional_info_chunks") or [])
+            attachment_blocks = list(rag.get("attachment_chunks") or [])
 
         if not additional_blocks:
             additional_blocks = load_extracted_content(
-                opp.additional_info,
+                list(getattr(opp, "additional_info", None) or []),
                 url_attr="additional_info_url",
                 group_chunks=False,
                 include_row_meta=True,
             )
+
         if not attachment_blocks:
             attachment_blocks = load_extracted_content(
-                opp.attachments,
+                list(getattr(opp, "attachments", None) or []),
                 url_attr="file_download_path",
                 title_attr="file_name",
                 group_chunks=False,
                 include_row_meta=True,
             )
 
-        if normalized == "basic":
-            context["additional_info_extracted"] = additional_blocks
-            context["attachments_extracted"] = attachment_blocks
-            return context
+        return additional_blocks, attachment_blocks
 
-        kw = context.get("keywords") if isinstance(context, dict) else {}
-        research_kw = kw.get("research") if isinstance(kw, dict) else {}
-        application_kw = kw.get("application") if isinstance(kw, dict) else {}
-
-        additional_info_brief = []
-        for item in list(additional_blocks or [])[:max_additional_items]:
-            additional_info_brief.append(
-                {
-                    "url": item.get("url"),
-                    "excerpt": self._short_text(item.get("content"), max_chars=max_item_chars),
-                }
-            )
-
-        attachments_brief = []
-        for item in list(attachment_blocks or [])[:max_attachment_items]:
-            attachments_brief.append(
-                {
-                    "title": item.get("title"),
-                    "url": item.get("url"),
-                    "excerpt": self._short_text(item.get("content"), max_chars=max_item_chars),
-                }
-            )
-
-        context["summary_description"] = self._normalize_text(context.get("summary_description"))
-        context["keywords"] = {
-            "research": {
-                "domain": self._brief_keyword_bucket(
-                    (research_kw or {}).get("domain"),
-                    limit=max_keywords_per_bucket,
-                ),
-                "specialization": self._brief_keyword_bucket(
-                    (research_kw or {}).get("specialization"),
-                    limit=max_keywords_per_bucket,
-                ),
-            },
-            "application": {
-                "domain": self._brief_keyword_bucket(
-                    (application_kw or {}).get("domain"),
-                    limit=max_keywords_per_bucket,
-                ),
-                "specialization": self._brief_keyword_bucket(
-                    (application_kw or {}).get("specialization"),
-                    limit=max_keywords_per_bucket,
-                ),
-            },
-        }
-        context["additional_info_brief"] = additional_info_brief
-        context["attachments_brief"] = attachments_brief
-        return context
-
-    def build_opportunity_basic_context(self, opp: Opportunity) -> Dict[str, Any]:
-        return self.build_opportunity_context(opp, profile="basic")
-
-    def build_opportunity_keyword_context(self, opp: Opportunity) -> Dict[str, Any]:
-        return self.build_opportunity_context(opp, profile="keyword")
-
-    def build_opportunity_explanation_context(
-        self,
+    @classmethod
+    def _build_opportunity_context_payload(
+        cls,
         opp: Opportunity,
         *,
-        max_summary_chars: int = 420,
-        max_item_chars: int = 240,
-        max_additional_items: int = 2,
-        max_attachment_items: int = 2,
-        max_keywords_per_bucket: int = 6,
+        include_keywords: bool,
+        use_rag: bool = True,
+        top_k_per_additional_source: int = DEFAULT_TOP_K_PER_ADDITIONAL_SOURCE,
+        top_k_per_attachment_source: int = DEFAULT_TOP_K_PER_ATTACHMENT_SOURCE,
     ) -> Dict[str, Any]:
-        return self.build_opportunity_context(
+        """Build shared opportunity payload used by both basic and full variants."""
+        additional_blocks, attachment_blocks = cls._extracted_rows(
             opp,
-            profile="explanation",
-            max_summary_chars=max_summary_chars,
-            max_item_chars=max_item_chars,
-            max_additional_items=max_additional_items,
-            max_attachment_items=max_attachment_items,
-            max_keywords_per_bucket=max_keywords_per_bucket,
+            use_rag=use_rag,
+            top_k_per_additional_source=top_k_per_additional_source,
+            top_k_per_attachment_source=top_k_per_attachment_source,
+        )
+
+        payload: Dict[str, Any] = {
+            "opportunity_id": getattr(opp, "opportunity_id", None),
+            "opportunity_title": getattr(opp, "opportunity_title", None),
+            "agency_name": getattr(opp, "agency_name", None),
+            "category": getattr(opp, "category", None),
+            "opportunity_status": getattr(opp, "opportunity_status", None),
+            "opportunity_link": cls._first_additional_info_link(opp),
+            "summary_description": getattr(opp, "summary_description", None),
+            "additional_info_count": len(additional_blocks),
+            "attachment_count": len(attachment_blocks),
+            "additional_info_extracted": additional_blocks,
+            "attachments_extracted": attachment_blocks,
+        }
+        if include_keywords:
+            payload["keywords"] = cls._to_keywords(opp)
+        return payload
+
+    @classmethod
+    def build_opportunity_basic_context(
+        cls,
+        opp: Opportunity,
+        *,
+        use_rag: bool = True,
+        top_k_per_additional_source: int = DEFAULT_TOP_K_PER_ADDITIONAL_SOURCE,
+        top_k_per_attachment_source: int = DEFAULT_TOP_K_PER_ATTACHMENT_SOURCE,
+    ) -> Dict[str, Any]:
+        """Build full opportunity context for keyword generation (keywords excluded)."""
+        return cls._build_opportunity_context_payload(
+            opp,
+            include_keywords=False,
+            use_rag=use_rag,
+            top_k_per_additional_source=top_k_per_additional_source,
+            top_k_per_attachment_source=top_k_per_attachment_source,
+        )
+
+    @classmethod
+    def build_opportunity_full_context(
+        cls,
+        opp: Opportunity,
+        *,
+        use_rag: bool = True,
+        top_k_per_additional_source: int = DEFAULT_TOP_K_PER_ADDITIONAL_SOURCE,
+        top_k_per_attachment_source: int = DEFAULT_TOP_K_PER_ATTACHMENT_SOURCE,
+    ) -> Dict[str, Any]:
+        """Build full opportunity context for matching/justification (keywords included)."""
+        return cls._build_opportunity_context_payload(
+            opp,
+            include_keywords=True,
+            use_rag=use_rag,
+            top_k_per_additional_source=top_k_per_additional_source,
+            top_k_per_attachment_source=top_k_per_attachment_source,
+        )
+
+    @classmethod
+    def build_opportunity_keyword_context(cls, opp: Opportunity) -> Dict[str, Any]:
+        """Build minimal keyword-only opportunity context for reranking."""
+        return {
+            "opportunity_id": getattr(opp, "opportunity_id", None),
+            "opportunity_title": getattr(opp, "opportunity_title", None),
+            "agency_name": getattr(opp, "agency_name", None),
+            "opportunity_link": cls._first_additional_info_link(opp),
+            "keywords": cls._to_keywords(opp),
+        }
+
+    @classmethod
+    def build_opportunity_matching_context(cls, opp: Opportunity) -> Dict[str, Any]:
+        """Build compact opportunity context for matching/group reasoning."""
+        return {
+            "opportunity_id": getattr(opp, "opportunity_id", None),
+            "opportunity_title": getattr(opp, "opportunity_title", None),
+            "agency_name": getattr(opp, "agency_name", None),
+            "summary_description": getattr(opp, "summary_description", None),
+            "keywords": cls._to_keywords(opp),
+        }
+
+    @classmethod
+    def build_opportunity_keyword_inventory(cls, opp: Opportunity) -> Dict[str, Any]:
+        """Build opportunity keyword inventory payload for reranking inputs."""
+        keyword_ctx = cls.build_opportunity_keyword_context(opp)
+        kw_inv = keyword_inventory_for_rerank(dict(keyword_ctx.get("keywords") or {}))
+        return {
+            "opportunity_id": keyword_ctx.get("opportunity_id"),
+            "opportunity_title": keyword_ctx.get("opportunity_title"),
+            "grant_domain_keywords": kw_inv.get("domain") or [],
+            "grant_specialization_keywords": kw_inv.get("specialization") or {},
+        }
+
+    @classmethod
+    def build_opportunity_source_linked_context(
+        cls,
+        opp: Opportunity,
+        *,
+        use_rag: bool = True,
+        top_k_per_additional_source: int = DEFAULT_TOP_K_PER_ADDITIONAL_SOURCE,
+        top_k_per_attachment_source: int = DEFAULT_TOP_K_PER_ATTACHMENT_SOURCE,
+    ) -> Dict[str, Any]:
+        """Build opportunity context that includes source-linked chunk blocks."""
+        return cls.build_opportunity_full_context(
+            opp,
+            use_rag=use_rag,
+            top_k_per_additional_source=top_k_per_additional_source,
+            top_k_per_attachment_source=top_k_per_attachment_source,
         )

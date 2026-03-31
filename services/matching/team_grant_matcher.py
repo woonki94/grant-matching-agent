@@ -110,11 +110,14 @@ class TeamGrantMatcher:
 
         def _process_opp(opp_id: str) -> List[Dict[str, object]]:
             with self.session_factory() as opp_sess:
-                f, w, c = self.context_generator.build_matching_inputs_for_opportunity(
+                payload = self.context_generator.build_matching_inputs_payload_for_opportunity(
                     sess=opp_sess,
                     opportunity_id=opp_id,
                     limit_rows=limit_rows,
                 )
+            f = list(payload.get("faculty_ids") or [])
+            w = dict(payload.get("requirements") or {"application": {}, "research": {}})
+            c = dict(payload.get("coverage") or {})
             if not f:
                 return []
 

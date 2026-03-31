@@ -211,8 +211,6 @@ class FacultyGrantMatcher:
             "domain_score": float(domain_sim),
             # Kept as llm_score column for compatibility with existing readers.
             "llm_score": final_score,
-            # Reason generation is intentionally removed in cross-encoder mode.
-            "reason": "",
             "covered": spec_score_payload.get("covered") or {"application": {}, "research": {}},
             "missing": spec_score_payload.get("missing") or {"application": [], "research": []},
             "evidence": evidence,

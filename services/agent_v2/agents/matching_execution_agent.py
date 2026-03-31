@@ -1006,17 +1006,20 @@ class MatchingExecutionAgent:
 
             # ── Phase 2: LLM scoring for existing team + candidate pool ────
             # Existing members are scored first so their coverage is in the DB
-            # before build_matching_inputs_for_opportunity is called.
+            # before matching inputs are built.
             all_to_score = existing_ids + [fid for fid in candidate_ids if fid not in existing_set]
             self._run_llm_scoring_for_candidates(opp_id, all_to_score)
 
             # ── Phase 3: build SuperFacultySelector inputs ─────────────────
             with self.session_factory() as sess:
-                f, w, c = self.context_generator.build_matching_inputs_for_opportunity(
+                payload = self.context_generator.build_matching_inputs_payload_for_opportunity(
                     sess=sess,
                     opportunity_id=opp_id,
                     limit_rows=500,
                 )
+            f = list(payload.get("faculty_ids") or [])
+            w = dict(payload.get("requirements") or {"application": {}, "research": {}})
+            c = dict(payload.get("coverage") or {})
 
             # Ensure every existing member is represented (add zero-coverage if absent)
             for fid in existing_ids:
@@ -1175,11 +1178,14 @@ class MatchingExecutionAgent:
 
             # ── Phase 3: build SuperFacultySelector inputs ─────────────────
             with self.session_factory() as sess:
-                f, w, c = self.context_generator.build_matching_inputs_for_opportunity(
+                payload = self.context_generator.build_matching_inputs_payload_for_opportunity(
                     sess=sess,
                     opportunity_id=opp_id,
                     limit_rows=500,
                 )
+            f = list(payload.get("faculty_ids") or [])
+            w = dict(payload.get("requirements") or {"application": {}, "research": {}})
+            c = dict(payload.get("coverage") or {})
 
             for fid in existing_ids:
                 if fid not in c:

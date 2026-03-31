@@ -53,6 +53,23 @@ def extract_specializations(kw: dict) -> dict:
     return out
 
 
+def specialization_text_sections(kw: Dict[str, Any]) -> Dict[str, List[str]]:
+    """
+    Normalize keyword payload into text-only specialization sections.
+
+    Output shape:
+    {
+      "research": ["spec text", ...],
+      "application": ["spec text", ...],
+    }
+    """
+    specs = extract_specializations(kw or {})
+    return {
+        "research": [str(item.get("t") or "").strip() for item in list(specs.get("research") or []) if str(item.get("t") or "").strip()],
+        "application": [str(item.get("t") or "").strip() for item in list(specs.get("application") or []) if str(item.get("t") or "").strip()],
+    }
+
+
 def keywords_for_matching(kw: dict) -> dict:
     specs = extract_specializations(kw)
     return {

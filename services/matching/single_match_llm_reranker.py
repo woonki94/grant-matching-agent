@@ -132,7 +132,6 @@ class OneToOneLLMReranker:
             inventory = self.context_generator.build_rerank_keyword_inventory_for_faculty(
                 sess=sess,
                 faculty_id=fid,
-                k=int(match_count),
             )
 
         faculty_payload = dict(inventory.get("faculty") or {})

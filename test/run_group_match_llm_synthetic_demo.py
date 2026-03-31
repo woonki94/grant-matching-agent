@@ -15,12 +15,12 @@ SYNTHETIC_EMAIL_TO_ID = {
 
 SYNTHETIC_OPP_INPUTS = {
     "syn-opp-001": {
-        "F": [101, 102, 201, 202, 203],
-        "w": {
+        "faculty_ids": [101, 102, 201, 202, 203],
+        "requirements": {
             "application": {0: 0.2, 1: 0.4, 2: 1.0},
             "research": {0: 0.2, 1: 0.4, 2: 1.0},
         },
-        "c": {
+        "coverage": {
             101: {"application": {0: 1.0, 1: 0.1, 2: 0.0}, "research": {0: 1.0, 1: 0.1, 2: 0.0}},
             102: {"application": {0: 0.2, 1: 1.0, 2: 0.0}, "research": {0: 0.2, 1: 1.0, 2: 0.0}},
             201: {"application": {0: 0.0, 1: 0.4, 2: 1.0}, "research": {0: 0.0, 1: 0.4, 2: 1.0}},
@@ -29,12 +29,12 @@ SYNTHETIC_OPP_INPUTS = {
         },
     },
     "syn-opp-002": {
-        "F": [101, 102, 301, 302, 303],
-        "w": {
+        "faculty_ids": [101, 102, 301, 302, 303],
+        "requirements": {
             "application": {0: 0.3, 1: 0.8, 2: 0.9},
             "research": {0: 0.3, 1: 0.8, 2: 0.9},
         },
-        "c": {
+        "coverage": {
             101: {"application": {0: 0.9, 1: 0.3, 2: 0.0}, "research": {0: 0.9, 1: 0.3, 2: 0.0}},
             102: {"application": {0: 0.2, 1: 0.9, 2: 0.0}, "research": {0: 0.2, 1: 0.9, 2: 0.0}},
             301: {"application": {0: 0.8, 1: 0.8, 2: 0.6}, "research": {0: 0.8, 1: 0.8, 2: 0.6}},
@@ -73,19 +73,15 @@ class _FakeMatchDAO:
         return list(SYNTHETIC_OPP_INPUTS.keys())
 
 
-def _fake_build_inputs_for_opportunity(*, sess, opportunity_id: str, limit_rows: int = 500):
+def _fake_build_inputs_payload_for_opportunity(*, sess, opportunity_id: str, limit_rows: int = 500):
     _ = sess
     _ = limit_rows
-    row = SYNTHETIC_OPP_INPUTS[opportunity_id]
-    f = list(row["F"])
-    w = row["w"]
-    c = row["c"]
-    return f, w, c
+    return dict(SYNTHETIC_OPP_INPUTS[opportunity_id])
 
 
 class _FakeContextGenerator:
-    def build_matching_inputs_for_opportunity(self, *, sess, opportunity_id: str, limit_rows: int = 500):
-        return _fake_build_inputs_for_opportunity(
+    def build_matching_inputs_payload_for_opportunity(self, *, sess, opportunity_id: str, limit_rows: int = 500):
+        return _fake_build_inputs_payload_for_opportunity(
             sess=sess,
             opportunity_id=opportunity_id,
             limit_rows=limit_rows,

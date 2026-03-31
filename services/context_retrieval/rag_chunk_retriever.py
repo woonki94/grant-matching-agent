@@ -419,8 +419,8 @@ def build_faculty_rag_query(
 def retrieve_opportunity_supporting_chunks(
     opp: Opportunity,
     *,
-    top_k_per_additional_source: int = 4,
-    top_k_per_attachment_source: int = 4,
+    top_k_per_additional_source: int = 10,
+    top_k_per_attachment_source: int = 10,
 ) -> Dict[str, Any]:
     """
     Retrieve top relevant chunk rows for an opportunity:

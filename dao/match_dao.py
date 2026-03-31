@@ -138,7 +138,6 @@ class MatchDAO:
             set_={
                 "domain_score": stmt.excluded.domain_score,
                 "llm_score": stmt.excluded.llm_score,
-                "reason": stmt.excluded.reason,
                 "covered": stmt.excluded.covered,
                 "missing": stmt.excluded.missing,
                 "evidence": stmt.excluded.evidence,
@@ -263,7 +262,7 @@ class MatchDAO:
         row = self.session.execute(
             text(
                 """
-                SELECT grant_id, faculty_id, domain_score, llm_score, covered, missing, reason, evidence
+                SELECT grant_id, faculty_id, domain_score, llm_score, covered, missing, evidence
                 FROM match_results
                 WHERE faculty_id = :faculty_id AND grant_id = :opportunity_id
                 LIMIT 1
@@ -279,7 +278,7 @@ class MatchDAO:
     def list_matches_for_opportunity(self, opportunity_id: str, limit: Optional[int] = 200):
         """List stored faculty match rows for a given opportunity, ordered by llm_score DESC."""
         base_sql = """
-            SELECT faculty_id, domain_score, llm_score, reason, covered, missing, evidence
+            SELECT faculty_id, domain_score, llm_score, covered, missing, evidence
             FROM match_results
             WHERE grant_id = :oid
             ORDER BY llm_score DESC, domain_score DESC
@@ -301,11 +300,12 @@ class MatchDAO:
         """
         Batch-fetch match rows for a specific set of faculty against one opportunity.
         Returns {faculty_id: {llm_score, domain_score, reason, covered, missing}}.
+        `reason` is kept as an empty string for backward-compatible callers.
         """
         if not faculty_ids:
             return {}
         q = text("""
-            SELECT faculty_id, domain_score, llm_score, reason, covered, missing
+            SELECT faculty_id, domain_score, llm_score, covered, missing
             FROM match_results
             WHERE grant_id = :oid
               AND faculty_id = ANY(:fids)
@@ -317,7 +317,7 @@ class MatchDAO:
             int(r["faculty_id"]): {
                 "llm_score":    round(float(r["llm_score"]    or 0), 3),
                 "domain_score": round(float(r["domain_score"] or 0), 3),
-                "reason":  str(r["reason"]  or ""),
+                "reason":  "",
                 "covered": r["covered"] or {},
                 "missing": r["missing"] or {},
             }
