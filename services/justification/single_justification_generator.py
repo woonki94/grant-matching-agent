@@ -179,9 +179,26 @@ class SingleJustificationGenerator:
             }
 
         context_text = str(context_text or "")
+        score_context = json.dumps(
+            {
+                "llm_score": self._safe_float(
+                    (one_match_payload or {}).get(
+                        "reranked_llm_score",
+                        (one_match_payload or {}).get("llm_score"),
+                    ),
+                    0.0,
+                )
+            },
+            ensure_ascii=False,
+        )
 
         try:
-            out = chain.invoke({"context_text": context_text})
+            out = chain.invoke(
+                {
+                    "context_text": context_text,
+                    "score_context": score_context,
+                }
+            )
         except Exception:
             logger.exception(
                 "LLM_CALL_FAILED[faculty_recommendations_one_match] meta=%s",

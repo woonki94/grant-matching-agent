@@ -22,6 +22,52 @@ FACULTY_CANDIDATE_PROMPT = ChatPromptTemplate.from_messages([
     ("human", "Context (JSON):\n{context_json}")
 ])
 
+FACULTY_RESEARCH_CANDIDATE_PROMPT = ChatPromptTemplate.from_messages([
+    ("system",
+     "You extract candidate keyword phrases from faculty context_retrieval for later structuring.\n\n"
+     "Rules:\n"
+     "- Do not retrieve anything if you don't have enough sources.\n"
+     "- Use ONLY the provided context_retrieval.\n"
+     "- Return a single JSON object with key `candidates` = list[str].\n"
+     "- Include TWO kinds of candidates:\n"
+     "  (A) AREA terms: 1–3 words, broad research fields or domains.\n"
+     "  (B) SPECIALIZATION statements: 8–25 words describing expertise, methods, systems, or problems the faculty works on.\n"
+     "- SPECIALIZATION phrases must describe capabilities the faculty HOLDS.\n"
+     "- Write phrases neutrally (no 'seeks', 'needs', 'requires').\n"
+     "- Prefer technical and research content; avoid administrative language.\n"
+     "- Lowercase unless proper nouns.\n"
+     "- Deduplicate.\n"
+     "- Item-length constraint: 1–3 words is PER AREA ITEM (not item count), and 8–25 words is PER SPECIALIZATION ITEM.\n"
+     "- Item-count constraint: target ~30–80 total candidates, and when evidence exists include at least 8 AREA items and at least 12 SPECIALIZATION items.\n"
+     "- Target ~30–80 candidates total.\n"
+     "- Focus constraint: keep ONLY RESEARCH-oriented candidates (theory, methods, models, algorithms, analysis, experiments); remove deployment/use-case-only phrases."
+    ),
+    ("human", "Context (JSON):\n{context_json}")
+])
+
+FACULTY_APPLICATION_CANDIDATE_PROMPT = ChatPromptTemplate.from_messages([
+    ("system",
+     "You extract candidate keyword phrases from faculty context_retrieval for later structuring.\n\n"
+     "Rules:\n"
+     "- Do not retrieve anything if you don't have enough sources.\n"
+     "- Use ONLY the provided context_retrieval.\n"
+     "- Return a single JSON object with key `candidates` = list[str].\n"
+     "- Include TWO kinds of candidates:\n"
+     "  (A) AREA terms: 1–3 words, broad research fields or domains.\n"
+     "  (B) SPECIALIZATION statements: 8–25 words describing expertise, methods, systems, or problems the faculty works on.\n"
+     "- SPECIALIZATION phrases must describe capabilities the faculty HOLDS.\n"
+     "- Write phrases neutrally (no 'seeks', 'needs', 'requires').\n"
+     "- Prefer technical and research content; avoid administrative language.\n"
+     "- Lowercase unless proper nouns.\n"
+     "- Deduplicate.\n"
+     "- Item-length constraint: 1–3 words is PER AREA ITEM (not item count), and 8–25 words is PER SPECIALIZATION ITEM.\n"
+     "- Item-count constraint: target ~30–80 total candidates, and when evidence exists include at least 8 AREA items and at least 12 SPECIALIZATION items.\n"
+     "- Target ~30–80 candidates total.\n"
+     "- Focus constraint: keep ONLY APPLICATION-oriented candidates (deployment, implementation, operations, use cases, translational execution); remove theory-only phrases."
+    ),
+    ("human", "Context (JSON):\n{context_json}")
+])
+
 OPP_CANDIDATE_PROMPT = ChatPromptTemplate.from_messages([
     ("system",
      "You extract candidate keyword phrases from a funding opportunity context_retrieval for later structuring.\n\n"
@@ -36,6 +82,48 @@ OPP_CANDIDATE_PROMPT = ChatPromptTemplate.from_messages([
      "- Lowercase unless proper nouns.\n"
      "- Deduplicate.\n"
      "- Target ~30–80 candidates total."
+    ),
+    ("human", "Context (JSON):\n{context_json}")
+])
+
+OPP_RESEARCH_CANDIDATE_PROMPT = ChatPromptTemplate.from_messages([
+    ("system",
+     "You extract candidate keyword phrases from a funding opportunity context_retrieval for later structuring.\n\n"
+     "Rules:\n"
+     "- Use ONLY the provided context_retrieval.\n"
+     "- Return a single JSON object with key `candidates` = list[str].\n"
+     "- Include TWO kinds of candidates:\n"
+     "  (A) AREA terms: 1–3 words, broad research or technical areas targeted.\n"
+     "  (B) SPECIALIZATION statements: 8–25 words describing capabilities, methods, or expertise the project expects investigators to have.\n"
+     "- SPECIALIZATION phrases must describe what the grant NEEDS faculty to have.\n"
+     "- Write phrases factually (do not include submission or administrative language).\n"
+     "- Lowercase unless proper nouns.\n"
+     "- Deduplicate.\n"
+     "- Item-length constraint: 1–3 words is PER AREA ITEM (not item count), and 8–25 words is PER SPECIALIZATION ITEM.\n"
+     "- Item-count constraint: target ~30–80 total candidates, and when evidence exists include at least 8 AREA items and at least 12 SPECIALIZATION items.\n"
+     "- Target ~30–80 candidates total.\n"
+     "- Focus constraint: keep ONLY RESEARCH requirement candidates (scientific scope, methods, theory, technical depth); remove deployment/use-case-only phrases."
+    ),
+    ("human", "Context (JSON):\n{context_json}")
+])
+
+OPP_APPLICATION_CANDIDATE_PROMPT = ChatPromptTemplate.from_messages([
+    ("system",
+     "You extract candidate keyword phrases from a funding opportunity context_retrieval for later structuring.\n\n"
+     "Rules:\n"
+     "- Use ONLY the provided context_retrieval.\n"
+     "- Return a single JSON object with key `candidates` = list[str].\n"
+     "- Include TWO kinds of candidates:\n"
+     "  (A) AREA terms: 1–3 words, broad research or technical areas targeted.\n"
+     "  (B) SPECIALIZATION statements: 8–25 words describing capabilities, methods, or expertise the project expects investigators to have.\n"
+     "- SPECIALIZATION phrases must describe what the grant NEEDS faculty to have.\n"
+     "- Write phrases factually (do not include submission or administrative language).\n"
+     "- Lowercase unless proper nouns.\n"
+     "- Deduplicate.\n"
+     "- Item-length constraint: 1–3 words is PER AREA ITEM (not item count), and 8–25 words is PER SPECIALIZATION ITEM.\n"
+     "- Item-count constraint: target ~30–80 total candidates, and when evidence exists include at least 8 AREA items and at least 12 SPECIALIZATION items.\n"
+     "- Target ~30–80 candidates total.\n"
+     "- Focus constraint: keep ONLY APPLICATION requirement candidates (implementation, operations, delivery, deployment, use-case execution); remove theory-only phrases."
     ),
     ("human", "Context (JSON):\n{context_json}")
 ])
@@ -60,12 +148,108 @@ FACULTY_KEYWORDS_PROMPT = ChatPromptTemplate.from_messages([
      "- research.specialization: 5–15 items\n"
      "- application.domain: 4–10 items\n"
      "- application.specialization: 5–15 items\n"
-     "- Avoid administrative or institutional language."
+     "- Avoid administrative or institutional language.\n"
+     "- Never output placeholder tokens like <UNKNOWN>, unknown, n/a, none, null.\n"
+     "- If evidence is insufficient for a field, return an empty list for that field."
     ),
     ("human",
      "Context (JSON):\n{context_json}\n\n"
      "Candidate phrases:\n{candidates}"
     )
+])
+
+FACULTY_RESEARCH_KEYWORDS_PROMPT = ChatPromptTemplate.from_messages([
+    ("system",
+     "You generate structured keywords from faculty context_retrieval.\n\n"
+     "Output must match this JSON schema:\n"
+     "{{\"domain\": [], \"specialization\": []}}\n\n"
+     "Definitions:\n"
+     "- domain: broad fields defining the faculty’s work.\n"
+     "- specialization: describing expertise, methods, or systems the faculty HAS.\n"
+     "- Item-length constraint: each domain item must be 1–3 words (PER ITEM, not item count).\n"
+     "- Item-length constraint: each specialization item must be 8–25 words (PER ITEM).\n\n"
+     "Rules:\n"
+     "- Use ONLY the provided context_retrieval and candidate phrases.\n"
+     "- Do NOT invent new topics.\n"
+     "- Lowercase unless proper nouns.\n"
+     "- Deduplicate.\n"
+     "- Item-count constraint: domain must contain 4–10 items.\n"
+     "- Item-count constraint: specialization must contain 5–15 items.\n"
+     "- If evidence exists, do not underfill below the minimum item counts.\n"
+     "- Avoid administrative or institutional language.\n"
+     "- Never output placeholder tokens like <UNKNOWN>, unknown, n/a, none, null.\n"
+     "- If evidence is insufficient for a field, return an empty list for that field.\n"
+     "- Focus constraint: output ONLY RESEARCH keywords (theory, methods, models, algorithms, analysis, experiments); remove deployment/use-case-only items."
+    ),
+    ("human",
+     "Context (JSON):\n{context_json}\n\n"
+     "Candidate phrases:\n{candidates}"
+    )
+])
+
+FACULTY_APPLICATION_KEYWORDS_PROMPT = ChatPromptTemplate.from_messages([
+    ("system",
+     "You generate structured keywords from faculty context_retrieval.\n\n"
+     "Output must match this JSON schema:\n"
+     "{{\"domain\": [], \"specialization\": []}}\n\n"
+     "Definitions:\n"
+     "- domain: broad fields defining the faculty’s work.\n"
+     "- specialization: describing expertise, methods, or systems the faculty HAS.\n"
+     "- Item-length constraint: each domain item must be 1–3 words (PER ITEM, not item count).\n"
+     "- Item-length constraint: each specialization item must be 8–25 words (PER ITEM).\n\n"
+     "Rules:\n"
+     "- Use ONLY the provided context_retrieval and candidate phrases.\n"
+     "- Do NOT invent new topics.\n"
+     "- Lowercase unless proper nouns.\n"
+     "- Deduplicate.\n"
+     "- Item-count constraint: domain must contain 4–10 items.\n"
+     "- Item-count constraint: specialization must contain 5–15 items.\n"
+     "- If evidence exists, do not underfill below the minimum item counts.\n"
+     "- Avoid administrative or institutional language.\n"
+     "- Never output placeholder tokens like <UNKNOWN>, unknown, n/a, none, null.\n"
+     "- If evidence is insufficient for a field, return an empty list for that field.\n"
+     "- Focus constraint: output ONLY APPLICATION keywords (deployment, implementation, operations, use-case execution); remove theory-only items."
+    ),
+    ("human",
+     "Context (JSON):\n{context_json}\n\n"
+     "Candidate phrases:\n{candidates}"
+    )
+])
+
+FACULTY_RESEARCH_MERGE_PROMPT = ChatPromptTemplate.from_messages([
+    ("system",
+     "You consolidate RESEARCH keyword outputs from multiple context batches for one faculty profile.\n"
+     "Return JSON: {{\"domain\": [..], \"specialization\": [..]}} only.\n"
+     "Rules:\n"
+     "- Use only provided batch outputs.\n"
+     "- Keep the strongest and most repeated concepts.\n"
+     "- Deduplicate and normalize wording.\n"
+     "- Item-length constraint: each domain item must be 1–3 words (PER ITEM, not item count).\n"
+     "- Item-length constraint: each specialization item must be 8–25 words (PER ITEM).\n"
+     "- Item-count constraint: domain must contain 4–10 items when evidence exists.\n"
+     "- Item-count constraint: specialization must contain 5–15 items when evidence exists.\n"
+     "- Never output placeholders like <UNKNOWN>, unknown, n/a, none, null.\n"
+     "- If evidence is insufficient, return empty lists."
+    ),
+    ("human", "BATCH RESEARCH OUTPUTS (JSON):\n{batch_json}")
+])
+
+FACULTY_APPLICATION_MERGE_PROMPT = ChatPromptTemplate.from_messages([
+    ("system",
+     "You consolidate APPLICATION keyword outputs from multiple context batches for one faculty profile.\n"
+     "Return JSON: {{\"domain\": [..], \"specialization\": [..]}} only.\n"
+     "Rules:\n"
+     "- Use only provided batch outputs.\n"
+     "- Keep the strongest and most repeated practical/use-case concepts.\n"
+     "- Deduplicate and normalize wording.\n"
+     "- Item-length constraint: each domain item must be 1–3 words (PER ITEM, not item count).\n"
+     "- Item-length constraint: each specialization item must be 8–25 words (PER ITEM).\n"
+     "- Item-count constraint: domain must contain 4–10 items when evidence exists.\n"
+     "- Item-count constraint: specialization must contain 5–15 items when evidence exists.\n"
+     "- Never output placeholders like <UNKNOWN>, unknown, n/a, none, null.\n"
+     "- If evidence is insufficient, return empty lists."
+    ),
+    ("human", "BATCH APPLICATION OUTPUTS (JSON):\n{batch_json}")
 ])
 
 
@@ -89,12 +273,108 @@ OPP_KEYWORDS_PROMPT = ChatPromptTemplate.from_messages([
      "- research.specialization: 5–15 items\n"
      "- application.domain: 4–10 items\n"
      "- application.specialization: 5–15 items\n"
-     "- Avoid generic submission or eligibility language."
+     "- Avoid generic submission or eligibility language.\n"
+     "- Never output placeholder tokens like <UNKNOWN>, unknown, n/a, none, null.\n"
+     "- If evidence is insufficient for a field, return an empty list for that field."
     ),
     ("human",
      "Context (JSON):\n{context_json}\n\n"
      "Candidate phrases:\n{candidates}"
     )
+])
+
+OPP_RESEARCH_KEYWORDS_PROMPT = ChatPromptTemplate.from_messages([
+    ("system",
+     "You generate structured keywords from a funding opportunity context_retrieval.\n\n"
+     "Output must match this JSON schema:\n"
+     "{{\"domain\": [], \"specialization\": []}}\n\n"
+     "Definitions:\n"
+     "- domain: broad research or technical areas.\n"
+     "- specialization: describing expertise, methods, or capabilities the project EXPECTS investigators to have.\n"
+     "- Item-length constraint: each domain item must be 1–3 words (PER ITEM, not item count).\n"
+     "- Item-length constraint: each specialization item must be 8–25 words (PER ITEM).\n\n"
+     "Rules:\n"
+     "- Use ONLY the provided context_retrieval and candidate phrases.\n"
+     "- Do NOT invent requirements not present in the text.\n"
+     "- Lowercase unless proper nouns.\n"
+     "- Deduplicate.\n"
+     "- Item-count constraint: domain must contain 4–10 items.\n"
+     "- Item-count constraint: specialization must contain 5–15 items.\n"
+     "- If evidence exists, do not underfill below the minimum item counts.\n"
+     "- Avoid generic submission or eligibility language.\n"
+     "- Never output placeholder tokens like <UNKNOWN>, unknown, n/a, none, null.\n"
+     "- If evidence is insufficient for a field, return an empty list for that field.\n"
+     "- Focus constraint: output ONLY RESEARCH requirements (scientific scope, methods, technical depth); remove delivery/deployment-only items."
+    ),
+    ("human",
+     "Context (JSON):\n{context_json}\n\n"
+     "Candidate phrases:\n{candidates}"
+    )
+])
+
+OPP_APPLICATION_KEYWORDS_PROMPT = ChatPromptTemplate.from_messages([
+    ("system",
+     "You generate structured keywords from a funding opportunity context_retrieval.\n\n"
+     "Output must match this JSON schema:\n"
+     "{{\"domain\": [], \"specialization\": []}}\n\n"
+     "Definitions:\n"
+     "- domain: broad research or technical areas.\n"
+     "- specialization: describing expertise, methods, or capabilities the project EXPECTS investigators to have.\n"
+     "- Item-length constraint: each domain item must be 1–3 words (PER ITEM, not item count).\n"
+     "- Item-length constraint: each specialization item must be 8–25 words (PER ITEM).\n\n"
+     "Rules:\n"
+     "- Use ONLY the provided context_retrieval and candidate phrases.\n"
+     "- Do NOT invent requirements not present in the text.\n"
+     "- Lowercase unless proper nouns.\n"
+     "- Deduplicate.\n"
+     "- Item-count constraint: domain must contain 4–10 items.\n"
+     "- Item-count constraint: specialization must contain 5–15 items.\n"
+     "- If evidence exists, do not underfill below the minimum item counts.\n"
+     "- Avoid generic submission or eligibility language.\n"
+     "- Never output placeholder tokens like <UNKNOWN>, unknown, n/a, none, null.\n"
+     "- If evidence is insufficient for a field, return an empty list for that field.\n"
+     "- Focus constraint: output ONLY APPLICATION requirements (implementation, operations, delivery, deployment, use-case execution); remove theory-only items."
+    ),
+    ("human",
+     "Context (JSON):\n{context_json}\n\n"
+     "Candidate phrases:\n{candidates}"
+    )
+])
+
+OPP_RESEARCH_MERGE_PROMPT = ChatPromptTemplate.from_messages([
+    ("system",
+     "You consolidate RESEARCH requirement keyword outputs from multiple context batches for one opportunity.\n"
+     "Return JSON: {{\"domain\": [..], \"specialization\": [..]}} only.\n"
+     "Rules:\n"
+     "- Use only provided batch outputs.\n"
+     "- Keep the strongest and most repeated requirement concepts.\n"
+     "- Deduplicate and normalize wording.\n"
+     "- Item-length constraint: each domain item must be 1–3 words (PER ITEM, not item count).\n"
+     "- Item-length constraint: each specialization item must be 8–25 words (PER ITEM).\n"
+     "- Item-count constraint: domain must contain 4–10 items when evidence exists.\n"
+     "- Item-count constraint: specialization must contain 5–15 items when evidence exists.\n"
+     "- Never output placeholders like <UNKNOWN>, unknown, n/a, none, null.\n"
+     "- If evidence is insufficient, return empty lists."
+    ),
+    ("human", "BATCH RESEARCH OUTPUTS (JSON):\n{batch_json}")
+])
+
+OPP_APPLICATION_MERGE_PROMPT = ChatPromptTemplate.from_messages([
+    ("system",
+     "You consolidate APPLICATION requirement keyword outputs from multiple context batches for one opportunity.\n"
+     "Return JSON: {{\"domain\": [..], \"specialization\": [..]}} only.\n"
+     "Rules:\n"
+     "- Use only provided batch outputs.\n"
+     "- Keep the strongest and most repeated practical requirement concepts.\n"
+     "- Deduplicate and normalize wording.\n"
+     "- Item-length constraint: each domain item must be 1–3 words (PER ITEM, not item count).\n"
+     "- Item-length constraint: each specialization item must be 8–25 words (PER ITEM).\n"
+     "- Item-count constraint: domain must contain 4–10 items when evidence exists.\n"
+     "- Item-count constraint: specialization must contain 5–15 items when evidence exists.\n"
+     "- Never output placeholders like <UNKNOWN>, unknown, n/a, none, null.\n"
+     "- If evidence is insufficient, return empty lists."
+    ),
+    ("human", "BATCH APPLICATION OUTPUTS (JSON):\n{batch_json}")
 ])
 
 FACULTY_SPECIALIZATION_WEIGHT_PROMPT = ChatPromptTemplate.from_messages([
@@ -202,7 +482,8 @@ OPP_SPECIALIZATION_SOURCE_PROMPT = ChatPromptTemplate.from_messages([
      "- Keep t exactly as provided in input specializations.\n"
      "- For each source, return only id, type, score.\n"
      "- Use ONLY ids and types that exist in source catalog.\n"
-     "- Pick up to 4 sources per specialization.\n"
+     "- Pick up at least one source per specialization.\n"
+     "- Usually multiple sources per specialization but not hard rule.\n"     
      "- score is confidence in [0,1].\n"
      "- If no support exists, return empty sources for that specialization.\n"
      "- Return ONLY JSON."
@@ -262,6 +543,24 @@ QUERY_CANDIDATE_PROMPT = ChatPromptTemplate.from_messages([
     ("human", "Context (JSON):\n{context_json}")
 ])
 
+QUERY_RESEARCH_CANDIDATE_PROMPT = ChatPromptTemplate.from_messages([
+    ("system",
+     "Extract RESEARCH candidate keyword phrases from the query context.\n"
+     "Return JSON: {{\"candidates\": [string, ...]}} only.\n"
+     "Focus on research/method/scientific signals. Deduplicate."
+    ),
+    ("human", "Context (JSON):\n{context_json}")
+])
+
+QUERY_APPLICATION_CANDIDATE_PROMPT = ChatPromptTemplate.from_messages([
+    ("system",
+     "Extract APPLICATION candidate keyword phrases from the query context.\n"
+     "Return JSON: {{\"candidates\": [string, ...]}} only.\n"
+     "Focus on practical/use-case/deployment signals. Deduplicate."
+    ),
+    ("human", "Context (JSON):\n{context_json}")
+])
+
 QUERY_KEYWORDS_PROMPT = ChatPromptTemplate.from_messages([
     ("system",
      "You generate structured keywords from a user research query.\n\n"
@@ -283,6 +582,30 @@ QUERY_KEYWORDS_PROMPT = ChatPromptTemplate.from_messages([
      "- application.domain: 4–10 items\n"
      "- application.specialization: 5–15 items\n"
      "- Avoid administrative or institutional language."
+    ),
+    ("human",
+     "Context (JSON):\n{context_json}\n\n"
+     "Candidate phrases:\n{candidates}"
+    )
+])
+
+QUERY_RESEARCH_KEYWORDS_PROMPT = ChatPromptTemplate.from_messages([
+    ("system",
+     "Generate RESEARCH keywords from query context.\n"
+     "Return JSON: {{\"domain\": [..], \"specialization\": [..]}} only.\n"
+     "Use only provided context and candidate phrases. Deduplicate."
+    ),
+    ("human",
+     "Context (JSON):\n{context_json}\n\n"
+     "Candidate phrases:\n{candidates}"
+    )
+])
+
+QUERY_APPLICATION_KEYWORDS_PROMPT = ChatPromptTemplate.from_messages([
+    ("system",
+     "Generate APPLICATION keywords from query context.\n"
+     "Return JSON: {{\"domain\": [..], \"specialization\": [..]}} only.\n"
+     "Use only provided context and candidate phrases. Deduplicate."
     ),
     ("human",
      "Context (JSON):\n{context_json}\n\n"

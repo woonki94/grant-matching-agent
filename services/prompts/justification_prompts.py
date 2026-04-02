@@ -5,6 +5,8 @@ FACULTY_RECS_PROMPT = ChatPromptTemplate.from_messages([
         "system",
         "You write a single narrative explanation of why a faculty member matches a grant.\n"
         "Use only the provided context.\n"
+        "Score note: llm_score is first produced from cross-encoder specialization matching, then reranked by an LLM.\n"
+        "Treat llm_score as a lightweight confidence hint only.\n"
         "Write naturally in paragraph form, with concrete evidence from publications/profile chunks when available.\n"
         "Focus on the match reasoning only.\n"
         "Strict prohibition: do NOT include requirement labels/text, and do NOT include any numeric scores/weights/percentages.\n"
@@ -12,6 +14,7 @@ FACULTY_RECS_PROMPT = ChatPromptTemplate.from_messages([
     ),
     (
         "human",
+        "CURRENT SCORE HINT:\n{score_context}\n\n"
         "JUSTIFICATION CONTEXT:\n{context_text}\n",
     ),
 ])

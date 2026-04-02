@@ -4,6 +4,7 @@ import json
 import hashlib
 import logging
 import re
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from langchain_core.prompts import ChatPromptTemplate
@@ -17,31 +18,32 @@ from db.models.faculty import Faculty, FacultyKeyword
 from db.models.opportunity import Opportunity, OpportunityKeyword
 from dto.llm_response_dto import (
     CandidatesOut,
-    KeywordsOut,
+    KeywordBucket,
     OpportunityCategoryOut,
-    SpecializationSourcesOut,
     WeightedSpecsOut,
 )
 from services.context_retrieval.context_generator import ContextGenerator
 from services.prompts.keyword_prompts import (
-    FACULTY_CANDIDATE_PROMPT,
-    FACULTY_KEYWORDS_PROMPT,
-    FACULTY_SPECIALIZATION_SOURCE_PROMPT,
+    FACULTY_APPLICATION_CANDIDATE_PROMPT,
+    FACULTY_APPLICATION_KEYWORDS_PROMPT,
+    FACULTY_APPLICATION_MERGE_PROMPT,
+    FACULTY_RESEARCH_CANDIDATE_PROMPT,
+    FACULTY_RESEARCH_KEYWORDS_PROMPT,
+    FACULTY_RESEARCH_MERGE_PROMPT,
     FACULTY_SPECIALIZATION_WEIGHT_PROMPT,
     OPP_CATEGORY_PROMPT,
-    OPP_CANDIDATE_PROMPT,
-    OPP_KEYWORDS_PROMPT,
-    OPP_SPECIALIZATION_SOURCE_PROMPT,
+    OPP_APPLICATION_CANDIDATE_PROMPT,
+    OPP_APPLICATION_KEYWORDS_PROMPT,
+    OPP_APPLICATION_MERGE_PROMPT,
+    OPP_RESEARCH_CANDIDATE_PROMPT,
+    OPP_RESEARCH_KEYWORDS_PROMPT,
+    OPP_RESEARCH_MERGE_PROMPT,
     OPP_SPECIALIZATION_WEIGHT_PROMPT,
 )
 from utils.embedder import embed_domain_bucket
 from utils.keyword_utils import (
-    attach_specialization_sources_from_llm,
-    apply_weighted_specializations,
-    build_specialization_source_catalog,
     coerce_keyword_sections,
     extract_domains_from_keywords,
-    specialization_text_sections,
 )
 from utils.payload_sanitizer import sanitize_for_postgres
 from utils.thread_pool import build_thread_local_getter, parallel_map, resolve_pool_size
@@ -51,38 +53,63 @@ logger = logging.getLogger(__name__)
 
 
 class _KeywordGeneratorBase:
+    """Shared keyword-generation pipeline used by faculty and opportunity generators."""
+
+    KEYWORD_MAX_CONTEXT_CHARS = 60_000
+    KEYWORD_MAX_CANDIDATES_PER_BATCH = 50
+    KEYWORD_MAX_BATCH_KEYWORDS = 20
+    KEYWORD_BATCH_WORKERS = 2
+
     def __init__(self, *, context_generator: ContextGenerator, force_regenerate: bool = False):
         self.context_generator = context_generator
         self.force_regenerate = bool(force_regenerate)
 
     @staticmethod
     def build_keyword_chain(
-        candidate_prompt: ChatPromptTemplate,
-        keywords_prompt: ChatPromptTemplate,
+        research_candidate_prompt: ChatPromptTemplate,
+        application_candidate_prompt: ChatPromptTemplate,
+        research_keywords_prompt: ChatPromptTemplate,
+        application_keywords_prompt: ChatPromptTemplate,
         weight_prompt: ChatPromptTemplate,
     ):
+        """Build chains for candidate extraction, keyword extraction, and weighting."""
         model_id = (settings.haiku or settings.sonnet or settings.opus or "").strip()
         llm = get_llm_client(model_id=model_id).build()
-        candidates_chain = candidate_prompt | llm.with_structured_output(CandidatesOut)
-        keywords_chain = keywords_prompt | llm.with_structured_output(KeywordsOut)
+        research_candidates_chain = research_candidate_prompt | llm.with_structured_output(CandidatesOut)
+        application_candidates_chain = application_candidate_prompt | llm.with_structured_output(CandidatesOut)
+        research_keywords_chain = research_keywords_prompt | llm.with_structured_output(KeywordBucket)
+        application_keywords_chain = application_keywords_prompt | llm.with_structured_output(KeywordBucket)
         weight_chain = weight_prompt | llm.with_structured_output(WeightedSpecsOut)
-        return candidates_chain, keywords_chain, weight_chain
+        return (
+            research_candidates_chain,
+            application_candidates_chain,
+            research_keywords_chain,
+            application_keywords_chain,
+            weight_chain,
+        )
+
+    @staticmethod
+    def build_keyword_merge_chain(
+        research_merge_prompt: ChatPromptTemplate,
+        application_merge_prompt: ChatPromptTemplate,
+    ):
+        """Build chains that merge per-batch keyword outputs into one section-level output."""
+        model_id = (settings.haiku or settings.sonnet or settings.opus or "").strip()
+        llm = get_llm_client(model_id=model_id).build()
+        research_merge_chain = research_merge_prompt | llm.with_structured_output(KeywordBucket)
+        application_merge_chain = application_merge_prompt | llm.with_structured_output(KeywordBucket)
+        return research_merge_chain, application_merge_chain
 
     @staticmethod
     def build_opportunity_category_chain():
+        """Build chain that classifies broad/specific opportunity categories from context + keywords."""
         model_id = (settings.haiku or settings.sonnet or settings.opus or "").strip()
         llm = get_llm_client(model_id=model_id).build()
         return OPP_CATEGORY_PROMPT | llm.with_structured_output(OpportunityCategoryOut)
 
-    #TODO: can be in the main chain.
-    @staticmethod
-    def build_specialization_source_chain(source_prompt: ChatPromptTemplate):
-        model_id = (settings.haiku or settings.sonnet or settings.opus or "").strip()
-        llm = get_llm_client(model_id=model_id).build()
-        return source_prompt | llm.with_structured_output(SpecializationSourcesOut)
-
     @staticmethod
     def _normalize_specific_categories(values: list[str]) -> list[str]:
+        """Normalize and dedupe specific category tags into snake_case tokens."""
         out: list[str] = []
         seen = set()
         for raw in values or []:
@@ -99,6 +126,7 @@ class _KeywordGeneratorBase:
 
     @staticmethod
     def _apply_limit(iterable, limit: int):
+        """Yield at most `limit` items (or all items when limit is not positive)."""
         if limit and limit > 0:
             count = 0
             for item in iterable:
@@ -109,13 +137,20 @@ class _KeywordGeneratorBase:
             return
         yield from iterable
 
+    @staticmethod
+    def _norm_text_key(value: Any) -> str:
+        """Create a stable, case-insensitive key for text dedupe/merge operations."""
+        return " ".join(str(value or "").strip().lower().split())
+
     def _resolve_force(self, force_regenerate: Optional[bool]) -> bool:
+        """Resolve per-call force flag, defaulting to the instance-level setting."""
         if force_regenerate is None:
             return self.force_regenerate
         return bool(force_regenerate)
 
     @staticmethod
     def _dedupe_in_order(values: List[Any]) -> Tuple[List[Any], int]:
+        """Dedupe list while preserving first-seen order and reporting duplicate count."""
         seen = set()
         out: List[Any] = []
         dup = 0
@@ -129,11 +164,13 @@ class _KeywordGeneratorBase:
 
     @staticmethod
     def _advisory_key(namespace: str, value: str) -> int:
+        """Create deterministic 64-bit key used for DB advisory locks."""
         digest = hashlib.sha256(f"{namespace}:{value}".encode("utf-8")).digest()
         raw = int.from_bytes(digest[:8], byteorder="big", signed=False)
         return raw - (1 << 64) if raw >= (1 << 63) else raw
 
     def _try_claim_job_lock(self, sess, *, namespace: str, value: str) -> bool:
+        """Try to claim transaction-scoped advisory lock; returns False when already taken."""
         key = self._advisory_key(namespace, value)
         got = sess.execute(
             text("SELECT pg_try_advisory_xact_lock(:k) AS locked"),
@@ -148,6 +185,7 @@ class _KeywordGeneratorBase:
         context: Dict[str, Any],
         keywords: Dict[str, Any],
     ) -> Dict[str, Any]:
+        """Classify opportunity category with a safe fallback to `unclear` on failure."""
         valid_broad = {"basic_research", "applied_research", "educational", "unclear"}
         try:
             out: OpportunityCategoryOut = category_chain.invoke(
@@ -176,73 +214,372 @@ class _KeywordGeneratorBase:
         obj: Any,
         *,
         context_builder: ContextBuilder,
-        candidates_chain,
-        keywords_chain,
+        research_candidates_chain,
+        application_candidates_chain,
+        research_keywords_chain,
+        application_keywords_chain,
         weight_chain,
-        source_chain=None,
+        research_merge_chain=None,
+        application_merge_chain=None,
+        source_embedding_client: Optional[Any] = None,
     ) -> Tuple[dict, dict]:
-        context = context_builder(obj)
+        """Run full keyword pipeline and return (keywords_with_sources, raw_debug_payload)."""
 
-        context = sanitize_for_postgres(context)
-        context_json = json.dumps(context, ensure_ascii=False)
-        cand_out: CandidatesOut = candidates_chain.invoke({"context_json": context_json})
-        candidates = (cand_out.candidates or [])[:50]
-
-        kw_out: KeywordsOut = keywords_chain.invoke(
-            {
-                "context_json": context_json,
-                "candidates": "\n".join(f"- {c}" for c in candidates),
-            }
+        #=================================
+        # 1. Build/normalize context and split into LLM-sized batches
+        #=================================
+        full_context = sanitize_for_postgres(context_builder(obj))
+        context_batches = self.context_generator.build_keyword_context_batches(
+            context=full_context,
+            max_chars=self.KEYWORD_MAX_CONTEXT_CHARS,
         )
-        kw_dict = coerce_keyword_sections(kw_out.model_dump())
-
-        spec_in = {
-            "research": (kw_dict.get("research") or {}).get("specialization") or [],
-            "application": (kw_dict.get("application") or {}).get("specialization") or [],
-        }
-        weighted_out: WeightedSpecsOut = weight_chain.invoke(
-            {
-                "context_json": context_json,
-                "spec_json": json.dumps(spec_in, ensure_ascii=False),
-            }
+        logger.info(
+            "Keyword generation batching batches=%s max_chars=%s",
+            len(context_batches),
+            self.KEYWORD_MAX_CONTEXT_CHARS,
         )
 
-        kw_weighted = apply_weighted_specializations(keywords=kw_dict, weighted=weighted_out)
-        source_catalog = build_specialization_source_catalog(context)
-        source_map_raw: Dict[str, Any] = {}
-        source_error: Optional[str] = None
-        kw_with_sources = kw_weighted
-        if source_catalog:
-            if source_chain is not None:
-                try:
-                    source_spec_input = specialization_text_sections(kw_weighted)
-                    source_out: SpecializationSourcesOut = source_chain.invoke(
-                        {
-                            "spec_json": json.dumps(source_spec_input, ensure_ascii=False),
-                            "source_catalog_json": json.dumps(source_catalog, ensure_ascii=False),
-                        }
-                    )
-                    source_map_raw = source_out.model_dump()
-                except Exception as e:
-                    source_error = f"{type(e).__name__}: {e}"
-            kw_with_sources = attach_specialization_sources_from_llm(
-                keywords=kw_weighted,
-                llm_sources=source_map_raw,
-                source_catalog=source_catalog,
+        #=================================
+        # 2. Run each batch in parallel (batch worker count is fixed to 2)
+        #    Each batch executes: candidate -> keyword -> weight
+        #=================================
+        batch_items: List[Tuple[int, Dict[str, Any]]] = [
+            (int(i), dict(ctx or {}))
+            for i, ctx in enumerate(list(context_batches), start=1)
+        ]
+        batch_workers = resolve_pool_size(
+            max_workers=int(self.KEYWORD_BATCH_WORKERS),
+            task_count=len(batch_items),
+        )
+        logger.info(
+            "Keyword generation batch parallel workers=%s batches=%s",
+            batch_workers,
+            len(batch_items),
+        )
+
+        def _run_one_batch(item: Tuple[int, Dict[str, Any]]) -> Dict[str, Any]:
+            batch_idx, batch_ctx = item
+            batch_json = json.dumps(batch_ctx, ensure_ascii=False)
+
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                fut_r_cand = pool.submit(research_candidates_chain.invoke, {"context_json": batch_json})
+                fut_a_cand = pool.submit(application_candidates_chain.invoke, {"context_json": batch_json})
+                candidates_research = self.context_generator.dedupe_keyword_texts(
+                    (fut_r_cand.result().candidates or [])[: self.KEYWORD_MAX_CANDIDATES_PER_BATCH]
+                )
+                candidates_application = self.context_generator.dedupe_keyword_texts(
+                    (fut_a_cand.result().candidates or [])[: self.KEYWORD_MAX_CANDIDATES_PER_BATCH]
+                )
+
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                fut_r_kw = pool.submit(
+                    research_keywords_chain.invoke,
+                    {
+                        "context_json": batch_json,
+                        "candidates": "\n".join(f"- {c}" for c in candidates_research),
+                    },
+                )
+                fut_a_kw = pool.submit(
+                    application_keywords_chain.invoke,
+                    {
+                        "context_json": batch_json,
+                        "candidates": "\n".join(f"- {c}" for c in candidates_application),
+                    },
+                )
+                research_out: KeywordBucket = fut_r_kw.result()
+                application_out: KeywordBucket = fut_a_kw.result()
+
+            research_kw = research_out.model_dump() if hasattr(research_out, "model_dump") else {}
+            application_kw = application_out.model_dump() if hasattr(application_out, "model_dump") else {}
+
+            keyword_row_research = self.context_generator.format_keyword_merge_input_row(
+                batch_idx=int(batch_idx),
+                candidates=candidates_research,
+                keyword_bucket=research_kw,
+                max_batch_keywords=self.KEYWORD_MAX_BATCH_KEYWORDS,
+            )
+            keyword_row_application = self.context_generator.format_keyword_merge_input_row(
+                batch_idx=int(batch_idx),
+                candidates=candidates_application,
+                keyword_bucket=application_kw,
+                max_batch_keywords=self.KEYWORD_MAX_BATCH_KEYWORDS,
             )
 
+            batch_spec_in = {
+                "research": list((keyword_row_research or {}).get("specialization") or []),
+                "application": list((keyword_row_application or {}).get("specialization") or []),
+            }
+
+            batch_weighted_payload: Dict[str, List[Dict[str, Any]]]
+            weight_error: Optional[str] = None
+            if batch_spec_in["research"] or batch_spec_in["application"]:
+                try:
+                    batch_weighted_out: WeightedSpecsOut = weight_chain.invoke(
+                        {
+                            "context_json": json.dumps(batch_ctx, ensure_ascii=False),
+                            "spec_json": json.dumps(batch_spec_in, ensure_ascii=False),
+                        }
+                    )
+                    batch_weighted_payload = {
+                        "research": [x.model_dump() for x in (batch_weighted_out.research or [])],
+                        "application": [x.model_dump() for x in (batch_weighted_out.application or [])],
+                    }
+                except Exception as e:
+                    weight_error = f"batch={int(batch_idx)} {type(e).__name__}: {e}"
+                    batch_weighted_payload = {
+                        "research": [{"t": str(t), "w": 0.0} for t in list(batch_spec_in.get("research") or [])],
+                        "application": [{"t": str(t), "w": 0.0} for t in list(batch_spec_in.get("application") or [])],
+                    }
+            else:
+                batch_weighted_payload = {"research": [], "application": []}
+
+            return {
+                "batch_idx": int(batch_idx),
+                "batch_ctx": batch_ctx,
+                "candidates_research": list(candidates_research),
+                "candidates_application": list(candidates_application),
+                "keyword_row_research": dict(keyword_row_research or {}),
+                "keyword_row_application": dict(keyword_row_application or {}),
+                "specializations_input": batch_spec_in,
+                "weighted": batch_weighted_payload,
+                "weight_error": weight_error,
+            }
+
+        def _on_batch_error(
+            _idx: int,
+            item: Tuple[int, Dict[str, Any]],
+            exc: Exception,
+        ) -> Dict[str, Any]:
+            batch_idx, batch_ctx = item
+            err = f"batch={int(batch_idx)} {type(exc).__name__}: {exc}"
+            logger.exception("Keyword generation batch failed %s", err)
+            return {
+                "batch_idx": int(batch_idx),
+                "batch_ctx": batch_ctx,
+                "candidates_research": [],
+                "candidates_application": [],
+                "keyword_row_research": {
+                    "batch_idx": int(batch_idx),
+                    "candidates": [],
+                    "domain": [],
+                    "specialization": [],
+                },
+                "keyword_row_application": {
+                    "batch_idx": int(batch_idx),
+                    "candidates": [],
+                    "domain": [],
+                    "specialization": [],
+                },
+                "specializations_input": {"research": [], "application": []},
+                "weighted": {"research": [], "application": []},
+                "weight_error": err,
+            }
+
+        batch_results = parallel_map(
+            batch_items,
+            max_workers=max(1, int(batch_workers or 1)),
+            run_item=_run_one_batch,
+            on_error=_on_batch_error,
+        )
+        batch_results = sorted(batch_results, key=lambda x: int((x or {}).get("batch_idx") or 0))
+
+        candidate_batches_research: List[List[str]] = [
+            list((row or {}).get("candidates_research") or [])
+            for row in batch_results
+        ]
+        candidate_batches_application: List[List[str]] = [
+            list((row or {}).get("candidates_application") or [])
+            for row in batch_results
+        ]
+        keyword_batches_research: List[Dict[str, Any]] = [
+            dict((row or {}).get("keyword_row_research") or {})
+            for row in batch_results
+        ]
+        keyword_batches_application: List[Dict[str, Any]] = [
+            dict((row or {}).get("keyword_row_application") or {})
+            for row in batch_results
+        ]
+
+        #=================================
+        # 3. Merge per-batch keywords into one R bucket and one A bucket
+        #=================================
+        fallback_research = self.context_generator.fallback_keyword_merge_bucket(
+            batch_domains=[list(item.get("domain") or []) for item in keyword_batches_research],
+            batch_specializations=[list(item.get("specialization") or []) for item in keyword_batches_research],
+        )
+        fallback_application = self.context_generator.fallback_keyword_merge_bucket(
+            batch_domains=[list(item.get("domain") or []) for item in keyword_batches_application],
+            batch_specializations=[list(item.get("specialization") or []) for item in keyword_batches_application],
+        )
+
+        if research_merge_chain is not None:
+            try:
+                merged_research_out: KeywordBucket = research_merge_chain.invoke(
+                    {"batch_json": json.dumps(keyword_batches_research, ensure_ascii=False)}
+                )
+                merged_research = self.context_generator.normalize_keyword_merge_output(merged_research_out)
+            except Exception:
+                merged_research = fallback_research
+        else:
+            merged_research = fallback_research
+
+        if application_merge_chain is not None:
+            try:
+                merged_application_out: KeywordBucket = application_merge_chain.invoke(
+                    {"batch_json": json.dumps(keyword_batches_application, ensure_ascii=False)}
+                )
+                merged_application = self.context_generator.normalize_keyword_merge_output(merged_application_out)
+            except Exception:
+                merged_application = fallback_application
+        else:
+            merged_application = fallback_application
+
+        kw_dict = coerce_keyword_sections(
+            {
+                "research": merged_research,
+                "application": merged_application,
+            }
+        )
+
+        #=================================
+        # 4. Weight specializations per batch, then merge via max(weight)+support_count
+        #=================================
+        spec_in = {
+            "research": list((kw_dict.get("research") or {}).get("specialization") or []),
+            "application": list((kw_dict.get("application") or {}).get("specialization") or []),
+        }
+        weighted_batches: List[Dict[str, Any]] = []
+        weight_errors: List[str] = []
+        merged_weighted_by_section: Dict[str, Dict[str, Dict[str, Any]]] = {
+            "research": {},
+            "application": {},
+        }
+
+        for batch in list(batch_results):
+            batch_idx = int((batch or {}).get("batch_idx") or 0)
+            batch_spec_in = dict((batch or {}).get("specializations_input") or {"research": [], "application": []})
+            batch_weighted_payload = dict((batch or {}).get("weighted") or {"research": [], "application": []})
+            batch_err = str((batch or {}).get("weight_error") or "").strip()
+            if batch_err:
+                weight_errors.append(batch_err)
+
+            weighted_batches.append(
+                {
+                    "batch_idx": batch_idx,
+                    "specializations_input": batch_spec_in,
+                    "weighted": batch_weighted_payload,
+                }
+            )
+
+            for sec in ("research", "application"):
+                seen_in_batch = set()
+                for item in list(batch_weighted_payload.get(sec) or []):
+                    text = str((item or {}).get("t") or "").strip()
+                    if not text:
+                        continue
+                    key = self._norm_text_key(text)
+                    if not key or key in seen_in_batch:
+                        continue
+                    seen_in_batch.add(key)
+                    try:
+                        w = float((item or {}).get("w", 0.0))
+                    except Exception:
+                        w = 0.0
+                    w = max(0.0, min(1.0, w))
+                    existing = merged_weighted_by_section[sec].get(key)
+                    if not existing:
+                        merged_weighted_by_section[sec][key] = {
+                            "t": text,
+                            "w": w,
+                            "support_count": 1,
+                        }
+                    else:
+                        if w > float(existing.get("w", 0.0)):
+                            existing["w"] = w
+                            existing["t"] = text
+                        existing["support_count"] = int(existing.get("support_count", 0)) + 1
+
+        # Ensure merged specializations are preserved even if weighting skipped/fails.
+        for sec in ("research", "application"):
+            for text in list((kw_dict.get(sec) or {}).get("specialization") or []):
+                t = str(text or "").strip()
+                if not t:
+                    continue
+                key = self._norm_text_key(t)
+                if not key:
+                    continue
+                if key not in merged_weighted_by_section[sec]:
+                    merged_weighted_by_section[sec][key] = {
+                        "t": t,
+                        "w": 0.0,
+                        "support_count": 0,
+                    }
+
+        #=================================
+        # 5. Build final weighted keyword object
+        #=================================
+        merged_weighted_specs = {
+            "research": sorted(
+                list(merged_weighted_by_section["research"].values()),
+                key=lambda x: (-float(x.get("w", 0.0)), -int(x.get("support_count", 0)), str(x.get("t") or "")),
+            ),
+            "application": sorted(
+                list(merged_weighted_by_section["application"].values()),
+                key=lambda x: (-float(x.get("w", 0.0)), -int(x.get("support_count", 0)), str(x.get("t") or "")),
+            ),
+        }
+
+        kw_weighted = {
+            "research": dict(kw_dict.get("research") or {}),
+            "application": dict(kw_dict.get("application") or {}),
+        }
+        kw_weighted["research"]["specialization"] = list(merged_weighted_specs["research"])
+        kw_weighted["application"]["specialization"] = list(merged_weighted_specs["application"])
+
+        #=================================
+        # 6. Attach evidence sources using cosine similarity over source catalog
+        #=================================
+        source_attach = self.context_generator.attach_keyword_sources_by_cosine(
+            keywords=kw_weighted,
+            context=full_context,
+            embedding_client=source_embedding_client,
+            max_sources_per_specialization=4,
+            min_similarity=0.10,
+        )
+        source_catalog = list(source_attach.get("source_catalog") or [])
+        source_map_raw = dict(source_attach.get("source_map_raw") or {})
+        source_error = source_attach.get("source_error")
+        kw_with_sources = dict(source_attach.get("keywords") or kw_weighted)
+
+        #=================================
+        # 7. Build raw debug payload for traceability and return
+        #=================================
         raw_debug = {
-            "context_used": context,
-            "candidates": candidates,
+            "context_used": full_context,
+            "source_mapping_method": "cosine_similarity",
+            "context_batches_used": context_batches,
+            "candidates": self.context_generator.dedupe_keyword_texts(
+                [x for row in candidate_batches_research for x in row]
+                + [x for row in candidate_batches_application for x in row]
+            ),
+            "candidates_research": self.context_generator.dedupe_keyword_texts(
+                [x for row in candidate_batches_research for x in row]
+            ),
+            "candidates_application": self.context_generator.dedupe_keyword_texts(
+                [x for row in candidate_batches_application for x in row]
+            ),
+            "keyword_batches_research": keyword_batches_research,
+            "keyword_batches_application": keyword_batches_application,
             "keywords_unweighted": kw_dict,
             "specializations_input": spec_in,
-            "weighted_specializations": {
-                "research": [x.model_dump() for x in weighted_out.research],
-                "application": [x.model_dump() for x in weighted_out.application],
-            },
+            "weight_strategy": "per_batch_max_weight_with_support_count",
+            "weighted_specializations_batches": weighted_batches,
+            "weighted_specializations": merged_weighted_specs,
             "specialization_source_catalog_count": len(source_catalog),
             "specialization_sources_raw": source_map_raw,
         }
+        if weight_errors:
+            raw_debug["weighted_specializations_errors"] = weight_errors
         if source_error:
             raw_debug["specialization_sources_error"] = source_error
         return sanitize_for_postgres(kw_with_sources), sanitize_for_postgres(raw_debug)
@@ -250,16 +587,31 @@ class _KeywordGeneratorBase:
 
 class FacultyKeywordGenerator(_KeywordGeneratorBase):
     def generate_faculty_keywords_for_id(self, faculty_id: int, *, force_regenerate: Optional[bool] = None) -> Optional[dict]:
+        """Generate and persist keywords for one faculty id."""
         if not faculty_id:
             return None
 
+        #=================================
+        # 1. Build chains and load target faculty row
+        #=================================
         force = self._resolve_force(force_regenerate)
-        faculty_cand_chain, faculty_kw_chain, faculty_w_chain = self.build_keyword_chain(
-            FACULTY_CANDIDATE_PROMPT,
-            FACULTY_KEYWORDS_PROMPT,
+        (
+            faculty_r_cand_chain,
+            faculty_a_cand_chain,
+            faculty_r_kw_chain,
+            faculty_a_kw_chain,
+            faculty_w_chain,
+        ) = self.build_keyword_chain(
+            FACULTY_RESEARCH_CANDIDATE_PROMPT,
+            FACULTY_APPLICATION_CANDIDATE_PROMPT,
+            FACULTY_RESEARCH_KEYWORDS_PROMPT,
+            FACULTY_APPLICATION_KEYWORDS_PROMPT,
             FACULTY_SPECIALIZATION_WEIGHT_PROMPT,
         )
-        faculty_source_chain = self.build_specialization_source_chain(FACULTY_SPECIALIZATION_SOURCE_PROMPT)
+        faculty_r_merge_chain, faculty_a_merge_chain = self.build_keyword_merge_chain(
+            FACULTY_RESEARCH_MERGE_PROMPT,
+            FACULTY_APPLICATION_MERGE_PROMPT,
+        )
 
         with SessionLocal() as sess:
             fac_dao = FacultyDAO(sess)
@@ -270,13 +622,22 @@ class FacultyKeywordGenerator(_KeywordGeneratorBase):
                 existing = (getattr(getattr(fac, "keyword", None), "keywords", None) or {})
                 return existing if existing else None
 
+            #=================================
+            # 2. Run keyword pipeline and upsert keyword JSON
+            #=================================
             faculty_keywords, faculty_keywords_raw = self.generate_keywords(
                 fac,
-                context_builder=self.context_generator.build_faculty_basic_context,
-                candidates_chain=faculty_cand_chain,
-                keywords_chain=faculty_kw_chain,
+                context_builder=lambda fac_obj: self.context_generator.build_faculty_basic_context(
+                    fac_obj,
+                    use_rag=False,
+                ),
+                research_candidates_chain=faculty_r_cand_chain,
+                application_candidates_chain=faculty_a_cand_chain,
+                research_keywords_chain=faculty_r_kw_chain,
+                application_keywords_chain=faculty_a_kw_chain,
                 weight_chain=faculty_w_chain,
-                source_chain=faculty_source_chain,
+                research_merge_chain=faculty_r_merge_chain,
+                application_merge_chain=faculty_a_merge_chain,
             )
 
             source_model = settings.haiku
@@ -292,6 +653,9 @@ class FacultyKeywordGenerator(_KeywordGeneratorBase):
                 ]
             )
 
+            #=================================
+            # 3. Build and persist domain embeddings for fast matching
+            #=================================
             r_domains, a_domains = extract_domains_from_keywords(faculty_keywords)
             r_vec = embed_domain_bucket(r_domains)
             a_vec = embed_domain_bucket(a_domains)
@@ -315,7 +679,12 @@ class FacultyKeywordGenerator(_KeywordGeneratorBase):
         commit_every: int = 10,
         workers: int = 4,
     ) -> None:
+        """Batch-generate faculty keywords in parallel with per-item transaction boundaries."""
         _ = commit_every  # Per-item commits are used in threaded mode.
+
+        #=================================
+        # 1. Resolve target faculty ids
+        #=================================
         force = self._resolve_force(force_regenerate)
         safe_limit = max(0, int(limit or 0))
         with SessionLocal() as sess:
@@ -333,6 +702,9 @@ class FacultyKeywordGenerator(_KeywordGeneratorBase):
             if duplicate_targets:
                 logger.warning("Faculty keyword batch deduped duplicate targets=%s", duplicate_targets)
 
+        #=================================
+        # 2. Prepare worker pool and thread-local chain state
+        #=================================
         pool_size = resolve_pool_size(max_workers=int(workers or 0), task_count=len(target_ids))
         logger.info(
             "Faculty keyword batch start force=%s limit=%s targets=%s workers=%s",
@@ -348,22 +720,40 @@ class FacultyKeywordGenerator(_KeywordGeneratorBase):
         embed_model = settings.bedrock_embed_model_id
 
         def _build_thread_state() -> Dict[str, Any]:
-            fac_cand_chain, fac_kw_chain, fac_w_chain = self.build_keyword_chain(
-                FACULTY_CANDIDATE_PROMPT,
-                FACULTY_KEYWORDS_PROMPT,
+            (
+                fac_r_cand_chain,
+                fac_a_cand_chain,
+                fac_r_kw_chain,
+                fac_a_kw_chain,
+                fac_w_chain,
+            ) = self.build_keyword_chain(
+                FACULTY_RESEARCH_CANDIDATE_PROMPT,
+                FACULTY_APPLICATION_CANDIDATE_PROMPT,
+                FACULTY_RESEARCH_KEYWORDS_PROMPT,
+                FACULTY_APPLICATION_KEYWORDS_PROMPT,
                 FACULTY_SPECIALIZATION_WEIGHT_PROMPT,
             )
-            fac_source_chain = self.build_specialization_source_chain(FACULTY_SPECIALIZATION_SOURCE_PROMPT)
+            fac_r_merge_chain, fac_a_merge_chain = self.build_keyword_merge_chain(
+                FACULTY_RESEARCH_MERGE_PROMPT,
+                FACULTY_APPLICATION_MERGE_PROMPT,
+            )
+            emb_client = get_embedding_client().build()
             return {
-                "candidates_chain": fac_cand_chain,
-                "keywords_chain": fac_kw_chain,
+                "research_candidates_chain": fac_r_cand_chain,
+                "application_candidates_chain": fac_a_cand_chain,
+                "research_keywords_chain": fac_r_kw_chain,
+                "application_keywords_chain": fac_a_kw_chain,
                 "weight_chain": fac_w_chain,
-                "source_chain": fac_source_chain,
-                "embedding_client": get_embedding_client().build(),
+                "research_merge_chain": fac_r_merge_chain,
+                "application_merge_chain": fac_a_merge_chain,
+                "embedding_client": emb_client,
             }
 
         get_thread_state = build_thread_local_getter(_build_thread_state)
 
+        #=================================
+        # 3. Per-item worker job: lock, generate, persist, embed
+        #=================================
         def _run_one(faculty_id: int) -> Dict[str, Any]:
             state = get_thread_state()
             with SessionLocal() as sess:
@@ -387,11 +777,18 @@ class FacultyKeywordGenerator(_KeywordGeneratorBase):
 
                 faculty_keywords, faculty_keywords_raw = self.generate_keywords(
                     fac,
-                    context_builder=self.context_generator.build_faculty_basic_context,
-                    candidates_chain=state["candidates_chain"],
-                    keywords_chain=state["keywords_chain"],
+                    context_builder=lambda fac_obj: self.context_generator.build_faculty_basic_context(
+                        fac_obj,
+                        use_rag=False,
+                    ),
+                    research_candidates_chain=state["research_candidates_chain"],
+                    application_candidates_chain=state["application_candidates_chain"],
+                    research_keywords_chain=state["research_keywords_chain"],
+                    application_keywords_chain=state["application_keywords_chain"],
                     weight_chain=state["weight_chain"],
-                    source_chain=state["source_chain"],
+                    research_merge_chain=state["research_merge_chain"],
+                    application_merge_chain=state["application_merge_chain"],
+                    source_embedding_client=state["embedding_client"],
                 )
 
                 fac_dao.upsert_keywords_json(
@@ -429,6 +826,9 @@ class FacultyKeywordGenerator(_KeywordGeneratorBase):
                 "error": f"{type(exc).__name__}: {exc}",
             }
 
+        #=================================
+        # 4. Execute workers and report summary
+        #=================================
         results = parallel_map(
             target_ids,
             max_workers=pool_size,
@@ -458,16 +858,31 @@ class OpportunityKeywordGenerator(_KeywordGeneratorBase):
         *,
         force_regenerate: Optional[bool] = None,
     ) -> Optional[dict]:
+        """Generate and persist keywords + category for one opportunity id."""
         if not opportunity_id:
             return None
 
+        #=================================
+        # 1. Build chains and load target opportunity row
+        #=================================
         force = self._resolve_force(force_regenerate)
-        opp_cand_chain, opp_kw_chain, opp_w_chain = self.build_keyword_chain(
-            OPP_CANDIDATE_PROMPT,
-            OPP_KEYWORDS_PROMPT,
+        (
+            opp_r_cand_chain,
+            opp_a_cand_chain,
+            opp_r_kw_chain,
+            opp_a_kw_chain,
+            opp_w_chain,
+        ) = self.build_keyword_chain(
+            OPP_RESEARCH_CANDIDATE_PROMPT,
+            OPP_APPLICATION_CANDIDATE_PROMPT,
+            OPP_RESEARCH_KEYWORDS_PROMPT,
+            OPP_APPLICATION_KEYWORDS_PROMPT,
             OPP_SPECIALIZATION_WEIGHT_PROMPT,
         )
-        opp_source_chain = self.build_specialization_source_chain(OPP_SPECIALIZATION_SOURCE_PROMPT)
+        opp_r_merge_chain, opp_a_merge_chain = self.build_keyword_merge_chain(
+            OPP_RESEARCH_MERGE_PROMPT,
+            OPP_APPLICATION_MERGE_PROMPT,
+        )
         opp_cat_chain = self.build_opportunity_category_chain()
 
         with SessionLocal() as sess:
@@ -480,13 +895,22 @@ class OpportunityKeywordGenerator(_KeywordGeneratorBase):
                 existing = (getattr(getattr(opp, "keyword", None), "keywords", None) or {})
                 return existing if existing else None
 
+            #=================================
+            # 2. Run keyword pipeline and classify opportunity category
+            #=================================
             opportunity_keywords, opportunity_keywords_raw = self.generate_keywords(
                 opp,
-                context_builder=self.context_generator.build_opportunity_basic_context,
-                candidates_chain=opp_cand_chain,
-                keywords_chain=opp_kw_chain,
+                context_builder=lambda opp_obj: self.context_generator.build_opportunity_basic_context(
+                    opp_obj,
+                    use_rag=False,
+                ),
+                research_candidates_chain=opp_r_cand_chain,
+                application_candidates_chain=opp_a_cand_chain,
+                research_keywords_chain=opp_r_kw_chain,
+                application_keywords_chain=opp_a_kw_chain,
                 weight_chain=opp_w_chain,
-                source_chain=opp_source_chain,
+                research_merge_chain=opp_r_merge_chain,
+                application_merge_chain=opp_a_merge_chain,
             )
             ctx_used = (opportunity_keywords_raw or {}).get("context_used") or self.context_generator.build_opportunity_basic_context(opp)
             category = self._classify_opportunity_category(
@@ -497,6 +921,9 @@ class OpportunityKeywordGenerator(_KeywordGeneratorBase):
             opportunity_keywords_raw = dict(opportunity_keywords_raw or {})
             opportunity_keywords_raw["category"] = category
 
+            #=================================
+            # 3. Persist keyword JSON + categories
+            #=================================
             source_model = settings.haiku
             embed_model = settings.bedrock_embed_model_id
             opp_dao.upsert_keywords_json(
@@ -515,6 +942,9 @@ class OpportunityKeywordGenerator(_KeywordGeneratorBase):
                 specific_categories=category.get("specific_categories") or [],
             )
 
+            #=================================
+            # 4. Build and persist domain embeddings for fast matching
+            #=================================
             r_domains, a_domains = extract_domains_from_keywords(opportunity_keywords)
             r_vec = embed_domain_bucket(r_domains)
             a_vec = embed_domain_bucket(a_domains)
@@ -538,7 +968,12 @@ class OpportunityKeywordGenerator(_KeywordGeneratorBase):
         commit_every: int = 10,
         workers: int = 4,
     ) -> None:
+        """Batch-generate opportunity keywords in parallel with per-item transaction boundaries."""
         _ = commit_every  # Per-item commits are used in threaded mode.
+
+        #=================================
+        # 1. Resolve target opportunity ids
+        #=================================
         force = self._resolve_force(force_regenerate)
         safe_limit = max(0, int(limit or 0))
         with SessionLocal() as sess:
@@ -556,6 +991,9 @@ class OpportunityKeywordGenerator(_KeywordGeneratorBase):
             if duplicate_targets:
                 logger.warning("Opportunity keyword batch deduped duplicate targets=%s", duplicate_targets)
 
+        #=================================
+        # 2. Prepare worker pool and thread-local chain state
+        #=================================
         pool_size = resolve_pool_size(max_workers=int(workers or 0), task_count=len(target_ids))
         logger.info(
             "Opportunity keyword batch start force=%s limit=%s targets=%s workers=%s",
@@ -571,24 +1009,42 @@ class OpportunityKeywordGenerator(_KeywordGeneratorBase):
         embed_model = settings.bedrock_embed_model_id
 
         def _build_thread_state() -> Dict[str, Any]:
-            opp_cand_chain, opp_kw_chain, opp_w_chain = self.build_keyword_chain(
-                OPP_CANDIDATE_PROMPT,
-                OPP_KEYWORDS_PROMPT,
+            (
+                opp_r_cand_chain,
+                opp_a_cand_chain,
+                opp_r_kw_chain,
+                opp_a_kw_chain,
+                opp_w_chain,
+            ) = self.build_keyword_chain(
+                OPP_RESEARCH_CANDIDATE_PROMPT,
+                OPP_APPLICATION_CANDIDATE_PROMPT,
+                OPP_RESEARCH_KEYWORDS_PROMPT,
+                OPP_APPLICATION_KEYWORDS_PROMPT,
                 OPP_SPECIALIZATION_WEIGHT_PROMPT,
             )
-            opp_source_chain = self.build_specialization_source_chain(OPP_SPECIALIZATION_SOURCE_PROMPT)
+            opp_r_merge_chain, opp_a_merge_chain = self.build_keyword_merge_chain(
+                OPP_RESEARCH_MERGE_PROMPT,
+                OPP_APPLICATION_MERGE_PROMPT,
+            )
             opp_cat_chain = self.build_opportunity_category_chain()
+            emb_client = get_embedding_client().build()
             return {
-                "candidates_chain": opp_cand_chain,
-                "keywords_chain": opp_kw_chain,
+                "research_candidates_chain": opp_r_cand_chain,
+                "application_candidates_chain": opp_a_cand_chain,
+                "research_keywords_chain": opp_r_kw_chain,
+                "application_keywords_chain": opp_a_kw_chain,
                 "weight_chain": opp_w_chain,
-                "source_chain": opp_source_chain,
+                "research_merge_chain": opp_r_merge_chain,
+                "application_merge_chain": opp_a_merge_chain,
                 "category_chain": opp_cat_chain,
-                "embedding_client": get_embedding_client().build(),
+                "embedding_client": emb_client,
             }
 
         get_thread_state = build_thread_local_getter(_build_thread_state)
 
+        #=================================
+        # 3. Per-item worker job: lock, generate, classify, persist, embed
+        #=================================
         def _run_one(opportunity_id: str) -> Dict[str, Any]:
             oid = str(opportunity_id)
             state = get_thread_state()
@@ -614,11 +1070,18 @@ class OpportunityKeywordGenerator(_KeywordGeneratorBase):
 
                 opportunity_keywords, opportunity_keywords_raw = self.generate_keywords(
                     opp,
-                    context_builder=self.context_generator.build_opportunity_basic_context,
-                    candidates_chain=state["candidates_chain"],
-                    keywords_chain=state["keywords_chain"],
+                    context_builder=lambda opp_obj: self.context_generator.build_opportunity_basic_context(
+                        opp_obj,
+                        use_rag=False,
+                    ),
+                    research_candidates_chain=state["research_candidates_chain"],
+                    application_candidates_chain=state["application_candidates_chain"],
+                    research_keywords_chain=state["research_keywords_chain"],
+                    application_keywords_chain=state["application_keywords_chain"],
                     weight_chain=state["weight_chain"],
-                    source_chain=state["source_chain"],
+                    research_merge_chain=state["research_merge_chain"],
+                    application_merge_chain=state["application_merge_chain"],
+                    source_embedding_client=state["embedding_client"],
                 )
                 ctx_used = (
                     (opportunity_keywords_raw or {}).get("context_used")
@@ -672,6 +1135,9 @@ class OpportunityKeywordGenerator(_KeywordGeneratorBase):
                 "error": f"{type(exc).__name__}: {exc}",
             }
 
+        #=================================
+        # 4. Execute workers and report summary
+        #=================================
         results = parallel_map(
             target_ids,
             max_workers=pool_size,

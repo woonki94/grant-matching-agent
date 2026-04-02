@@ -54,7 +54,10 @@ SQL
 
 echo "Running SQL migrations..."
 MIGRATIONS_ROOT="$PROJECT_ROOT/db/migrations"
-mapfile -t files < <(find "$MIGRATIONS_ROOT" -type f -name '*.sql' | sort)
+files=()
+while IFS= read -r f; do
+  files+=("$f")
+done < <(find "$MIGRATIONS_ROOT" -type f -name '*.sql' | sort)
 
 if [[ ${#files[@]} -eq 0 ]]; then
   echo "No SQL migrations found."

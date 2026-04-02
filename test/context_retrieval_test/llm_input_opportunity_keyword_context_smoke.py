@@ -28,7 +28,7 @@ def main(*, opportunity_id: str) -> int:
         if not opp:
             raise ValueError(f"Opportunity not found: {oid}")
 
-        payload = cgen.build_opportunity_basic_context(opp)
+        payload = cgen.build_opportunity_merged_content_context(opp)
 
     print(json.dumps(payload, ensure_ascii=False, indent=2, default=str))
     return 0
@@ -36,7 +36,7 @@ def main(*, opportunity_id: str) -> int:
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Smoke test: LLM input context for opportunity keyword generation.",
+        description="Smoke test: flat opportunity merged-content context.",
     )
     parser.add_argument("--opportunity-id", required=True)
     args = parser.parse_args()

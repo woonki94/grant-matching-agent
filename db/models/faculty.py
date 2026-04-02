@@ -149,6 +149,7 @@ class FacultyPublication(Base):
 
     title = Column(Text, nullable=False)
     abstract = Column(Text)
+    abstract_embedding = Column(Vector(EMBED_DIM), nullable=True)
     year = Column(Integer)
 
     faculty = relationship("Faculty", back_populates="publications")

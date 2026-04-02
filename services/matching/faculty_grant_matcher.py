@@ -13,6 +13,7 @@ from services.matching.single_match_llm_reranker import OneToOneLLMReranker
 from services.matching.specialization_cross_encoder import SpecializationCrossEncoderScorer
 from sqlalchemy.orm import selectinload
 from utils.keyword_utils import extract_specializations
+from utils.thread_pool import parallel_map, resolve_pool_size
 
 logger = logging.getLogger(__name__)
 
@@ -21,6 +22,7 @@ class FacultyGrantMatcher:
     """One-to-one faculty↔grant matcher using cross-encoder specialization coverage."""
 
     DEFAULT_COVERED_THRESHOLD = 0.30
+    DEFAULT_RERANK_WORKERS = 4
 
     def __init__(
         self,
@@ -329,6 +331,66 @@ class FacultyGrantMatcher:
         )
         return int(updated)
 
+    def _apply_reranked_scores_for_faculties(
+        self,
+        *,
+        faculty_ids: List[int],
+        workers: int = DEFAULT_RERANK_WORKERS,
+    ) -> int:
+        """Apply one-to-one LLM reranked scores for multiple faculty in parallel."""
+        target_ids = sorted({int(x) for x in list(faculty_ids or []) if x is not None})
+        if not target_ids:
+            return 0
+
+        pool_size = resolve_pool_size(max_workers=int(workers or 0), task_count=len(target_ids))
+        logger.info(
+            "Rerank batch start faculty_targets=%s workers=%s",
+            len(target_ids),
+            int(pool_size),
+        )
+
+        def _run_one(fid: int) -> Dict[str, Any]:
+            with self.session_factory() as sess:
+                match_dao = MatchDAO(sess)
+                updated = self._apply_reranked_scores_for_faculty(
+                    sess=sess,
+                    match_dao=match_dao,
+                    faculty_id=int(fid),
+                )
+                sess.commit()
+                return {
+                    "faculty_id": int(fid),
+                    "updated_rows": int(updated),
+                    "status": "done",
+                }
+
+        def _on_error(_idx: int, fid: int, exc: Exception) -> Dict[str, Any]:
+            logger.exception(
+                "Rerank batch failed for faculty_id=%s: %s",
+                int(fid),
+                f"{type(exc).__name__}: {exc}",
+            )
+            return {
+                "faculty_id": int(fid),
+                "updated_rows": 0,
+                "status": "failed",
+                "error": f"{type(exc).__name__}: {exc}",
+            }
+
+        outputs = parallel_map(
+            target_ids,
+            max_workers=pool_size,
+            run_item=_run_one,
+            on_error=_on_error,
+        )
+        total_updated = sum(int((row or {}).get("updated_rows") or 0) for row in list(outputs or []))
+        logger.info(
+            "Rerank batch done faculty_targets=%s updated_rows=%s",
+            len(target_ids),
+            int(total_updated),
+        )
+        return int(total_updated)
+
     def run(
         self,
         *,
@@ -336,6 +398,7 @@ class FacultyGrantMatcher:
         min_domain: float = 0.30,
         limit_faculty: int = 100,
         commit_every: int = 30,
+        rerank_workers: int = DEFAULT_RERANK_WORKERS,
     ) -> int:
         with self.session_factory() as sess:
             fac_dao = FacultyDAO(sess)
@@ -344,6 +407,7 @@ class FacultyGrantMatcher:
 
             faculty_iter = fac_dao.iter_faculty_with_relations(stream=False)
             processed = 0
+            rerank_faculty_ids: List[int] = []
 
             for fac in faculty_iter:
                 if limit_faculty and limit_faculty > 0 and processed >= limit_faculty:
@@ -368,13 +432,7 @@ class FacultyGrantMatcher:
 
                 if out_rows:
                     match_dao.upsert_matches(out_rows)
-                    # Commit first so reranker (separate session) can read the fresh rows.
-                    sess.commit()
-                    self._apply_reranked_scores_for_faculty(
-                        sess=sess,
-                        match_dao=match_dao,
-                        faculty_id=int(fac.faculty_id),
-                    )
+                    rerank_faculty_ids.append(int(fac.faculty_id))
 
                 processed += 1
                 if commit_every and processed % commit_every == 0:
@@ -382,6 +440,10 @@ class FacultyGrantMatcher:
                     logger.info("Committed after %d faculty processed", processed)
 
             sess.commit()
+            self._apply_reranked_scores_for_faculties(
+                faculty_ids=rerank_faculty_ids,
+                workers=int(rerank_workers),
+            )
             logger.info("Faculty-grant matching completed. Total faculty processed: %d", processed)
             return processed
 
@@ -442,6 +504,7 @@ class FacultyGrantMatcher:
         faculty_ids: Optional[List[int]] = None,
         k: int = 200,
         min_domain: float = 0.30,
+        rerank_workers: int = DEFAULT_RERANK_WORKERS,
     ) -> int:
         """
         Generate one-to-one match rows for exactly one grant.
@@ -504,11 +567,8 @@ class FacultyGrantMatcher:
                 # Commit first so reranker (separate session) can read the fresh rows.
                 sess.commit()
                 rerank_faculty_ids = sorted({int(row.get("faculty_id")) for row in out_rows if row.get("faculty_id") is not None})
-                for fid in rerank_faculty_ids:
-                    self._apply_reranked_scores_for_faculty(
-                        sess=sess,
-                        match_dao=match_dao,
-                        faculty_id=int(fid),
-                    )
-                sess.commit()
+                self._apply_reranked_scores_for_faculties(
+                    faculty_ids=rerank_faculty_ids,
+                    workers=int(rerank_workers),
+                )
             return len(out_rows)

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-set -eu
+set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname "$0")" && pwd)"
 PROJECT_ROOT="$(cd -- "${SCRIPT_DIR}/.." && pwd)"
@@ -8,34 +8,72 @@ cd "$PROJECT_ROOT"
 print_usage() {
   cat <<'EOF'
 Usage:
-  ./scripts/generate_keywords.sh [mode] [limit] [force] [workers]
+  ./scripts/generate_keywords.sh [options]
 
-Arguments:
-  mode   : all | faculty | opp
-           default: all
-  limit  : max rows to process (integer)
-           default: empty (no limit)
-  force  : true/false flag for regenerating existing keywords
-           accepted true values: true, 1, yes, force, --force-regenerate
-           default: false
-  workers: thread workers per batch
-           default: 4
+Options:
+  --mode <all|faculty|opp>  Run target (default: all)
+  --limit <int>             Max rows to process; 0 or omitted means no limit
+  --workers <int>           Thread workers per batch (default: 4)
+  --force-regenerate        Regenerate rows that already have keywords
+  -h, --help                Show this help message
 
 Examples:
   ./scripts/generate_keywords.sh
-  ./scripts/generate_keywords.sh faculty 50
-  ./scripts/generate_keywords.sh opp 100 true
-  ./scripts/generate_keywords.sh all 0 --force-regenerate
-  ./scripts/generate_keywords.sh all 0 false 8
+  ./scripts/generate_keywords.sh --mode faculty --limit 50
+  ./scripts/generate_keywords.sh --mode opp --limit 100 --force-regenerate
+  ./scripts/generate_keywords.sh --mode all --workers 8
 EOF
 }
 
-case "${1:-}" in
-  -h|--help|help)
-    print_usage
-    exit 0
-    ;;
-esac
+MODE="all"
+LIMIT=""
+FORCE_REGENERATE="0"
+WORKERS="4"
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --mode)
+      if [[ $# -lt 2 ]]; then
+        echo "Error: --mode requires a value." >&2
+        print_usage >&2
+        exit 1
+      fi
+      MODE="$2"
+      shift 2
+      ;;
+    --limit)
+      if [[ $# -lt 2 ]]; then
+        echo "Error: --limit requires a value." >&2
+        print_usage >&2
+        exit 1
+      fi
+      LIMIT="$2"
+      shift 2
+      ;;
+    --workers)
+      if [[ $# -lt 2 ]]; then
+        echo "Error: --workers requires a value." >&2
+        print_usage >&2
+        exit 1
+      fi
+      WORKERS="$2"
+      shift 2
+      ;;
+    --force-regenerate)
+      FORCE_REGENERATE="1"
+      shift
+      ;;
+    -h|--help|help)
+      print_usage
+      exit 0
+      ;;
+    *)
+      echo "Error: unknown argument '$1'." >&2
+      print_usage >&2
+      exit 1
+      ;;
+  esac
+done
 
 if [ -f "$PROJECT_ROOT/.env" ]; then
   echo "Loading .env..."
@@ -45,15 +83,10 @@ if [ -f "$PROJECT_ROOT/.env" ]; then
   set +a
 fi
 
-MODE="${1:-all}"
-LIMIT="${2:-}"
-FORCE_MODE="${3:-}"
-WORKERS="${4:-4}"
-
 echo "Running keyword generation pipeline..."
 echo "  Mode  : $MODE"
 echo "  Limit : ${LIMIT:-none}"
-echo "  Force : ${FORCE_MODE:-false}"
+echo "  Force : ${FORCE_REGENERATE}"
 echo "  Workers : ${WORKERS:-4}"
 echo
 echo "  LLM_PROVIDER                         : ${LLM_PROVIDER:-}"
@@ -83,22 +116,22 @@ case "$MODE" in
     ;;
 esac
 
-case "$FORCE_MODE" in
-  ""|false|0|no) ;;
-  true|1|yes|force|--force-regenerate) EXTRA_ARGS+=(--force-regenerate) ;;
-  *)
-    echo "Error: invalid force flag '$FORCE_MODE' (use: true|false or force)" >&2
-    echo >&2
-    print_usage >&2
-    exit 1
-    ;;
-esac
-
 if ! [[ "$WORKERS" =~ ^[0-9]+$ ]]; then
   echo "Error: workers must be a non-negative integer (got: '$WORKERS')." >&2
   echo >&2
   print_usage >&2
   exit 1
+fi
+
+if [[ -n "$LIMIT" ]] && ! [[ "$LIMIT" =~ ^-?[0-9]+$ ]]; then
+  echo "Error: limit must be an integer (got: '$LIMIT')." >&2
+  echo >&2
+  print_usage >&2
+  exit 1
+fi
+
+if [[ "$FORCE_REGENERATE" == "1" ]]; then
+  EXTRA_ARGS+=(--force-regenerate)
 fi
 
 if [ "$WORKERS" -gt 0 ]; then

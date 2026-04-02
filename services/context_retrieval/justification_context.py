@@ -10,6 +10,7 @@ class JustificationContextBuilder:
     This builder shapes payloads from already-fetched entities/rows. It does not
     instantiate DAOs or call other context generators directly.
     """
+    DISABLE_TEXT_TRUNCATION = True
 
     @staticmethod
     def _norm(text: Any) -> str:
@@ -25,6 +26,8 @@ class JustificationContextBuilder:
     @classmethod
     def _short(cls, text: Any, max_chars: int = 260) -> str:
         s = cls._norm(text)
+        if cls.DISABLE_TEXT_TRUNCATION:
+            return s
         if len(s) <= int(max_chars):
             return s
         return s[: int(max_chars)].rstrip()

@@ -14,8 +14,10 @@ from db.db_conn import SessionLocal
 from dto.llm_response_dto import LLMMatchOut
 from services.keywords.keyword_generator import FacultyKeywordGenerator
 from services.prompts.keyword_prompts import (
-    QUERY_CANDIDATE_PROMPT,
-    QUERY_KEYWORDS_PROMPT,
+    QUERY_APPLICATION_CANDIDATE_PROMPT,
+    QUERY_APPLICATION_KEYWORDS_PROMPT,
+    QUERY_RESEARCH_CANDIDATE_PROMPT,
+    QUERY_RESEARCH_KEYWORDS_PROMPT,
     QUERY_SPECIALIZATION_WEIGHT_PROMPT,
 )
 from services.prompts.matching_prompt import MATCH_PROMPT
@@ -70,9 +72,17 @@ def generate_query_keywords(
     query_text: str,
     user_urls: Optional[List[str]],
 ) -> Dict[str, Any]:
-    candidates_chain, keywords_chain, weight_chain = FacultyKeywordGenerator.build_keyword_chain(
-        QUERY_CANDIDATE_PROMPT,
-        QUERY_KEYWORDS_PROMPT,
+    (
+        research_candidates_chain,
+        application_candidates_chain,
+        research_keywords_chain,
+        application_keywords_chain,
+        weight_chain,
+    ) = FacultyKeywordGenerator.build_keyword_chain(
+        QUERY_RESEARCH_CANDIDATE_PROMPT,
+        QUERY_APPLICATION_CANDIDATE_PROMPT,
+        QUERY_RESEARCH_KEYWORDS_PROMPT,
+        QUERY_APPLICATION_KEYWORDS_PROMPT,
         QUERY_SPECIALIZATION_WEIGHT_PROMPT,
     )
 
@@ -80,19 +90,33 @@ def generate_query_keywords(
     context = sanitize_for_postgres(context)
     context_json = json.dumps(context, ensure_ascii=False)
 
-    cand_out = candidates_chain.invoke({"context_json": context_json})
-    candidates = (cand_out.candidates or [])[:50]
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        fut_r_cand = pool.submit(research_candidates_chain.invoke, {"context_json": context_json})
+        fut_a_cand = pool.submit(application_candidates_chain.invoke, {"context_json": context_json})
+        research_candidates = (fut_r_cand.result().candidates or [])[:50]
+        application_candidates = (fut_a_cand.result().candidates or [])[:50]
 
-    kw_out = keywords_chain.invoke(
-        {
-            "context_json": context_json,
-            "candidates": "\n".join(f"- {c}" for c in candidates),
-        }
-    )
-    kw_dict = kw_out.model_dump()
-    for k in ("research", "application"):
-        if isinstance(kw_dict.get(k), str):
-            kw_dict[k] = json.loads(kw_dict[k])
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        fut_r_kw = pool.submit(
+            research_keywords_chain.invoke,
+            {
+                "context_json": context_json,
+                "candidates": "\n".join(f"- {c}" for c in research_candidates),
+            },
+        )
+        fut_a_kw = pool.submit(
+            application_keywords_chain.invoke,
+            {
+                "context_json": context_json,
+                "candidates": "\n".join(f"- {c}" for c in application_candidates),
+            },
+        )
+        research_out = fut_r_kw.result()
+        application_out = fut_a_kw.result()
+    kw_dict = {
+        "research": research_out.model_dump(),
+        "application": application_out.model_dump(),
+    }
 
     spec_in = {
         "research": (kw_dict.get("research") or {}).get("specialization") or [],

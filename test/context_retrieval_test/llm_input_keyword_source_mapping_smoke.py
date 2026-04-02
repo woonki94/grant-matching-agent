@@ -16,11 +16,15 @@ from db.db_conn import SessionLocal
 from services.context_retrieval.context_generator import ContextGenerator
 from services.keywords.keyword_generator import _KeywordGeneratorBase
 from services.prompts.keyword_prompts import (
-    FACULTY_CANDIDATE_PROMPT,
-    FACULTY_KEYWORDS_PROMPT,
+    FACULTY_APPLICATION_CANDIDATE_PROMPT,
+    FACULTY_APPLICATION_KEYWORDS_PROMPT,
+    FACULTY_RESEARCH_CANDIDATE_PROMPT,
+    FACULTY_RESEARCH_KEYWORDS_PROMPT,
     FACULTY_SPECIALIZATION_WEIGHT_PROMPT,
-    OPP_CANDIDATE_PROMPT,
-    OPP_KEYWORDS_PROMPT,
+    OPP_APPLICATION_CANDIDATE_PROMPT,
+    OPP_APPLICATION_KEYWORDS_PROMPT,
+    OPP_RESEARCH_CANDIDATE_PROMPT,
+    OPP_RESEARCH_KEYWORDS_PROMPT,
     OPP_SPECIALIZATION_WEIGHT_PROMPT,
 )
 from test.context_retrieval_test._llm_input_common import norm
@@ -36,30 +40,59 @@ from utils.payload_sanitizer import sanitize_for_postgres
 def _build_source_mapping_input_from_live_keyword_pipeline(
     *,
     context: Dict[str, Any],
-    prompt_triplet: Tuple[Any, Any, Any],
+    prompt_pack: Tuple[Any, Any, Any, Any, Any],
     max_catalog_items: int,
     max_excerpt_chars: int,
 ) -> Dict[str, Any]:
-    candidate_prompt, keywords_prompt, weight_prompt = prompt_triplet
-    candidates_chain, keywords_chain, weight_chain = _KeywordGeneratorBase.build_keyword_chain(
-        candidate_prompt,
-        keywords_prompt,
+    (
+        research_candidate_prompt,
+        application_candidate_prompt,
+        research_keywords_prompt,
+        application_keywords_prompt,
+        weight_prompt,
+    ) = prompt_pack
+    (
+        research_candidates_chain,
+        application_candidates_chain,
+        research_keywords_chain,
+        application_keywords_chain,
+        weight_chain,
+    ) = _KeywordGeneratorBase.build_keyword_chain(
+        research_candidate_prompt,
+        application_candidate_prompt,
+        research_keywords_prompt,
+        application_keywords_prompt,
         weight_prompt,
     )
 
     sanitized_context = sanitize_for_postgres(dict(context or {}))
     context_json = json.dumps(sanitized_context, ensure_ascii=False)
 
-    cand_out = candidates_chain.invoke({"context_json": context_json})
-    candidates = (getattr(cand_out, "candidates", None) or [])[:50]
+    research_candidates = (
+        getattr(research_candidates_chain.invoke({"context_json": context_json}), "candidates", None) or []
+    )[:50]
+    application_candidates = (
+        getattr(application_candidates_chain.invoke({"context_json": context_json}), "candidates", None) or []
+    )[:50]
 
-    kw_out = keywords_chain.invoke(
+    research_out = research_keywords_chain.invoke(
         {
             "context_json": context_json,
-            "candidates": "\n".join(f"- {c}" for c in candidates),
+            "candidates": "\n".join(f"- {c}" for c in research_candidates),
         }
     )
-    kw_dict = coerce_keyword_sections(kw_out.model_dump())
+    application_out = application_keywords_chain.invoke(
+        {
+            "context_json": context_json,
+            "candidates": "\n".join(f"- {c}" for c in application_candidates),
+        }
+    )
+    kw_dict = coerce_keyword_sections(
+        {
+            "research": research_out.model_dump(),
+            "application": application_out.model_dump(),
+        }
+    )
     spec_in = {
         "research": (kw_dict.get("research") or {}).get("specialization") or [],
         "application": (kw_dict.get("application") or {}).get("specialization") or [],
@@ -72,8 +105,7 @@ def _build_source_mapping_input_from_live_keyword_pipeline(
     )
     kw_weighted = apply_weighted_specializations(keywords=kw_dict, weighted=weighted_out)
 
-    # This is the exact shape passed to source_chain in keyword_generator.generate_keywords.
-    # LLM-friendly text-only specialization list (no weights).
+    # This is the exact specialization text shape used before source-evidence mapping.
     spec_json = specialization_text_sections(kw_weighted)
     # max_excerpt_chars <= 0 means "no truncation" for this smoke test.
     excerpt_cap = int(max_excerpt_chars) if int(max_excerpt_chars) > 0 else 1_000_000_000
@@ -87,7 +119,8 @@ def _build_source_mapping_input_from_live_keyword_pipeline(
         "spec_json": spec_json,
         "source_catalog_json": source_catalog,
         "meta": {
-            "candidate_count": len(candidates),
+            "candidate_research_count": len(research_candidates),
+            "candidate_application_count": len(application_candidates),
             "specialization_count": len(spec_json.get("research") or [])
             + len(spec_json.get("application") or []),
             "source_catalog_count": len(source_catalog),
@@ -111,9 +144,11 @@ def _build_faculty_payload(
     context = cgen.build_faculty_basic_context(fac)
     source_input = _build_source_mapping_input_from_live_keyword_pipeline(
         context=context,
-        prompt_triplet=(
-            FACULTY_CANDIDATE_PROMPT,
-            FACULTY_KEYWORDS_PROMPT,
+        prompt_pack=(
+            FACULTY_RESEARCH_CANDIDATE_PROMPT,
+            FACULTY_APPLICATION_CANDIDATE_PROMPT,
+            FACULTY_RESEARCH_KEYWORDS_PROMPT,
+            FACULTY_APPLICATION_KEYWORDS_PROMPT,
             FACULTY_SPECIALIZATION_WEIGHT_PROMPT,
         ),
         max_catalog_items=max_catalog_items,
@@ -155,9 +190,11 @@ def _build_opportunity_payload(
     context = cgen.build_opportunity_basic_context(opp)
     source_input = _build_source_mapping_input_from_live_keyword_pipeline(
         context=context,
-        prompt_triplet=(
-            OPP_CANDIDATE_PROMPT,
-            OPP_KEYWORDS_PROMPT,
+        prompt_pack=(
+            OPP_RESEARCH_CANDIDATE_PROMPT,
+            OPP_APPLICATION_CANDIDATE_PROMPT,
+            OPP_RESEARCH_KEYWORDS_PROMPT,
+            OPP_APPLICATION_KEYWORDS_PROMPT,
             OPP_SPECIALIZATION_WEIGHT_PROMPT,
         ),
         max_catalog_items=max_catalog_items,

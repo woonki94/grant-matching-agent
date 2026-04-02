@@ -8,6 +8,7 @@ from dao.opportunity_dao import OpportunityDAO
 from db.models import Faculty, Opportunity
 from services.context_retrieval.faculty_context import FacultyContextBuilder
 from services.context_retrieval.justification_context import JustificationContextBuilder
+from services.context_retrieval.keyword_context import KeywordContextBuilder
 from services.context_retrieval.matching_context import MatchingContextBuilder
 from services.context_retrieval.opportunity_context import OpportunityContextBuilder
 
@@ -21,6 +22,7 @@ class ContextGenerator:
         *,
         faculty_builder: Optional[FacultyContextBuilder] = None,
         opportunity_builder: Optional[OpportunityContextBuilder] = None,
+        keyword_builder: Optional[KeywordContextBuilder] = None,
         matching_builder: Optional[MatchingContextBuilder] = None,
         justification_builder: Optional[JustificationContextBuilder] = None,
         faculty_dao_cls=FacultyDAO,
@@ -30,6 +32,7 @@ class ContextGenerator:
         """Initialize with injectable builders and DAO classes."""
         self.faculty = faculty_builder or FacultyContextBuilder()
         self.opportunity = opportunity_builder or OpportunityContextBuilder()
+        self.keyword = keyword_builder or KeywordContextBuilder()
         self.matching = matching_builder or MatchingContextBuilder()
         self.justification = justification_builder or JustificationContextBuilder()
 
@@ -76,6 +79,22 @@ class ContextGenerator:
         """Build minimal faculty keyword-only context for reranking."""
         return self.faculty.build_faculty_keyword_context(fac)
 
+    def build_faculty_merged_content_context(
+        self,
+        fac: Faculty,
+        *,
+        use_rag: bool = True,
+        top_k_per_source: int = FacultyContextBuilder.DEFAULT_TOP_K_PER_SOURCE,
+        max_recent_pub_titles: int = FacultyContextBuilder.DEFAULT_MAX_RECENT_PUB_TITLES,
+    ) -> Dict[str, Any]:
+        """Build flat faculty context with only name + merged content text."""
+        return self.faculty.build_faculty_merged_content_context(
+            fac,
+            use_rag=use_rag,
+            top_k_per_source=top_k_per_source,
+            max_recent_pub_titles=max_recent_pub_titles,
+        )
+
     # ===================================================
     # Opportunity Context
     # ===================================================
@@ -119,6 +138,119 @@ class ContextGenerator:
         """Build compact opportunity context for matching/group reasoning."""
         return self.opportunity.build_opportunity_matching_context(opp)
 
+    def build_opportunity_merged_content_context(
+        self,
+        opp: Opportunity,
+        *,
+        use_rag: bool = True,
+        top_k_per_additional_source: int = OpportunityContextBuilder.DEFAULT_TOP_K_PER_ADDITIONAL_SOURCE,
+        top_k_per_attachment_source: int = OpportunityContextBuilder.DEFAULT_TOP_K_PER_ATTACHMENT_SOURCE,
+    ) -> Dict[str, Any]:
+        """Build flat opportunity context with only title + merged summary/content text."""
+        return self.opportunity.build_opportunity_merged_content_context(
+            opp,
+            use_rag=use_rag,
+            top_k_per_additional_source=top_k_per_additional_source,
+            top_k_per_attachment_source=top_k_per_attachment_source,
+        )
+
+    # ===================================================
+    # Keyword Context Formatting
+    # ===================================================
+    def dedupe_keyword_texts(self, values: List[Any]) -> List[str]:
+        return self.keyword.dedupe_texts(values)
+
+    def build_keyword_context_batches(
+        self,
+        *,
+        context: Dict[str, Any],
+        max_chars: int,
+    ) -> List[Dict[str, Any]]:
+        return self.keyword.build_context_batches(
+            context=context,
+            max_chars=max_chars,
+        )
+
+    def build_keyword_weight_context_from_batches(
+        self,
+        *,
+        batches: List[Dict[str, Any]],
+        max_chars: int,
+    ) -> Dict[str, Any]:
+        return self.keyword.build_weight_context_from_batches(
+            batches=batches,
+            max_chars=max_chars,
+        )
+
+    def format_keyword_merge_input_row(
+        self,
+        *,
+        batch_idx: int,
+        candidates: List[Any],
+        keyword_bucket: Dict[str, Any],
+        max_batch_keywords: int = KeywordContextBuilder.DEFAULT_MAX_BATCH_KEYWORDS,
+    ) -> Dict[str, Any]:
+        return self.keyword.format_merge_input_row(
+            batch_idx=batch_idx,
+            candidates=candidates,
+            keyword_bucket=keyword_bucket,
+            max_batch_keywords=max_batch_keywords,
+        )
+
+    def normalize_keyword_merge_output(
+        self,
+        merged: Any,
+        *,
+        max_domain: int = KeywordContextBuilder.DEFAULT_MAX_MERGED_DOMAIN,
+        max_specialization: int = KeywordContextBuilder.DEFAULT_MAX_MERGED_SPECIALIZATION,
+    ) -> Dict[str, List[str]]:
+        return self.keyword.normalize_merge_output(
+            merged,
+            max_domain=max_domain,
+            max_specialization=max_specialization,
+        )
+
+    def fallback_keyword_merge_bucket(
+        self,
+        *,
+        batch_domains: List[List[str]],
+        batch_specializations: List[List[str]],
+        max_domain: int = KeywordContextBuilder.DEFAULT_MAX_MERGED_DOMAIN,
+        max_specialization: int = KeywordContextBuilder.DEFAULT_MAX_MERGED_SPECIALIZATION,
+    ) -> Dict[str, List[str]]:
+        return self.keyword.fallback_merge_bucket(
+            batch_domains=batch_domains,
+            batch_specializations=batch_specializations,
+            max_domain=max_domain,
+            max_specialization=max_specialization,
+        )
+
+    def build_keyword_source_catalog(
+        self,
+        *,
+        context: Dict[str, Any],
+    ) -> List[Dict[str, Any]]:
+        """Build specialization source catalog from keyword-generation context."""
+        return self.keyword.build_source_catalog(context=context)
+
+    def attach_keyword_sources_by_cosine(
+        self,
+        *,
+        keywords: Dict[str, Any],
+        context: Dict[str, Any],
+        embedding_client: Any,
+        max_sources_per_specialization: int = 4,
+        min_similarity: float = 0.10,
+    ) -> Dict[str, Any]:
+        """Attach specialization sources using cosine mapping over context-derived source catalog."""
+        return self.keyword.attach_sources_by_cosine(
+            keywords=keywords,
+            context=context,
+            embedding_client=embedding_client,
+            max_sources_per_specialization=max_sources_per_specialization,
+            min_similarity=min_similarity,
+        )
+
     # ===================================================
     # Justification Context (DAO orchestration here)
     # ===================================================
@@ -144,7 +276,8 @@ class ContextGenerator:
         if not opp:
             raise ValueError(f"Opportunity not found: {oid}")
 
-        return self.build_opportunity_basic_context(opp)
+        # Temporary experiment mode: use full extracted context without RAG filtering.
+        return self.build_opportunity_basic_context(opp, use_rag=False)
 
     def build_faculty_recommendation_source_linked_payload(
         self,
@@ -188,8 +321,15 @@ class ContextGenerator:
             match_rows=match_rows,
             build_faculty_keyword_context=self.build_faculty_keyword_context,
             build_opportunity_keyword_context=self.build_opportunity_keyword_context,
-            build_faculty_source_linked_context=self.faculty.build_faculty_source_linked_context,
-            build_opportunity_source_linked_context=self.opportunity.build_opportunity_source_linked_context,
+            # Temporary experiment mode: load full extracted chunks without RAG filtering.
+            build_faculty_source_linked_context=lambda fac_obj: self.faculty.build_faculty_source_linked_context(
+                fac_obj,
+                use_rag=False,
+            ),
+            build_opportunity_source_linked_context=lambda opp_obj: self.opportunity.build_opportunity_source_linked_context(
+                opp_obj,
+                use_rag=False,
+            ),
         )
 
     def build_faculty_recommendation_source_linked_text(

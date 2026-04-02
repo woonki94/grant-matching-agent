@@ -15,6 +15,7 @@ from utils.thread_pool import build_thread_local_getter, parallel_map, resolve_p
 
 class GroupJustificationGenerator:
     DEFAULT_JUSTIFICATION_WORKERS = 4
+    DISABLE_TEXT_TRUNCATION = True
 
     def __init__(
         self,
@@ -90,6 +91,8 @@ class GroupJustificationGenerator:
     @staticmethod
     def _short(text: Any, max_chars: int = 12_000) -> str:
         s = " ".join(str(text or "").split()).strip()
+        if GroupJustificationGenerator.DISABLE_TEXT_TRUNCATION:
+            return s
         if len(s) <= int(max_chars):
             return s
         return s[: int(max_chars)].rstrip()

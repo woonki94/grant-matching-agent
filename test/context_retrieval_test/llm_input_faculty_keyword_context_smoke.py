@@ -22,7 +22,7 @@ def main(*, faculty_id: int) -> int:
         if not fac:
             raise ValueError(f"Faculty not found: {faculty_id}")
 
-        payload = cgen.build_faculty_basic_context(fac)
+        payload = cgen.build_faculty_merged_content_context(fac)
 
     print(json.dumps(payload, ensure_ascii=False, indent=2, default=str))
     return 0
@@ -30,7 +30,7 @@ def main(*, faculty_id: int) -> int:
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Smoke test: LLM input context for faculty keyword generation.",
+        description="Smoke test: flat faculty merged-content context.",
     )
     parser.add_argument("--faculty-id", type=int, required=True)
     args = parser.parse_args()

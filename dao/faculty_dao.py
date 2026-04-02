@@ -9,6 +9,7 @@ from typing import List, Dict, Any, Iterator, Optional
 from db.models import Faculty
 from db.models.faculty import FacultyAdditionalInfo, FacultyPublication, FacultyKeyword, FacultyKeywordEmbedding
 from dto.faculty_dto import FacultyDTO, FacultyAdditionalInfoDTO, FacultyPublicationDTO
+from utils.embedder import embed_texts
 
 from logging_setup import setup_logging
 
@@ -176,11 +177,47 @@ class FacultyDAO:
 
         return count
 
-    def upsert_publications(self, faculty_id: int, items: List[FacultyPublicationDTO]) -> int:
+    def upsert_publications(
+        self,
+        faculty_id: int,
+        items: List[FacultyPublicationDTO],
+        *,
+        embedding_client: Optional[Any] = None,
+    ) -> int:
         """Insert or update faculty publication rows keyed by OpenAlex work id."""
         count = 0
+        items_list = list(items or [])
+        abstract_vec_by_idx: Dict[int, List[float]] = {}
 
-        for pub in items:
+        abstract_texts: List[str] = []
+        abstract_indices: List[int] = []
+        for idx, pub in enumerate(items_list):
+            text = str(getattr(pub, "abstract", "") or "").strip()
+            if not text:
+                continue
+            abstract_indices.append(idx)
+            abstract_texts.append(text)
+
+        if abstract_texts:
+            try:
+                emb = embed_texts(abstract_texts, embedding_client=embedding_client)
+                if getattr(emb, "ndim", 0) == 2 and int(emb.shape[0]) == len(abstract_indices):
+                    for emb_idx, row_idx in enumerate(abstract_indices):
+                        abstract_vec_by_idx[row_idx] = emb[emb_idx].astype(float).tolist()
+                else:
+                    logger.warning(
+                        "Publication abstract embedding size mismatch for faculty_id=%s (texts=%s, emb_shape=%s)",
+                        faculty_id,
+                        len(abstract_texts),
+                        tuple(getattr(emb, "shape", ()) or ()),
+                    )
+            except Exception:
+                logger.exception(
+                    "Failed to embed publication abstracts for faculty_id=%s",
+                    faculty_id,
+                )
+
+        for idx, pub in enumerate(items_list):
             # Skip incomplete publication rows.
             if not pub.openalex_work_id or not pub.title:
                 continue
@@ -204,6 +241,11 @@ class FacultyDAO:
             obj.scholar_author_id = pub.scholar_author_id
             obj.title = pub.title
             obj.abstract = pub.abstract
+            abstract_text = str(pub.abstract or "").strip()
+            if not abstract_text:
+                obj.abstract_embedding = None
+            elif idx in abstract_vec_by_idx:
+                obj.abstract_embedding = abstract_vec_by_idx[idx]
             obj.year = pub.year
 
             count += 1

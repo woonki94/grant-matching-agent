@@ -10,30 +10,56 @@ print_usage() {
 Generate combined output (grant explanation + final justification) for one faculty.
 
 Usage:
-  ./scripts/generate_justification.sh [email] [k]
+  ./scripts/generate_justification.sh --email <email> [--k <k>]
 
-Arguments:
-  email : faculty email in DB (required)
-  k     : top-k opportunities to generate (default: 5)
+Options:
+  --email <value>  Faculty email in DB (required)
+  --k <int>        Top-k opportunities to generate (default: 5)
+  -h, --help       Show this help message
 
 Examples:
-  ./scripts/generate_justification.sh dana.ainsworth@oregonstate.edu
-  ./scripts/generate_justification.sh dana.ainsworth@oregonstate.edu 10
+  ./scripts/generate_justification.sh --email dana.ainsworth@oregonstate.edu
+  ./scripts/generate_justification.sh --email dana.ainsworth@oregonstate.edu --k 10
 EOF
 }
 
-case "${1:-}" in
-  -h|--help|help)
-    print_usage
-    exit 0
-    ;;
-esac
+EMAIL=""
+K="5"
 
-EMAIL="${1:-}"
-K="${2:-5}"
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --email)
+      if [[ $# -lt 2 ]]; then
+        echo "Error: --email requires a value." >&2
+        print_usage >&2
+        exit 1
+      fi
+      EMAIL="$2"
+      shift 2
+      ;;
+    --k)
+      if [[ $# -lt 2 ]]; then
+        echo "Error: --k requires a value." >&2
+        print_usage >&2
+        exit 1
+      fi
+      K="$2"
+      shift 2
+      ;;
+    -h|--help|help)
+      print_usage
+      exit 0
+      ;;
+    *)
+      echo "Error: unknown argument '$1'." >&2
+      print_usage >&2
+      exit 1
+      ;;
+  esac
+done
 
 if [[ -z "$EMAIL" ]]; then
-  echo "Error: email is required." >&2
+  echo "Error: --email is required." >&2
   echo >&2
   print_usage >&2
   exit 1

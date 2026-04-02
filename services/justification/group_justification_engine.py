@@ -55,19 +55,19 @@ class GroupJustificationEngine:
 
     @staticmethod
     def _build_team_role_chain():
-        model_id = (settings.opus or settings.sonnet or settings.haiku or "").strip()
+        model_id = (settings.haiku or settings.sonnet or settings.opus or "").strip()
         llm = get_llm_client(model_id=model_id).build()
         return TEAM_ROLE_DECIDER_PROMPT | llm.with_structured_output(TeamRoleOut)
 
     @staticmethod
     def _build_why_working_chain():
-        model_id = (settings.sonnet or settings.haiku or settings.opus or "").strip()
+        model_id = (settings.sonnet or settings.opus or settings.haiku or "").strip()
         llm = get_llm_client(model_id=model_id).build()
         return WHY_WORKING_DECIDER_PROMPT | llm.with_structured_output(WhyWorkingOut)
 
     @staticmethod
     def _build_why_not_working_chain():
-        model_id = (settings.sonnet or settings.haiku or settings.opus or "").strip()
+        model_id = (settings.sonnet or settings.opus or settings.haiku or "").strip()
         llm = get_llm_client(model_id=model_id).build()
         return WHY_NOT_WORKING_DECIDER_PROMPT | llm.with_structured_output(WhyNotWorkingOut)
 
@@ -110,20 +110,6 @@ class GroupJustificationEngine:
         grant_keywords = grant_block.get("keywords") or {}
         grant_link = f"https://simpler.grants.gov/opportunity/{grant_id}" if grant_id else ""
         grant_ctx = dict(grant_brief_context or {})
-
-        logger.info(
-            "GROUP_EVIDENCE_INPUT meta=%s payload=%s",
-            json.dumps(
-                {
-                    "opportunity_id": grant_id,
-                    "team_size": len(team_block),
-                    "team_faculty_ids": [m.get("faculty_id") for m in list(team_block or [])],
-                    "evidence_chars": len(str(evidence_text or "")),
-                },
-                ensure_ascii=False,
-            ),
-            str(evidence_text or ""),
-        )
 
         try:
             grant_brief_chain = self._build_grant_brief_chain()
@@ -234,26 +220,6 @@ class GroupJustificationEngine:
                 "input": why_not_input,
                 "output": why_not.model_dump(),
             }
-            logger.info(
-                "GROUP_EVIDENCE_OUTPUT meta=%s output=%s",
-                json.dumps(
-                    {
-                        "opportunity_id": grant_id,
-                        "team_size": len(team_block),
-                    },
-                    ensure_ascii=False,
-                ),
-                json.dumps(
-                    {
-                        "grant_brief": grant_brief.model_dump(),
-                        "team_roles": team_roles.model_dump(),
-                        "why_working": why_working.model_dump(),
-                        "why_not_working": why_not.model_dump(),
-                    },
-                    ensure_ascii=False,
-                ),
-            )
-
             rec_input = {
                 "grant": {
                     "id": grant_id,
@@ -286,7 +252,7 @@ class GroupJustificationEngine:
             return justification, trace
         except Exception as e:
             logger.exception(
-                "GROUP_EVIDENCE_PIPELINE_FAILED meta=%s",
+                "GROUP_JUSTIFICATION_PIPELINE_FAILED meta=%s",
                 json.dumps(
                     {
                         "opportunity_id": grant_id,

@@ -19,6 +19,27 @@ class OpportunityContextBuilder:
     DEFAULT_TOP_K_PER_ATTACHMENT_SOURCE = 10
 
     @staticmethod
+    def _norm_text(value: Any) -> str:
+        """Normalize text to a single-line, trimmed string."""
+        return " ".join(str(value or "").split()).strip()
+
+    @classmethod
+    def _dedup_join_text(cls, parts: List[Any]) -> str:
+        """Join text parts in order while deduplicating by normalized text."""
+        out: List[str] = []
+        seen = set()
+        for part in list(parts or []):
+            text = cls._norm_text(part)
+            if not text:
+                continue
+            key = text.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(text)
+        return "\n\n".join(out).strip()
+
+    @staticmethod
     def _to_keywords(opp: Opportunity) -> Dict[str, Any]:
         """Read persisted opportunity keywords (or empty payload if missing)."""
         return (getattr(opp, "keyword", None) and getattr(opp.keyword, "keywords", None)) or {}
@@ -192,3 +213,47 @@ class OpportunityContextBuilder:
             top_k_per_additional_source=top_k_per_additional_source,
             top_k_per_attachment_source=top_k_per_attachment_source,
         )
+
+    @classmethod
+    def build_opportunity_merged_content_context(
+        cls,
+        opp: Opportunity,
+        *,
+        use_rag: bool = True,
+        top_k_per_additional_source: int = DEFAULT_TOP_K_PER_ADDITIONAL_SOURCE,
+        top_k_per_attachment_source: int = DEFAULT_TOP_K_PER_ATTACHMENT_SOURCE,
+    ) -> Dict[str, Any]:
+        """
+        Build minimal, flat opportunity context:
+        - opportunity_title
+        - summary_description (summary + extracted contents merged)
+        """
+        basic = cls.build_opportunity_basic_context(
+            opp,
+            use_rag=use_rag,
+            top_k_per_additional_source=top_k_per_additional_source,
+            top_k_per_attachment_source=top_k_per_attachment_source,
+        )
+
+        additional_parts = [
+            row.get("content")
+            for row in list(basic.get("additional_info_extracted") or [])
+            if isinstance(row, dict)
+        ]
+        attachment_parts = [
+            row.get("content")
+            for row in list(basic.get("attachments_extracted") or [])
+            if isinstance(row, dict)
+        ]
+        merged_summary = cls._dedup_join_text(
+            [
+                basic.get("summary_description"),
+                *additional_parts,
+                *attachment_parts,
+            ]
+        )
+
+        return {
+            "opportunity_title": basic.get("opportunity_title"),
+            "summary_description": merged_summary,
+        }

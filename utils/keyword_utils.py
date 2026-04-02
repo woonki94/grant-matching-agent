@@ -1,7 +1,12 @@
 from __future__ import annotations
 
 import json
-from typing import Any, Dict, List, Tuple
+from concurrent.futures import ThreadPoolExecutor
+from typing import Any, Dict, List, Optional, Tuple
+
+import numpy as np
+
+from utils.embedder import cosine_sim_matrix, embed_texts
 
 
 def coerce_keyword_sections(kw_dict: Dict[str, Any]) -> Dict[str, Any]:
@@ -368,4 +373,100 @@ def attach_specialization_sources_from_llm(
             )
         sec["specialization"] = merged_specs
         out[section] = sec
+    return out
+
+
+def map_specialization_sources_by_cosine(
+    *,
+    keywords: Dict[str, Any],
+    source_catalog: List[Dict[str, Any]],
+    embedding_client: Optional[Any] = None,
+    max_sources_per_specialization: int = 4,
+    min_similarity: float = 0.10,
+) -> Dict[str, Any]:
+    """
+    Build specialization->sources mapping using cosine similarity over embeddings.
+
+    Output shape matches SpecializationSourcesOut.model_dump():
+    {
+      "research": [{"t": "...", "sources": [{"id": 1, "type": "publication", "score": 0.42}]}],
+      "application": [...]
+    }
+    """
+    spec_sections = specialization_text_sections(keywords or {})
+    spec_rows: List[Dict[str, Any]] = []
+    for section in ("research", "application"):
+        for text in list(spec_sections.get(section) or []):
+            t = str(text or "").strip()
+            if not t:
+                continue
+            spec_rows.append({"section": section, "t": t})
+
+    catalog_rows: List[Dict[str, Any]] = []
+    for row in list(source_catalog or []):
+        try:
+            rid = int(row.get("id"))
+        except Exception:
+            continue
+        rtype = str(row.get("type") or "").strip()
+        excerpt = str(row.get("excerpt") or "").strip()
+        if not rtype or not excerpt:
+            continue
+        catalog_rows.append(
+            {
+                "id": rid,
+                "type": rtype,
+                "excerpt": excerpt,
+            }
+        )
+
+    out: Dict[str, Any] = {"research": [], "application": []}
+    if not spec_rows or not catalog_rows:
+        for row in spec_rows:
+            out[row["section"]].append({"t": row["t"], "sources": []})
+        return out
+
+    spec_texts = [row["t"] for row in spec_rows]
+    src_texts = [row["excerpt"] for row in catalog_rows]
+
+    # Naive parallelization: embed specialization texts and source excerpts concurrently.
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        fut_spec = pool.submit(embed_texts, spec_texts, embedding_client=embedding_client)
+        fut_src = pool.submit(embed_texts, src_texts, embedding_client=embedding_client)
+        spec_vecs = fut_spec.result()
+        src_vecs = fut_src.result()
+    sims = cosine_sim_matrix(spec_vecs, src_vecs)
+
+    keep_k = max(1, int(max_sources_per_specialization or 1))
+    threshold = float(min_similarity)
+
+    for i, spec in enumerate(spec_rows):
+        row_sims = np.asarray(sims[i], dtype=np.float32).reshape(-1)
+        ranked_idx = np.argsort(row_sims)[::-1]
+        refs: List[Dict[str, Any]] = []
+        seen = set()
+        for j in ranked_idx:
+            sim = float(row_sims[j])
+            if sim < threshold:
+                break
+            src = catalog_rows[int(j)]
+            key = (int(src["id"]), str(src["type"]))
+            if key in seen:
+                continue
+            seen.add(key)
+            refs.append(
+                {
+                    "id": int(src["id"]),
+                    "type": str(src["type"]),
+                    "score": max(0.0, min(1.0, float(round(sim, 6)))),
+                }
+            )
+            if len(refs) >= keep_k:
+                break
+        out[spec["section"]].append(
+            {
+                "t": spec["t"],
+                "sources": refs,
+            }
+        )
     return out

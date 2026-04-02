@@ -12,7 +12,7 @@ from tqdm import tqdm
 from tqdm.contrib.logging import logging_redirect_tqdm
 
 from logging_setup import setup_logging
-from config import settings
+from config import get_embedding_client, settings
 
 from dao.faculty_dao import FacultyDAO
 from db.db_conn import SessionLocal
@@ -99,6 +99,7 @@ def import_faculty(
     # -------------------------
     with SessionLocal() as sess:
         fac_dao = FacultyDAO(sess)
+        embedding_client = get_embedding_client().build()
 
         with logging_redirect_tqdm():
             for payload in tqdm(prepared, desc="Upserting faculty", unit="faculty"):
@@ -121,7 +122,11 @@ def import_faculty(
                         faculty.faculty_id,
                         dto.additional_info,
                     )
-                    fac_dao.upsert_publications(faculty.faculty_id, pubs)
+                    fac_dao.upsert_publications(
+                        faculty.faculty_id,
+                        pubs,
+                        embedding_client=embedding_client,
+                    )
 
                 except Exception:
                     logger.exception("Failed processing faculty link: %s", link)

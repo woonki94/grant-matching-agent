@@ -16,7 +16,7 @@ from db.db_conn import SessionLocal
 from dto.llm_response_dto import FacultyGrantRerankOut
 from services.context_retrieval.context_generator import ContextGenerator
 from services.prompts.justification_prompts import FACULTY_TOP_GRANT_RERANK_PROMPT
-from utils.thread_pool import parallel_map, resolve_pool_size
+from utils.thread_pool import build_thread_local_getter, parallel_map, resolve_pool_size
 
 logger = logging.getLogger(__name__)
 
@@ -24,7 +24,8 @@ logger = logging.getLogger(__name__)
 class OneToOneLLMReranker:
     """LLM reranker for existing one-to-one faculty-grant match rows."""
 
-    DEFAULT_MAX_CONTEXT_CHARS = 50_000
+    DEFAULT_MAX_CONTEXT_CHARS = 100_000
+    DEFAULT_CHUNK_WORKERS = 4
 
     def __init__(
         self,
@@ -52,7 +53,7 @@ class OneToOneLLMReranker:
 
     @staticmethod
     def _build_grant_rerank_chain():
-        model_id = (settings.opus or settings.sonnet or settings.haiku or "").strip()
+        model_id = (settings.sonnet or settings.opus or settings.haiku or "").strip()
         llm = get_llm_client(model_id=model_id).build()
         return FACULTY_TOP_GRANT_RERANK_PROMPT | llm.with_structured_output(FacultyGrantRerankOut)
 
@@ -109,6 +110,7 @@ class OneToOneLLMReranker:
         *,
         faculty_id: int,
         max_context_chars: int = DEFAULT_MAX_CONTEXT_CHARS,
+        chunk_workers: int = DEFAULT_CHUNK_WORKERS,
     ) -> Dict[str, Any]:
         """Rerank all stored grants for one faculty and persist llm_score updates."""
         fid = int(faculty_id)
@@ -157,52 +159,79 @@ class OneToOneLLMReranker:
             int(max_context_chars),
         )
 
-        chain = self._build_grant_rerank_chain()
         score_by_id: Dict[str, float] = {}
+        total_chunks = len(grant_chunks)
+        chunk_items: List[Dict[str, Any]] = [
+            {"idx": idx, "chunk": chunk}
+            for idx, chunk in enumerate(list(grant_chunks or []), start=1)
+        ]
+        chunk_pool = resolve_pool_size(
+            max_workers=int(chunk_workers or 0),
+            task_count=len(chunk_items),
+        )
+        get_chain = build_thread_local_getter(self._build_grant_rerank_chain)
 
-        for idx, chunk in enumerate(list(grant_chunks or []), start=1):
-            try:
-                payload = {
-                    "faculty_json": self._to_json(faculty_payload),
-                    "grants_json": self._to_json(chunk),
-                }
-                logger.info(
-                    "One-to-one rerank chunk_start faculty_id=%s chunk=%s/%s chunk_grants=%s faculty_json_chars=%s grants_json_chars=%s",
-                    fid,
-                    idx,
-                    len(grant_chunks),
-                    len(chunk),
-                    len(payload["faculty_json"]),
-                    len(payload["grants_json"]),
+        def _run_chunk(item: Dict[str, Any]) -> Dict[str, Any]:
+            idx = int(item.get("idx") or 0)
+            chunk = list(item.get("chunk") or [])
+            payload = {
+                "faculty_json": self._to_json(faculty_payload),
+                "grants_json": self._to_json(chunk),
+            }
+            logger.info(
+                "One-to-one rerank chunk_start faculty_id=%s chunk=%s/%s chunk_grants=%s faculty_json_chars=%s grants_json_chars=%s",
+                fid,
+                idx,
+                total_chunks,
+                len(chunk),
+                len(payload["faculty_json"]),
+                len(payload["grants_json"]),
+            )
+            out = get_chain().invoke(payload)
+            parsed = self._parse_rerank_output(out)
+            chunk_scores = {
+                self._norm(getattr(row, "opportunity_id", None)): self._safe_float(
+                    getattr(row, "llm_score", 0.0)
                 )
-                out = chain.invoke(
-                    payload
-                )
-                parsed = self._parse_rerank_output(out)
-                chunk_scores = {
-                    self._norm(getattr(item, "opportunity_id", None)): self._safe_float(
-                        getattr(item, "llm_score", 0.0)
-                    )
-                    for item in list(parsed.reranked_grants or [])
-                    if self._norm(getattr(item, "opportunity_id", None))
-                }
-                score_by_id.update(chunk_scores)
-                logger.info(
-                    "One-to-one rerank chunk_done faculty_id=%s chunk=%s/%s chunk_grants=%s scored=%s",
-                    fid,
-                    idx,
-                    len(grant_chunks),
-                    len(chunk),
-                    len(chunk_scores),
-                )
-            except Exception as exc:
-                logger.exception(
-                    "One-to-one rerank chunk failed faculty_id=%s chunk=%s/%s error=%s",
-                    fid,
-                    idx,
-                    len(grant_chunks),
-                    f"{type(exc).__name__}: {exc}",
-                )
+                for row in list(parsed.reranked_grants or [])
+                if self._norm(getattr(row, "opportunity_id", None))
+            }
+            logger.info(
+                "One-to-one rerank chunk_done faculty_id=%s chunk=%s/%s chunk_grants=%s scored=%s",
+                fid,
+                idx,
+                total_chunks,
+                len(chunk),
+                len(chunk_scores),
+            )
+            return {
+                "idx": idx,
+                "scores": chunk_scores,
+            }
+
+        def _on_chunk_error(_i: int, item: Dict[str, Any], exc: Exception) -> Dict[str, Any]:
+            idx = int((item or {}).get("idx") or 0)
+            logger.exception(
+                "One-to-one rerank chunk failed faculty_id=%s chunk=%s/%s error=%s",
+                fid,
+                idx,
+                total_chunks,
+                f"{type(exc).__name__}: {exc}",
+            )
+            return {
+                "idx": idx,
+                "scores": {},
+                "error": f"{type(exc).__name__}: {exc}",
+            }
+
+        chunk_outputs = parallel_map(
+            chunk_items,
+            max_workers=chunk_pool,
+            run_item=_run_chunk,
+            on_error=_on_chunk_error,
+        )
+        for row in sorted(list(chunk_outputs or []), key=lambda x: int((x or {}).get("idx") or 0)):
+            score_by_id.update(dict((row or {}).get("scores") or {}))
 
         base_by_id = {
             self._norm(g.get("opportunity_id")): dict(g)
