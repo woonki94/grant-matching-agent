@@ -355,6 +355,24 @@ class ContextGenerator:
             faculty_evidence_per_requirement=faculty_evidence_per_requirement,
         )
 
+    def build_group_justification_stage_inputs_from_contexts(
+        self,
+        *,
+        opp_ctx: Dict[str, Any],
+        team_ids: List[int],
+        match_rows_by_faculty: Dict[int, Dict[str, Any]],
+        faculty_contexts_by_id: Optional[Dict[int, Dict[str, Any]]] = None,
+        grant_brief_context: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """Build stage-specific group-justification inputs from prepared contexts/rows."""
+        return self.justification.build_group_justification_stage_inputs_from_contexts(
+            opp_ctx=dict(opp_ctx or {}),
+            team_ids=[int(x) for x in list(team_ids or [])],
+            match_rows_by_faculty=dict(match_rows_by_faculty or {}),
+            faculty_contexts_by_id=dict(faculty_contexts_by_id or {}),
+            grant_brief_context=dict(grant_brief_context or {}),
+        )
+
     # ===================================================
     # Matching Context (DAO orchestration here)
     # ===================================================

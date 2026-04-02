@@ -115,6 +115,23 @@ def render_markdown_report(results: List[Dict[str, Any]]) -> str:
         lines.append("")
         lines.append("---")
         lines.append("")
+
+        why_working_summary = str(just.get("why_working_summary") or "").strip()
+        strong_points = (just.get("coverage") or {}).get("strong", []) if isinstance(just.get("coverage"), dict) else []
+        strong_points = [str(x).strip() for x in list(strong_points or []) if str(x).strip()]
+        lines.append("## Why This Team Can Work")
+        lines.append("")
+        if why_working_summary:
+            lines.append(why_working_summary)
+        elif strong_points:
+            for point in strong_points[:6]:
+                lines.append(f"- {point}")
+        else:
+            lines.append("No team-level fit explanation was generated.")
+        lines.append("")
+        lines.append("---")
+        lines.append("")
+
         strengths = just.get("member_strengths") or []
         strengths_by_faculty: Dict[int, List[str]] = {}
         for s in strengths:
@@ -126,15 +143,21 @@ def render_markdown_report(results: List[Dict[str, Any]]) -> str:
             if isinstance(bullets, list):
                 strengths_by_faculty[fid] = [str(b).strip() for b in bullets if str(b).strip()]
 
-        for m in r.get("team_members", []):
-            fid = m.get("faculty_id")
-            name = m.get("faculty_name") or f"Faculty {fid}"
-            bullets = strengths_by_faculty.get(int(fid)) if isinstance(fid, int) else None
-            lines.append(f"### What {name} Can Do for This Grant")
+        has_member_strengths = any(list(v or []) for v in list(strengths_by_faculty.values()))
+        if has_member_strengths:
+            lines.append("## Member Contribution Details")
             lines.append("")
-            if bullets:
+            for m in r.get("team_members", []):
+                fid = m.get("faculty_id")
+                name = m.get("faculty_name") or f"Faculty {fid}"
+                bullets = strengths_by_faculty.get(int(fid)) if isinstance(fid, int) else None
+                if not bullets:
+                    continue
+                lines.append(f"### What {name} Can Do for This Grant")
+                lines.append("")
                 for b in bullets[:10]:
                     lines.append(f"- {_format_strength_bullet(b)}")
+                lines.append("")
             lines.append("")
 
         lines.append("")

@@ -19,6 +19,7 @@ TEAM_ROLE_DECIDER_PROMPT = ChatPromptTemplate.from_messages([
     ("system",
      "You assign concise role labels for each faculty in a grant team.\n"
      "Use only provided JSON. Do not invent facts.\n"
+     "Use faculty_lookup to map each faculty_name to the correct faculty_id in output.\n"
      "When evidence_text is present, ground each role in concrete evidence snippets.\n"
      "Return TeamRoleOut JSON only."),
     ("user",
@@ -31,18 +32,26 @@ TEAM_ROLE_DECIDER_PROMPT = ChatPromptTemplate.from_messages([
 
 WHY_WORKING_DECIDER_PROMPT = ChatPromptTemplate.from_messages([
     ("system",
-     "You analyze why this team matches a grant.\n"
-     "Use evidence_text when present to support claims.\n"
+     "You analyze why this TEAM matches a grant with faculty-by-faculty evidence.\n"
+     "Use only provided JSON. Do not invent facts.\n"
+     "Use faculty_lookup to map each faculty_name to the correct faculty_id in output.\n"
+     "Use evidence titles from faculty_spec_keywords when available.\n"
      "Use only provided JSON and return WhyWorkingOut JSON only."),
     ("user",
      "Input JSON:\n{input_json}\n\n"
      "Task:\n"
-     "- summary: concise 2-4 sentence fit summary.\n"
-     "- member_strengths: one entry per faculty with up to 5 bullets.\n"
-     "- member_strengths MUST include one entry for every faculty_id in the team.\n"
-     "- Each bullet format: <grant requirement>: <why this faculty can handle it>.\n"
+     "- summary: 4-7 sentences with this flow:\n"
+     "  1) one opening sentence on overall team fit,\n"
+     "  2) one concise sentence per faculty (in faculty_lookup order) describing strongest contribution,\n"
+     "  3) one closing sentence on execution readiness.\n"
+     "- member_strengths: one entry per faculty in faculty_lookup.\n"
+     "- For each member entry, provide up to 5 bullets.\n"
+     "- Each bullet should be one sentence: contribution first, then evidence.\n"
+     "- Preferred bullet pattern: <contribution>. Evidence: <title 1>; <title 2>.\n"
+     "- strong: 3-8 concise team-level strengths.\n"
+     "- partial: 1-5 team-level partially covered areas.\n"
      "- Do NOT mention explicit numeric weights or coverage values.\n"
-     "- strong/partial: concise evidence points in plain language.")
+     "- Keep language practical and proposal-oriented.")
 ])
 
 

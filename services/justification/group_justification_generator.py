@@ -15,7 +15,6 @@ from utils.thread_pool import build_thread_local_getter, parallel_map, resolve_p
 
 class GroupJustificationGenerator:
     DEFAULT_JUSTIFICATION_WORKERS = 4
-    DISABLE_TEXT_TRUNCATION = True
 
     def __init__(
         self,
@@ -88,46 +87,6 @@ class GroupJustificationGenerator:
             for f in fac_ctxs
         ]
 
-    @staticmethod
-    def _short(text: Any, max_chars: int = 12_000) -> str:
-        s = " ".join(str(text or "").split()).strip()
-        if GroupJustificationGenerator.DISABLE_TEXT_TRUNCATION:
-            return s
-        if len(s) <= int(max_chars):
-            return s
-        return s[: int(max_chars)].rstrip()
-
-    def _build_group_evidence_text(
-        self,
-        *,
-        sess,
-        opp_id: str,
-        team: List[int],
-        fac_obj_cache: Dict[int, Any],
-        opp_match_cache: Dict[str, Dict[int, Dict[str, Any]]],
-    ) -> str:
-        lines: List[str] = [f"GROUP EVIDENCE PACK: opportunity_id={opp_id}"]
-        per_opp = dict(opp_match_cache.get(str(opp_id)) or {})
-
-        for fid in list(team or []):
-            fac = fac_obj_cache.get(int(fid))
-            if not fac:
-                continue
-            score_row = dict(per_opp.get(int(fid)) or {})
-            domain_score = float(score_row.get("domain_score") or 0.0)
-            llm_score = float(score_row.get("llm_score") or 0.0)
-            member_text = self.context_generator.build_faculty_recommendation_source_linked_text(
-                sess=sess,
-                fac=fac,
-                top_rows=[(str(opp_id), float(domain_score), float(llm_score))],
-                max_requirements=3,
-                grant_evidence_per_requirement=2,
-                faculty_evidence_per_requirement=2,
-            )
-            lines.append(f"\nMEMBER {int(fid)} EVIDENCE\n{self._short(member_text, max_chars=12_000)}")
-
-        return "\n".join(lines).strip()
-
     def run_justifications_from_group_results(
         self,
         *,
@@ -156,7 +115,6 @@ class GroupJustificationGenerator:
             opp_cache: Dict[str, Dict[str, Any]] = {}
             grant_brief_ctx_cache: Dict[str, Dict[str, Any]] = {}
             fac_cache: Dict[int, Dict[str, Any]] = {}
-            fac_obj_cache: Dict[int, Any] = {}
             opp_member_cov_cache: Dict[str, Dict[int, Dict[str, Dict[int, float]]]] = {}
             opp_match_cache: Dict[str, Dict[int, Dict[str, Any]]] = {}
             results_by_index: Dict[int, Dict[str, Any]] = {}
@@ -185,18 +143,46 @@ class GroupJustificationGenerator:
                     preview_chars=50_000,
                 )
             for fid in team_fids:
-                fac_cache[fid] = fdao.get_faculty_keyword_context(fid) or {}
-                fac_obj_cache[fid] = fdao.get_with_relations_by_id(fid)
+                fac_ctx = dict(fdao.get_faculty_keyword_context(fid) or {})
+                fac_obj = fdao.get_with_relations_by_id(fid)
+                pub_title_by_id: Dict[int, str] = {}
+                pub_year_by_id: Dict[int, int] = {}
+                if fac_obj is not None:
+                    for pub in list(getattr(fac_obj, "publications", []) or []):
+                        try:
+                            pid = int(getattr(pub, "id"))
+                        except Exception:
+                            continue
+                        title = str(getattr(pub, "title", "") or "").strip()
+                        year = getattr(pub, "year", None)
+                        if title:
+                            pub_title_by_id[pid] = title
+                        try:
+                            if year is not None:
+                                pub_year_by_id[pid] = int(year)
+                        except Exception:
+                            pass
+                if pub_title_by_id:
+                    fac_ctx["publication_title_by_id"] = pub_title_by_id
+                if pub_year_by_id:
+                    fac_ctx["publication_year_by_id"] = pub_year_by_id
+                fac_cache[fid] = fac_ctx
             for opp_id in opp_ids:
                 opp_member_cov_cache[opp_id] = self.context_generator.build_member_coverages_for_opportunity(
                     sess=sess,
                     opportunity_id=opp_id,
                     limit_rows=limit_rows,
                 )
-                opp_match_cache[opp_id] = mdao.list_matches_for_opportunity_by_faculty_ids(
-                    opportunity_id=opp_id,
-                    faculty_ids=team_fids,
-                )
+                # Full one-to-one rows (includes evidence) keyed by faculty_id for stage inputs.
+                per_opp_rows: Dict[int, Dict[str, Any]] = {}
+                for fid in team_fids:
+                    row = mdao.get_match_for_faculty_opportunity(
+                        faculty_id=int(fid),
+                        opportunity_id=str(opp_id),
+                    )
+                    if row:
+                        per_opp_rows[int(fid)] = dict(row)
+                opp_match_cache[opp_id] = per_opp_rows
 
             for idx, row in enumerate(normalized_rows):
                 opp_id = str(row.get("opp_id") or row.get("grant_id") or "").strip()
@@ -262,13 +248,6 @@ class GroupJustificationGenerator:
                     "redundancy": row.get("redundancy"),
                     "meta": row.get("meta"),
                 }
-                evidence_text = self._build_group_evidence_text(
-                    sess=sess,
-                    opp_id=opp_id,
-                    team=team,
-                    fac_obj_cache=fac_obj_cache,
-                    opp_match_cache=opp_match_cache,
-                )
 
                 work_items.append(
                     {
@@ -281,10 +260,14 @@ class GroupJustificationGenerator:
                         "agency_name": agency_name,
                         "team": team,
                         "fac_ctxs": [dict(f) for f in fac_ctxs],
+                        "match_rows_by_faculty": {
+                            int(fid): dict((opp_match_cache.get(opp_id) or {}).get(int(fid)) or {})
+                            for fid in list(team or [])
+                            if (opp_match_cache.get(opp_id) or {}).get(int(fid)) is not None
+                        },
                         "coverage": coverage,
                         "member_coverages": member_coverages,
                         "group_meta": group_meta,
-                        "evidence_text": evidence_text,
                         "grant_link": grant_link,
                     }
                 )
@@ -308,10 +291,11 @@ class GroupJustificationGenerator:
                         opp_ctx=dict(item["opp_ctx"]),
                         grant_brief_context=dict(item.get("grant_brief_context") or {}),
                         fac_ctxs=[dict(f) for f in list(item["fac_ctxs"])],
+                        team_ids=[int(x) for x in list(item["team"])],
+                        match_rows_by_faculty=dict(item.get("match_rows_by_faculty") or {}),
                         coverage=item["coverage"],
                         member_coverages=dict(item["member_coverages"] or {}),
                         group_meta=dict(item["group_meta"] or {}),
-                        evidence_text=str(item.get("evidence_text") or ""),
                         trace={"index": idx, "opp_id": opp_id, "team": team},
                     )
                     out = {
@@ -319,6 +303,7 @@ class GroupJustificationGenerator:
                         "grant_id": opp_id,
                         "grant_title": item["grant_title"],
                         "agency_name": item["agency_name"],
+                        "grant_link": item["grant_link"],
                         "team": team,
                         "team_members": self._build_team_members(list(item["fac_ctxs"])),
                         "team_score": float(row.get("score") or 0.0),

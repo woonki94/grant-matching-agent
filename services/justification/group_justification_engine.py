@@ -16,7 +16,6 @@ from dto.llm_response_dto import (
     WhyWorkingOut,
 )
 from services.context_retrieval.context_generator import ContextGenerator
-from utils.keyword_utils import extract_requirement_specs
 from utils.thread_pool import parallel_map
 from services.prompts.group_match_prompt import (
     GRANT_BRIEF_PROMPT,
@@ -84,6 +83,8 @@ class GroupJustificationEngine:
         grant_brief_context: Optional[Dict[str, Any]] = None,
         fac_ctxs: List[Dict[str, Any]],
         coverage: Any,
+        team_ids: Optional[List[int]] = None,
+        match_rows_by_faculty: Optional[Dict[int, Dict[str, Any]]] = None,
         member_coverages: Optional[Dict[int, Dict[str, Dict[int, float]]]] = None,
         group_meta: Optional[Dict[str, Any]] = None,
         evidence_text: str = "",
@@ -92,24 +93,47 @@ class GroupJustificationEngine:
         trace = trace or {}
         trace.setdefault("steps", {})
 
-        context = self.context_generator.build_group_matching_context_from_contexts(
-            opp_ctx=opp_ctx,
-            fac_ctxs=fac_ctxs,
-            coverage=coverage,
-            member_coverages=member_coverages,
-            group_meta=group_meta,
+        team_block_ids: List[int] = [int(x) for x in list(team_ids or []) if x is not None]
+        faculty_contexts_by_id: Dict[int, Dict[str, Any]] = {}
+        if not team_block_ids:
+            for fctx in list(fac_ctxs or []):
+                try:
+                    fid = int((fctx or {}).get("faculty_id"))
+                    team_block_ids.append(fid)
+                    faculty_contexts_by_id[fid] = dict(fctx or {})
+                except Exception:
+                    continue
+        else:
+            allowed_ids = set(team_block_ids)
+            for fctx in list(fac_ctxs or []):
+                try:
+                    fid = int((fctx or {}).get("faculty_id"))
+                except Exception:
+                    continue
+                if fid in allowed_ids:
+                    faculty_contexts_by_id[fid] = dict(fctx or {})
+
+        stage_inputs = self.context_generator.build_group_justification_stage_inputs_from_contexts(
+            opp_ctx=dict(opp_ctx or {}),
+            team_ids=team_block_ids,
+            match_rows_by_faculty=dict(match_rows_by_faculty or {}),
+            faculty_contexts_by_id=dict(faculty_contexts_by_id or {}),
+            grant_brief_context=dict(grant_brief_context or {}),
         )
-        requirements = extract_requirement_specs(opp_ctx)
-        grant_block = context.get("grant") or {}
-        team_block = context.get("team") or []
-        coverage_block = context.get("coverage") or {}
-        grant_id = grant_block.get("id") or grant_block.get("opportunity_id")
-        grant_title = grant_block.get("title") or grant_block.get("opportunity_title")
-        grant_agency = grant_block.get("agency") or grant_block.get("agency_name")
-        grant_summary = grant_block.get("summary") or grant_block.get("summary_description")
-        grant_keywords = grant_block.get("keywords") or {}
-        grant_link = f"https://simpler.grants.gov/opportunity/{grant_id}" if grant_id else ""
-        grant_ctx = dict(grant_brief_context or {})
+
+        grant_ctx = dict((stage_inputs.get("grant_brief_input") or {}).get("grant_context") or {})
+        grant_id = grant_ctx.get("opportunity_id")
+        grant_title = grant_ctx.get("title")
+        grant_link = grant_ctx.get("opportunity_link") or (
+            f"https://simpler.grants.gov/opportunity/{grant_id}" if grant_id else ""
+        )
+
+        team_role_input = dict(stage_inputs.get("team_role_input") or {})
+        why_working_input = dict(stage_inputs.get("why_working_input") or {})
+        why_not_input = dict(stage_inputs.get("why_not_working_input") or {})
+        rec_template = dict(stage_inputs.get("recommendation_input_template") or {})
+
+        team_block = list(team_role_input.get("team_match_rows") or [])
 
         try:
             grant_brief_chain = self._build_grant_brief_chain()
@@ -118,51 +142,7 @@ class GroupJustificationEngine:
             why_not_working_chain = self._build_why_not_working_chain()
             recommender_chain = self._build_recommender_chain()
 
-            grant_brief_input = {
-                "grant_context": (
-                    grant_ctx
-                    if grant_ctx
-                    else {
-                        "opportunity_id": grant_id,
-                        "title": grant_title,
-                        "agency": grant_agency,
-                        "opportunity_link": grant_link,
-                        "summary": grant_summary,
-                    }
-                ),
-            }
-            team_role_input = {
-                "grant": {
-                    "id": grant_id,
-                    "title": grant_title,
-                    "keywords": grant_keywords,
-                },
-                "requirements": requirements,
-                "team": team_block,
-                "evidence_text": str(evidence_text or ""),
-            }
-            why_working_input = {
-                "grant": {
-                    "id": grant_id,
-                    "title": grant_title,
-                    "keywords": grant_keywords,
-                },
-                "requirements": requirements,
-                "team": team_block,
-                "team_final_coverage": coverage_block,
-                "evidence_text": str(evidence_text or ""),
-            }
-            why_not_input = {
-                "grant": {
-                    "id": grant_id,
-                    "title": grant_title,
-                    "keywords": grant_keywords,
-                },
-                "requirements": requirements,
-                "team": team_block,
-                "team_final_coverage": coverage_block,
-                "evidence_text": str(evidence_text or ""),
-            }
+            grant_brief_input = dict(stage_inputs.get("grant_brief_input") or {})
             section_jobs: List[Tuple[str, Any, Dict[str, str]]] = [
                 (
                     "grant_brief",
@@ -220,16 +200,23 @@ class GroupJustificationEngine:
                 "input": why_not_input,
                 "output": why_not.model_dump(),
             }
-            rec_input = {
-                "grant": {
-                    "id": grant_id,
-                    "title": grant_title,
-                    "link": grant_link,
-                },
+            rec_input = dict(rec_template or {})
+            rec_input.update(
+                {
+                    "grant": dict((rec_template or {}).get("grant") or {
+                        "id": grant_id,
+                        "title": grant_title,
+                        "link": grant_link,
+                    }),
+                }
+            )
+            rec_input.update(
+                {
                 "team_roles": team_roles.model_dump(),
                 "why_working": why_working.model_dump(),
                 "why_not_working": why_not.model_dump(),
-            }
+                }
+            )
             recommendation = recommender_chain.invoke({"input_json": self._safe_json(rec_input)})
             trace["steps"]["recommendation"] = {
                 "status": "ok",
@@ -239,6 +226,7 @@ class GroupJustificationEngine:
 
             justification = GroupJustificationOut(
                 one_paragraph=grant_brief.grant_quick_explanation or "",
+                why_working_summary=why_working.summary or "",
                 member_roles=team_roles.member_roles,
                 coverage={
                     "strong": why_working.strong,
@@ -278,6 +266,7 @@ class GroupJustificationEngine:
                     )
             justification = GroupJustificationOut(
                 one_paragraph="Insufficient model output to generate a complete structured justification.",
+                why_working_summary="",
                 member_roles=fallback_roles,
                 coverage={"strong": [], "partial": [], "missing": []},
                 member_strengths=[],

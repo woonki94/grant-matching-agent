@@ -184,6 +184,7 @@ class RecommendationOut(BaseModel):
 
 class GroupJustificationOut(BaseModel):
     one_paragraph: str
+    why_working_summary: str = ""
     member_roles: List[MemberRoleOut] = Field(default_factory=list)
     coverage: CoverageOut = Field(default_factory=CoverageOut)
     member_strengths: List[MemberStrengthOut] = Field(default_factory=list)
