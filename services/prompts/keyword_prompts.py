@@ -223,11 +223,15 @@ FACULTY_RESEARCH_MERGE_PROMPT = ChatPromptTemplate.from_messages([
      "Rules:\n"
      "- Use only provided batch outputs.\n"
      "- Keep the strongest and most repeated concepts.\n"
+     "- Merge semantically similar concepts into one canonical phrase.\n"
+     "- Prioritize concepts that recur across multiple batches.\n"
+     "- De-prioritize rare, one-off, overly narrow concepts.\n"
      "- Deduplicate and normalize wording.\n"
      "- Item-length constraint: each domain item must be 1–3 words (PER ITEM, not item count).\n"
      "- Item-length constraint: each specialization item must be 8–25 words (PER ITEM).\n"
      "- Item-count constraint: domain must contain 4–10 items when evidence exists.\n"
-     "- Item-count constraint: specialization must contain 5–15 items when evidence exists.\n"
+     "- Item-count constraint: specialization must contain at most 15 items (never exceed 15).\n"
+     "- If evidence is rich, prefer 15 recurring high-level concepts.\n"
      "- Never output placeholders like <UNKNOWN>, unknown, n/a, none, null.\n"
      "- If evidence is insufficient, return empty lists."
     ),
@@ -241,15 +245,61 @@ FACULTY_APPLICATION_MERGE_PROMPT = ChatPromptTemplate.from_messages([
      "Rules:\n"
      "- Use only provided batch outputs.\n"
      "- Keep the strongest and most repeated practical/use-case concepts.\n"
+     "- Merge semantically similar concepts into one canonical phrase.\n"
+     "- Prioritize concepts that recur across multiple batches.\n"
+     "- De-prioritize rare, one-off, overly narrow concepts.\n"
      "- Deduplicate and normalize wording.\n"
      "- Item-length constraint: each domain item must be 1–3 words (PER ITEM, not item count).\n"
      "- Item-length constraint: each specialization item must be 8–25 words (PER ITEM).\n"
      "- Item-count constraint: domain must contain 4–10 items when evidence exists.\n"
-     "- Item-count constraint: specialization must contain 5–15 items when evidence exists.\n"
+     "- Item-count constraint: specialization must contain at most 15 items (never exceed 15).\n"
+     "- If evidence is rich, prefer 15 recurring high-level practical concepts.\n"
      "- Never output placeholders like <UNKNOWN>, unknown, n/a, none, null.\n"
      "- If evidence is insufficient, return empty lists."
     ),
     ("human", "BATCH APPLICATION OUTPUTS (JSON):\n{batch_json}")
+])
+
+FACULTY_RESEARCH_WEIGHTED_MERGE_PROMPT = ChatPromptTemplate.from_messages([
+    ("system",
+     "You consolidate and reweight RESEARCH specialization outputs from multiple context batches for one faculty profile.\n"
+     "Return JSON using this schema only:\n"
+     "{{\"research\": [{{\"t\": string, \"w\": float}}], \"application\": []}}\n"
+     "Rules:\n"
+     "- Use only provided batch inputs (keywords + prior per-batch weights).\n"
+     "- Merge semantically similar specializations into one canonical phrase.\n"
+     "- Prioritize recurring concepts across batches and down-rank one-off narrow concepts.\n"
+     "- Keep t as 8–25 words.\n"
+     "- Keep w in [0,1].\n"
+     "- Output at most 15 research specializations.\n"
+     "- Do not invent unsupported concepts.\n"
+     "- Never output placeholders like <UNKNOWN>, unknown, n/a, none, null."
+    ),
+    ("human",
+     "FACULTY CONTEXT (JSON):\n{context_json}\n\n"
+     "BATCH RESEARCH KEYWORDS+WEIGHTS (JSON):\n{batch_json}"
+    )
+])
+
+FACULTY_APPLICATION_WEIGHTED_MERGE_PROMPT = ChatPromptTemplate.from_messages([
+    ("system",
+     "You consolidate and reweight APPLICATION specialization outputs from multiple context batches for one faculty profile.\n"
+     "Return JSON using this schema only:\n"
+     "{{\"research\": [], \"application\": [{{\"t\": string, \"w\": float}}]}}\n"
+     "Rules:\n"
+     "- Use only provided batch inputs (keywords + prior per-batch weights).\n"
+     "- Merge semantically similar specializations into one canonical phrase.\n"
+     "- Prioritize recurring practical concepts across batches and down-rank one-off narrow concepts.\n"
+     "- Keep t as 8–25 words.\n"
+     "- Keep w in [0,1].\n"
+     "- Output at most 15 application specializations.\n"
+     "- Do not invent unsupported concepts.\n"
+     "- Never output placeholders like <UNKNOWN>, unknown, n/a, none, null."
+    ),
+    ("human",
+     "FACULTY CONTEXT (JSON):\n{context_json}\n\n"
+     "BATCH APPLICATION KEYWORDS+WEIGHTS (JSON):\n{batch_json}"
+    )
 ])
 
 
@@ -348,11 +398,15 @@ OPP_RESEARCH_MERGE_PROMPT = ChatPromptTemplate.from_messages([
      "Rules:\n"
      "- Use only provided batch outputs.\n"
      "- Keep the strongest and most repeated requirement concepts.\n"
+     "- Merge semantically similar concepts into one canonical phrase.\n"
+     "- Prioritize concepts that recur across multiple batches.\n"
+     "- De-prioritize rare, one-off, overly narrow concepts.\n"
      "- Deduplicate and normalize wording.\n"
      "- Item-length constraint: each domain item must be 1–3 words (PER ITEM, not item count).\n"
      "- Item-length constraint: each specialization item must be 8–25 words (PER ITEM).\n"
      "- Item-count constraint: domain must contain 4–10 items when evidence exists.\n"
-     "- Item-count constraint: specialization must contain 5–15 items when evidence exists.\n"
+     "- Item-count constraint: specialization must contain at most 15 items (never exceed 15).\n"
+     "- If evidence is rich, prefer 15 recurring high-level requirement concepts.\n"
      "- Never output placeholders like <UNKNOWN>, unknown, n/a, none, null.\n"
      "- If evidence is insufficient, return empty lists."
     ),
@@ -366,15 +420,61 @@ OPP_APPLICATION_MERGE_PROMPT = ChatPromptTemplate.from_messages([
      "Rules:\n"
      "- Use only provided batch outputs.\n"
      "- Keep the strongest and most repeated practical requirement concepts.\n"
+     "- Merge semantically similar concepts into one canonical phrase.\n"
+     "- Prioritize concepts that recur across multiple batches.\n"
+     "- De-prioritize rare, one-off, overly narrow concepts.\n"
      "- Deduplicate and normalize wording.\n"
      "- Item-length constraint: each domain item must be 1–3 words (PER ITEM, not item count).\n"
      "- Item-length constraint: each specialization item must be 8–25 words (PER ITEM).\n"
      "- Item-count constraint: domain must contain 4–10 items when evidence exists.\n"
-     "- Item-count constraint: specialization must contain 5–15 items when evidence exists.\n"
+     "- Item-count constraint: specialization must contain at most 15 items (never exceed 15).\n"
+     "- If evidence is rich, prefer 15 recurring high-level practical requirement concepts.\n"
      "- Never output placeholders like <UNKNOWN>, unknown, n/a, none, null.\n"
      "- If evidence is insufficient, return empty lists."
     ),
     ("human", "BATCH APPLICATION OUTPUTS (JSON):\n{batch_json}")
+])
+
+OPP_RESEARCH_WEIGHTED_MERGE_PROMPT = ChatPromptTemplate.from_messages([
+    ("system",
+     "You consolidate and reweight RESEARCH specialization requirements from multiple context batches for one opportunity.\n"
+     "Return JSON using this schema only:\n"
+     "{{\"research\": [{{\"t\": string, \"w\": float}}], \"application\": []}}\n"
+     "Rules:\n"
+     "- Use only provided batch inputs (keywords + prior per-batch weights).\n"
+     "- Merge semantically similar requirements into one canonical phrase.\n"
+     "- Prioritize recurring core requirements across batches and down-rank one-off narrow requirements.\n"
+     "- Keep t as 8–25 words.\n"
+     "- Keep w in [0,1].\n"
+     "- Output at most 15 research specializations.\n"
+     "- Do not invent unsupported requirements.\n"
+     "- Never output placeholders like <UNKNOWN>, unknown, n/a, none, null."
+    ),
+    ("human",
+     "OPPORTUNITY CONTEXT (JSON):\n{context_json}\n\n"
+     "BATCH RESEARCH KEYWORDS+WEIGHTS (JSON):\n{batch_json}"
+    )
+])
+
+OPP_APPLICATION_WEIGHTED_MERGE_PROMPT = ChatPromptTemplate.from_messages([
+    ("system",
+     "You consolidate and reweight APPLICATION specialization requirements from multiple context batches for one opportunity.\n"
+     "Return JSON using this schema only:\n"
+     "{{\"research\": [], \"application\": [{{\"t\": string, \"w\": float}}]}}\n"
+     "Rules:\n"
+     "- Use only provided batch inputs (keywords + prior per-batch weights).\n"
+     "- Merge semantically similar requirements into one canonical phrase.\n"
+     "- Prioritize recurring practical requirements across batches and down-rank one-off narrow requirements.\n"
+     "- Keep t as 8–25 words.\n"
+     "- Keep w in [0,1].\n"
+     "- Output at most 15 application specializations.\n"
+     "- Do not invent unsupported requirements.\n"
+     "- Never output placeholders like <UNKNOWN>, unknown, n/a, none, null."
+    ),
+    ("human",
+     "OPPORTUNITY CONTEXT (JSON):\n{context_json}\n\n"
+     "BATCH APPLICATION KEYWORDS+WEIGHTS (JSON):\n{batch_json}"
+    )
 ])
 
 FACULTY_SPECIALIZATION_WEIGHT_PROMPT = ChatPromptTemplate.from_messages([
@@ -407,6 +507,70 @@ FACULTY_SPECIALIZATION_WEIGHT_PROMPT = ChatPromptTemplate.from_messages([
     )
 ])
 
+FACULTY_RESEARCH_SPECIALIZATION_WEIGHT_PROMPT = ChatPromptTemplate.from_messages([
+    ("system",
+     "You assign expertise weights to specialization phrases for a faculty member.\n\n"
+     "You will be given:\n"
+     "- faculty context_retrieval (JSON)\n"
+     "- specialization lists for research and application\n\n"
+     "Important clarification:\n"
+     "- The given specialization phrases represent areas that the faculty member is professionally experienced in.\n\n"
+     "Task:\n"
+     "- For EACH specialization phrase, output an object with:\n"
+     "  - t: the exact original specialization text (unchanged)\n"
+     "  - w: a number in [0,1] representing the faculty's level of expertise/proficiency in that specialization\n\n"
+     "Weight guidance:\n"
+     "- 0.85–1.00: primary expertise, strong evidence in context_retrieval\n"
+     "- 0.60–0.84: strong working expertise\n"
+     "- 0.35–0.59: some experience / occasional involvement\n"
+     "- 0.10–0.34: weak/unclear evidence (use if mentioned but not supported)\n\n"
+     "Rules:\n"
+     "- Do NOT invent new specialization phrases.\n"
+     "- Keep text exactly the same as input for t.\n"
+     "- If evidence is unclear, be conservative (lower w).\n"
+     "- Focus constraint: evaluate ONLY research specializations from the input.\n"
+     "- Return application as an empty list.\n"
+     "- Return ONLY JSON in the specified output format."
+    ),
+    ("human",
+     "FACULTY CONTEXT (JSON):\n{context_json}\n\n"
+     "SPECIALIZATIONS INPUT (JSON):\n{spec_json}\n\n"
+     "Return weighted specializations JSON."
+    )
+])
+
+FACULTY_APPLICATION_SPECIALIZATION_WEIGHT_PROMPT = ChatPromptTemplate.from_messages([
+    ("system",
+     "You assign expertise weights to specialization phrases for a faculty member.\n\n"
+     "You will be given:\n"
+     "- faculty context_retrieval (JSON)\n"
+     "- specialization lists for research and application\n\n"
+     "Important clarification:\n"
+     "- The given specialization phrases represent areas that the faculty member is professionally experienced in.\n\n"
+     "Task:\n"
+     "- For EACH specialization phrase, output an object with:\n"
+     "  - t: the exact original specialization text (unchanged)\n"
+     "  - w: a number in [0,1] representing the faculty's level of expertise/proficiency in that specialization\n\n"
+     "Weight guidance:\n"
+     "- 0.85–1.00: primary expertise, strong evidence in context_retrieval\n"
+     "- 0.60–0.84: strong working expertise\n"
+     "- 0.35–0.59: some experience / occasional involvement\n"
+     "- 0.10–0.34: weak/unclear evidence (use if mentioned but not supported)\n\n"
+     "Rules:\n"
+     "- Do NOT invent new specialization phrases.\n"
+     "- Keep text exactly the same as input for t.\n"
+     "- If evidence is unclear, be conservative (lower w).\n"
+     "- Focus constraint: evaluate ONLY application specializations from the input.\n"
+     "- Return research as an empty list.\n"
+     "- Return ONLY JSON in the specified output format."
+    ),
+    ("human",
+     "FACULTY CONTEXT (JSON):\n{context_json}\n\n"
+     "SPECIALIZATIONS INPUT (JSON):\n{spec_json}\n\n"
+     "Return weighted specializations JSON."
+    )
+])
+
 OPP_SPECIALIZATION_WEIGHT_PROMPT = ChatPromptTemplate.from_messages([
     ("system",
      "You assign importance weights to specialization requirements for a funding opportunity.\n\n"
@@ -430,6 +594,74 @@ OPP_SPECIALIZATION_WEIGHT_PROMPT = ChatPromptTemplate.from_messages([
      "- Base weights ONLY on evidence in the provided opportunity context_retrieval.\n"
      "- If importance is unclear, be conservative (assign a lower weight).\n"
      "- Do NOT include administrative, eligibility, or submission criteria.\n"
+     "- Return ONLY JSON in the specified output format."
+    ),
+    ("human",
+     "OPPORTUNITY CONTEXT (JSON):\n{context_json}\n\n"
+     "SPECIALIZATIONS INPUT (JSON):\n{spec_json}\n\n"
+     "Return weighted specializations JSON."
+    )
+])
+
+OPP_RESEARCH_SPECIALIZATION_WEIGHT_PROMPT = ChatPromptTemplate.from_messages([
+    ("system",
+     "You assign importance weights to specialization requirements for a funding opportunity.\n\n"
+     "You will be given:\n"
+     "- opportunity context_retrieval (JSON)\n"
+     "- specialization lists for research and application\n\n"
+     "Important clarification:\n"
+     "- The given specialization phrases represent capabilities that the opportunity REQUIRES faculty investigators to have.\n\n"
+     "Task:\n"
+     "- For EACH specialization phrase, output an object with:\n"
+     "  - t: the exact original specialization text (unchanged)\n"
+     "  - w: a number in [0,1] representing how critical this requirement is to the project’s success\n\n"
+     "Weight guidance:\n"
+     "- 0.85–1.00: core / essential requirement (project cannot succeed without it)\n"
+     "- 0.60–0.84: important requirement (strongly preferred)\n"
+     "- 0.35–0.59: supporting requirement\n"
+     "- 0.10–0.34: minor or optional requirement\n\n"
+     "Rules:\n"
+     "- Do NOT invent new specialization phrases.\n"
+     "- Keep the text exactly the same as input for t.\n"
+     "- Base weights ONLY on evidence in the provided opportunity context_retrieval.\n"
+     "- If importance is unclear, be conservative (assign a lower weight).\n"
+     "- Do NOT include administrative, eligibility, or submission criteria.\n"
+     "- Focus constraint: evaluate ONLY research specializations from the input.\n"
+     "- Return application as an empty list.\n"
+     "- Return ONLY JSON in the specified output format."
+    ),
+    ("human",
+     "OPPORTUNITY CONTEXT (JSON):\n{context_json}\n\n"
+     "SPECIALIZATIONS INPUT (JSON):\n{spec_json}\n\n"
+     "Return weighted specializations JSON."
+    )
+])
+
+OPP_APPLICATION_SPECIALIZATION_WEIGHT_PROMPT = ChatPromptTemplate.from_messages([
+    ("system",
+     "You assign importance weights to specialization requirements for a funding opportunity.\n\n"
+     "You will be given:\n"
+     "- opportunity context_retrieval (JSON)\n"
+     "- specialization lists for research and application\n\n"
+     "Important clarification:\n"
+     "- The given specialization phrases represent capabilities that the opportunity REQUIRES faculty investigators to have.\n\n"
+     "Task:\n"
+     "- For EACH specialization phrase, output an object with:\n"
+     "  - t: the exact original specialization text (unchanged)\n"
+     "  - w: a number in [0,1] representing how critical this requirement is to the project’s success\n\n"
+     "Weight guidance:\n"
+     "- 0.85–1.00: core / essential requirement (project cannot succeed without it)\n"
+     "- 0.60–0.84: important requirement (strongly preferred)\n"
+     "- 0.35–0.59: supporting requirement\n"
+     "- 0.10–0.34: minor or optional requirement\n\n"
+     "Rules:\n"
+     "- Do NOT invent new specialization phrases.\n"
+     "- Keep the text exactly the same as input for t.\n"
+     "- Base weights ONLY on evidence in the provided opportunity context_retrieval.\n"
+     "- If importance is unclear, be conservative (assign a lower weight).\n"
+     "- Do NOT include administrative, eligibility, or submission criteria.\n"
+     "- Focus constraint: evaluate ONLY application specializations from the input.\n"
+     "- Return research as an empty list.\n"
      "- Return ONLY JSON in the specified output format."
     ),
     ("human",
