@@ -941,7 +941,7 @@ class MatchingExecutionAgent:
             self.faculty_matcher.run_for_opportunity(
                 opportunity_id=opp_id,
                 faculty_ids=needs_scoring,
-                min_domain=0.0,
+                min_domain=0.3,
             )
             # ── Step 3: batch-fetch newly computed rows ───────────────────────
             with self.session_factory() as sess:

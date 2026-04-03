@@ -79,14 +79,14 @@ class SingleJustificationGenerator:
     @staticmethod
     def _build_grant_explanation_chain():
         """Build the LLM chain used for grant-only explanation generation."""
-        model_id = (settings.sonnet or settings.haiku or settings.opus or "").strip()
+        model_id = (settings.haiku or settings.sonnet or settings.opus or "").strip()
         llm = get_llm_client(model_id=model_id).build()
         return GRANT_EXPLANATION_PROMPT | llm.with_structured_output(GrantExplanationOut)
 
     @staticmethod
     def _build_final_justification_chain():
         """Build the free-form LLM chain for final one-match justification writing."""
-        model_id = (settings.opus or settings.sonnet or settings.haiku or "").strip()
+        model_id = (settings.sonnet or settings.opus or settings.haiku or "").strip()
         llm = get_llm_client(model_id=model_id).build()
         return FACULTY_RECS_PROMPT | llm
 
