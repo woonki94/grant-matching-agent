@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import Any, Callable, Dict, List, Tuple
 
+from utils.keyword_utils import extract_requirement_specs
 
 
 class JustificationContextBuilder:
@@ -480,18 +481,23 @@ class JustificationContextBuilder:
         match_rows_by_faculty: Dict[int, Dict[str, Any]],
         faculty_contexts_by_id: Optional[Dict[int, Dict[str, Any]]] = None,
         grant_brief_context: Optional[Dict[str, Any]] = None,
+        coverage: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """
         Build stage-specific group-justification LLM inputs.
 
-        Requested shape:
-        - team_roles: grant_requirements + team_match_rows
-          team_match_rows carries faculty_id + domain_score + llm_score + faculty_specializations
-        - why_working/why_not_working: grant specialization keywords only
-        - recommendation: template based on prior stage outputs
+        Old-compatible shape:
+        - team_roles: grant + requirements + team + evidence_text
+        - why_working: grant + requirements + team + team_final_coverage + evidence_text
+        - why_not_working: grant + requirements + team + team_final_coverage + evidence_text
+
+        Compatibility:
+        - Also keeps newer helper keys (grant_requirements / faculty_lookup / team_match_rows /
+          faculty_spec_keywords) so current prompt variants can still read richer fields.
         """
         grant_context_min = cls._build_grant_context_min(opp_ctx=dict(opp_ctx or {}))
         grant_requirements = cls._build_grant_requirements_weighted(opp_ctx=dict(opp_ctx or {}))
+        requirements = extract_requirement_specs(dict(opp_ctx or {}))
         team_match_rows = cls._build_team_match_rows(
             team_ids=[int(x) for x in list(team_ids or [])],
             match_rows_by_faculty=dict(match_rows_by_faculty or {}),
@@ -514,21 +520,87 @@ class JustificationContextBuilder:
             else ""
         )
 
+        team_block: List[Dict[str, Any]] = []
+        for fid in list(team_ids or []):
+            fid_int = int(fid)
+            fac_ctx = dict((faculty_contexts_by_id or {}).get(fid_int) or {})
+            row = dict((match_rows_by_faculty or {}).get(fid_int) or {})
+            covered = dict(row.get("covered") or {})
+            team_block.append(
+                {
+                    "faculty_id": fid_int,
+                    "name": cls._norm(fac_ctx.get("name")) or f"faculty_{fid_int}",
+                    "email": cls._norm(fac_ctx.get("email")),
+                    "covered": {
+                        "application": dict((covered.get("application") or {})),
+                        "research": dict((covered.get("research") or {})),
+                    },
+                }
+            )
+
+        grant_block = {
+            "id": grant_id,
+            "title": grant_title,
+            "agency": grant_context_min.get("agency"),
+            "summary": grant_context_min.get("summary"),
+            "keywords": dict((opp_ctx or {}).get("keywords") or {}),
+        }
+        team_final_coverage = dict(coverage or {})
+
+        flattened = cls._build_flattened_evidence_from_one_to_one(
+            team_ids=[int(x) for x in list(team_ids or [])],
+            match_rows_by_faculty=dict(match_rows_by_faculty or {}),
+            faculty_contexts_by_id=dict(faculty_contexts_by_id or {}),
+        )
+        evidence_lines: List[str] = []
+        for row in list(flattened or [])[:200]:
+            evidence_lines.append(
+                "[{section}] {faculty} | requirement: {requirement} | specialization: {spec} | pair={pair:.4f} | req={req:.4f}".format(
+                    section=cls._norm(row.get("section")),
+                    faculty=cls._norm(row.get("faculty_name")),
+                    requirement=cls._norm(row.get("requirement")),
+                    spec=cls._norm(row.get("faculty_specialization")),
+                    pair=cls._safe_float(row.get("pair_score")),
+                    req=cls._safe_float(row.get("requirement_score")),
+                )
+            )
+        evidence_text = "\n".join(evidence_lines).strip()
+
         return {
             "grant_brief_input": {
                 "grant_context": dict(grant_brief_context or grant_context_min),
             },
             "team_role_input": {
+                # Old structure
+                "grant": dict(grant_block),
+                "requirements": dict(requirements or {"application": {}, "research": {}}),
+                "team": list(team_block),
+                "evidence_text": evidence_text,
+                # Newer compatibility fields
                 "grant_requirements": dict(grant_requirements or {"application": [], "research": []}),
                 "faculty_lookup": list(faculty_lookup),
                 "team_match_rows": list(team_match_rows),
             },
             "why_working_input": {
+                # Old structure
+                "grant": dict(grant_block),
+                "requirements": dict(requirements or {"application": {}, "research": {}}),
+                "team": list(team_block),
+                "team_final_coverage": dict(team_final_coverage or {}),
+                "evidence_text": evidence_text,
+                # Newer compatibility fields
                 "grant_requirements": dict(grant_requirements or {"application": [], "research": []}),
                 "faculty_lookup": list(faculty_lookup),
                 "faculty_spec_keywords": list(faculty_spec_keywords),
             },
             "why_not_working_input": {
+                # Old structure
+                "grant": dict(grant_block),
+                "requirements": dict(requirements or {"application": {}, "research": {}}),
+                "team": list(team_block),
+                "team_final_coverage": dict(team_final_coverage or {}),
+                "evidence_text": evidence_text,
+                # Newer compatibility fields
                 "grant_requirements": dict(grant_requirements or {"application": [], "research": []}),
                 "faculty_spec_keywords": list(faculty_spec_keywords),
             },

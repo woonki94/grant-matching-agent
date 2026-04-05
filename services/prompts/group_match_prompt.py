@@ -9,47 +9,41 @@ GRANT_BRIEF_PROMPT = ChatPromptTemplate.from_messages([
      "Input JSON:\n{input_json}\n\n"
      "Task:\n"
      "- Read grant data from the grant_context object.\n"
-     "- grant_title: concise title from grant_context.title.\n"
-     "- grant_link: use grant_context.opportunity_link when available.\n"
-     "- grant_quick_explanation: 3-5 sentences explaining what this grant is about.\n"
-     "- priority_themes: 3-6 concise bullets about high-priority themes.")
+     "- grant_quick_explanation: 3-5 concise sentences explaining what this grant is about.\n"
+     "- Focus on scope, goals, and expected work; avoid boilerplate.")
 ])
 
 TEAM_ROLE_DECIDER_PROMPT = ChatPromptTemplate.from_messages([
     ("system",
      "You assign concise role labels for each faculty in a grant team.\n"
      "Use only provided JSON. Do not invent facts.\n"
-     "Use faculty_lookup to map each faculty_name to the correct faculty_id in output.\n"
-     "When evidence_text is present, ground each role in concrete evidence snippets.\n"
+     "Return roles in the same order as faculty_lookup.\n"
      "Return TeamRoleOut JSON only."),
     ("user",
      "Input JSON:\n{input_json}\n\n"
      "Task:\n"
-     "- For each team member, produce member_roles entry with faculty_id, role, why.\n"
+     "- Produce roles: [string, ...], one role per faculty in faculty_lookup order.\n"
      "- Role should be short and specific (e.g., 'Naval Materials Lead').\n"
-     "- why should be 1 sentence grounded in provided keywords/coverage.")
+     "- Do NOT output faculty_id or explanation text.")
 ])
 
 WHY_WORKING_DECIDER_PROMPT = ChatPromptTemplate.from_messages([
     ("system",
      "You analyze why this TEAM matches a grant with faculty-by-faculty evidence.\n"
      "Use only provided JSON. Do not invent facts.\n"
-     "Use faculty_lookup to map each faculty_name to the correct faculty_id in output.\n"
      "Use evidence titles from faculty_spec_keywords when available.\n"
      "Use only provided JSON and return WhyWorkingOut JSON only."),
     ("user",
      "Input JSON:\n{input_json}\n\n"
      "Task:\n"
-     "- summary: 4-7 sentences with this flow:\n"
-     "  1) one opening sentence on overall team fit,\n"
-     "  2) one concise sentence per faculty (in faculty_lookup order) describing strongest contribution,\n"
-     "  3) one closing sentence on execution readiness.\n"
+     "- summary: concise 3-5 sentences on why this team can work.\n"
      "- member_strengths: one entry per faculty in faculty_lookup.\n"
-     "- For each member entry, provide up to 5 bullets.\n"
-     "- Each bullet should be one sentence: contribution first, then evidence.\n"
-     "- Preferred bullet pattern: <contribution>. Evidence: <title 1>; <title 2>.\n"
-     "- strong: 3-8 concise team-level strengths.\n"
-     "- partial: 1-5 team-level partially covered areas.\n"
+     "- Each member_strengths entry must include faculty_name and bullets.\n"
+     "- For each member, provide 2-5 concise bullets.\n"
+     "- Each bullet should be one sentence with this format:\n"
+     "  <contribution>. Evidence: <exact evidence title> [source=<publication|additional_info|attachment>].\n"
+     "- For publication evidence, include year in the title when available.\n"
+     "- Use exact evidence titles from input when present; do not invent titles.\n"
      "- Do NOT mention explicit numeric weights or coverage values.\n"
      "- Keep language practical and proposal-oriented.")
 ])
@@ -63,9 +57,9 @@ WHY_NOT_WORKING_DECIDER_PROMPT = ChatPromptTemplate.from_messages([
     ("user",
      "Input JSON:\n{input_json}\n\n"
      "Task:\n"
-     "- why_not_working: practical team-level improvement factors (not raw keyword dumps).\n"
-     "- Explain what capability is missing and why it matters for execution.\n"
-     "- missing: concise grouped capability gaps (3-6 items), avoid near-duplicate phrasing.\n"
+     "- why_not_working: concise practical risk bullets (3-5 items), not keyword dumps.\n"
+     "- Each bullet should explain one major gap and why it matters.\n"
+     "- missing: concise grouped gap labels (0-3 items), avoid near-duplicates.\n"
      "- Do NOT mention explicit numeric weights or coverage values.")
 ])
 
@@ -77,9 +71,10 @@ RECOMMENDER_PROMPT = ChatPromptTemplate.from_messages([
     ("user",
      "Input JSON:\n{input_json}\n\n"
      "Task:\n"
-     "- recommendation: one paragraph decision.\n"
-     "- Encourage to pursue if the team is strong\n"
-     "- Provide concrete strengthening actions when feasible.\n"
-     "- If the fit is fundamentally poor, clearly advise against pursuit.\n"
+     "- recommendation: concise decision in 2-4 sentences.\n"
+     "- team_grant_fit: numeric fit score on 0.00-1.00 scale (higher is better).\n"
+     "- Encourage pursuit if fit is strong.\n"
+     "- If not, give only the most important strengthening actions.\n"
+     "- If fit is fundamentally poor, clearly advise against pursuit.\n"
      "- Do NOT mention explicit numeric weights or coverage values.")
 ])

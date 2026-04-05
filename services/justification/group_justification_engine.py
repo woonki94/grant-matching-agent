@@ -47,6 +47,10 @@ class GroupJustificationEngine:
         return json.dumps(obj, ensure_ascii=False, indent=2)
 
     @staticmethod
+    def _norm(text: Any) -> str:
+        return " ".join(str(text or "").split()).strip()
+
+    @staticmethod
     def _build_grant_brief_chain():
         model_id = (settings.haiku or settings.sonnet or settings.opus or "").strip()
         llm = get_llm_client(model_id=model_id).build()
@@ -119,6 +123,7 @@ class GroupJustificationEngine:
             match_rows_by_faculty=dict(match_rows_by_faculty or {}),
             faculty_contexts_by_id=dict(faculty_contexts_by_id or {}),
             grant_brief_context=dict(grant_brief_context or {}),
+            coverage=dict(coverage or {}),
         )
 
         grant_ctx = dict((stage_inputs.get("grant_brief_input") or {}).get("grant_context") or {})
@@ -180,6 +185,52 @@ class GroupJustificationEngine:
             why_working: WhyWorkingOut = section_outputs["why_working"]
             why_not: WhyNotWorkingOut = section_outputs["why_not_working"]
 
+            faculty_lookup = list(team_role_input.get("faculty_lookup") or [])
+            # LLM now returns plain role strings in faculty_lookup order.
+            mapped_member_roles: List[Dict[str, Any]] = []
+            raw_roles = [self._norm(x) for x in list(getattr(team_roles, "roles", None) or [])]
+            for idx, fac in enumerate(faculty_lookup):
+                try:
+                    fid = int((fac or {}).get("faculty_id"))
+                except Exception:
+                    continue
+                role = raw_roles[idx] if idx < len(raw_roles) and raw_roles[idx] else "Contributor"
+                mapped_member_roles.append({"faculty_id": fid, "role": role})
+
+            # WhyWorkingOut.member_strengths now returns faculty_name + bullets.
+            name_to_id: Dict[str, int] = {}
+            for fac in faculty_lookup:
+                try:
+                    fid = int((fac or {}).get("faculty_id"))
+                except Exception:
+                    continue
+                fname = self._norm((fac or {}).get("faculty_name")).lower()
+                if fname:
+                    name_to_id[fname] = fid
+
+            mapped_strengths_by_id: Dict[int, List[str]] = {}
+            for idx, item in enumerate(list(why_working.member_strengths or [])):
+                fname = self._norm(getattr(item, "faculty_name", "")).lower()
+                fid = name_to_id.get(fname)
+                if fid is None and idx < len(faculty_lookup):
+                    try:
+                        fid = int((faculty_lookup[idx] or {}).get("faculty_id"))
+                    except Exception:
+                        fid = None
+                if fid is None:
+                    continue
+                bullets = [self._norm(b) for b in list(getattr(item, "bullets", []) or []) if self._norm(b)]
+                if fid not in mapped_strengths_by_id:
+                    mapped_strengths_by_id[fid] = []
+                for b in bullets:
+                    if b not in mapped_strengths_by_id[fid]:
+                        mapped_strengths_by_id[fid].append(b)
+            mapped_member_strengths = [
+                {"faculty_id": fid, "bullets": bullets}
+                for fid, bullets in mapped_strengths_by_id.items()
+                if list(bullets or [])
+            ]
+
             trace["steps"]["grant_brief"] = {
                 "status": "ok",
                 "input": grant_brief_input,
@@ -227,15 +278,16 @@ class GroupJustificationEngine:
             justification = GroupJustificationOut(
                 one_paragraph=grant_brief.grant_quick_explanation or "",
                 why_working_summary=why_working.summary or "",
-                member_roles=team_roles.member_roles,
+                member_roles=mapped_member_roles,
                 coverage={
-                    "strong": why_working.strong,
-                    "partial": why_working.partial,
+                    "strong": [],
+                    "partial": [],
                     "missing": why_not.missing,
                 },
-                member_strengths=why_working.member_strengths,
+                member_strengths=mapped_member_strengths,
                 why_not_working=why_not.why_not_working,
                 recommendation=recommendation.recommendation,
+                team_grant_fit=float(getattr(recommendation, "team_grant_fit", 0.0) or 0.0),
             )
             return justification, trace
         except Exception as e:
@@ -254,16 +306,17 @@ class GroupJustificationEngine:
                 "error": f"{type(e).__name__}: {e}",
             }
             fallback_roles = []
-            for tm in team_block:
-                fid = tm.get("faculty_id")
-                if isinstance(fid, int):
-                    fallback_roles.append(
-                        {
-                            "faculty_id": fid,
-                            "role": "Contributor",
-                            "why": "Insufficient LLM output; role inferred as general contributor.",
-                        }
-                    )
+            for fac in list(team_role_input.get("faculty_lookup") or []):
+                try:
+                    fid = int((fac or {}).get("faculty_id"))
+                except Exception:
+                    continue
+                fallback_roles.append(
+                    {
+                        "faculty_id": fid,
+                        "role": "Contributor",
+                    }
+                )
             justification = GroupJustificationOut(
                 one_paragraph="Insufficient model output to generate a complete structured justification.",
                 why_working_summary="",
@@ -272,5 +325,6 @@ class GroupJustificationEngine:
                 member_strengths=[],
                 why_not_working=["Structured writer stages failed; verify model/service health and rerun."],
                 recommendation="Review this result manually and rerun generation.",
+                team_grant_fit=0.0,
             )
             return justification, trace

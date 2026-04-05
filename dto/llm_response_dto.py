@@ -149,7 +149,6 @@ class GrantExplanationOut(BaseModel):
 class MemberRoleOut(BaseModel):
     faculty_id: int
     role: str = Field(..., description="Short label like 'AI/ML lead', 'Education/Outreach lead', etc.")
-    why: str = Field(..., description="1-2 sentences describing their unique contribution")
 
 class CoverageOut(BaseModel):
     strong: List[str] = Field(default_factory=list)
@@ -161,19 +160,18 @@ class MemberStrengthOut(BaseModel):
     bullets: List[str] = Field(default_factory=list)
 
 class TeamRoleOut(BaseModel):
-    member_roles: List[MemberRoleOut] = Field(default_factory=list)
+    roles: List[str] = Field(default_factory=list)
 
 class GrantBriefOut(BaseModel):
-    grant_title: str = ""
-    grant_link: str = ""
     grant_quick_explanation: str = ""
-    priority_themes: List[str] = Field(default_factory=list)
+
+class MemberStrengthLLMOut(BaseModel):
+    faculty_name: str = ""
+    bullets: List[str] = Field(default_factory=list)
 
 class WhyWorkingOut(BaseModel):
     summary: str = ""
-    member_strengths: List[MemberStrengthOut] = Field(default_factory=list)
-    strong: List[str] = Field(default_factory=list)
-    partial: List[str] = Field(default_factory=list)
+    member_strengths: List[MemberStrengthLLMOut] = Field(default_factory=list)
 
 class WhyNotWorkingOut(BaseModel):
     why_not_working: List[str] = Field(default_factory=list)
@@ -181,6 +179,7 @@ class WhyNotWorkingOut(BaseModel):
 
 class RecommendationOut(BaseModel):
     recommendation: str = ""
+    team_grant_fit: float = Field(0.0, ge=0.0, le=1.0)
 
 class GroupJustificationOut(BaseModel):
     one_paragraph: str
@@ -190,6 +189,7 @@ class GroupJustificationOut(BaseModel):
     member_strengths: List[MemberStrengthOut] = Field(default_factory=list)
     why_not_working: List[str] = Field(default_factory=list)
     recommendation: str = ""
+    team_grant_fit: float = Field(0.0, ge=0.0, le=1.0)
 
 # ───────────────────────────────────────────────
 # Candidate team selection (Additional layer for selecting group)

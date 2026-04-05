@@ -363,6 +363,7 @@ class ContextGenerator:
         match_rows_by_faculty: Dict[int, Dict[str, Any]],
         faculty_contexts_by_id: Optional[Dict[int, Dict[str, Any]]] = None,
         grant_brief_context: Optional[Dict[str, Any]] = None,
+        coverage: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Build stage-specific group-justification inputs from prepared contexts/rows."""
         return self.justification.build_group_justification_stage_inputs_from_contexts(
@@ -371,6 +372,7 @@ class ContextGenerator:
             match_rows_by_faculty=dict(match_rows_by_faculty or {}),
             faculty_contexts_by_id=dict(faculty_contexts_by_id or {}),
             grant_brief_context=dict(grant_brief_context or {}),
+            coverage=dict(coverage or {}),
         )
 
     # ===================================================

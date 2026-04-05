@@ -238,6 +238,36 @@ class MatchingExecutionAgent:
 
         return out
 
+    @staticmethod
+    def _extract_team_grant_fit_for_sort(row: Dict[str, Any]) -> float:
+        """Read team_grant_fit from group-justification payload (best-effort)."""
+        if not isinstance(row, dict):
+            return 0.0
+        just = row.get("justification")
+        if not isinstance(just, dict):
+            just = row.get("group_justification")
+        if isinstance(just, dict):
+            try:
+                return float(just.get("team_grant_fit") or 0.0)
+            except Exception:
+                return 0.0
+        return 0.0
+
+    def _sort_group_results_for_return(
+        self,
+        *,
+        rows: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        """Sort group-match rows for API return: team_grant_fit desc, then team_score desc."""
+        return sorted(
+            list(rows or []),
+            key=lambda r: (
+                float(self._extract_team_grant_fit_for_sort(r)),
+                float((r or {}).get("team_score") or 0.0),
+            ),
+            reverse=True,
+        )
+
     def generate_keywords_for_group(self, *, faculty_ids: List[int]) -> Dict[str, Any]:
         self._call("MatchingExecutionAgent.generate_keywords_for_group")
         generated = 0
@@ -686,6 +716,7 @@ class MatchingExecutionAgent:
             broad_category=broad_category,
             query_text=query_text,
         )
+        results = self._sort_group_results_for_return(rows=list(results or []))
         if top_k_grants is not None:
             try:
                 k = max(int(top_k_grants), 1)
@@ -732,6 +763,7 @@ class MatchingExecutionAgent:
             broad_category=broad_category,
             query_text=query_text,
         )
+        results = self._sort_group_results_for_return(rows=list(results or []))
         if top_k_grants is not None:
             try:
                 k = max(int(top_k_grants), 1)
