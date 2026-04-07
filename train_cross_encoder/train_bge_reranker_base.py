@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 import random
 import sys
 from dataclasses import dataclass
@@ -11,6 +12,16 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
+
+WANDB_REPORT_TARGET = "wandb"
+WANDB_WATCH_DISABLED = "false"
+WANDB_ENV_WATCH = "WANDB_WATCH"
+WANDB_ENV_API_KEY = "WANDB_API_KEY"
+WANDB_ENV_PROJECT = "WANDB_PROJECT"
+WANDB_ENV_ENTITY = "WANDB_ENTITY"
+WANDB_API_KEY_MIN_LEN = 30
+WANDB_ARG_ENABLE = "--wandb"
+WANDB_HELP_ENABLE = "Enable Weights & Biases logging."
 
 
 def _clean_text(value: Any) -> str:
@@ -48,6 +59,34 @@ def _safe_unit_float(value: Any, *, default: float = 0.0) -> float:
     return parsed
 
 
+def _load_selected_env_from_file(env_path: Path, keys: Sequence[str]) -> Dict[str, str]:
+    wanted = set(str(k) for k in list(keys or []))
+    if not wanted:
+        return {}
+    if not env_path.exists() or not env_path.is_file():
+        return {}
+    out: Dict[str, str] = {}
+    try:
+        raw_lines = env_path.read_text(encoding="utf-8").splitlines()
+    except Exception:
+        return {}
+    for raw in raw_lines:
+        line = str(raw or "").strip()
+        if not line or line.startswith("#"):
+            continue
+        if "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        k = _clean_text(key)
+        if not k or k not in wanted:
+            continue
+        v = str(value).strip()
+        if len(v) >= 2 and ((v[0] == v[-1] == '"') or (v[0] == v[-1] == "'")):
+            v = v[1:-1]
+        out[k] = v
+    return out
+
+
 def _resolve_dataset_path(path_str: str) -> Path:
     if _clean_text(path_str):
         p = Path(_clean_text(path_str)).expanduser().resolve()
@@ -77,6 +116,8 @@ class PointwiseRow:
     weights: float
     source: str
     pair_id: str
+    candidate_type: str
+    domain_bucket: str
 
 
 def _load_pointwise_from_rankdistill(
@@ -96,6 +137,11 @@ def _load_pointwise_from_rankdistill(
     pair_rows_skipped_empty = 0
     pair_rows_skipped_pref = 0
     source_counts: Dict[str, int] = {}
+    candidate_type_counts: Dict[str, int] = {}
+    domain_bucket_counts: Dict[str, int] = {}
+    label_sum = 0.0
+    label_sq_sum = 0.0
+    weight_sum = 0.0
 
     with dataset_jsonl.open("r", encoding="utf-8") as f:
         for raw in f:
@@ -129,6 +175,15 @@ def _load_pointwise_from_rankdistill(
             src = _clean_text(item.get("label_source")) or "unknown"
             source_counts[src] = int(source_counts.get(src, 0)) + 1
 
+            grant_domains_raw = item.get("grant_domains")
+            grant_domains: List[str] = []
+            if isinstance(grant_domains_raw, (list, tuple)):
+                for d in grant_domains_raw:
+                    tok = _clean_text(d).lower()
+                    if tok:
+                        grant_domains.append(tok)
+            domain_bucket = sorted(set(grant_domains))[0] if grant_domains else "unknown"
+
             if soft_labels:
                 pos_label = _safe_unit_float(item.get("positive_teacher_score"), default=1.0)
                 neg_label = _safe_unit_float(item.get("negative_teacher_score"), default=0.0)
@@ -141,6 +196,14 @@ def _load_pointwise_from_rankdistill(
 
             # Weight examples by preference strength, with a floor.
             w = max(0.10, pref)
+            pos_candidate_type = _clean_text(item.get("positive_candidate_type")) or "unknown"
+            neg_candidate_type = _clean_text(item.get("negative_candidate_type")) or "unknown"
+            candidate_type_counts[pos_candidate_type] = int(candidate_type_counts.get(pos_candidate_type, 0)) + 1
+            candidate_type_counts[neg_candidate_type] = int(candidate_type_counts.get(neg_candidate_type, 0)) + 1
+            domain_bucket_counts[domain_bucket] = int(domain_bucket_counts.get(domain_bucket, 0)) + 2
+            label_sum += float(pos_label) + float(neg_label)
+            label_sq_sum += float(pos_label) ** 2 + float(neg_label) ** 2
+            weight_sum += float(w) * 2.0
             rows.append(
                 PointwiseRow(
                     query=query,
@@ -149,6 +212,8 @@ def _load_pointwise_from_rankdistill(
                     weights=float(w),
                     source=src,
                     pair_id=pair_id + "::pos",
+                    candidate_type=pos_candidate_type,
+                    domain_bucket=domain_bucket,
                 )
             )
             rows.append(
@@ -159,6 +224,8 @@ def _load_pointwise_from_rankdistill(
                     weights=float(w),
                     source=src,
                     pair_id=pair_id + "::neg",
+                    candidate_type=neg_candidate_type,
+                    domain_bucket=domain_bucket,
                 )
             )
             pair_rows_used += 1
@@ -166,13 +233,31 @@ def _load_pointwise_from_rankdistill(
     rng = random.Random(int(seed))
     rng.shuffle(rows)
 
+    fallback_like_pair_rows = 0
+    for key, count in source_counts.items():
+        k = _clean_text(key).lower()
+        if "fallback" in k or "partial" in k:
+            fallback_like_pair_rows += int(count)
+
+    pointwise_total = int(len(rows))
+    label_mean = float(label_sum / pointwise_total) if pointwise_total > 0 else 0.0
+    label_var = float((label_sq_sum / pointwise_total) - (label_mean ** 2)) if pointwise_total > 0 else 0.0
+    label_std = float(math.sqrt(max(0.0, label_var)))
+
     stats = {
         "pair_rows_total_seen": int(pair_rows_total),
         "pair_rows_used": int(pair_rows_used),
         "pair_rows_skipped_empty": int(pair_rows_skipped_empty),
         "pair_rows_skipped_pref": int(pair_rows_skipped_pref),
-        "pointwise_rows_total": int(len(rows)),
+        "pointwise_rows_total": pointwise_total,
+        "pointwise_label_mean": float(label_mean),
+        "pointwise_label_std": float(label_std),
+        "pointwise_weight_mean": (float(weight_sum) / float(pointwise_total) if pointwise_total > 0 else 0.0),
+        "fallback_like_pair_rows": int(fallback_like_pair_rows),
+        "fallback_like_pair_ratio": (float(fallback_like_pair_rows) / float(pair_rows_used) if pair_rows_used > 0 else 0.0),
         "label_source_counts": dict(source_counts),
+        "candidate_type_counts": dict(candidate_type_counts),
+        "domain_bucket_counts": dict(domain_bucket_counts),
     }
     return rows, stats
 
@@ -215,6 +300,175 @@ def _rows_to_hf_dicts(rows: Sequence[PointwiseRow]) -> List[Dict[str, Any]]:
     return out
 
 
+def _safe_metric_suffix(value: Any, *, max_len: int = 48) -> str:
+    token = _clean_text(value).lower()
+    if not token:
+        return "unknown"
+    out_chars: List[str] = []
+    prev_us = False
+    for ch in token:
+        if ch.isalnum():
+            out_chars.append(ch)
+            prev_us = False
+        else:
+            if not prev_us:
+                out_chars.append("_")
+                prev_us = True
+    out = "".join(out_chars).strip("_") or "unknown"
+    return out[: int(max_len)]
+
+
+def _distribution_metrics(values: np.ndarray, *, prefix: str) -> Dict[str, float]:
+    arr = np.asarray(values, dtype=np.float64).reshape(-1)
+    if arr.size <= 0:
+        return {
+            f"{prefix}_mean": 0.0,
+            f"{prefix}_std": 0.0,
+            f"{prefix}_min": 0.0,
+            f"{prefix}_max": 0.0,
+            f"{prefix}_p05": 0.0,
+            f"{prefix}_p50": 0.0,
+            f"{prefix}_p95": 0.0,
+        }
+    return {
+        f"{prefix}_mean": float(np.mean(arr)),
+        f"{prefix}_std": float(np.std(arr)),
+        f"{prefix}_min": float(np.min(arr)),
+        f"{prefix}_max": float(np.max(arr)),
+        f"{prefix}_p05": float(np.quantile(arr, 0.05)),
+        f"{prefix}_p50": float(np.quantile(arr, 0.50)),
+        f"{prefix}_p95": float(np.quantile(arr, 0.95)),
+    }
+
+
+def _slice_metrics(
+    *,
+    preds: np.ndarray,
+    labels: np.ndarray,
+    slice_values: Sequence[str],
+    prefix: str,
+    top_n: int = 10,
+) -> Dict[str, float]:
+    p = np.asarray(preds, dtype=np.float64).reshape(-1)
+    y = np.asarray(labels, dtype=np.float64).reshape(-1)
+    if p.size <= 0 or y.size <= 0 or len(slice_values) != p.size:
+        return {}
+
+    by_slice: Dict[str, List[int]] = {}
+    for i, raw in enumerate(slice_values):
+        key = _clean_text(raw) or "unknown"
+        by_slice.setdefault(key, []).append(int(i))
+
+    ranked = sorted(by_slice.items(), key=lambda kv: len(kv[1]), reverse=True)
+    selected = ranked[: max(1, int(top_n))]
+    out: Dict[str, float] = {
+        f"{prefix}_slice_total": float(len(by_slice)),
+    }
+    for raw_key, idxs in selected:
+        idx = np.asarray(idxs, dtype=np.int64)
+        key = _safe_metric_suffix(raw_key)
+        yp = p[idx]
+        yy = y[idx]
+        mse = float(np.mean((yp - yy) ** 2)) if yp.size > 0 else 0.0
+        mae = float(np.mean(np.abs(yp - yy))) if yp.size > 0 else 0.0
+        out[f"{prefix}_{key}_count"] = float(idx.size)
+        out[f"{prefix}_{key}_mse"] = mse
+        out[f"{prefix}_{key}_mae"] = mae
+        out[f"{prefix}_{key}_pred_mean"] = float(np.mean(yp)) if yp.size > 0 else 0.0
+        out[f"{prefix}_{key}_label_mean"] = float(np.mean(yy)) if yy.size > 0 else 0.0
+    return out
+
+
+def _ranking_metrics(
+    *,
+    preds: np.ndarray,
+    labels: np.ndarray,
+    query_values: Sequence[str],
+    ks: Sequence[int] = (1, 3, 5, 10),
+    relevance_threshold: float = 0.5,
+) -> Dict[str, float]:
+    p = np.asarray(preds, dtype=np.float64).reshape(-1)
+    y = np.asarray(labels, dtype=np.float64).reshape(-1)
+    if p.size <= 0 or y.size <= 0 or len(query_values) != p.size:
+        return {}
+
+    safe_ks = sorted({max(1, int(k)) for k in list(ks or [])})
+    groups: Dict[str, List[int]] = {}
+    for i, q in enumerate(query_values):
+        groups.setdefault(_clean_text(q) or "unknown", []).append(int(i))
+
+    ndcg_sum = {k: 0.0 for k in safe_ks}
+    mrr_sum = {k: 0.0 for k in safe_ks}
+    recall_sum = {k: 0.0 for k in safe_ks}
+    ndcg_cnt = {k: 0 for k in safe_ks}
+    rel_cnt = {k: 0 for k in safe_ks}
+
+    def _dcg(rels: np.ndarray) -> float:
+        if rels.size <= 0:
+            return 0.0
+        ranks = np.arange(2, rels.size + 2, dtype=np.float64)
+        gains = np.power(2.0, rels) - 1.0
+        return float(np.sum(gains / np.log2(ranks)))
+
+    for _, idxs in groups.items():
+        idx = np.asarray(idxs, dtype=np.int64)
+        yp = p[idx]
+        yy = y[idx]
+        if yp.size <= 0:
+            continue
+
+        order_pred = np.argsort(-yp)
+        order_true = np.argsort(-yy)
+        yy_pred_ranked = yy[order_pred]
+        yy_true_ranked = yy[order_true]
+
+        relevant_idx = set(int(i) for i, v in enumerate(yy.tolist()) if float(v) >= float(relevance_threshold))
+        has_relevant = len(relevant_idx) > 0
+
+        for k in safe_ks:
+            kk = min(int(k), int(yy.size))
+            if kk <= 0:
+                continue
+            dcg = _dcg(yy_pred_ranked[:kk])
+            idcg = _dcg(yy_true_ranked[:kk])
+            if idcg > 0.0:
+                ndcg_sum[k] += float(dcg / idcg)
+                ndcg_cnt[k] += 1
+            if has_relevant:
+                rel_cnt[k] += 1
+                top_pred = order_pred[:kk].tolist()
+                hits = [rank + 1 for rank, local_idx in enumerate(top_pred) if int(local_idx) in relevant_idx]
+                mrr_sum[k] += (1.0 / float(min(hits))) if hits else 0.0
+                recall_sum[k] += (float(len(set(top_pred) & relevant_idx)) / float(len(relevant_idx)))
+
+    out: Dict[str, float] = {
+        "rank_query_groups": float(len(groups)),
+    }
+    for k in safe_ks:
+        out[f"rank_ndcg_at_{k}"] = (ndcg_sum[k] / float(max(1, ndcg_cnt[k])))
+        out[f"rank_mrr_at_{k}"] = (mrr_sum[k] / float(max(1, rel_cnt[k])))
+        out[f"rank_recall_at_{k}"] = (recall_sum[k] / float(max(1, rel_cnt[k])))
+    out["rank_relevance_threshold"] = float(relevance_threshold)
+    return out
+
+
+def _spotcheck_indices(rows: Sequence[PointwiseRow], *, max_items: int = 24) -> List[int]:
+    items: List[Tuple[str, int]] = []
+    for idx, row in enumerate(list(rows or [])):
+        key = "||".join(
+            [
+                _clean_text(row.pair_id),
+                _clean_text(row.source),
+                _clean_text(row.candidate_type),
+                _clean_text(row.query),
+                _clean_text(row.doc),
+            ]
+        )
+        items.append((key, int(idx)))
+    items.sort(key=lambda x: x[0])
+    return [idx for _, idx in items[: max(1, int(max_items))]]
+
+
 def train_bge_reranker(
     *,
     dataset_jsonl: Path,
@@ -241,6 +495,7 @@ def train_bge_reranker(
     use_mps: bool,
     num_workers: int,
     resume_from_checkpoint: str,
+    use_wandb: bool,
 ) -> Dict[str, Any]:
     try:
         import torch
@@ -251,6 +506,7 @@ def train_bge_reranker(
             AutoTokenizer,
             DataCollatorWithPadding,
             Trainer,
+            TrainerCallback,
             TrainingArguments,
             set_seed,
         )
@@ -276,9 +532,183 @@ def train_bge_reranker(
                 loss = torch.sum(w * (logits - labels) ** 2) / denom
             return (loss, outputs) if return_outputs else loss
 
+    class PeriodicLossTrackerCallback(TrainerCallback):
+        def __init__(self, *, log_jsonl_path: Path, wandb_enabled: bool, quality_state: Dict[str, Any]):
+            self.log_jsonl_path = log_jsonl_path
+            self.wandb_enabled = bool(wandb_enabled)
+            self.quality_state = quality_state
+            self.last_train_loss: Optional[float] = None
+            if self.log_jsonl_path.exists():
+                try:
+                    self.log_jsonl_path.unlink()
+                except Exception:
+                    pass
+
+        @staticmethod
+        def _to_float(value: Any) -> Optional[float]:
+            try:
+                return float(value)
+            except Exception:
+                return None
+
+        @staticmethod
+        def _fmt(value: Any, *, precision: int = 6) -> str:
+            parsed = PeriodicLossTrackerCallback._to_float(value)
+            if parsed is None:
+                return "n/a"
+            return f"{parsed:.{precision}f}"
+
+        @staticmethod
+        def _fmt_sci(value: Any) -> str:
+            parsed = PeriodicLossTrackerCallback._to_float(value)
+            if parsed is None:
+                return "n/a"
+            return f"{parsed:.3e}"
+
+        def on_log(self, args, state, control, logs=None, **kwargs):  # type: ignore[override]
+            payload = dict(logs or {})
+            if not payload:
+                return control
+
+            record = {
+                "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+                "step": int(getattr(state, "global_step", 0) or 0),
+                **payload,
+            }
+            try:
+                with self.log_jsonl_path.open("a", encoding="utf-8") as f:
+                    f.write(json.dumps(record, ensure_ascii=False) + "\n")
+            except Exception:
+                pass
+
+            step = int(record.get("step") or 0)
+            epoch = self._fmt(record.get("epoch"), precision=4)
+            if "loss" in payload:
+                self.last_train_loss = self._to_float(payload.get("loss"))
+                print(
+                    "[train_log] "
+                    f"step={step} epoch={epoch} "
+                    f"loss={self._fmt(payload.get('loss'))} "
+                    f"lr={self._fmt_sci(payload.get('learning_rate'))} "
+                    f"grad_norm={self._fmt(payload.get('grad_norm'), precision=4)}"
+                )
+            elif "eval_loss" in payload:
+                gap = None
+                eval_loss_val = self._to_float(payload.get("eval_loss"))
+                if eval_loss_val is not None and self.last_train_loss is not None:
+                    gap = float(eval_loss_val - self.last_train_loss)
+                    print(f"[gap_log] step={step} train_eval_loss_gap={self._fmt(gap)}")
+                    try:
+                        with self.log_jsonl_path.open("a", encoding="utf-8") as f:
+                            f.write(
+                                json.dumps(
+                                    {
+                                        "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+                                        "step": int(step),
+                                        "train_eval_loss_gap": float(gap),
+                                    },
+                                    ensure_ascii=False,
+                                )
+                                + "\n"
+                            )
+                    except Exception:
+                        pass
+                    if self.wandb_enabled:
+                        try:
+                            import wandb  # type: ignore
+
+                            if getattr(wandb, "run", None) is not None:
+                                wandb.log({"train_eval_loss_gap": float(gap)}, step=int(step))
+                        except Exception:
+                            pass
+                print(
+                    "[eval_log] "
+                    f"step={step} epoch={epoch} "
+                    f"eval_loss={self._fmt(payload.get('eval_loss'))} "
+                    f"eval_mse={self._fmt(payload.get('eval_mse'))} "
+                    f"eval_mae={self._fmt(payload.get('eval_mae'))} "
+                    f"eval_pearson={self._fmt(payload.get('eval_pearson'))}"
+                )
+            return control
+
+        def on_evaluate(self, args, state, control, metrics=None, **kwargs):  # type: ignore[override]
+            if not self.wandb_enabled:
+                return control
+            rows = list(self.quality_state.get("spotcheck_rows") or [])
+            if not rows:
+                return control
+            try:
+                import wandb  # type: ignore
+
+                if getattr(wandb, "run", None) is None:
+                    return control
+                table = wandb.Table(
+                    columns=[
+                        "pair_id",
+                        "source",
+                        "candidate_type",
+                        "domain_bucket",
+                        "label",
+                        "prediction",
+                        "abs_error",
+                        "query",
+                        "doc",
+                    ]
+                )
+                for row in rows:
+                    table.add_data(
+                        row.get("pair_id", ""),
+                        row.get("source", ""),
+                        row.get("candidate_type", ""),
+                        row.get("domain_bucket", ""),
+                        float(row.get("label", 0.0)),
+                        float(row.get("prediction", 0.0)),
+                        float(row.get("abs_error", 0.0)),
+                        row.get("query", ""),
+                        row.get("doc", ""),
+                    )
+                wandb.log({"spotcheck_table": table}, step=int(getattr(state, "global_step", 0) or 0))
+            except Exception:
+                pass
+            return control
+
     dataset_jsonl = dataset_jsonl.resolve()
     output_dir = output_dir.resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
+    loss_log_jsonl = output_dir / "train_loss_log.jsonl"
+    wandb_enabled = bool(use_wandb)
+    if wandb_enabled:
+        env_file = Path(__file__).resolve().parents[1] / ".env"
+        loaded_env = _load_selected_env_from_file(
+            env_file,
+            keys=[WANDB_ENV_API_KEY, WANDB_ENV_PROJECT, WANDB_ENV_ENTITY],
+        )
+        for k, v in loaded_env.items():
+            os.environ.setdefault(k, v)
+
+        api_key = _clean_text(os.getenv(WANDB_ENV_API_KEY))
+        if not api_key:
+            raise RuntimeError(
+                "W&B logging requested but WANDB_API_KEY is not set. "
+                f"Set it in shell env or in {env_file}."
+            )
+        if len(api_key) < int(WANDB_API_KEY_MIN_LEN):
+            raise RuntimeError(
+                "W&B logging requested but WANDB_API_KEY looks too short "
+                f"(len={len(api_key)}). Please paste the full API key."
+            )
+        if not _clean_text(os.getenv(WANDB_ENV_PROJECT)):
+            print("[wandb_warn] WANDB_PROJECT is unset; W&B default project will be used.")
+        if not _clean_text(os.getenv(WANDB_ENV_ENTITY)):
+            print("[wandb_warn] WANDB_ENTITY is unset; W&B default account will be used.")
+        try:
+            import wandb  # type: ignore  # noqa: F401
+        except Exception as e:
+            raise RuntimeError(
+                "W&B logging requested but `wandb` is not installed. Install packages in your venv:\n"
+                "pip install wandb"
+            ) from e
+        os.environ.setdefault(WANDB_ENV_WATCH, WANDB_WATCH_DISABLED)
 
     safe_model_name = _clean_text(model_name) or "BAAI/bge-reranker-base"
     safe_seed = int(seed)
@@ -307,6 +737,8 @@ def train_bge_reranker(
     train_rows, val_rows = _split_rows(rows, val_ratio=float(max(0.0, val_ratio)), seed=safe_seed)
     if not train_rows:
         raise RuntimeError("Training split is empty.")
+    eval_spotcheck_idx = _spotcheck_indices(val_rows, max_items=24)
+    quality_state: Dict[str, Any] = {"spotcheck_rows": []}
 
     train_dicts = _rows_to_hf_dicts(train_rows)
     val_dicts = _rows_to_hf_dicts(val_rows)
@@ -366,6 +798,7 @@ def train_bge_reranker(
         preds, labels = eval_pred
         p = np.asarray(preds).reshape(-1)
         y = np.asarray(labels).reshape(-1)
+        quality_state["spotcheck_rows"] = []
         if p.size <= 0 or y.size <= 0:
             return {"mse": 0.0, "mae": 0.0, "pearson": 0.0}
         mse = float(np.mean((p - y) ** 2))
@@ -374,7 +807,55 @@ def train_bge_reranker(
             pearson = float(np.corrcoef(p, y)[0, 1])
         else:
             pearson = 0.0
-        return {"mse": mse, "mae": mae, "pearson": pearson}
+        out: Dict[str, float] = {"mse": mse, "mae": mae, "pearson": pearson}
+
+        out.update(_distribution_metrics(p, prefix="pred"))
+        out.update(_distribution_metrics(y, prefix="label"))
+        out["pred_low_ratio"] = float(np.mean((p <= 0.05).astype(np.float32))) if p.size > 0 else 0.0
+        out["pred_high_ratio"] = float(np.mean((p >= 0.95).astype(np.float32))) if p.size > 0 else 0.0
+        out["pred_collapse_flag"] = 1.0 if float(np.std(p)) < 0.01 else 0.0
+
+        if len(val_rows) == int(p.size):
+            query_values = [r.query for r in val_rows]
+            source_values = [r.source for r in val_rows]
+            candidate_values = [r.candidate_type for r in val_rows]
+            domain_values = [r.domain_bucket for r in val_rows]
+            out.update(
+                _ranking_metrics(
+                    preds=p,
+                    labels=y,
+                    query_values=query_values,
+                    ks=(1, 3, 5, 10),
+                    relevance_threshold=0.5,
+                )
+            )
+            out.update(_slice_metrics(preds=p, labels=y, slice_values=source_values, prefix="slice_source", top_n=10))
+            out.update(_slice_metrics(preds=p, labels=y, slice_values=candidate_values, prefix="slice_candidate", top_n=10))
+            out.update(_slice_metrics(preds=p, labels=y, slice_values=domain_values, prefix="slice_domain", top_n=10))
+
+            spot_rows: List[Dict[str, Any]] = []
+            for i in eval_spotcheck_idx:
+                if i < 0 or i >= len(val_rows):
+                    continue
+                row = val_rows[i]
+                pred_v = float(p[i])
+                label_v = float(y[i])
+                spot_rows.append(
+                    {
+                        "pair_id": row.pair_id,
+                        "source": row.source,
+                        "candidate_type": row.candidate_type,
+                        "domain_bucket": row.domain_bucket,
+                        "label": label_v,
+                        "prediction": pred_v,
+                        "abs_error": float(abs(pred_v - label_v)),
+                        "query": row.query,
+                        "doc": row.doc,
+                    }
+                )
+            quality_state["spotcheck_rows"] = spot_rows
+
+        return out
 
     do_eval = bool(eval_ds is not None and len(eval_ds) > 0)
 
@@ -402,7 +883,7 @@ def train_bge_reranker(
         "bf16": bool(bf16 and use_cuda_device),
         "dataloader_num_workers": _safe_limit(num_workers, default=0, minimum=0, maximum=64),
         "dataloader_pin_memory": False,
-        "report_to": [],
+        "report_to": [WANDB_REPORT_TARGET] if wandb_enabled else [],
         "remove_unused_columns": False,
         "load_best_model_at_end": bool(do_eval),
         "metric_for_best_model": "mse" if do_eval else None,
@@ -444,6 +925,41 @@ def train_bge_reranker(
 
     trainer_kwargs = {k: v for k, v in trainer_kwargs.items() if k in trainer_params}
     trainer = WeightedMSETrainer(**trainer_kwargs)
+    trainer.add_callback(
+        PeriodicLossTrackerCallback(
+            log_jsonl_path=loss_log_jsonl,
+            wandb_enabled=wandb_enabled,
+            quality_state=quality_state,
+        )
+    )
+
+    dataset_quality_log: Dict[str, float] = {
+        "dq_pair_rows_total_seen": float(load_stats.get("pair_rows_total_seen") or 0),
+        "dq_pair_rows_used": float(load_stats.get("pair_rows_used") or 0),
+        "dq_pair_rows_skipped_empty": float(load_stats.get("pair_rows_skipped_empty") or 0),
+        "dq_pair_rows_skipped_pref": float(load_stats.get("pair_rows_skipped_pref") or 0),
+        "dq_pointwise_rows_total": float(load_stats.get("pointwise_rows_total") or 0),
+        "dq_pointwise_label_mean": float(load_stats.get("pointwise_label_mean") or 0.0),
+        "dq_pointwise_label_std": float(load_stats.get("pointwise_label_std") or 0.0),
+        "dq_pointwise_weight_mean": float(load_stats.get("pointwise_weight_mean") or 0.0),
+        "dq_fallback_like_pair_rows": float(load_stats.get("fallback_like_pair_rows") or 0),
+        "dq_fallback_like_pair_ratio": float(load_stats.get("fallback_like_pair_ratio") or 0.0),
+        "dq_train_rows": float(len(train_rows)),
+        "dq_eval_rows": float(len(val_rows)),
+        "dq_eval_ratio_effective": float((len(val_rows) / max(1, len(rows)))),
+    }
+    for raw_key, value in dict(load_stats.get("label_source_counts") or {}).items():
+        dataset_quality_log[f"dq_source_count_{_safe_metric_suffix(raw_key)}"] = float(value or 0)
+    for raw_key, value in dict(load_stats.get("candidate_type_counts") or {}).items():
+        dataset_quality_log[f"dq_candidate_count_{_safe_metric_suffix(raw_key)}"] = float(value or 0)
+    domain_counts = sorted(
+        list(dict(load_stats.get("domain_bucket_counts") or {}).items()),
+        key=lambda kv: int(kv[1] or 0),
+        reverse=True,
+    )
+    for raw_key, value in domain_counts[:12]:
+        dataset_quality_log[f"dq_domain_count_{_safe_metric_suffix(raw_key)}"] = float(value or 0)
+    trainer.log(dataset_quality_log)
 
     train_result = trainer.train(resume_from_checkpoint=_clean_text(resume_from_checkpoint) or None)
     eval_metrics = trainer.evaluate() if do_eval else {}
@@ -464,6 +980,7 @@ def train_bge_reranker(
         },
         "train_metrics": dict(getattr(train_result, "metrics", {}) or {}),
         "eval_metrics": dict(eval_metrics or {}),
+        "loss_log_jsonl": str(loss_log_jsonl),
         "params": {
             "epochs": float(num_epochs),
             "batch_size": int(per_device_batch_size),
@@ -481,6 +998,7 @@ def train_bge_reranker(
             "use_mps_effective": bool(use_mps_device),
             "trainer_device": str(getattr(trainer.args, "device", "")),
             "seed": int(safe_seed),
+            "wandb_enabled": bool(wandb_enabled),
         },
     }
 
@@ -525,6 +1043,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--use-mps", dest="use_mps", action="store_true", default=True, help="Use MPS when available (default: on).")
     parser.add_argument("--no-mps", dest="use_mps", action="store_false", help="Disable MPS and fall back to CPU/CUDA selection.")
     parser.add_argument("--resume-from-checkpoint", type=str, default="", help="Checkpoint path to resume.")
+    parser.add_argument(WANDB_ARG_ENABLE, action="store_true", help=WANDB_HELP_ENABLE)
     parser.add_argument("--json-only", action="store_true", help="Print only JSON summary.")
     return parser
 
@@ -559,6 +1078,7 @@ def main() -> int:
         use_mps=bool(args.use_mps),
         num_workers=int(args.num_workers),
         resume_from_checkpoint=_clean_text(args.resume_from_checkpoint),
+        use_wandb=bool(args.wandb),
     )
 
     if not args.json_only:
@@ -568,6 +1088,9 @@ def main() -> int:
         print(f"  val rows         : {summary.get('split', {}).get('val_rows', 0)}")
         print(f"  output dir       : {summary.get('output_dir', '')}")
         print(f"  summary          : {summary.get('summary_path', '')}")
+        print(f"  loss log         : {summary.get('loss_log_jsonl', '')}")
+        if bool(summary.get("params", {}).get("wandb_enabled")):
+            print("  wandb            : enabled")
         print()
 
     print(json.dumps(summary, indent=2))
