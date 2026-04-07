@@ -5,6 +5,7 @@ import importlib
 import json
 import random
 import re
+import time
 import sys
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timezone
@@ -50,6 +51,20 @@ def _now_utc() -> str:
 def _write_json(path: Path, payload: Dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _is_aws_token_expired_error(text: str) -> bool:
+    s = _clean_text(text).lower()
+    if not s:
+        return False
+    patterns = [
+        "expiredtoken",
+        "token has expired",
+        "security token included in the request is expired",
+        "the provided token has expired",
+        "aws session token has expired",
+    ]
+    return any(p in s for p in patterns)
 
 
 @lru_cache(maxsize=1)
@@ -269,7 +284,10 @@ class PlanRouter:
         return bool(pass_eval and pass_conf and pass_margin and pass_fp and pass_fn and pass_hard)
 
     def decide(self, state: FinetuneWorkflowState) -> Dict[str, Any]:
-        if _clean_text(state.get("error")):
+        error_text = _clean_text(state.get("error"))
+        if error_text:
+            if _is_aws_token_expired_error(error_text):
+                return {"next_action": "wait_for_aws_token", "stop_reason": "awaiting_aws_token_refresh"}
             return {"next_action": "finish", "stop_reason": "error"}
 
         raw_iteration = state.get("iteration")
@@ -767,6 +785,36 @@ class AgenticFinetuneGraph:
             "stop_reason": _clean_text(out.get("stop_reason")),
         }
 
+    def _node_wait_for_aws_token(self, state: FinetuneWorkflowState) -> FinetuneWorkflowState:
+        error_text = _clean_text(state.get("error"))
+        print()
+        print("[agentic] AWS token appears to be expired.")
+        if error_text:
+            print(f"[agentic] last error: {error_text}")
+        print("[agentic] Please refresh AWS credentials, then press Enter to retry.")
+        print("[agentic] Type 'quit' to stop the run.")
+        print()
+
+        try:
+            answer = _clean_text(input("aws-refresh> ")).lower()
+        except EOFError:
+            # Non-interactive environments: wait briefly and retry automatically.
+            print("[agentic] Non-interactive mode detected. Waiting 30s before retry...")
+            time.sleep(30)
+            answer = ""
+        except KeyboardInterrupt:
+            answer = "quit"
+
+        if answer in {"quit", "q", "exit", "stop"}:
+            return {"error": "Run stopped by user while waiting for refreshed AWS token."}
+
+        # Clear error and retry the current stage.
+        return {
+            "error": "",
+            "next_action": "",
+            "stop_reason": "",
+        }
+
     def _node_tool_build_dataset(self, state: FinetuneWorkflowState) -> FinetuneWorkflowState:
         try:
             run_dir = Path(_clean_text(state.get("run_dir"))).resolve()
@@ -920,6 +968,7 @@ class AgenticFinetuneGraph:
 
         graph = StateGraph(FinetuneWorkflowState)
         graph.add_node("plan_route", self._node_plan_route)
+        graph.add_node("wait_for_aws_token", self._node_wait_for_aws_token)
         graph.add_node("tool_build_dataset", self._node_tool_build_dataset)
         graph.add_node("tool_train_v2_simple", self._node_tool_train_v2_simple)
         graph.add_node("tool_probe_quality", self._node_tool_probe_quality)
@@ -932,6 +981,7 @@ class AgenticFinetuneGraph:
         graph.add_edge("tool_train_v2_simple", "plan_route")
         graph.add_edge("tool_probe_quality", "plan_route")
         graph.add_edge("retune_and_advance", "plan_route")
+        graph.add_edge("wait_for_aws_token", "plan_route")
         graph.add_edge("finish", END)
         return graph.compile()
 
