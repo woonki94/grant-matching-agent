@@ -832,7 +832,23 @@ def build_dataset(
 
     common_dim, faculty_specs, grant_specs = _select_common_embedding_dim(faculty_specs_raw, grant_specs_raw)
     if common_dim <= 0 or not faculty_specs or not grant_specs:
-        raise RuntimeError("No shared embedding dimension found across faculty/grant specialization keywords.")
+        fac_dim_counter = Counter(len(x.embedding) for x in faculty_specs_raw if x.embedding)
+        grant_dim_counter = Counter(len(x.embedding) for x in grant_specs_raw if x.embedding)
+        debug_payload = {
+            "faculty_specs_raw_count": int(len(faculty_specs_raw)),
+            "grant_specs_raw_count": int(len(grant_specs_raw)),
+            "faculty_embedded_count": int(sum(fac_dim_counter.values())),
+            "grant_embedded_count": int(sum(grant_dim_counter.values())),
+            "faculty_embedding_dims": dict(fac_dim_counter),
+            "grant_embedding_dims": dict(grant_dim_counter),
+            "common_dims": sorted([int(d) for d in fac_dim_counter if d in grant_dim_counter]),
+            "embed_model_id": _clean_text(settings.bedrock_embed_model_id),
+            "aws_region": _clean_text(settings.aws_region),
+        }
+        raise RuntimeError(
+            "No shared embedding dimension found across faculty/grant specialization keywords. "
+            f"Debug={json.dumps(json_ready(debug_payload), ensure_ascii=False)}"
+        )
 
     query_sets = _generate_query_candidate_sets(
         grant_specs=grant_specs,

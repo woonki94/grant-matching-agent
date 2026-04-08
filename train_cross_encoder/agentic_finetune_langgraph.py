@@ -53,6 +53,132 @@ def _write_json(path: Path, payload: Dict[str, Any]) -> None:
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
+def _json_safe(value: Any) -> Any:
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, dict):
+        return {str(k): _json_safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [_json_safe(x) for x in value]
+    return str(value)
+
+
+def _append_jsonl(path: Path, payload: Dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(_json_safe(payload), ensure_ascii=False) + "\n")
+
+
+def _checkpoint_path(run_dir: Path) -> Path:
+    return run_dir / "agentic_state.json"
+
+
+def _merge_state(base_state: Dict[str, Any], updates: Dict[str, Any] | None = None) -> Dict[str, Any]:
+    out = dict(base_state or {})
+    out.update(dict(updates or {}))
+    return out
+
+
+def _save_state_checkpoint(
+    *,
+    run_dir: Path,
+    state: Dict[str, Any],
+    stage: str,
+    event: str,
+) -> None:
+    payload = {
+        "updated_at_utc": _now_utc(),
+        "stage": _clean_text(stage),
+        "event": _clean_text(event),
+        "state": _json_safe(dict(state or {})),
+    }
+    _write_json(_checkpoint_path(run_dir), payload)
+
+
+def _save_state_checkpoint_from_state(
+    state: Dict[str, Any],
+    *,
+    stage: str,
+    event: str,
+    updates: Dict[str, Any] | None = None,
+) -> None:
+    run_dir_str = _clean_text(state.get("run_dir"))
+    if not run_dir_str:
+        return
+    run_dir = Path(run_dir_str).resolve()
+    merged = _merge_state(dict(state or {}), dict(updates or {}))
+    _save_state_checkpoint(
+        run_dir=run_dir,
+        state=merged,
+        stage=stage,
+        event=event,
+    )
+
+
+def _load_state_checkpoint(run_dir: Path) -> Dict[str, Any]:
+    p = _checkpoint_path(run_dir)
+    if not p.exists() or not p.is_file():
+        return {}
+    try:
+        obj = json.loads(p.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    state = dict(obj or {}).get("state")
+    return dict(state or {}) if isinstance(state, dict) else {}
+
+
+def _log_runtime_event(
+    *,
+    run_dir: Path,
+    event: str,
+    stage: str,
+    payload: Dict[str, Any] | None = None,
+    level: str = "INFO",
+) -> None:
+    body = dict(payload or {})
+    rec = {
+        "timestamp_utc": _now_utc(),
+        "level": _clean_text(level) or "INFO",
+        "stage": _clean_text(stage),
+        "event": _clean_text(event),
+        "payload": body,
+    }
+    _append_jsonl(run_dir / "agentic_trace.jsonl", rec)
+    payload_preview = ", ".join(f"{k}={body[k]}" for k in list(body.keys())[:6])
+    if payload_preview:
+        print(f"[agentic][{rec['level']}][{stage}] {event} | {payload_preview}")
+    else:
+        print(f"[agentic][{rec['level']}][{stage}] {event}")
+
+
+def _log_state_event(
+    state: Dict[str, Any],
+    *,
+    event: str,
+    stage: str,
+    payload: Dict[str, Any] | None = None,
+    level: str = "INFO",
+) -> None:
+    run_dir_str = _clean_text(state.get("run_dir"))
+    if not run_dir_str:
+        return
+    body = dict(payload or {})
+    if "iteration" not in body and state.get("iteration") is not None:
+        try:
+            body["iteration"] = int(state.get("iteration"))
+        except Exception:
+            pass
+    _log_runtime_event(
+        run_dir=Path(run_dir_str).resolve(),
+        event=event,
+        stage=stage,
+        payload=body,
+        level=level,
+    )
+
+
 def _is_aws_token_expired_error(text: str) -> bool:
     s = _clean_text(text).lower()
     if not s:
@@ -63,8 +189,19 @@ def _is_aws_token_expired_error(text: str) -> bool:
         "security token included in the request is expired",
         "the provided token has expired",
         "aws session token has expired",
+        "credentials were refreshed, but the refreshed credentials are still expired",
+        "refreshed credentials are still expired",
+        "expired credentials",
+        "request has expired",
     ]
-    return any(p in s for p in patterns)
+    if any(p in s for p in patterns):
+        return True
+    # Guardrail for variant botocore wording.
+    if "credential" in s and "expired" in s:
+        return True
+    if "token" in s and "expired" in s:
+        return True
+    return False
 
 
 @lru_cache(maxsize=1)
@@ -779,14 +916,39 @@ class AgenticFinetuneGraph:
         return action or "finish"
 
     def _node_plan_route(self, state: FinetuneWorkflowState) -> FinetuneWorkflowState:
+        _log_state_event(dict(state), event="node_enter", stage="plan_route")
         out = self.router.decide(state)
-        return {
+        _log_state_event(
+            dict(state),
+            event="route_decision",
+            stage="plan_route",
+            payload={
+                "next_action": _clean_text(out.get("next_action")),
+                "stop_reason": _clean_text(out.get("stop_reason")),
+                "has_error": bool(_clean_text(state.get("error"))),
+            },
+        )
+        updates = {
             "next_action": _clean_text(out.get("next_action")),
             "stop_reason": _clean_text(out.get("stop_reason")),
         }
+        _save_state_checkpoint_from_state(
+            dict(state),
+            stage="plan_route",
+            event="node_exit",
+            updates=updates,
+        )
+        return updates
 
     def _node_wait_for_aws_token(self, state: FinetuneWorkflowState) -> FinetuneWorkflowState:
         error_text = _clean_text(state.get("error"))
+        _log_state_event(
+            dict(state),
+            event="node_enter",
+            stage="wait_for_aws_token",
+            level="WARN",
+            payload={"error": error_text[:300]},
+        )
         print()
         print("[agentic] AWS token appears to be expired.")
         if error_text:
@@ -800,35 +962,95 @@ class AgenticFinetuneGraph:
         except EOFError:
             # Non-interactive environments: wait briefly and retry automatically.
             print("[agentic] Non-interactive mode detected. Waiting 30s before retry...")
+            _log_state_event(
+                dict(state),
+                event="non_interactive_wait",
+                stage="wait_for_aws_token",
+                level="WARN",
+                payload={"wait_seconds": 30},
+            )
             time.sleep(30)
             answer = ""
         except KeyboardInterrupt:
             answer = "quit"
 
         if answer in {"quit", "q", "exit", "stop"}:
-            return {"error": "Run stopped by user while waiting for refreshed AWS token."}
+            _log_state_event(
+                dict(state),
+                event="user_aborted",
+                stage="wait_for_aws_token",
+                level="WARN",
+            )
+            updates = {"error": "Run stopped by user while waiting for refreshed AWS token."}
+            _save_state_checkpoint_from_state(
+                dict(state),
+                stage="wait_for_aws_token",
+                event="node_exit",
+                updates=updates,
+            )
+            return updates
 
         # Clear error and retry the current stage.
-        return {
+        _log_state_event(
+            dict(state),
+            event="retry_after_refresh",
+            stage="wait_for_aws_token",
+            payload={"answer": ("entered" if answer else "empty")},
+        )
+        updates = {
             "error": "",
             "next_action": "",
             "stop_reason": "",
         }
+        _save_state_checkpoint_from_state(
+            dict(state),
+            stage="wait_for_aws_token",
+            event="node_exit",
+            updates=updates,
+        )
+        return updates
 
     def _node_tool_build_dataset(self, state: FinetuneWorkflowState) -> FinetuneWorkflowState:
         try:
+            _log_state_event(dict(state), event="node_enter", stage="tool_build_dataset")
             run_dir = Path(_clean_text(state.get("run_dir"))).resolve()
             iteration = int(state.get("iteration") or 1)
             dataset_cfg = DatasetTuningConfig(**dict(state.get("dataset_cfg") or {}))
             iter_dir = run_dir / f"iter_{iteration:02d}"
             iter_dir.mkdir(parents=True, exist_ok=True)
+            _log_state_event(
+                dict(state),
+                event="build_dataset_start",
+                stage="tool_build_dataset",
+                payload={
+                    "iter_dir": str(iter_dir),
+                    "top_k_candidates": int(dataset_cfg.top_k_candidates),
+                    "hard_negatives_per_grant": int(dataset_cfg.hard_negatives_per_grant),
+                    "random_negatives_per_grant": int(dataset_cfg.random_negatives_per_grant),
+                    "max_queries": int(dataset_cfg.max_queries),
+                    "max_pairs": int(dataset_cfg.max_pairs),
+                },
+            )
             payload = self.tools.build_llm_spec_pair_dataset(
                 cfg=dataset_cfg,
                 output_dir=iter_dir / "dataset",
                 output_prefix=f"agentic_iter{iteration:02d}",
             )
             dataset_jsonl = _clean_text(dict(payload.get("output") or {}).get("jsonl_path"))
-            return {
+            counts = dict(payload.get("counts") or {})
+            _log_state_event(
+                dict(state),
+                event="build_dataset_done",
+                stage="tool_build_dataset",
+                payload={
+                    "dataset_jsonl": dataset_jsonl,
+                    "queries_ranked": counts.get("queries_ranked"),
+                    "pairs_saved_after_cap": counts.get("pairs_saved_after_cap"),
+                    "faculty_specs_used": counts.get("faculty_specs_used"),
+                    "grant_specs_used": counts.get("grant_specs_used"),
+                },
+            )
+            updates = {
                 "dataset_payload": payload,
                 "dataset_jsonl": dataset_jsonl,
                 "model_dir": str((iter_dir / "model").resolve()),
@@ -836,25 +1058,91 @@ class AgenticFinetuneGraph:
                 "probe_summary": {},
                 "error": "",
             }
+            _save_state_checkpoint_from_state(
+                dict(state),
+                stage="tool_build_dataset",
+                event="node_exit",
+                updates=updates,
+            )
+            return updates
         except Exception as e:
-            return {"error": f"tool_build_dataset failed: {e}"}
+            _log_state_event(
+                dict(state),
+                event="build_dataset_failed",
+                stage="tool_build_dataset",
+                level="ERROR",
+                payload={"error": _clean_text(str(e))[:600]},
+            )
+            updates = {"error": f"tool_build_dataset failed: {e}"}
+            _save_state_checkpoint_from_state(
+                dict(state),
+                stage="tool_build_dataset",
+                event="node_exit_error",
+                updates=updates,
+            )
+            return updates
 
     def _node_tool_train_v2_simple(self, state: FinetuneWorkflowState) -> FinetuneWorkflowState:
         try:
+            _log_state_event(dict(state), event="node_enter", stage="tool_train_v2_simple")
             dataset_jsonl = Path(_clean_text(state.get("dataset_jsonl"))).resolve()
             model_dir = Path(_clean_text(state.get("model_dir"))).resolve()
             loop_cfg = LoopConfig(**dict(state.get("loop_cfg") or {}))
+            _log_state_event(
+                dict(state),
+                event="train_start",
+                stage="tool_train_v2_simple",
+                payload={
+                    "dataset_jsonl": str(dataset_jsonl),
+                    "model_dir": str(model_dir),
+                    "wandb": bool(loop_cfg.use_wandb),
+                },
+            )
             payload = self.tools.train_v2_simple(
                 dataset_jsonl=dataset_jsonl,
                 output_dir=model_dir,
                 use_wandb=bool(loop_cfg.use_wandb),
             )
-            return {"train_summary": payload, "error": ""}
+            _log_state_event(
+                dict(state),
+                event="train_done",
+                stage="tool_train_v2_simple",
+                payload={
+                    "train_loss": payload.get("train_loss"),
+                    "eval_loss": payload.get("eval_loss"),
+                    "train_rows": payload.get("train_rows"),
+                    "eval_rows": payload.get("eval_rows"),
+                    "group_overlap": payload.get("group_overlap"),
+                },
+            )
+            updates = {"train_summary": payload, "error": ""}
+            _save_state_checkpoint_from_state(
+                dict(state),
+                stage="tool_train_v2_simple",
+                event="node_exit",
+                updates=updates,
+            )
+            return updates
         except Exception as e:
-            return {"error": f"tool_train_v2_simple failed: {e}"}
+            _log_state_event(
+                dict(state),
+                event="train_failed",
+                stage="tool_train_v2_simple",
+                level="ERROR",
+                payload={"error": _clean_text(str(e))[:600]},
+            )
+            updates = {"error": f"tool_train_v2_simple failed: {e}"}
+            _save_state_checkpoint_from_state(
+                dict(state),
+                stage="tool_train_v2_simple",
+                event="node_exit_error",
+                updates=updates,
+            )
+            return updates
 
     def _node_tool_probe_quality(self, state: FinetuneWorkflowState) -> FinetuneWorkflowState:
         try:
+            _log_state_event(dict(state), event="node_enter", stage="tool_probe_quality")
             run_dir = Path(_clean_text(state.get("run_dir"))).resolve()
             iteration = int(state.get("iteration") or 1)
             dataset_cfg = DatasetTuningConfig(**dict(state.get("dataset_cfg") or {}))
@@ -868,6 +1156,16 @@ class AgenticFinetuneGraph:
             rng = random.Random(int(dataset_cfg.seed) + int(iteration))
             rng.shuffle(candidates)
             candidates = candidates[: max(20, int(loop_cfg.probe_candidate_count))]
+            _log_state_event(
+                dict(state),
+                event="probe_inputs_ready",
+                stage="tool_probe_quality",
+                payload={
+                    "faculty_spec_count": len(faculty_specs),
+                    "grant_spec_count": len(grant_specs),
+                    "candidate_pool_size": len(candidates),
+                },
+            )
 
             probe_case_payload = _generate_probe_cases(
                 tools=self.tools,
@@ -878,6 +1176,20 @@ class AgenticFinetuneGraph:
                 candidate_texts=candidates,
             )
             probe_cases = list(probe_case_payload.get("cases") or [])
+            case_tag_counts: Dict[str, int] = {}
+            for c in probe_cases:
+                tag = _clean_text((c or {}).get("case_tag")).lower() or "unknown"
+                case_tag_counts[tag] = int(case_tag_counts.get(tag, 0)) + 1
+            _log_state_event(
+                dict(state),
+                event="probe_cases_generated",
+                stage="tool_probe_quality",
+                payload={
+                    "case_source": _clean_text(probe_case_payload.get("source")),
+                    "case_count": len(probe_cases),
+                    "case_tag_counts": dict(case_tag_counts),
+                },
+            )
             probe_summary = _probe_inference(
                 tools=self.tools,
                 model_dir=model_dir,
@@ -889,6 +1201,20 @@ class AgenticFinetuneGraph:
             )
             probe_summary["probe_cases_requested"] = int(loop_cfg.probe_query_count)
             probe_summary["probe_case_pool_size"] = int(len(candidates))
+            _log_state_event(
+                dict(state),
+                event="probe_done",
+                stage="tool_probe_quality",
+                payload={
+                    "probe_cases_used": probe_summary.get("probe_cases_used"),
+                    "low_conf_ratio": probe_summary.get("low_conf_ratio"),
+                    "low_margin_ratio": probe_summary.get("low_margin_ratio"),
+                    "false_positive_rate": probe_summary.get("false_positive_rate"),
+                    "false_negative_rate": probe_summary.get("false_negative_rate"),
+                    "hard_negative_top1_rate": probe_summary.get("hard_negative_top1_rate"),
+                    "quality_score": probe_summary.get("quality_score"),
+                },
+            )
 
             train_summary = dict(state.get("train_summary") or {})
             dataset_payload = dict(state.get("dataset_payload") or {})
@@ -913,17 +1239,45 @@ class AgenticFinetuneGraph:
 
             history = list(state.get("history") or [])
             history.append(record)
-            return {
+            _log_state_event(
+                dict(state),
+                event="iteration_record_written",
+                stage="tool_probe_quality",
+                payload={"path": str(iter_dir / "iteration_summary.json")},
+            )
+            updates = {
                 "probe_summary": probe_summary,
                 "history": history,
                 "best_eval_loss": best_eval_loss,
                 "best_iteration": best_iteration,
                 "error": "",
             }
+            _save_state_checkpoint_from_state(
+                dict(state),
+                stage="tool_probe_quality",
+                event="node_exit",
+                updates=updates,
+            )
+            return updates
         except Exception as e:
-            return {"error": f"tool_probe_quality failed: {e}"}
+            _log_state_event(
+                dict(state),
+                event="probe_failed",
+                stage="tool_probe_quality",
+                level="ERROR",
+                payload={"error": _clean_text(str(e))[:600]},
+            )
+            updates = {"error": f"tool_probe_quality failed: {e}"}
+            _save_state_checkpoint_from_state(
+                dict(state),
+                stage="tool_probe_quality",
+                event="node_exit_error",
+                updates=updates,
+            )
+            return updates
 
     def _node_retune_and_advance(self, state: FinetuneWorkflowState) -> FinetuneWorkflowState:
+        _log_state_event(dict(state), event="node_enter", stage="retune_and_advance")
         dataset_cfg = DatasetTuningConfig(**dict(state.get("dataset_cfg") or {}))
         train_summary = dict(state.get("train_summary") or {})
         probe_summary = dict(state.get("probe_summary") or {})
@@ -935,7 +1289,20 @@ class AgenticFinetuneGraph:
             prev_best_eval_loss=(None if best_eval_loss is None else float(best_eval_loss)),
         )
         next_iteration = int(state.get("iteration") or 1) + 1
-        return {
+        _log_state_event(
+            dict(state),
+            event="retune_done",
+            stage="retune_and_advance",
+            payload={
+                "next_iteration": next_iteration,
+                "top_k_candidates": int(tuned.top_k_candidates),
+                "hard_negatives_per_grant": int(tuned.hard_negatives_per_grant),
+                "random_negatives_per_grant": int(tuned.random_negatives_per_grant),
+                "candidates_per_query": int(tuned.candidates_per_query),
+                "max_queries": int(tuned.max_queries),
+            },
+        )
+        updates = {
             "dataset_cfg": asdict(tuned),
             "iteration": next_iteration,
             "dataset_payload": {},
@@ -944,8 +1311,21 @@ class AgenticFinetuneGraph:
             "train_summary": {},
             "probe_summary": {},
         }
+        _save_state_checkpoint_from_state(
+            dict(state),
+            stage="retune_and_advance",
+            event="node_exit",
+            updates=updates,
+        )
+        return updates
 
     def _node_finish(self, state: FinetuneWorkflowState) -> FinetuneWorkflowState:
+        _log_state_event(
+            dict(state),
+            event="node_enter",
+            stage="finish",
+            payload={"stop_reason": _clean_text(state.get("stop_reason"))},
+        )
         run_dir = Path(_clean_text(state.get("run_dir"))).resolve()
         final_payload = {
             "created_at_utc": _now_utc(),
@@ -956,9 +1336,30 @@ class AgenticFinetuneGraph:
             "stop_reason": _clean_text(state.get("stop_reason")),
             "history": list(state.get("history") or []),
             "error": _clean_text(state.get("error")),
+            "trace_file": str(run_dir / "agentic_trace.jsonl"),
+            "state_checkpoint": str(_checkpoint_path(run_dir)),
         }
         _write_json(run_dir / "agentic_summary.json", final_payload)
-        return {"result": final_payload}
+        _log_runtime_event(
+            run_dir=run_dir,
+            event="run_finished",
+            stage="finish",
+            payload={
+                "iterations_ran": final_payload.get("iterations_ran"),
+                "best_iteration": final_payload.get("best_iteration"),
+                "best_eval_loss": final_payload.get("best_eval_loss"),
+                "stop_reason": final_payload.get("stop_reason"),
+                "error": final_payload.get("error"),
+            },
+        )
+        updates = {"result": final_payload}
+        _save_state_checkpoint_from_state(
+            dict(state),
+            stage="finish",
+            event="node_exit",
+            updates=updates,
+        )
+        return updates
 
     def _build_graph(self):
         try:
@@ -991,9 +1392,36 @@ class AgenticFinetuneGraph:
         run_dir: Path,
         dataset_cfg: DatasetTuningConfig,
         loop_cfg: LoopConfig,
+        fresh_start: bool = False,
     ) -> Dict[str, Any]:
         run_dir.mkdir(parents=True, exist_ok=True)
-        init_state: FinetuneWorkflowState = {
+        resume_state = {}
+        if not bool(fresh_start):
+            resume_state = _load_state_checkpoint(run_dir)
+        _log_runtime_event(
+            run_dir=run_dir,
+            event="run_start",
+            stage="run",
+            payload={
+                "max_iterations": int(loop_cfg.max_iterations),
+                "target_eval_loss": float(loop_cfg.target_eval_loss),
+                "target_false_positive_rate": float(loop_cfg.target_false_positive_rate),
+                "target_false_negative_rate": float(loop_cfg.target_false_negative_rate),
+                "target_hard_negative_top1_rate": float(loop_cfg.target_hard_negative_top1_rate),
+                "use_wandb": bool(loop_cfg.use_wandb),
+                "init_top_k_candidates": int(dataset_cfg.top_k_candidates),
+                "init_hard_negatives_per_grant": int(dataset_cfg.hard_negatives_per_grant),
+                "init_random_negatives_per_grant": int(dataset_cfg.random_negatives_per_grant),
+                "init_candidates_per_query": int(dataset_cfg.candidates_per_query),
+                "init_max_queries": int(dataset_cfg.max_queries),
+                "init_max_pairs": int(dataset_cfg.max_pairs),
+                "init_faculty_limit": int(dataset_cfg.faculty_limit),
+                "init_grant_limit": int(dataset_cfg.grant_limit),
+                "fresh_start": bool(fresh_start),
+                "resume_found": bool(resume_state),
+            },
+        )
+        default_state: FinetuneWorkflowState = {
             "run_dir": str(run_dir),
             "iteration": 1,
             "max_iterations": int(loop_cfg.max_iterations),
@@ -1012,11 +1440,48 @@ class AgenticFinetuneGraph:
             "error": "",
             "result": {},
         }
+        if resume_state:
+            init_state = _merge_state(default_state, resume_state)
+            init_state["run_dir"] = str(run_dir)
+            init_state["max_iterations"] = int(loop_cfg.max_iterations)
+            init_state["loop_cfg"] = asdict(loop_cfg)
+            if not dict(init_state.get("dataset_cfg") or {}):
+                init_state["dataset_cfg"] = asdict(dataset_cfg)
+            # Retry workflow on restart instead of keeping stale terminal/error flags.
+            init_state["error"] = ""
+            init_state["next_action"] = ""
+            init_state["stop_reason"] = ""
+            init_state["result"] = {}
+            _log_runtime_event(
+                run_dir=run_dir,
+                event="resume_loaded",
+                stage="run",
+                payload={
+                    "iteration": init_state.get("iteration"),
+                    "history_count": len(list(init_state.get("history") or [])),
+                    "dataset_jsonl_present": bool(_clean_text(init_state.get("dataset_jsonl"))),
+                    "train_summary_present": bool(dict(init_state.get("train_summary") or {})),
+                    "probe_summary_present": bool(dict(init_state.get("probe_summary") or {})),
+                },
+            )
+        else:
+            init_state = dict(default_state)
+            _log_runtime_event(
+                run_dir=run_dir,
+                event="resume_not_found_start_fresh",
+                stage="run",
+            )
+        _save_state_checkpoint(
+            run_dir=run_dir,
+            state=dict(init_state),
+            stage="run",
+            event="invoke_graph",
+        )
         out = self.graph.invoke(init_state)
         result = dict(out.get("result") or {})
         if result:
             return result
-        return {
+        fallback = {
             "created_at_utc": _now_utc(),
             "run_dir": str(run_dir),
             "iterations_ran": int(len(list(out.get("history") or []))),
@@ -1025,7 +1490,28 @@ class AgenticFinetuneGraph:
             "stop_reason": _clean_text(out.get("stop_reason")),
             "history": list(out.get("history") or []),
             "error": _clean_text(out.get("error")),
+            "trace_file": str(run_dir / "agentic_trace.jsonl"),
+            "state_checkpoint": str(_checkpoint_path(run_dir)),
         }
+        _write_json(run_dir / "agentic_summary.json", fallback)
+        _save_state_checkpoint(
+            run_dir=run_dir,
+            state=_merge_state(dict(out or {}), {"result": fallback}),
+            stage="run",
+            event="run_finished_fallback",
+        )
+        _log_runtime_event(
+            run_dir=run_dir,
+            event="run_finished_fallback",
+            stage="run",
+            level="WARN",
+            payload={
+                "iterations_ran": fallback.get("iterations_ran"),
+                "stop_reason": fallback.get("stop_reason"),
+                "error": fallback.get("error"),
+            },
+        )
+        return fallback
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -1048,10 +1534,19 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--target-false-positive-rate", type=float, default=0.30, help="Stopping threshold for probe false-positive rate.")
     p.add_argument("--target-false-negative-rate", type=float, default=0.30, help="Stopping threshold for probe false-negative rate.")
     p.add_argument("--target-hard-negative-top1-rate", type=float, default=0.25, help="Stopping threshold for hard-negative@top1 rate.")
+    p.add_argument("--init-top-k-candidates", type=int, default=6, help="Initial top-k cosine candidates per query.")
+    p.add_argument("--init-hard-negatives-per-grant", type=int, default=6, help="Initial hard negatives per query.")
+    p.add_argument("--init-random-negatives-per-grant", type=int, default=4, help="Initial random negatives per query.")
+    p.add_argument("--init-candidates-per-query", type=int, default=12, help="Initial total candidates fed to LLM ranker.")
+    p.add_argument("--init-max-queries", type=int, default=1200, help="Initial cap for query specs per iteration.")
+    p.add_argument("--init-max-pairs", type=int, default=30000, help="Initial cap for pair rows per iteration.")
+    p.add_argument("--init-faculty-limit", type=int, default=80000, help="Initial max faculty keyword rows to fetch.")
+    p.add_argument("--init-grant-limit", type=int, default=80000, help="Initial max grant keyword rows to fetch.")
     p.add_argument("--probe-query-count", type=int, default=24, help="Number of probe queries each iteration.")
     p.add_argument("--probe-candidate-count", type=int, default=120, help="Number of candidate docs for probing.")
     p.add_argument("--llm-model", type=str, default="", help="Optional LLM model id for dataset/probe stages.")
     p.add_argument("--no-wandb", action="store_true", help="Disable W&B during training.")
+    p.add_argument("--fresh-start", action="store_true", help="Ignore existing checkpoint in run-dir and restart from iteration 1.")
     p.add_argument("--json-only", action="store_true", help="Print only final JSON payload.")
     return p
 
@@ -1061,7 +1556,17 @@ def main() -> int:
     run_dir = Path(_clean_text(args.run_dir)).expanduser().resolve()
     llm_model = _clean_text(args.llm_model) or _resolve_default_llm_model()
 
-    dataset_cfg = DatasetTuningConfig(llm_model=llm_model)
+    dataset_cfg = DatasetTuningConfig(
+        top_k_candidates=int(args.init_top_k_candidates),
+        hard_negatives_per_grant=int(args.init_hard_negatives_per_grant),
+        random_negatives_per_grant=int(args.init_random_negatives_per_grant),
+        candidates_per_query=int(args.init_candidates_per_query),
+        max_queries=int(args.init_max_queries),
+        max_pairs=int(args.init_max_pairs),
+        faculty_limit=int(args.init_faculty_limit),
+        grant_limit=int(args.init_grant_limit),
+        llm_model=llm_model,
+    )
     loop_cfg = LoopConfig(
         max_iterations=int(args.max_iterations),
         target_eval_loss=float(args.target_eval_loss),
@@ -1080,6 +1585,7 @@ def main() -> int:
         run_dir=run_dir,
         dataset_cfg=dataset_cfg,
         loop_cfg=loop_cfg,
+        fresh_start=bool(args.fresh_start),
     )
 
     if not args.json_only:
@@ -1090,6 +1596,7 @@ def main() -> int:
         print(f"  best eval loss   : {payload.get('best_eval_loss', None)}")
         print(f"  stop reason      : {payload.get('stop_reason', '')}")
         print(f"  summary          : {run_dir / 'agentic_summary.json'}")
+        print(f"  checkpoint       : {payload.get('state_checkpoint', run_dir / 'agentic_state.json')}")
         print()
 
     print(json.dumps(payload, ensure_ascii=False, indent=2))
