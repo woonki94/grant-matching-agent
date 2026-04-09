@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 from typing import Any, Dict, List, Optional
 
 from flask import Flask, Response, request, stream_with_context
@@ -346,6 +347,7 @@ def chat():
     @stream_with_context
     def generate():
         print("chat.start")
+        start_time = time.time()
 
         if not user_message:
             print("chat.request_info.empty_message")
@@ -473,6 +475,7 @@ def chat():
                     "query": user_message,
                     "orchestrator": decision_out,
                     "result": result,
+                    "elapsed_seconds": round(time.time() - start_time, 2),
                 },
             )
             return
@@ -526,6 +529,7 @@ def chat():
                 "query": user_message,
                 "orchestrator": decision_out,
                 "result": decision_out.get("result") or {},
+                "elapsed_seconds": round(time.time() - start_time, 2),
             },
         )
 
@@ -694,6 +698,7 @@ def find_collaborators():
 
     @stream_with_context
     def generate():
+        start_time = time.time()
         if not grant_link and not grant_title:
             yield _sse("request_info", {"type": "missing_grant", "message": "Please provide a grant link or title."})
             return
@@ -748,6 +753,7 @@ def find_collaborators():
         yield _sse("message", {
             "message": "Here are the suggested collaborators.",
             "result": result,
+            "elapsed_seconds": round(time.time() - start_time, 2),
         })
 
     return Response(generate(), mimetype="text/event-stream", headers=_sse_headers())
@@ -765,6 +771,7 @@ def form_team():
 
     @stream_with_context
     def generate():
+        start_time = time.time()
         if not grant_link and not grant_title:
             yield _sse("request_info", {"type": "missing_grant", "message": "Please provide a grant link or title."})
             return
@@ -819,6 +826,7 @@ def form_team():
         yield _sse("message", {
             "message": "Here is the suggested team.",
             "result": result,
+            "elapsed_seconds": round(time.time() - start_time, 2),
         })
 
     return Response(generate(), mimetype="text/event-stream", headers=_sse_headers())
