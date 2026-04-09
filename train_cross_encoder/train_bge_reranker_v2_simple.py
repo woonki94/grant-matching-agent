@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import random
+from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -116,6 +118,38 @@ class PointwiseRow:
     pair_id: str
     source: str
     group_id: str
+    domain_bucket: str
+
+
+def _safe_metric_suffix(value: Any, *, max_len: int = 48) -> str:
+    token = _clean_text(value).lower()
+    if not token:
+        return "unknown"
+    out_chars: List[str] = []
+    prev_us = False
+    for ch in token:
+        if ch.isalnum():
+            out_chars.append(ch)
+            prev_us = False
+        else:
+            if not prev_us:
+                out_chars.append("_")
+                prev_us = True
+    out = "".join(out_chars).strip("_") or "unknown"
+    return out[: int(max_len)]
+
+
+def _stable_hash_token(text: str, *, seed: int) -> str:
+    raw = f"{int(seed)}::{_clean_text(text)}"
+    return hashlib.sha1(raw.encode("utf-8")).hexdigest()
+
+
+def _extract_domain_bucket(item: Dict[str, Any]) -> str:
+    domains = list(item.get("grant_domains") or [])
+    clean = sorted({_clean_text(x).lower() for x in domains if _clean_text(x)})
+    if clean:
+        return clean[0]
+    return "unknown"
 
 
 def load_pointwise_dataset(dataset_jsonl: Path) -> List[PointwiseRow]:
@@ -170,6 +204,7 @@ def load_pointwise_dataset(dataset_jsonl: Path) -> List[PointwiseRow]:
                 pair_id=pair_id + "::pos",
                 source=source,
                 group_id=group_id,
+                domain_bucket=_extract_domain_bucket(item),
             )
             neg_row = PointwiseRow(
                 query=query,
@@ -178,6 +213,7 @@ def load_pointwise_dataset(dataset_jsonl: Path) -> List[PointwiseRow]:
                 pair_id=pair_id + "::neg",
                 source=source,
                 group_id=group_id,
+                domain_bucket=_extract_domain_bucket(item),
             )
 
             if DEDUPE_POINTWISE_ROWS:
@@ -208,31 +244,71 @@ def split_rows(rows: Sequence[PointwiseRow]) -> Tuple[List[PointwiseRow], List[P
         return all_rows, []
 
     group_to_rows: Dict[str, List[PointwiseRow]] = {}
+    group_to_domain: Dict[str, str] = {}
     for r in all_rows:
         gid = _clean_text(r.group_id) or "unknown"
         group_to_rows.setdefault(gid, []).append(r)
+        if gid not in group_to_domain:
+            group_to_domain[gid] = _clean_text(r.domain_bucket) or "unknown"
 
     group_ids = list(group_to_rows.keys())
     if len(group_ids) <= 1:
         # Not enough independent groups to make a leakage-safe split.
         return all_rows, []
 
-    rng = random.Random(SEED)
-    rng.shuffle(group_ids)
-
     target_val_rows = int(round(n_total * VAL_RATIO))
     target_val_rows = max(1, min(n_total - 1, target_val_rows))
+
+    # Domain-balanced deterministic selection.
+    domain_to_groups: Dict[str, List[str]] = {}
+    for gid in group_ids:
+        domain = _clean_text(group_to_domain.get(gid)) or "unknown"
+        domain_to_groups.setdefault(domain, []).append(gid)
+    for domain, gids in domain_to_groups.items():
+        gids.sort(key=lambda x: _stable_hash_token(f"{domain}::{x}", seed=SEED))
+
     selected_val_groups = set()
     cur_val_rows = 0
-    for gid in group_ids:
+
+    # Pass 1: ensure diversity (at most one seed group per domain when possible).
+    for domain in sorted(domain_to_groups.keys()):
+        gids = domain_to_groups.get(domain) or []
+        if len(gids) <= 1:
+            continue
         if cur_val_rows >= target_val_rows:
             break
+        gid = gids[0]
         selected_val_groups.add(gid)
         cur_val_rows += len(group_to_rows.get(gid, []))
 
+    # Pass 2: fill remaining target rows round-robin across domains.
+    domain_order = sorted(domain_to_groups.keys(), key=lambda d: _stable_hash_token(d, seed=SEED))
+    domain_cursor = {d: 0 for d in domain_order}
+    while cur_val_rows < target_val_rows and domain_order:
+        made_progress = False
+        for domain in domain_order:
+            gids = domain_to_groups.get(domain) or []
+            cur_idx = int(domain_cursor.get(domain, 0))
+            while cur_idx < len(gids) and gids[cur_idx] in selected_val_groups:
+                cur_idx += 1
+            domain_cursor[domain] = cur_idx
+            if cur_idx >= len(gids):
+                continue
+            gid = gids[cur_idx]
+            selected_val_groups.add(gid)
+            cur_val_rows += len(group_to_rows.get(gid, []))
+            domain_cursor[domain] = cur_idx + 1
+            made_progress = True
+            if cur_val_rows >= target_val_rows:
+                break
+        if not made_progress:
+            break
+
     if len(selected_val_groups) >= len(group_ids):
         # Guarantee at least one train group.
-        selected_val_groups.remove(group_ids[-1])
+        fallback_gid = sorted(group_ids, key=lambda x: _stable_hash_token(x, seed=SEED))[-1]
+        if fallback_gid in selected_val_groups:
+            selected_val_groups.remove(fallback_gid)
 
     val_rows: List[PointwiseRow] = []
     train_rows: List[PointwiseRow] = []
@@ -246,6 +322,7 @@ def split_rows(rows: Sequence[PointwiseRow]) -> Tuple[List[PointwiseRow], List[P
     if not train_rows or not val_rows:
         return all_rows, []
 
+    rng = random.Random(SEED)
     rng.shuffle(train_rows)
     rng.shuffle(val_rows)
     return train_rows, val_rows
@@ -319,6 +396,8 @@ def run_train(
     train_rows, eval_rows = split_rows(rows)
     if not train_rows:
         raise RuntimeError("Training split is empty.")
+    train_domain_counts = Counter(_safe_metric_suffix(r.domain_bucket) for r in train_rows)
+    eval_domain_counts = Counter(_safe_metric_suffix(r.domain_bucket) for r in eval_rows)
     train_groups = {r.group_id for r in train_rows}
     eval_groups = {r.group_id for r in eval_rows}
     group_overlap = len(train_groups & eval_groups)
@@ -469,6 +548,8 @@ def run_train(
         "train_groups": int(len(train_groups)),
         "eval_groups": int(len(eval_groups)),
         "group_overlap": int(group_overlap),
+        "train_domain_counts": dict(train_domain_counts),
+        "eval_domain_counts": dict(eval_domain_counts),
         "train_loss": float((getattr(train_result, "metrics", {}) or {}).get("train_loss", 0.0)),
         "eval_loss": float((eval_metrics or {}).get("eval_loss", 0.0)) if do_eval else None,
         "wandb_enabled": bool(use_wandb),

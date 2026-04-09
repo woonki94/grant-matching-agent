@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import random
@@ -13,7 +14,6 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
-from langchain_core.prompts import ChatPromptTemplate
 from pydantic import BaseModel, Field
 from sqlalchemy import text
 
@@ -23,7 +23,7 @@ if __package__ is None or __package__ == "":
     if str(project_root) not in sys.path:
         sys.path.insert(0, str(project_root))
 
-from config import get_llm_client, settings
+from config import get_embedding_client, get_llm_client, settings
 from db.db_conn import SessionLocal
 from utils.thread_pool import build_thread_local_getter, parallel_map, resolve_pool_size
 from utils.embedder import embed_texts
@@ -38,42 +38,36 @@ class RankedQueryOut(BaseModel):
     items: List[RankedQueryRow] = Field(default_factory=list)
 
 
-RANK_BATCH_PROMPT = ChatPromptTemplate.from_messages(
-    [
-        (
-            "system",
-            "You are evaluating whether candidate research specializations support a query research specialization.\n"
-            "\n"
-            "Goal:\n"
-            "For each query specialization, rank candidate specializations from MOST supportive to LEAST supportive.\n"
-            "\n"
-            "A candidate is supportive if it:\n"
-            "- directly addresses the research topic\n"
-            "- provides methods or techniques used for the topic\n"
-            "- represents a closely related research direction\n"
-            "\n"
-            "A candidate is less relevant if it:\n"
-            "- is from a different scientific domain\n"
-            "- only shares generic AI/ML terminology\n"
-            "- does not meaningfully contribute to the research goal\n"
-            "\n"
-            "Instructions:\n"
-            "- Rank candidates by semantic support for the query specialization.\n"
-            "- Do NOT explain your reasoning.\n"
-            "- Return JSON only.\n"
-            "Output schema:\n"
-            "{{\n"
-            '  "items": [\n'
-            '    {{"q": 1, "ranked": [3,1,2]}}\n'
-            "  ]\n"
-            "}}\n"
-            "Rules:\n"
-            "- Each ranked list must contain every candidate index exactly once.\n"
-            "- Preserve the candidate index space provided in the task.\n"
-            "- Always produce a ranking even if relevance is weak.\n"
-        ),
-        ("human", "Tasks JSON:\n{tasks_json}"),
-    ]
+RANK_BATCH_SYSTEM_PROMPT = (
+    "You are evaluating whether candidate research specializations support a query research specialization.\n"
+    "\n"
+    "Goal:\n"
+    "For each query specialization, rank candidate specializations from MOST supportive to LEAST supportive.\n"
+    "\n"
+    "A candidate is supportive if it:\n"
+    "- directly addresses the research topic\n"
+    "- provides methods or techniques used for the topic\n"
+    "- represents a closely related research direction\n"
+    "\n"
+    "A candidate is less relevant if it:\n"
+    "- is from a different scientific domain\n"
+    "- only shares generic AI/ML terminology\n"
+    "- does not meaningfully contribute to the research goal\n"
+    "\n"
+    "Instructions:\n"
+    "- Rank candidates by semantic support for the query specialization.\n"
+    "- Do NOT explain your reasoning.\n"
+    "- Return JSON only.\n"
+    "Output schema:\n"
+    "{{\n"
+    '  "items": [\n'
+    '    {{"q": 1, "ranked": [3,1,2]}}\n'
+    "  ]\n"
+    "}}\n"
+    "Rules:\n"
+    "- Each ranked list must contain every candidate index exactly once.\n"
+    "- Preserve the candidate index space provided in the task.\n"
+    "- Always produce a ranking even if relevance is weak.\n"
 )
 
 
@@ -93,8 +87,41 @@ class SpecRow:
         return f"{self.source}:{self.owner_id}:{self.spec_node_id}"
 
 
+# Hard-negative focused defaults.
+DEFAULT_TOP_K_CANDIDATES = 2
+DEFAULT_HARD_NEGATIVES_PER_GRANT = 6
+DEFAULT_RANDOM_NEGATIVES_PER_GRANT = 2
+DEFAULT_CANDIDATES_PER_QUERY = 10
+DEFAULT_MAX_PAIRS = 200000
+
+# Teacher label sharpening.
+HARD_NEGATIVE_POS_FLOOR = 0.80
+HARD_NEGATIVE_NEG_CAP = 0.20
+HARD_NEGATIVE_MIN_MARGIN = 0.50
+MINED_FALSE_POSITIVE_POS_FLOOR = 0.90
+MINED_FALSE_POSITIVE_NEG_CAP = 0.10
+MINED_FALSE_POSITIVE_MIN_MARGIN = 0.70
+GENERAL_MIN_MARGIN = 0.15
+
+# Probe-mining.
+DEFAULT_MINED_MAX_ROWS = 30000
+PROBE_NEGATIVES_PER_CASE = 2
+PROBE_POSITIVES_PER_CASE = 2
+
+
 def _clean_text(value: Any) -> str:
     return str(value or "").strip()
+
+
+def _normalize_text_key(value: Any) -> str:
+    return _clean_text(value).lower()
+
+
+def _stable_text_id(value: Any) -> str:
+    text = _clean_text(value)
+    if not text:
+        return "empty"
+    return hashlib.sha1(text.encode("utf-8")).hexdigest()[:16]
 
 
 def _safe_limit(value: Any, *, default: int, minimum: int, maximum: int) -> int:
@@ -124,15 +151,33 @@ def _safe_unit_float(value: Any, *, default: float = 0.0) -> float:
 
 
 def _coerce_vector(value: Any) -> List[float]:
-    if not isinstance(value, (list, tuple)):
-        return []
-    out: List[float] = []
-    for item in value:
+    if isinstance(value, np.ndarray):
         try:
-            out.append(float(item))
+            return [float(x) for x in value.astype(float).tolist()]
         except Exception:
             return []
-    return out
+    if isinstance(value, (list, tuple)):
+        out: List[float] = []
+        for item in value:
+            try:
+                out.append(float(item))
+            except Exception:
+                return []
+        return out
+    if isinstance(value, str):
+        raw = value.strip()
+        if not raw:
+            return []
+        if raw.startswith("[") and raw.endswith("]"):
+            raw = raw[1:-1]
+        try:
+            arr = np.fromstring(raw, sep=",", dtype=np.float32)
+        except Exception:
+            return []
+        if arr.size <= 0:
+            return []
+        return [float(x) for x in arr.tolist()]
+    return []
 
 
 def _coerce_domain_list(values: Iterable[Any]) -> List[str]:
@@ -288,15 +333,163 @@ def _fetch_grant_specs(
     return out
 
 
+def _fetch_faculty_specs_from_embedding_table(
+    *,
+    min_spec_weight: float,
+    limit: int,
+    embedding_model: str,
+) -> List[SpecRow]:
+    sql = text(
+        """
+        WITH limited_faculty AS (
+            SELECT fk.faculty_id
+            FROM faculty_keywords fk
+            WHERE fk.keywords IS NOT NULL
+            ORDER BY fk.faculty_id ASC
+            LIMIT :limit
+        )
+        SELECT
+            fse.faculty_id::text AS owner_id,
+            lower(coalesce(f.email, '')) AS owner_email,
+            fk.keywords AS keywords,
+            fse.section AS section,
+            fse.spec_text AS spec_text,
+            fse.spec_norm AS spec_norm,
+            fse.spec_weight AS spec_weight,
+            fse.spec_vec AS spec_vec
+        FROM faculty_specialization_embedding fse
+        JOIN limited_faculty lf ON lf.faculty_id = fse.faculty_id
+        JOIN faculty f ON f.faculty_id = fse.faculty_id
+        LEFT JOIN faculty_keywords fk ON fk.faculty_id = fse.faculty_id
+        WHERE fse.model = :embedding_model
+          AND COALESCE(fse.spec_weight, 1.0) >= :min_spec_weight
+        ORDER BY fse.faculty_id ASC, fse.id ASC
+        """
+    )
+    out: List[SpecRow] = []
+    with SessionLocal() as sess:
+        rows = sess.execute(
+            sql,
+            {
+                "limit": int(max(1, limit)),
+                "embedding_model": _clean_text(embedding_model),
+                "min_spec_weight": float(max(0.0, min_spec_weight)),
+            },
+        ).mappings().all()
+
+    for row in rows:
+        item = dict(row or {})
+        owner_id = _clean_text(item.get("owner_id"))
+        owner_email = _clean_text(item.get("owner_email")).lower()
+        spec_text = _clean_text(item.get("spec_text"))
+        spec_norm = _clean_text(item.get("spec_norm"))
+        section = _clean_text(item.get("section"))
+        spec_weight = float(item.get("spec_weight") if item.get("spec_weight") is not None else 1.0)
+        embedding = _coerce_vector(item.get("spec_vec"))
+        if not owner_id or not spec_text or not embedding:
+            continue
+        spec_node_id = f"{section}:{spec_norm or _stable_text_id(spec_text)}"
+        keywords = item.get("keywords") or {}
+        domains = _extract_domains(keywords)
+        out.append(
+            SpecRow(
+                source="faculty",
+                owner_id=owner_id,
+                owner_email=owner_email,
+                spec_node_id=spec_node_id,
+                text=spec_text,
+                spec_weight=float(spec_weight),
+                domains=list(domains),
+                embedding=embedding,
+            )
+        )
+    return out
+
+
+def _fetch_grant_specs_from_embedding_table(
+    *,
+    min_spec_weight: float,
+    limit: int,
+    embedding_model: str,
+) -> List[SpecRow]:
+    sql = text(
+        """
+        WITH limited_grants AS (
+            SELECT ok.opportunity_id
+            FROM opportunity_keywords ok
+            WHERE ok.keywords IS NOT NULL
+            ORDER BY ok.opportunity_id ASC
+            LIMIT :limit
+        )
+        SELECT
+            ose.opportunity_id::text AS owner_id,
+            ok.keywords AS keywords,
+            ose.section AS section,
+            ose.spec_text AS spec_text,
+            ose.spec_norm AS spec_norm,
+            ose.spec_weight AS spec_weight,
+            ose.spec_vec AS spec_vec
+        FROM opportunity_specialization_embedding ose
+        JOIN limited_grants lg ON lg.opportunity_id = ose.opportunity_id
+        LEFT JOIN opportunity_keywords ok ON ok.opportunity_id = ose.opportunity_id
+        WHERE ose.model = :embedding_model
+          AND COALESCE(ose.spec_weight, 1.0) >= :min_spec_weight
+        ORDER BY ose.opportunity_id ASC, ose.id ASC
+        """
+    )
+    out: List[SpecRow] = []
+    with SessionLocal() as sess:
+        rows = sess.execute(
+            sql,
+            {
+                "limit": int(max(1, limit)),
+                "embedding_model": _clean_text(embedding_model),
+                "min_spec_weight": float(max(0.0, min_spec_weight)),
+            },
+        ).mappings().all()
+
+    for row in rows:
+        item = dict(row or {})
+        owner_id = _clean_text(item.get("owner_id"))
+        spec_text = _clean_text(item.get("spec_text"))
+        spec_norm = _clean_text(item.get("spec_norm"))
+        section = _clean_text(item.get("section"))
+        spec_weight = float(item.get("spec_weight") if item.get("spec_weight") is not None else 1.0)
+        embedding = _coerce_vector(item.get("spec_vec"))
+        if not owner_id or not spec_text or not embedding:
+            continue
+        spec_node_id = f"{section}:{spec_norm or _stable_text_id(spec_text)}"
+        keywords = item.get("keywords") or {}
+        domains = _extract_domains(keywords)
+        out.append(
+            SpecRow(
+                source="grant",
+                owner_id=owner_id,
+                owner_email="",
+                spec_node_id=spec_node_id,
+                text=spec_text,
+                spec_weight=float(spec_weight),
+                domains=list(domains),
+                embedding=embedding,
+            )
+        )
+    return out
+
+
 def _embed_spec_rows(
     specs: Sequence[SpecRow],
     *,
     batch_size: int,
+    max_workers: int,
 ) -> List[SpecRow]:
     rows = list(specs or [])
     if not rows:
         return []
     safe_batch = _safe_limit(batch_size, default=64, minimum=1, maximum=512)
+    safe_workers = resolve_pool_size(
+        max_workers=max(1, int(max_workers)),
+        task_count=max(1, int((len(rows) + safe_batch - 1) // safe_batch)),
+    )
 
     unique_texts: List[str] = []
     seen = set()
@@ -307,14 +500,27 @@ def _embed_spec_rows(
         seen.add(t)
         unique_texts.append(t)
 
-    by_text: Dict[str, List[float]] = {}
+    chunk_payloads: List[List[str]] = []
     for i in range(0, len(unique_texts), safe_batch):
-        chunk = unique_texts[i: i + safe_batch]
-        vecs = embed_texts(chunk)
+        chunk_payloads.append(unique_texts[i : i + safe_batch])
+
+    get_embedder = build_thread_local_getter(lambda: get_embedding_client().build())
+
+    def _run_chunk(chunk: List[str]) -> List[Tuple[str, List[float]]]:
+        vecs = embed_texts(chunk, embedding_client=get_embedder())
         if vecs.ndim != 2 or vecs.shape[0] != len(chunk):
             raise RuntimeError("Embedding batch returned invalid shape.")
-        for j, t in enumerate(chunk):
-            by_text[t] = [float(x) for x in vecs[j].tolist()]
+        return [(t, [float(x) for x in vecs[j].tolist()]) for j, t in enumerate(chunk)]
+
+    by_text: Dict[str, List[float]] = {}
+    chunk_results = parallel_map(
+        chunk_payloads,
+        max_workers=safe_workers,
+        run_item=_run_chunk,
+    )
+    for pairs in list(chunk_results or []):
+        for t, v in list(pairs or []):
+            by_text[t] = list(v or [])
 
     out: List[SpecRow] = []
     for row in rows:
@@ -344,6 +550,34 @@ def _normalize_rows(vectors: np.ndarray) -> np.ndarray:
     norms = np.linalg.norm(vectors, axis=1, keepdims=True)
     norms = np.where(norms <= 0.0, 1.0, norms)
     return vectors / norms
+
+
+def _resolve_candidate_mix(
+    *,
+    top_k: int,
+    hard_neg_per_query: int,
+    random_neg_per_query: int,
+    candidates_per_query: int,
+) -> Dict[str, int]:
+    safe_top_k = _safe_limit(top_k, default=DEFAULT_TOP_K_CANDIDATES, minimum=1, maximum=64)
+    safe_hard = _safe_limit(hard_neg_per_query, default=DEFAULT_HARD_NEGATIVES_PER_GRANT, minimum=0, maximum=128)
+    safe_easy = _safe_limit(random_neg_per_query, default=DEFAULT_RANDOM_NEGATIVES_PER_GRANT, minimum=0, maximum=32)
+    safe_total = _safe_limit(candidates_per_query, default=DEFAULT_CANDIDATES_PER_QUERY, minimum=2, maximum=256)
+
+    # Enforce hard-negative-heavy composition:
+    # 2 positives : 4-6 hard negatives : 1-2 easy negatives.
+    # We generalize from top_k while preserving the hard-negative emphasis.
+    min_hard = max(4, safe_top_k * 2)
+    safe_hard = max(safe_hard, min_hard)
+    safe_easy = min(max(1, safe_easy), 2)
+    safe_total = max(safe_total, safe_top_k + safe_hard + safe_easy)
+
+    return {
+        "top_k": int(safe_top_k),
+        "hard_neg_per_query": int(safe_hard),
+        "easy_neg_per_query": int(safe_easy),
+        "candidates_per_query": int(safe_total),
+    }
 
 
 def _generate_query_candidate_sets(
@@ -376,13 +610,14 @@ def _generate_query_candidate_sets(
         hard_idx = hard_pool[: min(len(hard_pool), int(max(0, hard_neg_per_query)))]
 
         selected = list(dict.fromkeys(top_idx + hard_idx))
-        remaining = [int(x) for x in ordered if int(x) not in set(selected)]
-        random_idx: List[int] = []
+        selected_set = set(selected)
+        remaining = [int(x) for x in ordered if int(x) not in selected_set]
+        easy_idx: List[int] = []
         if remaining and random_neg_per_query > 0:
             pick_n = min(len(remaining), int(random_neg_per_query))
-            random_idx = rng.sample(remaining, pick_n)
+            easy_idx = rng.sample(remaining, pick_n)
 
-        combined = list(dict.fromkeys(selected + random_idx))
+        combined = list(dict.fromkeys(selected + easy_idx))
 
         # Ensure at least two candidates, backfill from remaining.
         if len(combined) < 2:
@@ -402,7 +637,7 @@ def _generate_query_candidate_sets(
 
         top_set = set(top_idx)
         hard_set = set(hard_idx)
-        random_set = set(random_idx)
+        easy_set = set(easy_idx)
         candidates: List[Dict[str, Any]] = []
         for local_i, f_idx in enumerate(combined, start=1):
             fac_spec = faculty_specs[int(f_idx)]
@@ -410,8 +645,8 @@ def _generate_query_candidate_sets(
                 ctype = "topk"
             elif int(f_idx) in hard_set:
                 ctype = "hard_negative"
-            elif int(f_idx) in random_set:
-                ctype = "random_negative"
+            elif int(f_idx) in easy_set:
+                ctype = "easy_negative"
             else:
                 ctype = "backfill"
             candidates.append(
@@ -456,8 +691,16 @@ def _downsample_query_sets(
 
 
 def _build_rank_chain(model_id: str):
+    from langchain_core.prompts import ChatPromptTemplate
+
+    rank_batch_prompt = ChatPromptTemplate.from_messages(
+        [
+            ("system", RANK_BATCH_SYSTEM_PROMPT),
+            ("human", "Tasks JSON:\n{tasks_json}"),
+        ]
+    )
     llm = get_llm_client(model_id).build()
-    return RANK_BATCH_PROMPT | llm.with_structured_output(RankedQueryOut)
+    return rank_batch_prompt | llm.with_structured_output(RankedQueryOut)
 
 
 def _sanitize_ranking(
@@ -666,6 +909,42 @@ def _label_query_rankings_with_llm(
     return labeled_queries, meta
 
 
+def _label_query_rankings_with_cosine(
+    *,
+    query_sets: Sequence[Dict[str, Any]],
+) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    labeled: List[Dict[str, Any]] = []
+    for query_row in list(query_sets or []):
+        row = dict(query_row or {})
+        candidates = list(row.get("candidates") or [])
+        ranked = sorted(
+            candidates,
+            key=lambda c: float(c.get("cosine_sim") or 0.0),
+            reverse=True,
+        )
+        ranking = [int(c.get("i") or 0) for c in ranked if int(c.get("i") or 0) > 0]
+        if len(ranking) < 2:
+            continue
+        row["ranking"] = ranking
+        row["label_source"] = "cosine_ranking"
+        labeled.append(row)
+
+    meta = {
+        "queries_total": int(len(list(query_sets or []))),
+        "queries_labeled": int(len(labeled)),
+        "labeler": "cosine_only",
+        "llm_batch_size": 0,
+        "llm_max_workers": 0,
+        "llm_model": "",
+        "llm_calls": 0,
+        "retries_used": 0,
+        "fallback_query_count": 0,
+        "fallback_query_ratio": 0.0,
+        "partial_fallback_query_count": 0,
+    }
+    return labeled, meta
+
+
 def _expand_rankings_to_pairwise_rows(
     *,
     ranked_queries: Sequence[Dict[str, Any]],
@@ -753,6 +1032,327 @@ def _expand_rankings_to_pairwise_rows(
     }
 
 
+def _load_mined_false_positive_rows(
+    *,
+    probes_json_path: str,
+    seed: int,
+    max_rows: int,
+) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    path = Path(_clean_text(probes_json_path)).expanduser().resolve() if _clean_text(probes_json_path) else None
+    if path is None:
+        return [], {
+            "enabled": False,
+            "probes_json_path": "",
+            "probe_cases_seen": 0,
+            "probe_cases_used": 0,
+            "probe_rows_added_before_cap": 0,
+            "probe_rows_added_after_cap": 0,
+        }
+    if not path.exists() or not path.is_file():
+        raise FileNotFoundError(f"Probe-scored JSON file not found: {path}")
+
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as e:
+        raise RuntimeError(f"Failed to parse probes JSON: {path}. error={e}") from e
+
+    cases = []
+    if isinstance(payload, dict):
+        raw_cases = payload.get("cases")
+        if isinstance(raw_cases, list):
+            cases = list(raw_cases)
+        elif isinstance(payload.get("failure_examples_preview"), list):
+            # Allow summary JSON as a fallback input.
+            cases = list(payload.get("failure_examples_preview") or [])
+
+    rng = random.Random(int(seed))
+    pair_rows: List[Dict[str, Any]] = []
+    cases_seen = len(cases)
+    cases_used = 0
+
+    for idx, case_raw in enumerate(cases):
+        case = dict(case_raw or {})
+        query = _clean_text(case.get("query"))
+        if not query:
+            continue
+
+        positives = []
+        for p in list(case.get("positives") or case.get("expected_positives") or []):
+            t = _clean_text(p)
+            if t:
+                positives.append(t)
+        if not positives:
+            continue
+
+        ranked = list(case.get("ranked") or case.get("top_ranked_preview") or [])
+        if not ranked:
+            continue
+
+        negatives: List[Dict[str, Any]] = []
+        for cand_raw in ranked:
+            cand = dict(cand_raw or {})
+            cand_text = _clean_text(cand.get("candidate"))
+            if not cand_text:
+                continue
+            is_pos = int(cand.get("is_positive") or 0)
+            if is_pos == 1:
+                continue
+            negatives.append(
+                {
+                    "candidate": cand_text,
+                    "kind": _clean_text(cand.get("kind")) or "hard_negative",
+                }
+            )
+        if not negatives:
+            continue
+
+        hard_first = sorted(
+            negatives,
+            key=lambda x: (0 if "hard" in _normalize_text_key(x.get("kind")) else 1),
+        )
+        neg_picks = hard_first[: max(1, int(PROBE_NEGATIVES_PER_CASE))]
+        pos_picks = positives[: max(1, int(PROBE_POSITIVES_PER_CASE))]
+        if not neg_picks or not pos_picks:
+            continue
+
+        query_id = f"probe:{_stable_text_id(query)}"
+        for pos_text in pos_picks:
+            for neg in neg_picks:
+                neg_text = _clean_text(neg.get("candidate"))
+                if not neg_text:
+                    continue
+                if _normalize_text_key(pos_text) == _normalize_text_key(neg_text):
+                    continue
+                kind = _clean_text(neg.get("kind")) or "hard_negative"
+                if "hard" not in _normalize_text_key(kind):
+                    kind = "hard_negative"
+                pair_rows.append(
+                    {
+                        "distill_method": "probe_mined_false_positive",
+                        "label": 1,
+                        "query": query,
+                        "positive": pos_text,
+                        "negative": neg_text,
+                        "query_spec_id": query_id,
+                        "grant_id": f"probe_case_{idx}",
+                        "grant_domains": [],
+                        "grant_spec_weight": 1.0,
+                        "positive_spec_id": f"probe_pos:{_stable_text_id(pos_text)}",
+                        "negative_spec_id": f"probe_neg:{_stable_text_id(neg_text)}",
+                        "positive_faculty_id": "",
+                        "negative_faculty_id": "",
+                        "positive_faculty_email": "",
+                        "negative_faculty_email": "",
+                        "positive_domains": [],
+                        "negative_domains": [],
+                        "positive_spec_weight": 1.0,
+                        "negative_spec_weight": 1.0,
+                        "positive_rank": 1,
+                        "negative_rank": 2,
+                        "candidate_count": int(len(ranked)),
+                        "positive_teacher_score": float(MINED_FALSE_POSITIVE_POS_FLOOR),
+                        "negative_teacher_score": float(MINED_FALSE_POSITIVE_NEG_CAP),
+                        "teacher_margin": float(MINED_FALSE_POSITIVE_POS_FLOOR - MINED_FALSE_POSITIVE_NEG_CAP),
+                        "preference_strength": 1.0,
+                        "positive_cosine_sim": 0.0,
+                        "negative_cosine_sim": 0.0,
+                        "positive_candidate_type": "topk",
+                        "negative_candidate_type": str(kind),
+                        "label_source": "mined_false_positive",
+                    }
+                )
+                cases_used += 1
+
+    before_cap = len(pair_rows)
+    safe_max = max(0, int(max_rows))
+    if safe_max > 0 and len(pair_rows) > safe_max:
+        rng.shuffle(pair_rows)
+        pair_rows = pair_rows[:safe_max]
+
+    return pair_rows, {
+        "enabled": True,
+        "probes_json_path": str(path),
+        "probe_cases_seen": int(cases_seen),
+        "probe_cases_used": int(cases_used),
+        "probe_rows_added_before_cap": int(before_cap),
+        "probe_rows_added_after_cap": int(len(pair_rows)),
+    }
+
+
+def _sharpen_teacher_labels(rows: Sequence[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    adjusted_total = 0
+    adjusted_hard = 0
+    adjusted_mined = 0
+
+    for raw in list(rows or []):
+        row = dict(raw or {})
+        old_pos = _safe_unit_float(row.get("positive_teacher_score"), default=1.0)
+        old_neg = _safe_unit_float(row.get("negative_teacher_score"), default=0.0)
+        source = _normalize_text_key(row.get("label_source"))
+        neg_type = _normalize_text_key(row.get("negative_candidate_type"))
+
+        is_mined = "mined_false_positive" in source
+        is_hard = ("hard_negative" in neg_type) or is_mined
+
+        pos = float(old_pos)
+        neg = float(old_neg)
+
+        if is_mined:
+            pos = max(pos, float(MINED_FALSE_POSITIVE_POS_FLOOR))
+            neg = min(neg, float(MINED_FALSE_POSITIVE_NEG_CAP))
+            min_margin = float(MINED_FALSE_POSITIVE_MIN_MARGIN)
+        elif is_hard:
+            pos = max(pos, float(HARD_NEGATIVE_POS_FLOOR))
+            neg = min(neg, float(HARD_NEGATIVE_NEG_CAP))
+            min_margin = float(HARD_NEGATIVE_MIN_MARGIN)
+        else:
+            min_margin = float(GENERAL_MIN_MARGIN)
+
+        if (pos - neg) < min_margin:
+            pos = min(1.0, max(pos, neg + min_margin))
+            if (pos - neg) < min_margin:
+                neg = max(0.0, pos - min_margin)
+        if pos <= neg:
+            pos = min(1.0, neg + 1e-3)
+
+        pos = float(_safe_unit_float(pos, default=1.0))
+        neg = float(_safe_unit_float(neg, default=0.0))
+        margin = float(max(0.0, pos - neg))
+
+        pref = _safe_unit_float(row.get("preference_strength"), default=0.0)
+        if is_mined:
+            pref = max(pref, 0.85)
+        elif is_hard:
+            pref = max(pref, 0.65)
+        pref = max(pref, margin)
+
+        if abs(pos - old_pos) > 1e-12 or abs(neg - old_neg) > 1e-12:
+            adjusted_total += 1
+            if is_hard:
+                adjusted_hard += 1
+            if is_mined:
+                adjusted_mined += 1
+
+        row["positive_teacher_score"] = float(pos)
+        row["negative_teacher_score"] = float(neg)
+        row["teacher_margin"] = float(_safe_unit_float(margin, default=0.0))
+        row["preference_strength"] = float(_safe_unit_float(pref, default=0.0))
+        out.append(row)
+
+    return out, {
+        "teacher_labels_adjusted_total": int(adjusted_total),
+        "teacher_labels_adjusted_hard_negative": int(adjusted_hard),
+        "teacher_labels_adjusted_mined_false_positive": int(adjusted_mined),
+    }
+
+
+def _clean_pair_rows(
+    rows: Sequence[Dict[str, Any]],
+) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    # 1) Drop invalid rows and exact duplicates.
+    invalid_dropped = 0
+    exact_dupe_dropped = 0
+    best_by_key: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
+    best_score: Dict[Tuple[str, str, str], Tuple[float, float, float]] = {}
+
+    for raw in list(rows or []):
+        row = dict(raw or {})
+        query = _clean_text(row.get("query"))
+        pos = _clean_text(row.get("positive"))
+        neg = _clean_text(row.get("negative"))
+        if not query or not pos or not neg:
+            invalid_dropped += 1
+            continue
+        if _normalize_text_key(pos) == _normalize_text_key(neg):
+            invalid_dropped += 1
+            continue
+
+        key = (_normalize_text_key(query), _normalize_text_key(pos), _normalize_text_key(neg))
+        score_key = (
+            float(_safe_unit_float(row.get("teacher_margin"), default=0.0)),
+            float(_safe_unit_float(row.get("preference_strength"), default=0.0)),
+            float(_safe_unit_float(row.get("positive_teacher_score"), default=0.0)),
+        )
+        old_score = best_score.get(key)
+        if old_score is None or score_key > old_score:
+            if old_score is not None:
+                exact_dupe_dropped += 1
+            best_by_key[key] = row
+            best_score[key] = score_key
+        else:
+            exact_dupe_dropped += 1
+
+    deduped = list(best_by_key.values())
+
+    # 2) Resolve contradictory roles for same (query, doc).
+    role_stats: Dict[Tuple[str, str], Dict[str, List[float]]] = {}
+    for row in deduped:
+        qk = _normalize_text_key(row.get("query"))
+        pk = _normalize_text_key(row.get("positive"))
+        nk = _normalize_text_key(row.get("negative"))
+        pos_score = float(_safe_unit_float(row.get("positive_teacher_score"), default=0.0))
+        neg_score = float(_safe_unit_float(row.get("negative_teacher_score"), default=0.0))
+        role_stats.setdefault((qk, pk), {"pos": [], "neg": []})["pos"].append(pos_score)
+        role_stats.setdefault((qk, nk), {"pos": [], "neg": []})["neg"].append(neg_score)
+
+    preferred_role: Dict[Tuple[str, str], str] = {}
+    contradictions = 0
+    for key, stats in role_stats.items():
+        pos_vals = list(stats.get("pos") or [])
+        neg_vals = list(stats.get("neg") or [])
+        if not pos_vals or not neg_vals:
+            continue
+        contradictions += 1
+        mean_pos = float(np.mean(np.asarray(pos_vals, dtype=np.float64)))
+        mean_neg = float(np.mean(np.asarray(neg_vals, dtype=np.float64)))
+        preferred_role[key] = "positive" if mean_pos >= mean_neg else "negative"
+
+    contradiction_dropped = 0
+    cleaned: List[Dict[str, Any]] = []
+    for row in deduped:
+        qk = _normalize_text_key(row.get("query"))
+        pk = (qk, _normalize_text_key(row.get("positive")))
+        nk = (qk, _normalize_text_key(row.get("negative")))
+
+        drop = False
+        if preferred_role.get(pk) == "negative":
+            drop = True
+        if preferred_role.get(nk) == "positive":
+            drop = True
+        if drop:
+            contradiction_dropped += 1
+            continue
+        cleaned.append(row)
+
+    return cleaned, {
+        "invalid_rows_dropped": int(invalid_dropped),
+        "exact_duplicate_rows_dropped": int(exact_dupe_dropped),
+        "contradiction_keys": int(contradictions),
+        "contradiction_rows_dropped": int(contradiction_dropped),
+        "pair_rows_after_cleaning": int(len(cleaned)),
+    }
+
+
+def _cap_rows(
+    rows: Sequence[Dict[str, Any]],
+    *,
+    max_rows: int,
+    seed: int,
+) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    out = list(rows or [])
+    before_cap = len(out)
+    safe_max = max(0, int(max_rows))
+    if safe_max > 0 and len(out) > safe_max:
+        rng = random.Random(int(seed))
+        rng.shuffle(out)
+        out = out[:safe_max]
+    return out, {
+        "pair_rows_before_final_cap": int(before_cap),
+        "pair_rows_after_final_cap": int(len(out)),
+    }
+
+
 def _save_dataset(
     *,
     rows: Sequence[Dict[str, Any]],
@@ -800,35 +1400,72 @@ def build_dataset(
     faculty_limit: int,
     grant_limit: int,
     embed_batch_size: int,
+    embed_max_workers: int,
+    use_stored_spec_embeddings: bool,
+    spec_embedding_model: str,
+    use_llm_ranker: bool,
+    mined_probes_json: str,
+    mined_max_rows: int,
     seed: int,
     output_dir: Path,
     output_prefix: str,
 ) -> Dict[str, Any]:
-    safe_top_k = _safe_limit(top_k_candidates, default=8, minimum=1, maximum=200)
-    safe_hard = _safe_limit(hard_negatives_per_grant, default=4, minimum=0, maximum=200)
-    safe_rand = _safe_limit(random_negatives_per_grant, default=4, minimum=0, maximum=200)
-    safe_candidates_per_query = _safe_limit(candidates_per_query, default=16, minimum=2, maximum=128)
+    mix = _resolve_candidate_mix(
+        top_k=top_k_candidates,
+        hard_neg_per_query=hard_negatives_per_grant,
+        random_neg_per_query=random_negatives_per_grant,
+        candidates_per_query=candidates_per_query,
+    )
+    safe_top_k = int(mix["top_k"])
+    safe_hard = int(mix["hard_neg_per_query"])
+    safe_rand = int(mix["easy_neg_per_query"])
+    safe_candidates_per_query = int(mix["candidates_per_query"])
     safe_max_queries = _safe_limit(max_queries, default=5000, minimum=1, maximum=2_000_000)
-    safe_max_pairs = _safe_limit(max_pairs, default=200000, minimum=1, maximum=5_000_000)
+    safe_max_pairs = _safe_limit(max_pairs, default=DEFAULT_MAX_PAIRS, minimum=0, maximum=5_000_000)
     safe_batch = _safe_limit(llm_batch_size, default=8, minimum=1, maximum=64)
     safe_retries = _safe_limit(llm_max_retries, default=2, minimum=1, maximum=8)
     safe_workers = _safe_limit(llm_max_workers, default=4, minimum=1, maximum=64)
     safe_fac_limit = _safe_limit(faculty_limit, default=200000, minimum=1, maximum=2_000_000)
     safe_grant_limit = _safe_limit(grant_limit, default=200000, minimum=1, maximum=2_000_000)
     safe_embed_batch = _safe_limit(embed_batch_size, default=64, minimum=1, maximum=512)
+    safe_embed_workers = _safe_limit(embed_max_workers, default=4, minimum=1, maximum=64)
+    safe_use_stored_embeddings = bool(use_stored_spec_embeddings)
+    safe_embedding_model = _clean_text(spec_embedding_model) or _clean_text(settings.bedrock_embed_model_id)
+    safe_use_llm_ranker = bool(use_llm_ranker)
+    safe_mined_max_rows = _safe_limit(mined_max_rows, default=DEFAULT_MINED_MAX_ROWS, minimum=0, maximum=2_000_000)
     safe_seed = int(seed)
 
-    faculty_specs_raw = _fetch_faculty_specs(
-        min_spec_weight=faculty_min_spec_weight,
-        limit=safe_fac_limit,
-    )
-    grant_specs_raw = _fetch_grant_specs(
-        min_spec_weight=grant_min_spec_weight,
-        limit=safe_grant_limit,
-    )
+    if safe_use_stored_embeddings:
+        faculty_specs_raw = _fetch_faculty_specs_from_embedding_table(
+            min_spec_weight=faculty_min_spec_weight,
+            limit=safe_fac_limit,
+            embedding_model=safe_embedding_model,
+        )
+        grant_specs_raw = _fetch_grant_specs_from_embedding_table(
+            min_spec_weight=grant_min_spec_weight,
+            limit=safe_grant_limit,
+            embedding_model=safe_embedding_model,
+        )
+    else:
+        faculty_specs_raw = _fetch_faculty_specs(
+            min_spec_weight=faculty_min_spec_weight,
+            limit=safe_fac_limit,
+        )
+        grant_specs_raw = _fetch_grant_specs(
+            min_spec_weight=grant_min_spec_weight,
+            limit=safe_grant_limit,
+        )
 
-    faculty_specs_raw = _embed_spec_rows(faculty_specs_raw, batch_size=safe_embed_batch)
-    grant_specs_raw = _embed_spec_rows(grant_specs_raw, batch_size=safe_embed_batch)
+        faculty_specs_raw = _embed_spec_rows(
+            faculty_specs_raw,
+            batch_size=safe_embed_batch,
+            max_workers=safe_embed_workers,
+        )
+        grant_specs_raw = _embed_spec_rows(
+            grant_specs_raw,
+            batch_size=safe_embed_batch,
+            max_workers=safe_embed_workers,
+        )
 
     common_dim, faculty_specs, grant_specs = _select_common_embedding_dim(faculty_specs_raw, grant_specs_raw)
     if common_dim <= 0 or not faculty_specs or not grant_specs:
@@ -844,6 +1481,8 @@ def build_dataset(
             "common_dims": sorted([int(d) for d in fac_dim_counter if d in grant_dim_counter]),
             "embed_model_id": _clean_text(settings.bedrock_embed_model_id),
             "aws_region": _clean_text(settings.aws_region),
+            "use_stored_spec_embeddings": bool(safe_use_stored_embeddings),
+            "spec_embedding_model": safe_embedding_model,
         }
         raise RuntimeError(
             "No shared embedding dimension found across faculty/grant specialization keywords. "
@@ -861,19 +1500,47 @@ def build_dataset(
     )
     query_sets = _downsample_query_sets(query_sets, max_queries=safe_max_queries, seed=safe_seed)
 
-    ranked_queries, llm_meta = _label_query_rankings_with_llm(
-        query_sets=query_sets,
-        llm_batch_size=safe_batch,
-        model_id=(llm_model or settings.haiku or "").strip(),
-        max_retries=safe_retries,
-        llm_max_workers=safe_workers,
-    )
+    if safe_use_llm_ranker:
+        ranked_queries, llm_meta = _label_query_rankings_with_llm(
+            query_sets=query_sets,
+            llm_batch_size=safe_batch,
+            model_id=(llm_model or settings.haiku or "").strip(),
+            max_retries=safe_retries,
+            llm_max_workers=safe_workers,
+        )
+    else:
+        ranked_queries, llm_meta = _label_query_rankings_with_cosine(
+            query_sets=query_sets,
+        )
 
-    pair_rows, pair_meta = _expand_rankings_to_pairwise_rows(
+    pair_rows_base, pair_meta = _expand_rankings_to_pairwise_rows(
         ranked_queries=ranked_queries,
-        max_pairs=safe_max_pairs,
+        max_pairs=0,
         seed=safe_seed,
     )
+
+    probe_rows, probe_meta = _load_mined_false_positive_rows(
+        probes_json_path=_clean_text(mined_probes_json),
+        seed=safe_seed,
+        max_rows=safe_mined_max_rows,
+    )
+
+    pair_rows_all = list(pair_rows_base) + list(probe_rows)
+    pair_rows_sharp, sharpen_meta = _sharpen_teacher_labels(pair_rows_all)
+    pair_rows_clean, clean_meta = _clean_pair_rows(pair_rows_sharp)
+    pair_rows, cap_meta = _cap_rows(
+        pair_rows_clean,
+        max_rows=safe_max_pairs,
+        seed=safe_seed,
+    )
+    pair_meta = {
+        **dict(pair_meta or {}),
+        "pairs_generated_before_cap": int(len(pair_rows_all)),
+        "pairs_saved_after_cap": int(len(pair_rows)),
+        "pairs_generated_from_rankings": int(len(pair_rows_base)),
+    }
+
+    final_label_source_counts = Counter(_clean_text(x.get("label_source")) for x in pair_rows)
 
     candidate_type_counts = Counter()
     label_source_counts = Counter()
@@ -894,6 +1561,8 @@ def build_dataset(
                 "candidates_per_query": safe_candidates_per_query,
                 "max_queries": safe_max_queries,
                 "max_pairs": safe_max_pairs,
+                "mined_probes_json": _clean_text(mined_probes_json),
+                "mined_max_rows": safe_mined_max_rows,
                 "llm_batch_size": safe_batch,
                 "llm_model": (llm_model or settings.haiku or "").strip(),
                 "llm_max_retries": safe_retries,
@@ -903,6 +1572,10 @@ def build_dataset(
                 "faculty_limit": safe_fac_limit,
                 "grant_limit": safe_grant_limit,
                 "embed_batch_size": safe_embed_batch,
+                "embed_max_workers": safe_embed_workers,
+                "use_stored_spec_embeddings": bool(safe_use_stored_embeddings),
+                "spec_embedding_model": safe_embedding_model,
+                "use_llm_ranker": bool(safe_use_llm_ranker),
                 "seed": safe_seed,
             },
             "counts": {
@@ -915,7 +1588,12 @@ def build_dataset(
                 "queries_ranked": len(ranked_queries),
                 "candidate_type_counts": dict(candidate_type_counts),
                 "query_label_source_counts": dict(label_source_counts),
+                "final_pair_label_source_counts": dict(final_label_source_counts),
                 **pair_meta,
+                **probe_meta,
+                **sharpen_meta,
+                **clean_meta,
+                **cap_meta,
             },
             "llm": llm_meta,
         },
@@ -929,6 +1607,8 @@ def build_dataset(
             "candidates_per_query": safe_candidates_per_query,
             "max_queries": safe_max_queries,
             "max_pairs": safe_max_pairs,
+            "mined_probes_json": _clean_text(mined_probes_json),
+            "mined_max_rows": safe_mined_max_rows,
             "llm_batch_size": safe_batch,
             "llm_model": (llm_model or settings.haiku or "").strip(),
             "llm_max_workers": safe_workers,
@@ -937,6 +1617,10 @@ def build_dataset(
             "faculty_limit": safe_fac_limit,
             "grant_limit": safe_grant_limit,
             "embed_batch_size": safe_embed_batch,
+            "embed_max_workers": safe_embed_workers,
+            "use_stored_spec_embeddings": bool(safe_use_stored_embeddings),
+            "spec_embedding_model": safe_embedding_model,
+            "use_llm_ranker": bool(safe_use_llm_ranker),
             "seed": safe_seed,
         },
         "counts": {
@@ -949,7 +1633,12 @@ def build_dataset(
             "queries_ranked": len(ranked_queries),
             "candidate_type_counts": dict(candidate_type_counts),
             "query_label_source_counts": dict(label_source_counts),
+            "final_pair_label_source_counts": dict(final_label_source_counts),
             **pair_meta,
+            **probe_meta,
+            **sharpen_meta,
+            **clean_meta,
+            **cap_meta,
         },
         "llm": llm_meta,
         "output": paths,
@@ -964,12 +1653,12 @@ def _build_parser() -> argparse.ArgumentParser:
             "using Grant specs as queries and Faculty specs as candidate docs."
         )
     )
-    parser.add_argument("--top-k-candidates", type=int, default=8, help="Top cosine candidates per query.")
-    parser.add_argument("--hard-negatives-per-grant", type=int, default=10, help="Hard negatives per query.")
-    parser.add_argument("--random-negatives-per-grant", type=int, default=10, help="Random negatives per query.")
-    parser.add_argument("--candidates-per-query", type=int, default=20, help="Total candidates fed to ranker per query.")
+    parser.add_argument("--top-k-candidates", type=int, default=DEFAULT_TOP_K_CANDIDATES, help="Top cosine candidates per query (positive-heavy pool).")
+    parser.add_argument("--hard-negatives-per-grant", type=int, default=DEFAULT_HARD_NEGATIVES_PER_GRANT, help="Hard negatives per query.")
+    parser.add_argument("--random-negatives-per-grant", type=int, default=DEFAULT_RANDOM_NEGATIVES_PER_GRANT, help="Easy/random negatives per query (kept small).")
+    parser.add_argument("--candidates-per-query", type=int, default=DEFAULT_CANDIDATES_PER_QUERY, help="Total candidates fed to ranker per query.")
     parser.add_argument("--max-queries", type=int, default=5000, help="Max queries (grant specs) to label.")
-    parser.add_argument("--max-pairs", type=int, default=200000, help="Max pairwise preference rows to save.")
+    parser.add_argument("--max-pairs", type=int, default=DEFAULT_MAX_PAIRS, help="Max pairwise preference rows to save (0 = all).")
     parser.add_argument("--llm-batch-size", type=int, default=8, help="Queries per LLM ranking call.")
     parser.add_argument("--llm-model", type=str, default=(settings.haiku or "").strip(), help="Bedrock model id for ranking labels.")
     parser.add_argument("--llm-max-retries", type=int, default=2, help="Retries per LLM batch.")
@@ -979,6 +1668,35 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--faculty-limit", type=int, default=200000, help="Max faculty keyword rows to fetch from Postgres.")
     parser.add_argument("--grant-limit", type=int, default=200000, help="Max grant/opportunity keyword rows to fetch from Postgres.")
     parser.add_argument("--embed-batch-size", type=int, default=64, help="Specialization text embedding batch size.")
+    parser.add_argument("--embed-max-workers", type=int, default=4, help="Parallel workers for embedding batches.")
+    parser.add_argument(
+        "--use-stored-spec-embeddings",
+        action="store_true",
+        help="Use precomputed rows from faculty_specialization_embedding/opportunity_specialization_embedding tables.",
+    )
+    parser.add_argument(
+        "--spec-embedding-model",
+        type=str,
+        default=(settings.bedrock_embed_model_id or "").strip(),
+        help="Embedding model id filter when --use-stored-spec-embeddings is enabled.",
+    )
+    parser.add_argument(
+        "--no-llm-rank",
+        action="store_true",
+        help="Disable LLM ranking labels and use cosine-only ranking labels.",
+    )
+    parser.add_argument(
+        "--mined-probes-json",
+        type=str,
+        default="",
+        help="Optional path to probes_scored.json to mine false positives back into training rows.",
+    )
+    parser.add_argument(
+        "--mined-max-rows",
+        type=int,
+        default=DEFAULT_MINED_MAX_ROWS,
+        help="Cap mined probe rows added to dataset (0 = all).",
+    )
     parser.add_argument("--seed", type=int, default=42, help="Random seed.")
     parser.add_argument("--output-dir", type=str, default=str(default_output_dir), help="Output directory for dataset files.")
     parser.add_argument("--output-prefix", type=str, default="spec_pair_rankdistill_train", help="Output file prefix.")
@@ -1004,6 +1722,12 @@ def main() -> int:
         faculty_limit=int(args.faculty_limit),
         grant_limit=int(args.grant_limit),
         embed_batch_size=int(args.embed_batch_size),
+        embed_max_workers=int(args.embed_max_workers),
+        use_stored_spec_embeddings=bool(args.use_stored_spec_embeddings),
+        spec_embedding_model=_clean_text(args.spec_embedding_model),
+        use_llm_ranker=not bool(args.no_llm_rank),
+        mined_probes_json=_clean_text(args.mined_probes_json),
+        mined_max_rows=int(args.mined_max_rows),
         seed=int(args.seed),
         output_dir=Path(_clean_text(args.output_dir)),
         output_prefix=_clean_text(args.output_prefix) or "spec_pair_rankdistill_train",
