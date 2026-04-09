@@ -390,3 +390,37 @@ class MatchDAO:
             )
             updated += 1
         return updated
+
+    def get_justification(self, *, faculty_id: int, opportunity_id: str) -> str:
+        """Return cached justification text for a faculty×grant pair, or empty string."""
+        from db.models.match_result import MatchResult
+        row = (
+            self.session.query(MatchResult.justification)
+            .filter(
+                MatchResult.faculty_id == int(faculty_id),
+                MatchResult.grant_id == str(opportunity_id),
+            )
+            .first()
+        )
+        if row is None:
+            return ""
+        return str(row.justification or "")
+
+    def save_justification(self, *, faculty_id: int, opportunity_id: str, justification: str) -> None:
+        """Write justification text to the match_results row for a faculty×grant pair."""
+        from sqlalchemy import text
+        self.session.execute(
+            text(
+                """
+                UPDATE match_results
+                SET justification = :justification
+                WHERE faculty_id = :faculty_id
+                  AND grant_id   = :grant_id
+                """
+            ),
+            {
+                "faculty_id": int(faculty_id),
+                "grant_id": str(opportunity_id),
+                "justification": str(justification),
+            },
+        )

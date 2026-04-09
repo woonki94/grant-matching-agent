@@ -8,10 +8,12 @@ from typing import Any, Dict, List, Optional, Tuple
 from config import get_llm_client, settings
 from dao.faculty_dao import FacultyDAO
 from dao.match_dao import MatchDAO
+from dao.opportunity_dao import OpportunityDAO
 from db.db_conn import SessionLocal
 from db.models.faculty import Faculty
-from dto.llm_response_dto import GrantExplanationOut
+from dto.llm_response_dto import GrantBriefOut, GrantExplanationOut
 from services.context_retrieval.context_generator import ContextGenerator
+from services.prompts.group_match_prompt import GRANT_BRIEF_PROMPT
 from services.prompts.justification_prompts import (
     FACULTY_RECS_PROMPT,
     GRANT_EXPLANATION_PROMPT,
@@ -84,6 +86,13 @@ class SingleJustificationGenerator:
         return GRANT_EXPLANATION_PROMPT | llm.with_structured_output(GrantExplanationOut)
 
     @staticmethod
+    def _build_grant_brief_chain():
+        """Build the LLM chain used for grant brief (3-5 sentence) generation."""
+        model_id = (settings.haiku or settings.sonnet or settings.opus or "").strip()
+        llm = get_llm_client(model_id=model_id).build()
+        return GRANT_BRIEF_PROMPT | llm.with_structured_output(GrantBriefOut)
+
+    @staticmethod
     def _build_final_justification_chain():
         """Build the free-form LLM chain for final one-match justification writing."""
         model_id = (settings.sonnet or settings.opus or settings.haiku or "").strip()
@@ -96,15 +105,25 @@ class SingleJustificationGenerator:
         opportunity_id: str,
         preview_chars: int = 50_000,
     ) -> Dict[str, Any]:
-        """Generate one grant explanation from grant-context payload only."""
-        logger.info(
-            "JUSTIFICATION_STEP grant_explanation_start opportunity_id=%s",
-            str(opportunity_id),
-        )
+        """Return grant explanation — from DB cache if available, otherwise generate via LLM and cache."""
+        oid = str(opportunity_id)
+
+        # Cache hit: return stored explanation without an LLM call.
+        with SessionLocal() as sess:
+            kw_row = OpportunityDAO(sess).get_opportunity_keyword(oid)
+            cached = self._norm(getattr(kw_row, "grant_explanation", None) or "")
+            if cached:
+                logger.info(
+                    "JUSTIFICATION_STEP grant_explanation_cache_hit opportunity_id=%s", oid
+                )
+                return {"grant_context": {}, "grant_explanation": cached}
+
+        # Cache miss: generate via LLM, persist, and return.
+        logger.info("JUSTIFICATION_STEP grant_explanation_start opportunity_id=%s", oid)
         with SessionLocal() as sess:
             grant_context = self.context_generator.build_grant_context_only(
                 sess=sess,
-                opportunity_id=str(opportunity_id),
+                opportunity_id=oid,
                 preview_chars=int(preview_chars),
             )
 
@@ -117,15 +136,54 @@ class SingleJustificationGenerator:
             explanation = self._norm(out.get("grant_explanation"))
         else:
             explanation = self._norm(getattr(out, "grant_explanation", None) or str(out or ""))
+
+        if explanation:
+            with SessionLocal() as sess:
+                dao = OpportunityDAO(sess)
+                dao.save_grant_explanation(opportunity_id=oid, explanation=explanation)
+                sess.commit()
+
         logger.info(
             "JUSTIFICATION_STEP grant_explanation_done opportunity_id=%s chars=%s",
-            str(opportunity_id),
-            len(self._norm(explanation)),
+            oid,
+            len(explanation),
         )
         return {
             "grant_context": grant_context,
             "grant_explanation": explanation,
         }
+
+    def _generate_grant_brief(self, *, opportunity_id: str) -> str:
+        """Return grant brief (3-5 sentences) — from DB cache if available, otherwise generate via LLM and cache."""
+        oid = str(opportunity_id)
+
+        with SessionLocal() as sess:
+            kw_row = OpportunityDAO(sess).get_opportunity_keyword(oid)
+            cached = self._norm(getattr(kw_row, "grant_brief", None) or "")
+            if cached:
+                logger.info("JUSTIFICATION_STEP grant_brief_cache_hit opportunity_id=%s", oid)
+                return cached
+
+        logger.info("JUSTIFICATION_STEP grant_brief_start opportunity_id=%s", oid)
+        with SessionLocal() as sess:
+            grant_context = self.context_generator.build_grant_context_only(
+                sess=sess,
+                opportunity_id=oid,
+                preview_chars=50_000,
+            )
+
+        chain = self._build_grant_brief_chain()
+        out = chain.invoke({"input_json": json.dumps({"grant_context": dict(grant_context or {})}, ensure_ascii=False)})
+        brief = self._norm(getattr(out, "grant_quick_explanation", None) or "")
+
+        if brief:
+            with SessionLocal() as sess:
+                dao = OpportunityDAO(sess)
+                dao.save_grant_brief(opportunity_id=oid, brief=brief)
+                sess.commit()
+
+        logger.info("JUSTIFICATION_STEP grant_brief_done opportunity_id=%s chars=%s", oid, len(brief))
+        return brief
 
     def _load_top_grants_for_faculty(
         self,
@@ -408,9 +466,11 @@ class SingleJustificationGenerator:
         justifications_by_id: Dict[str, str] = {}
         with SessionLocal() as sess:
             fdao = FacultyDAO(sess)
+            mdao = MatchDAO(sess)
             fac = fdao.get_with_relations_by_email(email_norm)
             if not fac:
                 raise ValueError(f"No faculty found with email: {email_norm}")
+            faculty_id = int(fac.faculty_id)
 
             source_payload = self.context_generator.build_faculty_recommendation_source_linked_payload(
                 sess=sess,
@@ -425,6 +485,17 @@ class SingleJustificationGenerator:
             }
             jobs: List[Dict[str, Any]] = []
             for oid, domain_score, llm_score in top_rows:
+                # Cache hit: skip LLM call entirely.
+                cached_justification = mdao.get_justification(
+                    faculty_id=faculty_id, opportunity_id=oid
+                )
+                if cached_justification:
+                    logger.info(
+                        "JUSTIFICATION_STEP final_justification_cache_hit opportunity_id=%s", oid
+                    )
+                    justifications_by_id[oid] = cached_justification
+                    continue
+
                 one_match_payload = dict(opp_payload_by_id.get(oid) or by_id.get(oid) or {})
                 if not one_match_payload:
                     logger.info(
@@ -441,6 +512,7 @@ class SingleJustificationGenerator:
                 jobs.append(
                     {
                         "opportunity_id": oid,
+                        "faculty_id": faculty_id,
                         "context_text": self._sanitize_context_text_for_final_llm(one_match_text),
                         "payload": one_match_payload,
                     }
@@ -460,6 +532,7 @@ class SingleJustificationGenerator:
 
             def _run_job(job: Dict[str, Any]) -> Dict[str, Any]:
                 oid = self._norm(job.get("opportunity_id"))
+                fid = int(job.get("faculty_id"))
                 logger.info(
                     "JUSTIFICATION_STEP final_justification_one_match_start opportunity_id=%s",
                     oid,
@@ -471,10 +544,17 @@ class SingleJustificationGenerator:
                     opportunity_id=oid,
                 )
                 jtext = self._sanitize_final_justification_text(parsed.get("justification"))
-                return {
-                    "opportunity_id": oid,
-                    "justification": self._norm(jtext),
-                }
+                jtext = self._norm(jtext)
+
+                if jtext:
+                    with SessionLocal() as _sess:
+                        _mdao = MatchDAO(_sess)
+                        _mdao.save_justification(
+                            faculty_id=fid, opportunity_id=oid, justification=jtext
+                        )
+                        _sess.commit()
+
+                return {"opportunity_id": oid, "justification": jtext}
 
             def _on_job_error(_index: int, job: Dict[str, Any], exc: Exception) -> Dict[str, Any]:
                 oid = self._norm((job or {}).get("opportunity_id"))
