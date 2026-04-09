@@ -185,6 +185,8 @@ class OpportunityKeyword(Base):
     )
     raw_json = Column(JSONB)
     source = Column(String, nullable=False, default="gpt-5")
+    grant_explanation = Column(Text, nullable=True)
+    grant_brief = Column(Text, nullable=True)
 
     opportunity = relationship("Opportunity", back_populates="keyword")
 

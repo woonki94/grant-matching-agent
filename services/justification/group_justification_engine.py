@@ -140,20 +140,30 @@ class GroupJustificationEngine:
 
         team_block = list(team_role_input.get("team_match_rows") or [])
 
+        # Check grant_brief cache — skip Haiku call if already stored.
+        cached_brief: Optional[str] = None
+        if grant_id:
+            kw_row = self.odao.get_opportunity_keyword(str(grant_id))
+            cached_brief = self._norm(getattr(kw_row, "grant_brief", None) or "")
+
         try:
-            grant_brief_chain = self._build_grant_brief_chain()
             team_role_chain = self._build_team_role_chain()
             why_working_chain = self._build_why_working_chain()
             why_not_working_chain = self._build_why_not_working_chain()
             recommender_chain = self._build_recommender_chain()
 
             grant_brief_input = dict(stage_inputs.get("grant_brief_input") or {})
-            section_jobs: List[Tuple[str, Any, Dict[str, str]]] = [
-                (
-                    "grant_brief",
-                    grant_brief_chain,
-                    {"input_json": self._safe_json(grant_brief_input)},
-                ),
+            section_jobs: List[Tuple[str, Any, Dict[str, str]]] = []
+            if not cached_brief:
+                grant_brief_chain = self._build_grant_brief_chain()
+                section_jobs.append(
+                    (
+                        "grant_brief",
+                        grant_brief_chain,
+                        {"input_json": self._safe_json(grant_brief_input)},
+                    )
+                )
+            section_jobs += [
                 (
                     "team_roles",
                     team_role_chain,
@@ -180,7 +190,20 @@ class GroupJustificationEngine:
                 )
             }
 
-            grant_brief: GrantBriefOut = section_outputs["grant_brief"]
+            if cached_brief:
+                grant_brief = GrantBriefOut(grant_quick_explanation=cached_brief)
+                logger.info("GROUP_JUSTIFICATION grant_brief_cache_hit opportunity_id=%s", grant_id)
+            else:
+                grant_brief = section_outputs["grant_brief"]
+                # Persist for future requests.
+                brief_text = self._norm(getattr(grant_brief, "grant_quick_explanation", "") or "")
+                if brief_text and grant_id:
+                    try:
+                        self.odao.save_grant_brief(opportunity_id=str(grant_id), brief=brief_text)
+                        self.odao.session.commit()
+                    except Exception:
+                        logger.warning("Failed to cache grant_brief for opportunity_id=%s", grant_id)
+
             team_roles: TeamRoleOut = section_outputs["team_roles"]
             why_working: WhyWorkingOut = section_outputs["why_working"]
             why_not: WhyNotWorkingOut = section_outputs["why_not_working"]
