@@ -1052,6 +1052,7 @@ class MatchingExecutionAgent:
             f = list(payload.get("faculty_ids") or [])
             w = dict(payload.get("requirements") or {"application": {}, "research": {}})
             c = dict(payload.get("coverage") or {})
+            l = dict(payload.get("llm_scores") or {})
 
             # Ensure every existing member is represented (add zero-coverage if absent)
             for fid in existing_ids:
@@ -1080,6 +1081,7 @@ class MatchingExecutionAgent:
                 K=K,
                 required_faculty_ids=existing_ids,
                 num_candidates=1,
+                llm_scores=l,
             )
 
             team_score = round(
@@ -1218,6 +1220,7 @@ class MatchingExecutionAgent:
             f = list(payload.get("faculty_ids") or [])
             w = dict(payload.get("requirements") or {"application": {}, "research": {}})
             c = dict(payload.get("coverage") or {})
+            l = dict(payload.get("llm_scores") or {})
 
             for fid in existing_ids:
                 if fid not in c:
@@ -1242,6 +1245,7 @@ class MatchingExecutionAgent:
                 K=K,
                 required_faculty_ids=existing_ids,
                 num_candidates=1,
+                llm_scores=l,
             )
 
             team_score = round(
