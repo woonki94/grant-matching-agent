@@ -4,6 +4,7 @@ import argparse
 import hashlib
 import inspect
 import json
+import os
 import random
 import shutil
 import sys
@@ -47,6 +48,14 @@ DEFAULT_GATE_FP_MAX = 0.25
 DEFAULT_GATE_MARGIN_MIN = 0.10
 DEFAULT_LLM_EVAL_CASES = 40
 
+WANDB_REPORT_TARGET = "wandb"
+WANDB_ENV_WATCH = "WANDB_WATCH"
+WANDB_WATCH_DISABLED = "false"
+WANDB_ENV_API_KEY = "WANDB_API_KEY"
+WANDB_ENV_PROJECT = "WANDB_PROJECT"
+WANDB_ENV_ENTITY = "WANDB_ENTITY"
+WANDB_API_KEY_MIN_LEN = 30
+
 
 @dataclass
 class TripletRow:
@@ -70,6 +79,32 @@ def _default_llm_eval_model() -> str:
         return _clean_text(getattr(settings, "haiku", ""))
     except Exception:
         return ""
+
+
+def _load_selected_env_from_file(env_path: Path, keys: Sequence[str]) -> Dict[str, str]:
+    wanted = set(str(k) for k in list(keys or []))
+    if not wanted:
+        return {}
+    if not env_path.exists() or not env_path.is_file():
+        return {}
+    out: Dict[str, str] = {}
+    try:
+        raw_lines = env_path.read_text(encoding="utf-8").splitlines()
+    except Exception:
+        return {}
+    for raw in raw_lines:
+        line = str(raw or "").strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        k = _clean_text(key)
+        if k not in wanted:
+            continue
+        v = str(value).strip()
+        if len(v) >= 2 and ((v[0] == v[-1] == '"') or (v[0] == v[-1] == "'")):
+            v = v[1:-1]
+        out[k] = v
+    return out
 
 
 def _clean_text(value: Any) -> str:
@@ -718,6 +753,7 @@ def train_one_round(
     margin_weight: float,
     pointwise_weight: float,
     margin_value: float,
+    use_wandb: bool,
 ) -> Dict[str, Any]:
     try:
         import torch
@@ -763,7 +799,7 @@ def train_one_round(
         "save_total_limit": _safe_limit(save_total_limit, default=DEFAULT_SAVE_TOTAL_LIMIT, minimum=1, maximum=100),
         "dataloader_num_workers": _safe_limit(num_workers, default=0, minimum=0, maximum=64),
         "dataloader_pin_memory": False,
-        "report_to": [],
+        "report_to": [WANDB_REPORT_TARGET] if bool(use_wandb) else [],
         "remove_unused_columns": False,
         "seed": int(seed),
         "fp16": bool(fp16 and use_cuda_device),
@@ -808,6 +844,7 @@ def train_one_round(
         "device": str(getattr(trainer.args, "device", "")),
         "cuda_available": bool(cuda_available),
         "mps_available": bool(mps_available),
+        "wandb_enabled": bool(use_wandb),
     }
 
 
@@ -885,6 +922,60 @@ def run_finetune(args) -> Dict[str, Any]:
     if not val_rows:
         raise RuntimeError("Validation split is empty after query-group split. Increase dataset size or val_ratio.")
 
+    wandb_enabled = bool(args.wandb)
+    wandb = None
+    if wandb_enabled:
+        env_file = Path(__file__).resolve().parents[1] / ".env"
+        loaded_env = _load_selected_env_from_file(
+            env_file,
+            keys=[WANDB_ENV_API_KEY, WANDB_ENV_PROJECT, WANDB_ENV_ENTITY],
+        )
+        for k, v in loaded_env.items():
+            os.environ.setdefault(k, v)
+
+        api_key = _clean_text(os.getenv(WANDB_ENV_API_KEY))
+        if not api_key:
+            raise RuntimeError(
+                "W&B logging requested but WANDB_API_KEY is not set. "
+                f"Set it in shell env or in {env_file}."
+            )
+        if len(api_key) < int(WANDB_API_KEY_MIN_LEN):
+            raise RuntimeError(
+                "W&B logging requested but WANDB_API_KEY looks too short "
+                f"(len={len(api_key)}). Please paste the full API key."
+            )
+
+        try:
+            import wandb as _wandb  # type: ignore
+        except Exception as e:
+            raise RuntimeError("W&B requested but package not installed. Run: pip install wandb") from e
+
+        os.environ.setdefault(WANDB_ENV_WATCH, WANDB_WATCH_DISABLED)
+        run_name = _clean_text(args.wandb_run_name) or f"finetune-cross-encoder-{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}"
+        _wandb.init(
+            project=_clean_text(os.getenv(WANDB_ENV_PROJECT)) or None,
+            entity=_clean_text(os.getenv(WANDB_ENV_ENTITY)) or None,
+            name=run_name,
+            config={
+                "dataset_jsonl": str(dataset_jsonl),
+                "output_dir": str(output_root),
+                "model_name": _clean_text(args.model_name) or DEFAULT_MODEL_NAME,
+                "rounds": int(args.rounds),
+                "epochs": float(args.epochs),
+                "batch_size": int(args.batch_size),
+                "learning_rate": float(args.learning_rate),
+                "pair_weight": float(args.pair_weight),
+                "margin_weight": float(args.margin_weight),
+                "pointwise_weight": float(args.pointwise_weight),
+                "margin_value": float(args.margin_value),
+                "hard_negative_weight": float(args.hard_negative_weight),
+                "gate_hard_negative_top1_rate_max": float(args.gate_hard_negative_top1_rate_max),
+                "gate_false_positive_rate_max": float(args.gate_false_positive_rate_max),
+                "gate_mean_top1_top2_margin_min": float(args.gate_mean_top1_top2_margin_min),
+            },
+        )
+        wandb = _wandb
+
     round_summaries: List[Dict[str, Any]] = []
     mined_rows_all: List[TripletRow] = []
     model_path_for_round = _clean_text(args.model_name) or DEFAULT_MODEL_NAME
@@ -915,6 +1006,7 @@ def run_finetune(args) -> Dict[str, Any]:
             margin_weight=float(args.margin_weight),
             pointwise_weight=float(args.pointwise_weight),
             margin_value=float(args.margin_value),
+            use_wandb=bool(wandb_enabled),
         )
 
         try:
@@ -1013,6 +1105,24 @@ def run_finetune(args) -> Dict[str, Any]:
             "mined_refresh": dict(mine_meta or {}),
             "mined_rows_cumulative": int(len(mined_rows_all)),
         }
+        if wandb is not None and getattr(wandb, "run", None) is not None:
+            wandb.log(
+                {
+                    "round/index": int(round_idx),
+                    "round/train_rows": int(len(train_rows)),
+                    "round/val_rows": int(len(val_rows)),
+                    "round/ranking_top1_accuracy": float(ranking_metrics.get("top1_accuracy") or 0.0),
+                    "round/ranking_false_positive_rate": float(ranking_metrics.get("false_positive_rate") or 0.0),
+                    "round/ranking_hard_negative_top1_rate": float(ranking_metrics.get("hard_negative_top1_rate") or 0.0),
+                    "round/ranking_mean_top1_top2_margin": float(ranking_metrics.get("mean_top1_top2_margin") or 0.0),
+                    "round/ranking_mrr": float(ranking_metrics.get("mrr") or 0.0),
+                    "round/gates_all_pass": int(bool(acceptance_gates.get("all_pass"))),
+                    "round/mined_queries": int(mine_meta.get("queries_mined") or 0),
+                    "round/mined_triplets": int(mine_meta.get("triplets_mined") or 0),
+                    "round/mined_triplets_cumulative": int(len(mined_rows_all)),
+                },
+                step=int(round_idx),
+            )
         (round_dir / "round_summary.json").write_text(
             json.dumps(round_summary, ensure_ascii=False, indent=2),
             encoding="utf-8",
@@ -1038,6 +1148,8 @@ def run_finetune(args) -> Dict[str, Any]:
     summary = {
         "created_at_utc": datetime.now(timezone.utc).isoformat(),
         "dataset_jsonl": str(dataset_jsonl),
+        "wandb_enabled": bool(wandb_enabled),
+        "wandb_run_name": (_clean_text(args.wandb_run_name) if bool(wandb_enabled) else ""),
         "load_stats": dict(load_stats or {}),
         "split": {
             "train_rows_base": int(len(train_rows_base)),
@@ -1053,9 +1165,20 @@ def run_finetune(args) -> Dict[str, Any]:
             "acceptance_gates": dict(promoted.get("acceptance_gates") or {}),
         },
     }
+    if wandb is not None and getattr(wandb, "run", None) is not None:
+        promoted_metrics = dict(summary.get("promoted", {}).get("ranking_metrics") or {})
+        promoted_gates = dict(summary.get("promoted", {}).get("acceptance_gates") or {})
+        wandb.summary["promoted_round"] = int(summary.get("promoted", {}).get("round") or 0)
+        wandb.summary["promoted_top1_accuracy"] = float(promoted_metrics.get("top1_accuracy") or 0.0)
+        wandb.summary["promoted_false_positive_rate"] = float(promoted_metrics.get("false_positive_rate") or 0.0)
+        wandb.summary["promoted_hard_negative_top1_rate"] = float(promoted_metrics.get("hard_negative_top1_rate") or 0.0)
+        wandb.summary["promoted_mean_top1_top2_margin"] = float(promoted_metrics.get("mean_top1_top2_margin") or 0.0)
+        wandb.summary["promoted_gate_pass"] = bool(promoted_gates.get("all_pass"))
     summary_path = output_root / "finetune_summary.json"
     summary_path.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
     summary["summary_path"] = str(summary_path)
+    if wandb is not None and getattr(wandb, "run", None) is not None:
+        wandb.finish()
     return summary
 
 
@@ -1106,6 +1229,8 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--gate-hard-negative-top1-rate-max", type=float, default=DEFAULT_GATE_HARD_NEG_MAX, help="Gate threshold: hard_negative_top1_rate <= x")
     p.add_argument("--gate-false-positive-rate-max", type=float, default=DEFAULT_GATE_FP_MAX, help="Gate threshold: false_positive_rate <= x")
     p.add_argument("--gate-mean-top1-top2-margin-min", type=float, default=DEFAULT_GATE_MARGIN_MIN, help="Gate threshold: mean_top1_top2_margin >= x")
+    p.add_argument("--wandb", action="store_true", help="Enable Weights & Biases logging.")
+    p.add_argument("--wandb-run-name", type=str, default="", help="Optional W&B run name.")
     p.add_argument("--json-only", action="store_true", help="Print JSON summary only.")
     return p
 
