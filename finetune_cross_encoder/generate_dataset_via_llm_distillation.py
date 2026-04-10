@@ -32,9 +32,11 @@ DEFAULT_MAX_PAIRS = 1_000_000
 DEFAULT_CANDIDATE_POOL_SIZE = 24
 DEFAULT_LLM_BATCH_SIZE = 8
 DEFAULT_LLM_MAX_RETRIES = 2
-DEFAULT_LLM_WORKERS = 4
+DEFAULT_LLM_WORKERS = 8
 DEFAULT_FACULTY_LIMIT = 200_000
 DEFAULT_GRANT_LIMIT = 200_000
+LLM_QUERY_MAX_CHARS = 700
+LLM_CANDIDATE_MAX_CHARS = 500
 
 POS_TEACHER_SCORE_TOP1 = 0.95
 POS_TEACHER_SCORE_DECAY = 0.05
@@ -97,6 +99,15 @@ class SpecRow:
 
 def _clean_text(value: Any) -> str:
     return str(value or "").strip()
+
+
+def _compact_text_for_llm(value: Any, *, max_chars: int) -> str:
+    text = " ".join(_clean_text(value).split())
+    if max_chars <= 0:
+        return text
+    if len(text) <= max_chars:
+        return text
+    return text[:max_chars].rstrip()
 
 
 def _normalize_text_key(value: Any) -> str:
@@ -534,14 +545,11 @@ def _label_query_sets_with_llm(
             tasks_payload.append(
                 {
                     "q": int(local_q),
-                    "query": _clean_text(row.get("query")),
-                    "grant_domains": list(row.get("grant_domains") or []),
+                    "query": _compact_text_for_llm(row.get("query"), max_chars=LLM_QUERY_MAX_CHARS),
                     "candidates": [
                         {
                             "i": int(c.get("i") or 0),
-                            "text": _clean_text(c.get("text")),
-                            "cosine_sim": float(c.get("cosine_sim") or 0.0),
-                            "domains": list(c.get("faculty_domains") or []),
+                            "text": _compact_text_for_llm(c.get("text"), max_chars=LLM_CANDIDATE_MAX_CHARS),
                         }
                         for c in list(row.get("candidates") or [])
                     ],
@@ -557,7 +565,9 @@ def _label_query_sets_with_llm(
                 with lock:
                     stats["retries_used"] += 1
             try:
-                out = get_chain().invoke({"tasks_json": json.dumps(tasks_payload, ensure_ascii=False)})
+                out = get_chain().invoke(
+                    {"tasks_json": json.dumps(tasks_payload, ensure_ascii=False, separators=(",", ":"))}
+                )
                 items = list(getattr(out, "items", []) or [])
                 parsed_items = {}
                 for it in items:
@@ -805,6 +815,15 @@ def _expand_to_pair_and_triplet_rows(
                     }
                 )
 
+    pair_rows_before_drop = int(len(pair_rows))
+    triplet_rows_before_drop = int(len(triplet_rows))
+    pair_rows = [row for row in pair_rows if _clean_text(row.get("label_source")) != "cosine_fallback"]
+    triplet_rows = [row for row in triplet_rows if _clean_text(row.get("label_source")) != "cosine_fallback"]
+    dropped_cosine_fallback_pairs = int(pair_rows_before_drop - len(pair_rows))
+    dropped_cosine_fallback_triplets = int(triplet_rows_before_drop - len(triplet_rows))
+
+    pairs_generated_before_cap = int(len(pair_rows))
+    triplets_generated_before_cap = int(len(triplet_rows))
     rng.shuffle(pair_rows)
     rng.shuffle(triplet_rows)
     if safe_max_pairs > 0 and len(pair_rows) > safe_max_pairs:
@@ -813,9 +832,12 @@ def _expand_to_pair_and_triplet_rows(
         triplet_rows = triplet_rows[:safe_max_pairs]
 
     meta = {
-        "pairs_generated_before_cap": int(len(pair_rows)),
+        "pairs_generated_before_cap": int(pairs_generated_before_cap),
+        "triplets_generated_before_cap": int(triplets_generated_before_cap),
         "pairs_saved_after_cap": int(len(pair_rows)),
         "triplets_saved_after_cap": int(len(triplet_rows)),
+        "dropped_cosine_fallback_pairs": int(dropped_cosine_fallback_pairs),
+        "dropped_cosine_fallback_triplets": int(dropped_cosine_fallback_triplets),
         "skipped_missing": int(skipped_missing),
         "skipped_overlap": int(skipped_overlap),
         "skipped_easy_hard": int(skipped_easy_hard),
