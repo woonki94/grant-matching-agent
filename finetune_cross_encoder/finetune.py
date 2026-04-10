@@ -486,6 +486,127 @@ def evaluate_ranking_metrics(
     }
 
 
+def evaluate_validation_loss(
+    *,
+    tokenizer,
+    model,
+    device,
+    rows: Sequence[TripletRow],
+    batch_size: int,
+    max_length: int,
+    pair_weight: float,
+    margin_weight: float,
+    pointwise_weight: float,
+    margin_value: float,
+) -> Dict[str, Any]:
+    import torch
+    import torch.nn.functional as F
+
+    eval_rows = list(rows or [])
+    if not eval_rows:
+        return {
+            "row_count": 0,
+            "val_total_loss": 0.0,
+            "val_pairwise_loss": 0.0,
+            "val_margin_loss": 0.0,
+            "val_pointwise_loss": 0.0,
+            "val_pairwise_term": 0.0,
+            "val_margin_term": 0.0,
+            "val_pointwise_term": 0.0,
+        }
+
+    bs = _safe_limit(batch_size, default=DEFAULT_INFER_BATCH_SIZE, minimum=1, maximum=8192)
+    mx = _safe_limit(max_length, default=DEFAULT_MAX_LENGTH, minimum=32, maximum=4096)
+    pair_w = float(max(0.0, pair_weight))
+    margin_w = float(max(0.0, margin_weight))
+    point_w = float(max(0.0, pointwise_weight))
+    margin_v = float(max(0.0, margin_value))
+
+    model_input_names = set(str(x) for x in list(getattr(tokenizer, "model_input_names", []) or []))
+    if not model_input_names:
+        model_input_names = {"input_ids", "attention_mask", "token_type_ids"}
+
+    def _to_score(logits):
+        if logits.ndim == 2 and logits.shape[-1] > 1:
+            return logits[:, -1].float().view(-1)
+        return logits.squeeze(-1).float().view(-1)
+
+    total_weight = 0.0
+    total_sum = 0.0
+    pair_sum = 0.0
+    margin_sum = 0.0
+    point_sum = 0.0
+
+    model.eval()
+    for s in range(0, len(eval_rows), bs):
+        batch_rows = eval_rows[s : s + bs]
+        q = [_clean_text(x.query) for x in batch_rows]
+        p = [_clean_text(x.positive) for x in batch_rows]
+        n = [_clean_text(x.negative) for x in batch_rows]
+
+        enc_pos = tokenizer(
+            q,
+            p,
+            padding=True,
+            truncation=True,
+            max_length=mx,
+            return_tensors="pt",
+        )
+        enc_neg = tokenizer(
+            q,
+            n,
+            padding=True,
+            truncation=True,
+            max_length=mx,
+            return_tensors="pt",
+        )
+        pos_inputs = {k: v.to(device) for k, v in enc_pos.items() if str(k) in model_input_names}
+        neg_inputs = {k: v.to(device) for k, v in enc_neg.items() if str(k) in model_input_names}
+        sample_w = torch.tensor([float(max(0.0, x.sample_weight)) for x in batch_rows], dtype=torch.float32, device=device)
+        pos_label = torch.tensor([_safe_unit_float(x.pos_label_score, default=1.0) for x in batch_rows], dtype=torch.float32, device=device)
+        neg_label = torch.tensor([_safe_unit_float(x.neg_label_score, default=0.0) for x in batch_rows], dtype=torch.float32, device=device)
+
+        with torch.no_grad():
+            pos_outputs = model(**pos_inputs)
+            neg_outputs = model(**neg_inputs)
+            s_pos = _to_score(pos_outputs.logits)
+            s_neg = _to_score(neg_outputs.logits)
+            delta = s_pos - s_neg
+
+            l_pair = F.softplus(-delta)
+            l_margin = F.relu(margin_v - delta)
+            l_point = 0.5 * ((s_pos - pos_label) ** 2 + (s_neg - neg_label) ** 2)
+
+            per_item = (pair_w * l_pair) + (margin_w * l_margin)
+            if point_w > 0.0:
+                per_item = per_item + (point_w * l_point)
+
+            w_sum = float(sample_w.sum().detach().cpu().item())
+            total_weight += w_sum
+            total_sum += float(torch.sum(sample_w * per_item).detach().cpu().item())
+            pair_sum += float(torch.sum(sample_w * l_pair).detach().cpu().item())
+            margin_sum += float(torch.sum(sample_w * l_margin).detach().cpu().item())
+            point_sum += float(torch.sum(sample_w * l_point).detach().cpu().item())
+
+    denom = max(1e-8, float(total_weight))
+    val_pairwise_loss = float(pair_sum) / denom
+    val_margin_loss = float(margin_sum) / denom
+    val_pointwise_loss = float(point_sum) / denom
+    val_pairwise_term = float(pair_w) * val_pairwise_loss
+    val_margin_term = float(margin_w) * val_margin_loss
+    val_pointwise_term = float(point_w) * val_pointwise_loss
+    return {
+        "row_count": int(len(eval_rows)),
+        "val_total_loss": float(total_sum) / denom,
+        "val_pairwise_loss": val_pairwise_loss,
+        "val_margin_loss": val_margin_loss,
+        "val_pointwise_loss": val_pointwise_loss,
+        "val_pairwise_term": val_pairwise_term,
+        "val_margin_term": val_margin_term,
+        "val_pointwise_term": val_pointwise_term,
+    }
+
+
 def _dedupe_triplets(rows: Sequence[TripletRow]) -> List[TripletRow]:
     out: List[TripletRow] = []
     seen = set()
@@ -1054,6 +1175,18 @@ def run_finetune(args) -> Dict[str, Any]:
             batch_size=int(args.infer_batch_size),
             max_length=int(args.max_length),
         )
+        validation_loss = evaluate_validation_loss(
+            tokenizer=tokenizer,
+            model=model,
+            device=device,
+            rows=val_rows,
+            batch_size=int(args.infer_batch_size),
+            max_length=int(args.max_length),
+            pair_weight=float(args.pair_weight),
+            margin_weight=float(args.margin_weight),
+            pointwise_weight=float(args.pointwise_weight),
+            margin_value=float(args.margin_value),
+        )
 
         llm_eval_summary: Dict[str, Any] = {}
         if int(args.llm_eval_cases) > 0:
@@ -1070,17 +1203,27 @@ def run_finetune(args) -> Dict[str, Any]:
                     "LLM eval requested, but no model id is configured. "
                     "Pass --llm-eval-model explicitly or set BEDROCK_CLAUDE_HAIKU in .env."
                 )
-            llm_eval_summary = run_llm_quality_eval(
-                model_dir=str(round_dir),
-                llm_model=eval_llm_model,
-                num_cases=int(args.llm_eval_cases),
-                output_dir=output_root / "eval_runs",
-                cpu_only=bool(args.cpu_only_eval),
-                seed=int(args.seed) + int(round_idx),
-                gate_hard_negative_top1_rate_max=float(args.gate_hard_negative_top1_rate_max),
-                gate_false_positive_rate_max=float(args.gate_false_positive_rate_max),
-                gate_mean_top1_top2_margin_min=float(args.gate_mean_top1_top2_margin_min),
-            )
+            eval_kwargs = {
+                "model_dir": str(round_dir),
+                "llm_model": eval_llm_model,
+                "num_cases": int(args.llm_eval_cases),
+                "output_dir": output_root / "eval_runs",
+                "cpu_only": bool(args.cpu_only_eval),
+                "seed": int(args.seed) + int(round_idx),
+                "gate_hard_negative_top1_rate_max": float(args.gate_hard_negative_top1_rate_max),
+                "gate_false_positive_rate_max": float(args.gate_false_positive_rate_max),
+                "gate_mean_top1_top2_margin_min": float(args.gate_mean_top1_top2_margin_min),
+            }
+            eval_sig = inspect.signature(run_llm_quality_eval)
+            eval_supported = set(eval_sig.parameters.keys())
+            eval_call_kwargs = {k: v for k, v in eval_kwargs.items() if k in eval_supported}
+            eval_dropped = [k for k in eval_kwargs.keys() if k not in eval_supported]
+            llm_eval_summary = run_llm_quality_eval(**eval_call_kwargs)
+            if eval_dropped:
+                llm_eval_summary["compat_note"] = (
+                    "Evaluator version does not support some optional args; ignored: "
+                    + ", ".join(eval_dropped)
+                )
             acceptance_gates = dict(llm_eval_summary.get("acceptance_gates") or {})
             if not acceptance_gates:
                 acceptance_gates = _gate_result(
@@ -1120,6 +1263,7 @@ def run_finetune(args) -> Dict[str, Any]:
             "val_rows": int(len(val_rows)),
             "train_info": dict(train_info or {}),
             "ranking_metrics": dict(ranking_metrics or {}),
+            "validation_loss": dict(validation_loss or {}),
             "acceptance_gates": dict(acceptance_gates or {}),
             "llm_eval": dict(llm_eval_summary or {}),
             "mined_refresh": dict(mine_meta or {}),
@@ -1136,6 +1280,13 @@ def run_finetune(args) -> Dict[str, Any]:
                     "round/ranking_hard_negative_top1_rate": float(ranking_metrics.get("hard_negative_top1_rate") or 0.0),
                     "round/ranking_mean_top1_top2_margin": float(ranking_metrics.get("mean_top1_top2_margin") or 0.0),
                     "round/ranking_mrr": float(ranking_metrics.get("mrr") or 0.0),
+                    "round/val_total_loss": float(validation_loss.get("val_total_loss") or 0.0),
+                    "round/val_pairwise_loss": float(validation_loss.get("val_pairwise_loss") or 0.0),
+                    "round/val_margin_loss": float(validation_loss.get("val_margin_loss") or 0.0),
+                    "round/val_pointwise_loss": float(validation_loss.get("val_pointwise_loss") or 0.0),
+                    "round/val_pairwise_term": float(validation_loss.get("val_pairwise_term") or 0.0),
+                    "round/val_margin_term": float(validation_loss.get("val_margin_term") or 0.0),
+                    "round/val_pointwise_term": float(validation_loss.get("val_pointwise_term") or 0.0),
                     "round/gates_all_pass": int(bool(acceptance_gates.get("all_pass"))),
                     "round/mined_queries": int(mine_meta.get("queries_mined") or 0),
                     "round/mined_triplets": int(mine_meta.get("triplets_mined") or 0),

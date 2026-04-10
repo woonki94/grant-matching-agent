@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import inspect
 import json
 import sys
 from pathlib import Path
@@ -118,29 +119,39 @@ def main() -> int:
             "Set BEDROCK_CLAUDE_HAIKU in .env or pass --llm-model."
         )
 
-    summary = run_llm_quality_eval(
-        model_dir=str(model_dir),
-        llm_model=llm_model,
-        num_cases=int(args.num_cases),
-        output_dir=Path(_clean_text(args.output_dir)),
-        cpu_only=bool(args.cpu_only),
-        seed=int(args.seed),
-        gate_hard_negative_top1_rate_max=(
+    run_kwargs = {
+        "model_dir": str(model_dir),
+        "llm_model": llm_model,
+        "num_cases": int(args.num_cases),
+        "output_dir": Path(_clean_text(args.output_dir)),
+        "cpu_only": bool(args.cpu_only),
+        "seed": int(args.seed),
+        "gate_hard_negative_top1_rate_max": (
             float(args.gate_hard_negative_top1_rate_max)
             if float(args.gate_hard_negative_top1_rate_max) >= 0.0
             else None
         ),
-        gate_false_positive_rate_max=(
+        "gate_false_positive_rate_max": (
             float(args.gate_false_positive_rate_max)
             if float(args.gate_false_positive_rate_max) >= 0.0
             else None
         ),
-        gate_mean_top1_top2_margin_min=(
+        "gate_mean_top1_top2_margin_min": (
             float(args.gate_mean_top1_top2_margin_min)
             if float(args.gate_mean_top1_top2_margin_min) >= 0.0
             else None
         ),
-    )
+    }
+    sig = inspect.signature(run_llm_quality_eval)
+    supported = set(sig.parameters.keys())
+    call_kwargs = {k: v for k, v in run_kwargs.items() if k in supported}
+    dropped = [k for k in run_kwargs.keys() if k not in supported]
+    summary = run_llm_quality_eval(**call_kwargs)
+    if dropped:
+        summary["compat_note"] = (
+            "Evaluator version does not support some optional args; ignored: "
+            + ", ".join(dropped)
+        )
 
     if not bool(args.json_only):
         metrics = dict(summary.get("metrics") or {})
