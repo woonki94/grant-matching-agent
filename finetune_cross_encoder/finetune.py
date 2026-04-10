@@ -678,13 +678,25 @@ def _setup_training_components(
             self.margin_weight = float(max(0.0, margin_weight))
             self.pointwise_weight = float(max(0.0, pointwise_weight))
             self.margin_value = float(max(0.0, margin_value))
+            model_input_names = list(getattr(tokenizer, "model_input_names", []) or [])
+            if not model_input_names:
+                model_input_names = ["input_ids", "attention_mask", "token_type_ids"]
+            self.model_input_names = set(str(x) for x in model_input_names)
 
         @staticmethod
-        def _extract_prefix_inputs(inputs: Dict[str, Any], prefix: str) -> Dict[str, Any]:
+        def _extract_prefix_inputs(
+            inputs: Dict[str, Any],
+            prefix: str,
+            *,
+            allowed_names: Sequence[str],
+        ) -> Dict[str, Any]:
             out: Dict[str, Any] = {}
+            allowed = set(str(x) for x in list(allowed_names or []))
             for k, v in inputs.items():
                 if k.startswith(prefix):
-                    out[k[len(prefix) :]] = v
+                    model_key = k[len(prefix) :]
+                    if model_key in allowed:
+                        out[model_key] = v
             return out
 
         @staticmethod
@@ -694,8 +706,16 @@ def _setup_training_components(
             return logits.squeeze(-1).float().view(-1)
 
         def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):  # type: ignore[override]
-            pos_inputs = self._extract_prefix_inputs(inputs, "pos_")
-            neg_inputs = self._extract_prefix_inputs(inputs, "neg_")
+            pos_inputs = self._extract_prefix_inputs(
+                inputs,
+                "pos_",
+                allowed_names=self.model_input_names,
+            )
+            neg_inputs = self._extract_prefix_inputs(
+                inputs,
+                "neg_",
+                allowed_names=self.model_input_names,
+            )
             pos_outputs = model(**pos_inputs)
             neg_outputs = model(**neg_inputs)
             s_pos = self._to_score(pos_outputs.logits)
