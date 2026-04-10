@@ -758,7 +758,7 @@ def train_one_round(
     try:
         import torch
         from datasets import Dataset
-        from transformers import TrainingArguments, set_seed
+        from transformers import Trainer, TrainingArguments, set_seed
     except Exception as e:
         raise RuntimeError(
             "Missing training dependencies. Install: pip install torch transformers datasets accelerate"
@@ -819,19 +819,19 @@ def train_one_round(
     ta_kwargs = {k: v for k, v in ta_kwargs.items() if k in ta_params and v is not None}
     training_args = TrainingArguments(**ta_kwargs)
 
-    trainer_sig = inspect.signature(PairwiseMarginTrainer.__init__)
-    trainer_params = set(trainer_sig.parameters.keys())
+    base_trainer_sig = inspect.signature(Trainer.__init__)
+    base_trainer_params = set(base_trainer_sig.parameters.keys())
     trainer_kwargs: Dict[str, Any] = {
         "model": model,
         "args": training_args,
         "train_dataset": train_ds,
         "data_collator": collator,
     }
-    if "tokenizer" in trainer_params:
+    if "tokenizer" in base_trainer_params:
         trainer_kwargs["tokenizer"] = tokenizer
-    elif "processing_class" in trainer_params:
+    elif "processing_class" in base_trainer_params:
         trainer_kwargs["processing_class"] = tokenizer
-    trainer_kwargs = {k: v for k, v in trainer_kwargs.items() if k in trainer_params}
+    trainer_kwargs = {k: v for k, v in trainer_kwargs.items() if k in base_trainer_params}
     trainer = PairwiseMarginTrainer(**trainer_kwargs)
 
     train_result = trainer.train()
