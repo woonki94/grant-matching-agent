@@ -101,12 +101,13 @@ def _load_model(model_dir: Path, device, device_name: str):
 
     tok_last_err: Optional[Exception] = None
     tokenizer = None
+    # Prefer slow tokenizer first to avoid known fast-tokenizer regex incompatibility warnings.
     tok_attempts = (
-        {"use_fast": True, "fix_mistral_regex": True},
         {"use_fast": False, "fix_mistral_regex": True},
+        {"use_fast": True, "fix_mistral_regex": True},
         {"fix_mistral_regex": True},
-        {"use_fast": True},
         {"use_fast": False},
+        {"use_fast": True},
         {},
     )
     for kwargs in tok_attempts:
