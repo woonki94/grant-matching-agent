@@ -479,6 +479,7 @@ def _compute_quality_metrics(scored_cases: Sequence[Dict[str, Any]]) -> Dict[str
             "hard_negative_top1_rate": 0.0,
             "low_confidence_ratio": 0.0,
             "low_margin_ratio": 0.0,
+            "mean_top1_top2_margin": 0.0,
             "low_margin_threshold": float(LOW_MARGIN_THRESHOLD),
             "low_confidence_threshold": float(LOW_CONFIDENCE_THRESHOLD),
         }
@@ -491,6 +492,8 @@ def _compute_quality_metrics(scored_cases: Sequence[Dict[str, Any]]) -> Dict[str
     hard_neg_top1 = 0
     low_conf = 0
     low_margin = 0
+    margin_sum = 0.0
+    margin_count = 0
     recall_hits = {k: 0 for k in TOP_KS}
 
     for case in cases:
@@ -512,10 +515,14 @@ def _compute_quality_metrics(scored_cases: Sequence[Dict[str, Any]]) -> Dict[str
             low_conf += 1
         if len(ranked) >= 2:
             margin = float(ranked[0].get("score") or 0.0) - float(ranked[1].get("score") or 0.0)
+            margin_sum += float(margin)
+            margin_count += 1
             if margin < float(LOW_MARGIN_THRESHOLD):
                 low_margin += 1
         else:
             low_margin += 1
+            margin_sum += 0.0
+            margin_count += 1
 
         first_pos_rank: Optional[int] = None
         for pos, row in enumerate(ranked, start=1):
@@ -546,8 +553,53 @@ def _compute_quality_metrics(scored_cases: Sequence[Dict[str, Any]]) -> Dict[str
         "hard_negative_top1_rate": float(hard_neg_top1) / float(n),
         "low_confidence_ratio": float(low_conf) / float(n),
         "low_margin_ratio": float(low_margin) / float(n),
+        "mean_top1_top2_margin": (float(margin_sum) / float(max(1, margin_count))),
         "low_margin_threshold": float(LOW_MARGIN_THRESHOLD),
         "low_confidence_threshold": float(LOW_CONFIDENCE_THRESHOLD),
+    }
+
+
+def _compute_acceptance_gates(
+    *,
+    metrics: Dict[str, Any],
+    gate_hard_negative_top1_rate_max: Optional[float],
+    gate_false_positive_rate_max: Optional[float],
+    gate_mean_top1_top2_margin_min: Optional[float],
+) -> Dict[str, Any]:
+    m_hard = float(metrics.get("hard_negative_top1_rate") or 0.0)
+    m_fp = float(metrics.get("false_positive_rate") or 0.0)
+    m_margin = float(metrics.get("mean_top1_top2_margin") or 0.0)
+
+    hard_enabled = gate_hard_negative_top1_rate_max is not None
+    fp_enabled = gate_false_positive_rate_max is not None
+    margin_enabled = gate_mean_top1_top2_margin_min is not None
+
+    hard_pass = (not hard_enabled) or (m_hard <= float(gate_hard_negative_top1_rate_max or 0.0))
+    fp_pass = (not fp_enabled) or (m_fp <= float(gate_false_positive_rate_max or 0.0))
+    margin_pass = (not margin_enabled) or (m_margin >= float(gate_mean_top1_top2_margin_min or 0.0))
+    all_pass = bool(hard_pass and fp_pass and margin_pass)
+
+    return {
+        "enabled": bool(hard_enabled or fp_enabled or margin_enabled),
+        "all_pass": bool(all_pass),
+        "hard_negative_top1_rate": {
+            "enabled": bool(hard_enabled),
+            "threshold_max": (float(gate_hard_negative_top1_rate_max) if hard_enabled else None),
+            "actual": float(m_hard),
+            "pass": bool(hard_pass),
+        },
+        "false_positive_rate": {
+            "enabled": bool(fp_enabled),
+            "threshold_max": (float(gate_false_positive_rate_max) if fp_enabled else None),
+            "actual": float(m_fp),
+            "pass": bool(fp_pass),
+        },
+        "mean_top1_top2_margin": {
+            "enabled": bool(margin_enabled),
+            "threshold_min": (float(gate_mean_top1_top2_margin_min) if margin_enabled else None),
+            "actual": float(m_margin),
+            "pass": bool(margin_pass),
+        },
     }
 
 
@@ -681,6 +733,9 @@ def run_llm_quality_eval(
     output_dir: Path,
     cpu_only: bool,
     seed: int,
+    gate_hard_negative_top1_rate_max: Optional[float] = None,
+    gate_false_positive_rate_max: Optional[float] = None,
+    gate_mean_top1_top2_margin_min: Optional[float] = None,
 ) -> Dict[str, Any]:
     ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
     run_dir = output_dir.expanduser().resolve() / f"llm_quality_{ts}"
@@ -702,6 +757,12 @@ def run_llm_quality_eval(
     scored_cases = list(scored.get("scored_cases") or [])
 
     metrics = _compute_quality_metrics(scored_cases)
+    gates = _compute_acceptance_gates(
+        metrics=metrics,
+        gate_hard_negative_top1_rate_max=gate_hard_negative_top1_rate_max,
+        gate_false_positive_rate_max=gate_false_positive_rate_max,
+        gate_mean_top1_top2_margin_min=gate_mean_top1_top2_margin_min,
+    )
     failures = _select_failure_samples(scored_cases, FAILURE_SAMPLE_SIZE)
     review = _llm_quality_review(
         llm_model=llm_model,
@@ -740,6 +801,7 @@ def run_llm_quality_eval(
         "device": scored.get("device"),
         "probe_generation": probe_result.get("meta", {}),
         "metrics": metrics,
+        "acceptance_gates": gates,
         "failure_examples_count": len(failures),
         "failure_examples_preview": failures[: min(5, len(failures))],
         "llm_quality_review": review,
@@ -767,6 +829,24 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output-dir", type=str, default=str(default_out), help="Base output directory for eval artifacts.")
     parser.add_argument("--seed", type=int, default=42, help="Random seed.")
     parser.add_argument("--cpu-only", action="store_true", help="Force CPU even if CUDA/MPS is available.")
+    parser.add_argument(
+        "--gate-hard-negative-top1-rate-max",
+        type=float,
+        default=-1.0,
+        help="Acceptance gate: pass only if hard_negative_top1_rate <= threshold. Negative = disabled.",
+    )
+    parser.add_argument(
+        "--gate-false-positive-rate-max",
+        type=float,
+        default=-1.0,
+        help="Acceptance gate: pass only if false_positive_rate <= threshold. Negative = disabled.",
+    )
+    parser.add_argument(
+        "--gate-mean-top1-top2-margin-min",
+        type=float,
+        default=-1.0,
+        help="Acceptance gate: pass only if mean_top1_top2_margin >= threshold. Negative = disabled.",
+    )
     parser.add_argument("--json-only", action="store_true", help="Print JSON only.")
     return parser
 
@@ -781,6 +861,21 @@ def main() -> int:
         output_dir=Path(_clean_text(args.output_dir)),
         cpu_only=bool(args.cpu_only),
         seed=int(args.seed),
+        gate_hard_negative_top1_rate_max=(
+            float(args.gate_hard_negative_top1_rate_max)
+            if float(args.gate_hard_negative_top1_rate_max) >= 0.0
+            else None
+        ),
+        gate_false_positive_rate_max=(
+            float(args.gate_false_positive_rate_max)
+            if float(args.gate_false_positive_rate_max) >= 0.0
+            else None
+        ),
+        gate_mean_top1_top2_margin_min=(
+            float(args.gate_mean_top1_top2_margin_min)
+            if float(args.gate_mean_top1_top2_margin_min) >= 0.0
+            else None
+        ),
     )
 
     if not bool(args.json_only):
@@ -794,8 +889,12 @@ def main() -> int:
         print(f"  false positive rate     : {metrics.get('false_positive_rate', 0.0):.4f}")
         print(f"  false negative rate@3   : {metrics.get('false_negative_rate_at_3', 0.0):.4f}")
         print(f"  hard negative top1 rate : {metrics.get('hard_negative_top1_rate', 0.0):.4f}")
+        print(f"  mean top1-top2 margin   : {metrics.get('mean_top1_top2_margin', 0.0):.4f}")
         print(f"  low confidence ratio    : {metrics.get('low_confidence_ratio', 0.0):.4f}")
         print(f"  low margin ratio        : {metrics.get('low_margin_ratio', 0.0):.4f}")
+        gate = dict(summary.get("acceptance_gates") or {})
+        if bool(gate.get("enabled")):
+            print(f"  acceptance gates pass   : {bool(gate.get('all_pass'))}")
         print(f"  summary file            : {summary.get('files', {}).get('summary', '')}")
         print()
 

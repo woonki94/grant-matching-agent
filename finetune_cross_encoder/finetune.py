@@ -142,6 +142,51 @@ def _safe_unit_float(value: Any, *, default: float = 0.0) -> float:
     return out
 
 
+def _load_tokenizer_stable(model_name_or_path: str):
+    try:
+        from transformers import AutoConfig, AutoTokenizer
+    except Exception as e:
+        raise RuntimeError(
+            "Missing tokenizer dependencies. Install: pip install transformers sentencepiece tiktoken"
+        ) from e
+
+    target = _clean_text(model_name_or_path)
+    if not target:
+        raise RuntimeError("Tokenizer load target is empty.")
+
+    last_error: Optional[Exception] = None
+    # Prefer slow tokenizer first to avoid broken fast-tokenizer regex patterns.
+    attempts = (
+        {"use_fast": False},
+        {"use_fast": True},
+        {},
+    )
+    for kwargs in attempts:
+        try:
+            return AutoTokenizer.from_pretrained(target, trust_remote_code=True, **kwargs)
+        except Exception as e:
+            last_error = e
+
+    # Fallback: tokenizer from base model id in local config.
+    base_name = ""
+    try:
+        cfg = AutoConfig.from_pretrained(target, trust_remote_code=True, local_files_only=True)
+        base_name = _clean_text(getattr(cfg, "_name_or_path", ""))
+    except Exception:
+        base_name = ""
+    if base_name and base_name != target:
+        for kwargs in attempts:
+            try:
+                return AutoTokenizer.from_pretrained(base_name, trust_remote_code=True, **kwargs)
+            except Exception as e:
+                last_error = e
+
+    raise RuntimeError(
+        "Failed to load a stable tokenizer. "
+        f"target={target}, last_error={last_error}"
+    )
+
+
 def _stable_hash(value: str) -> str:
     return hashlib.sha1(_clean_text(value).encode("utf-8")).hexdigest()[:16]
 
@@ -779,13 +824,13 @@ def _setup_training_components(
     try:
         import torch
         import torch.nn.functional as F
-        from transformers import AutoModelForSequenceClassification, AutoTokenizer, Trainer
+        from transformers import AutoModelForSequenceClassification, Trainer
     except Exception as e:
         raise RuntimeError(
             "Missing training dependencies. Install: pip install torch transformers datasets accelerate"
         ) from e
 
-    tokenizer = AutoTokenizer.from_pretrained(model_name_or_path, trust_remote_code=True)
+    tokenizer = _load_tokenizer_stable(model_name_or_path)
     model = AutoModelForSequenceClassification.from_pretrained(
         model_name_or_path,
         num_labels=1,
@@ -1152,11 +1197,11 @@ def run_finetune(args) -> Dict[str, Any]:
 
         try:
             import torch
-            from transformers import AutoModelForSequenceClassification, AutoTokenizer
+            from transformers import AutoModelForSequenceClassification
         except Exception as e:
             raise RuntimeError("Missing dependencies for evaluation. Install: pip install torch transformers") from e
 
-        tokenizer = AutoTokenizer.from_pretrained(str(round_dir), trust_remote_code=True)
+        tokenizer = _load_tokenizer_stable(str(round_dir))
         model = AutoModelForSequenceClassification.from_pretrained(str(round_dir), trust_remote_code=True)
         if torch.cuda.is_available():
             device = torch.device("cuda")
