@@ -158,7 +158,9 @@ def _load_tokenizer_stable(model_name_or_path: str):
     # Prefer slow tokenizer first to avoid broken fast-tokenizer regex patterns.
     attempts = (
         {"use_fast": False, "fix_mistral_regex": True},
+        {"use_fast": True, "fix_mistral_regex": True},
         {"use_fast": False},
+        {"use_fast": True},
     )
     for kwargs in attempts:
         try:
