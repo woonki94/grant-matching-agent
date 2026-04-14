@@ -14,6 +14,10 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
+try:
+    from tqdm.auto import tqdm as _tqdm
+except Exception:
+    _tqdm = None
 
 # Ensure project root on sys.path for direct script execution.
 if __package__ is None or __package__ == "":
@@ -817,7 +821,16 @@ def train(args) -> Dict[str, Any]:
     epoch_count = max(1, int(math.ceil(float(args.epochs))))
     for epoch_idx in range(epoch_count):
         epoch_seed = int(args.seed) + epoch_idx * 1003
-        for batch in _iter_batches(train_rows, batch_size=int(args.batch_size), shuffle=True, seed=epoch_seed):
+        epoch_iter = _iter_batches(train_rows, batch_size=int(args.batch_size), shuffle=True, seed=epoch_seed)
+        if _tqdm is not None:
+            epoch_iter = _tqdm(
+                epoch_iter,
+                total=int(max(1, steps_per_epoch)),
+                desc=f"epoch {epoch_idx + 1}/{epoch_count}",
+                leave=False,
+            )
+
+        for batch in epoch_iter:
             global_step += 1
 
             loss, info = _batch_forward_and_loss(
@@ -866,6 +879,17 @@ def train(args) -> Dict[str, Any]:
                     f"list={payload['train/listwise_loss']:.6f} "
                     f"pair={payload['train/pairwise_loss']:.6f}"
                 )
+                if _tqdm is not None and hasattr(epoch_iter, "set_postfix"):
+                    try:
+                        epoch_iter.set_postfix(
+                            {
+                                "loss": f"{payload['train/loss']:.4f}",
+                                "list": f"{payload['train/listwise_loss']:.4f}",
+                                "pair": f"{payload['train/pairwise_loss']:.4f}",
+                            }
+                        )
+                    except Exception:
+                        pass
                 if wandb is not None and getattr(wandb, "run", None) is not None:
                     wandb.log(payload, step=int(global_step))
                 train_loss_running = 0.0
