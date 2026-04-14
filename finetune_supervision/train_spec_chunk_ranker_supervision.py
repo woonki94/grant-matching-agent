@@ -690,6 +690,10 @@ def _evaluate(
 def train(args) -> Dict[str, Any]:
     import torch
     from transformers import AutoModelForSequenceClassification, get_linear_schedule_with_warmup, set_seed
+    from transformers.utils import logging as hf_logging
+
+    # Keep terminal output focused on training/eval signals.
+    hf_logging.set_verbosity_error()
 
     dataset_dir = Path(_clean_text(args.dataset_dir)).expanduser().resolve()
     listwise_path = Path(_clean_text(args.listwise_jsonl)).expanduser().resolve() if _clean_text(args.listwise_jsonl) else None
