@@ -202,7 +202,7 @@ def enrich_new_faculty(
     faculty_id: int,
     osu_webpage: Optional[str],
     personal_website: Optional[str],
-    google_scholar: Optional[str],
+    google_scholar: Optional[str] = None,
 ) -> None:
     """
     Enrich a newly inserted faculty record from available profile sources.

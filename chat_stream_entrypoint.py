@@ -1043,5 +1043,94 @@ def edit_faculty_profile_by_email():
         return {"ok": False, "error": f"{type(e).__name__}: {e}"}, 500
 
 
+
+
+@app.post("/api/faculty/create")
+def create_faculty_profiles():
+    # Parse multipart/form-data for faculty creation
+    content_type = (request.content_type or "").lower()
+    if "multipart/form-data" not in content_type:
+        return {
+            "ok": False,
+            "error": "Expected multipart/form-data.",
+        }, 400
+
+    body: dict = {}
+    for key in request.form:
+        values = request.form.getlist(key)
+        body[key] = values[0] if len(values) == 1 else values
+
+    # JSON-decode emails if needed
+    for key in ("emails",):
+        raw = body.get(key)
+        if isinstance(raw, str):
+            try:
+                body[key] = json.loads(raw)
+            except Exception:
+                pass
+
+    emails = _to_email_list(body.get("emails") or body.get("email"))
+    if not emails:
+        return {
+            "ok": False,
+            "error": "At least one email is required.",
+        }, 400
+
+    # Build OSU URL map
+    osu_url_map: dict = {}
+    for em, url in zip(request.form.getlist("osu_url_email"), request.form.getlist("osu_url_value")):
+        em, url = em.strip().lower(), url.strip()
+        if em and url:
+            osu_url_map[em] = url
+
+    # Validate required OSU URLs
+    missing_osu = [e for e in emails if e not in osu_url_map]
+    if missing_osu:
+        return {
+            "ok": False,
+            "error": f"OSU profile URL is required for: {', '.join(missing_osu)}",
+        }, 400
+
+    # Build CV PDF map (optional)
+    cv_pdf_map: dict = {}
+    for em, fobj in zip(request.form.getlist("cv_email"), request.files.getlist("cv_file")):
+        em = em.strip().lower()
+        if em:
+            cv_pdf_map[em] = fobj.read()
+
+    try:
+        from services.agent_v2.agents.faculty_context_agent import FacultyContextAgent
+        from services.keywords.keyword_generator import FacultyKeywordGenerator
+        from services.context_retrieval.context_generator import ContextGenerator
+
+        logger.info(f"Creating faculty for emails: {emails}, osu_url_map: {osu_url_map}")
+        agent = FacultyContextAgent()
+        keyword_generator = FacultyKeywordGenerator(context_generator=ContextGenerator())
+        result = agent.resolve_and_ingest_faculties(
+            emails=emails,
+            osu_url_map=osu_url_map,
+            cv_pdf_map=cv_pdf_map,
+            keyword_generator=keyword_generator,
+        )
+        logger.info(f"Result: {result}")
+        # Count created faculty (those with faculty_id)
+        created_count = len(result.get("newly_added", []))
+        return {
+            "ok": True,
+            "message": f"Created {created_count} faculty profile(s).",
+            "created": created_count,
+            "resolved": result.get("resolved", []),
+            "newly_added": result.get("newly_added", []),
+            "failed": result.get("failed", []),
+        }, 200
+    except Exception as e:
+        logger.exception("POST /api/faculty/create failed")
+        return {"ok": False, "error": f"{type(e).__name__}: {e}"}, 500
+
+
+
+
+
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000, debug=True, threaded=True)
+

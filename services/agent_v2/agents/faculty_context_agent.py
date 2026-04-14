@@ -169,6 +169,7 @@ class FacultyContextAgent:
             faculty_id=faculty_id,
             osu_webpage=url,
             personal_website=personal_website_url,
+            google_scholar=None,
         )
 
         return faculty_id
