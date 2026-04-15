@@ -528,6 +528,7 @@ def _batch_forward_and_loss(
         truncation=True,
         max_length=int(max_length),
         return_tensors="pt",
+        verbose=False,
     )
     enc = {k: v.to(device) for k, v in enc.items()}
 
@@ -750,6 +751,7 @@ def _evaluate(
                 truncation=True,
                 max_length=int(max_length),
                 return_tensors="pt",
+                verbose=False,
             )
             enc = {k: v.to(device) for k, v in enc.items()}
             out = model(**enc)
