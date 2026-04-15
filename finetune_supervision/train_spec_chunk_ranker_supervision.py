@@ -8,7 +8,7 @@ import random
 import shutil
 import sys
 from collections import Counter, defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
@@ -54,6 +54,7 @@ class QueryExample:
     query_group: str
     docs: List[str]
     target_scores: List[float]
+    pair_constraints: List[Tuple[int, int, float]] = field(default_factory=list)
 
 
 @dataclass
@@ -222,6 +223,9 @@ def _load_pairs_as_examples(path: Path, *, max_queries: int, min_candidates: int
     safe_min_cands = _safe_limit(min_candidates, default=2, minimum=2, maximum=256)
     grouped: Dict[str, Dict[str, Any]] = {}
     skipped = 0
+    schema_counts = Counter()
+    hard_pair_rows = 0
+    easy_pair_rows = 0
 
     with path.open("r", encoding="utf-8") as f:
         for raw in f:
@@ -233,11 +237,10 @@ def _load_pairs_as_examples(path: Path, *, max_queries: int, min_candidates: int
             except Exception:
                 skipped += 1
                 continue
+
             query = _clean_text(item.get("query"))
-            doc = _clean_text(item.get("doc"))
             group = _clean_text(item.get("query_group"))
-            score = _safe_unit_float(item.get("label_score"), default=0.0)
-            if not query or not doc or not group:
+            if not query or not group:
                 skipped += 1
                 continue
 
@@ -246,13 +249,49 @@ def _load_pairs_as_examples(path: Path, *, max_queries: int, min_candidates: int
                 {
                     "query": query,
                     "docs": {},
+                    "raw_pairs": [],
                 },
             )
             docs: Dict[str, float] = payload["docs"]
-            # Keep max score if duplicate doc appears.
-            prev = docs.get(doc)
-            if prev is None or score > prev:
-                docs[doc] = float(score)
+
+            # Schema A (legacy): query+doc+label_score
+            doc = _clean_text(item.get("doc"))
+            if doc:
+                schema_counts["doc_score_rows"] += 1
+                score = _safe_unit_float(item.get("label_score"), default=0.0)
+                prev = docs.get(doc)
+                if prev is None or score > prev:
+                    docs[doc] = float(score)
+                continue
+
+            # Schema B (boundary/margin): query+positive+negative(+pair_weight...)
+            pos = _clean_text(item.get("positive"))
+            neg = _clean_text(item.get("negative"))
+            if pos and neg and pos != neg:
+                schema_counts["pos_neg_rows"] += 1
+                pos_score = _safe_unit_float(item.get("positive_teacher_score"), default=1.0)
+                neg_score = _safe_unit_float(item.get("negative_teacher_score"), default=0.0)
+                pair_weight = _safe_float(item.get("pair_weight"), default=1.0)
+                if pair_weight <= 0.0:
+                    pair_weight = 1.0
+                neg_type = _clean_text(item.get("negative_type")).lower()
+                if neg_type == "hard_negative":
+                    hard_pair_rows += 1
+                elif neg_type == "easy_negative":
+                    easy_pair_rows += 1
+
+                prev_pos = docs.get(pos)
+                if prev_pos is None or pos_score > prev_pos:
+                    docs[pos] = float(pos_score)
+                prev_neg = docs.get(neg)
+                if prev_neg is None or neg_score > prev_neg:
+                    docs[neg] = float(neg_score)
+
+                payload["raw_pairs"].append((pos, neg, float(pair_weight)))
+                continue
+
+            schema_counts["unknown_rows"] += 1
+            skipped += 1
 
     examples: List[QueryExample] = []
     for group, payload in grouped.items():
@@ -263,14 +302,44 @@ def _load_pairs_as_examples(path: Path, *, max_queries: int, min_candidates: int
         ranked = sorted(docs_map.items(), key=lambda x: float(x[1]), reverse=True)
         docs = [str(x[0]) for x in ranked]
         targets = [float(x[1]) for x in ranked]
-        examples.append(QueryExample(query=query, query_group=group, docs=docs, target_scores=targets))
+        idx_by_doc = {doc: i for i, doc in enumerate(docs)}
+
+        # Optional explicit pair constraints from pos/neg schema.
+        pair_constraints: List[Tuple[int, int, float]] = []
+        pair_best_weight: Dict[Tuple[int, int], float] = {}
+        for pos, neg, w in list(payload.get("raw_pairs") or []):
+            i = idx_by_doc.get(str(pos))
+            j = idx_by_doc.get(str(neg))
+            if i is None or j is None or int(i) == int(j):
+                continue
+            key = (int(i), int(j))
+            prev = pair_best_weight.get(key)
+            if prev is None or float(w) > float(prev):
+                pair_best_weight[key] = float(w)
+        for (i, j), w in pair_best_weight.items():
+            pair_constraints.append((int(i), int(j), float(w)))
+
+        examples.append(
+            QueryExample(
+                query=query,
+                query_group=group,
+                docs=docs,
+                target_scores=targets,
+                pair_constraints=pair_constraints,
+            )
+        )
         if safe_max > 0 and len(examples) >= safe_max:
             break
 
+    constrained_examples = sum(1 for ex in examples if list(ex.pair_constraints or []))
     meta = {
         "input_path": str(path),
         "examples_loaded": int(len(examples)),
         "rows_skipped": int(skipped),
+        "schema_counts": dict(schema_counts),
+        "hard_pair_rows": int(hard_pair_rows),
+        "easy_pair_rows": int(easy_pair_rows),
+        "examples_with_pair_constraints": int(constrained_examples),
     }
     return examples, meta
 
@@ -482,13 +551,30 @@ def _batch_forward_and_loss(
         # Listwise (ListNet-style): fit the full ranking distribution.
         list_loss = -(F.softmax(target, dim=0) * F.log_softmax(scores, dim=0)).sum()
 
-        # Pairwise (RankNet): enforce margin/order between ranked positions.
-        pair_idx = _build_pair_indices(
-            int(scores.numel()),
-            max_pairs=int(max_pairs_per_query),
-            top_focus=int(top_focus_pairs),
-            rng=rng,
-        )
+        # Pairwise (RankNet): prefer explicit pair constraints when available.
+        pair_idx: List[Tuple[int, int, float]] = []
+        raw_constraints = list(ex.pair_constraints or [])
+        if raw_constraints:
+            for i, j, w in raw_constraints:
+                ii = int(i)
+                jj = int(j)
+                if ii < 0 or jj < 0 or ii >= int(scores.numel()) or jj >= int(scores.numel()) or ii == jj:
+                    continue
+                ww = float(max(0.0, _safe_float(w, default=1.0)))
+                if ww <= 0.0:
+                    continue
+                pair_idx.append((ii, jj, ww))
+            safe_cap = _safe_limit(max_pairs_per_query, default=DEFAULT_MAX_PAIRS_PER_QUERY, minimum=1, maximum=4096)
+            if len(pair_idx) > safe_cap:
+                # Keep highest-weight constraints first, then cap.
+                pair_idx = sorted(pair_idx, key=lambda x: float(x[2]), reverse=True)[:safe_cap]
+        if not pair_idx:
+            pair_idx = _build_pair_indices(
+                int(scores.numel()),
+                max_pairs=int(max_pairs_per_query),
+                top_focus=int(top_focus_pairs),
+                rng=rng,
+            )
         pair_terms: List[torch.Tensor] = []
         pair_weight_sum = 0.0
         for i, j, w in pair_idx:
