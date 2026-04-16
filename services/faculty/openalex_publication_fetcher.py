@@ -105,8 +105,6 @@ class OpenAlexPublicationFetcher:
             inst_l = _clean_text(last_inst).lower()
             if org_l and org_l in inst_l:
                 score += 0.12
-            if "oregon state" in inst_l:
-                score += 0.08
 
             works_count = it.get("works_count")
             if isinstance(works_count, int) and works_count > 0:
@@ -197,4 +195,3 @@ class OpenAlexPublicationFetcher:
             cursor = str(next_cursor)
 
         return results
-
