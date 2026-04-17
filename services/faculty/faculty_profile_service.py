@@ -551,12 +551,12 @@ class FacultyProfileService:
         year_to: int,
     ) -> List["FacultyPublicationDTO"]:
         try:
-            from services.faculty.openalex_publication_fetcher import OpenAlexPublicationFetcher
+            from services.faculty.author_publication_fetcher import AuthorPublicationFetcher
         except Exception:
             return []
 
         try:
-            fetcher = OpenAlexPublicationFetcher()
+            fetcher = AuthorPublicationFetcher()
             author_id = fetcher.resolve_author_id(
                 faculty_name=str(faculty_name or ""),
                 org_hint=str(org_hint or ""),
