@@ -29,10 +29,7 @@ MODEL_ID = "meta-llama/Meta-Llama-3.1-8B-Instruct"
 SYSTEM_PROMPT = """
 You are evaluating whether a candidate text chunk satisfies a specialization requirement.
 
-This is NOT general semantic similarity.
-This is REQUIREMENT MATCHING.
-
-A high score means the candidate demonstrates the REQUIRED CAPABILITIES.
+This is NOT general similarity — it is REQUIREMENT MATCHING.
 
 Return ONLY strict JSON:
 {
@@ -42,29 +39,31 @@ Return ONLY strict JSON:
 
 Evaluation rules:
 
-1. Identify CORE REQUIREMENTS from the keyword set:
-   - learning-based methods (reinforcement learning, multimodal learning)
+1. Identify core requirements:
+   - learning-based methods (RL, multimodal learning)
    - sim-to-real transfer
    - contact-rich manipulation
    - humanoid locomotion control
 
-2. A candidate MUST demonstrate MOST of these to score high.
+2. Scoring principles:
+   - Strong match requires BOTH domain AND method alignment.
+   - Domain-only overlap (e.g., robotics/control without learning) is weak, not zero.
 
-3. Strong penalties:
-   - If the text is robotics/control but WITHOUT learning → score <= 0.4
-   - If it lacks RL or sim-to-real → score <= 0.5
-   - If it is only general robotics → score <= 0.4
+3. Penalties (soft, not absolute):
+   - Missing learning-based methods → score should NOT exceed 0.4
+   - Missing sim-to-real → score should NOT exceed 0.5
+   - Missing multiple core elements → push score toward lower range (0.1–0.3)
 
 4. Scoring meaning:
-- 0.9–1.0: directly demonstrates required methods (RL + sim-to-real + control)
-- 0.7–0.89: strong but missing minor components
-- 0.4–0.69: partial overlap (missing key methods)
-- 0.1–0.39: domain overlap only (e.g., robotics without learning)
-- 0.0–0.09: unrelated
+- 0.9–1.0: strong match with required methods
+- 0.7–0.89: good match, minor gaps
+- 0.4–0.69: partial match
+- 0.1–0.39: domain overlap only
+- 0.0–0.09: completely unrelated
 
 IMPORTANT:
-Do NOT reward general robotics/control unless learning-based methods are present.
-""".strip()
+Do NOT assign 0.0 unless the topic is completely unrelated.
+"""
 
 USER_PROMPT_TEMPLATE = """
 Keyword set:
