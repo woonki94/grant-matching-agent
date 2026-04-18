@@ -4,8 +4,7 @@ import json
 import re
 from typing import Any, Dict, Optional
 
-import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from vllm import LLM, SamplingParams
 
 # ------------------------------------------------------------
 # Edit these manually
@@ -22,9 +21,10 @@ Our lab develops model-based and learning-based control for humanoid robots,
 including sim-to-real adaptation, robust gait generation, and manipulation under
 contact uncertainty.
 """.strip()
+CHUNK_TEXTS = [CHUNK_TEXT]  # Add more chunk strings for batched scoring.
 
-# Hugging Face model id (LLaMA 3.1 8B Instruct)
-MODEL_ID = "meta-llama/Meta-Llama-3.1-8B-Instruct"
+# Hugging Face model id (LLaMA 3.1 70B Instruct)
+MODEL_ID = "meta-llama/Llama-3.1-70B-Instruct"
 
 SYSTEM_PROMPT = """
 You are evaluating whether a candidate text chunk satisfies a specialization requirement.
@@ -74,12 +74,19 @@ Candidate chunk:
 """.strip()
 
 MAX_NEW_TOKENS = 80
+TEMPERATURE = 0.0  # deterministic scoring for teacher labels
+STOP_STRINGS = ["}\n", "}"]  # stop early after JSON object
+TENSOR_PARALLEL_SIZE = 1  # set 2/4/8 on multi-GPU nodes
 
 
 def _extract_json_object(text: str) -> Optional[Dict[str, Any]]:
     raw = (text or "").strip()
     if not raw:
         return None
+
+    if raw.startswith("{") and raw.count("{") > raw.count("}"):
+        raw = raw + ("}" * (raw.count("{") - raw.count("}")))
+
     try:
         obj = json.loads(raw)
         if isinstance(obj, dict):
@@ -133,68 +140,57 @@ def _build_prompt(tokenizer, system_prompt: str, user_prompt: str) -> str:
     )
 
 
-def _select_device_and_dtype() -> tuple[torch.device, torch.dtype]:
-    if torch.cuda.is_available():
-        return torch.device("cuda"), torch.float16
-    if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-        return torch.device("mps"), torch.float16
-    return torch.device("cpu"), torch.float32
-
-
 def main() -> int:
-    device, dtype = _select_device_and_dtype()
-
-    tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
-    if tokenizer.pad_token_id is None and tokenizer.eos_token is not None:
-        tokenizer.pad_token = tokenizer.eos_token
-
-    model = AutoModelForCausalLM.from_pretrained(
+    llm = LLM(
         MODEL_ID,
-        dtype=dtype,
+        tensor_parallel_size=TENSOR_PARALLEL_SIZE,
     )
-    model.to(device)
-    model.eval()
+    tokenizer = llm.get_tokenizer()
 
-    user_prompt = USER_PROMPT_TEMPLATE.format(
-        keyword_set=KEYWORD_SET_TEXT,
-        chunk=CHUNK_TEXT,
-    )
-    prompt_text = _build_prompt(tokenizer, SYSTEM_PROMPT, user_prompt)
-
-    encoded = tokenizer(prompt_text, return_tensors="pt")
-    encoded = {k: v.to(device) for k, v in encoded.items()}
-
-    with torch.no_grad():
-        output_ids = model.generate(
-            **encoded,
-            max_new_tokens=MAX_NEW_TOKENS,
-            do_sample=True,
-            temperature=0.3,
-            top_p=0.9,
-            pad_token_id=tokenizer.pad_token_id,
+    prompts = []
+    for chunk_text in CHUNK_TEXTS:
+        user_prompt = USER_PROMPT_TEMPLATE.format(
+            keyword_set=KEYWORD_SET_TEXT,
+            chunk=chunk_text,
         )
+        prompts.append(_build_prompt(tokenizer, SYSTEM_PROMPT, user_prompt))
 
-    new_tokens = output_ids[0][encoded["input_ids"].shape[1] :]
-    raw_response = tokenizer.decode(new_tokens, skip_special_tokens=True).strip()
-
-    parsed = _extract_json_object(raw_response) or {}
-    score = _coerce_score(parsed.get("score"))
-    reason = str(parsed.get("reason") or "").strip() or "No reason returned."
+    sampling_params = SamplingParams(
+        max_tokens=MAX_NEW_TOKENS,
+        temperature=TEMPERATURE,
+        stop=STOP_STRINGS,
+    )
+    outputs = llm.generate(prompts, sampling_params)
+    if not outputs:
+        raise RuntimeError("vLLM returned no outputs.")
 
     print(f"model_id={MODEL_ID}")
-    print(f"device={device}")
+    print("backend=vllm")
+    print(f"tensor_parallel_size={TENSOR_PARALLEL_SIZE}")
+    print(f"batch_size={len(prompts)}")
     print("")
     print("keyword_set:")
     print(KEYWORD_SET_TEXT)
-    print("")
-    print("chunk:")
-    print(CHUNK_TEXT)
-    print("")
-    print(f"score={score:.4f}")
-    print(f"reason={reason}")
-    print("")
-    print("raw_response:")
-    print(raw_response)
+
+    for idx, (chunk_text, out) in enumerate(zip(CHUNK_TEXTS, outputs), start=1):
+        if not out.outputs:
+            raw_response = ""
+        else:
+            raw_response = str(out.outputs[0].text or "").strip()
+        parsed = _extract_json_object(raw_response) or {}
+        score = _coerce_score(parsed.get("score"))
+        reason = str(parsed.get("reason") or "").strip() or "No reason returned."
+
+        print("")
+        print(f"[item {idx}]")
+        print("chunk:")
+        print(chunk_text)
+        print("")
+        print(f"score={score:.4f}")
+        print(f"reason={reason}")
+        print("")
+        print("raw_response:")
+        print(raw_response)
     return 0
 
 
