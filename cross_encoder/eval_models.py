@@ -24,7 +24,7 @@ contact uncertainty.
 """.strip()
 
 # Hugging Face model id (LLaMA 3.1 8B Instruct)
-MODEL_ID = "meta-llama/Llama-3.1-8B"
+MODEL_ID = "meta-llama/Meta-Llama-3.1-8B-Instruct"
 
 SYSTEM_PROMPT = """
 You are scoring relevance between:
@@ -53,7 +53,7 @@ Candidate chunk:
 {chunk}
 """.strip()
 
-MAX_NEW_TOKENS = 120
+MAX_NEW_TOKENS = 80
 
 
 def _extract_json_object(text: str) -> Optional[Dict[str, Any]]:
@@ -91,25 +91,25 @@ def _coerce_score(value: Any) -> float:
 
 
 def _build_prompt(tokenizer, system_prompt: str, user_prompt: str) -> str:
+    if not hasattr(tokenizer, "apply_chat_template"):
+        raise RuntimeError(
+            "Tokenizer does not support apply_chat_template(). "
+            "Use an instruct/chat tokenizer for this model."
+        )
+    if not getattr(tokenizer, "chat_template", None):
+        raise RuntimeError(
+            "tokenizer.chat_template is not set. "
+            "This script requires a tokenizer with a valid chat template."
+        )
+
     messages = [
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": user_prompt},
     ]
-    if hasattr(tokenizer, "apply_chat_template") and getattr(tokenizer, "chat_template", None):
-        try:
-            return tokenizer.apply_chat_template(
-                messages,
-                tokenize=False,
-                add_generation_prompt=True,
-            )
-        except Exception:
-            pass
-    return (
-        "System:\n"
-        + system_prompt
-        + "\n\nUser:\n"
-        + user_prompt
-        + "\n\nAssistant:\n"
+    return tokenizer.apply_chat_template(
+        messages,
+        tokenize=False,
+        add_generation_prompt=True,
     )
 
 
@@ -144,22 +144,14 @@ def main() -> int:
     encoded = tokenizer(prompt_text, return_tensors="pt")
     encoded = {k: v.to(device) for k, v in encoded.items()}
 
-    gen_cfg = model.generation_config
-    gen_cfg.do_sample = False
-    if hasattr(gen_cfg, "temperature"):
-        gen_cfg.temperature = None
-    if hasattr(gen_cfg, "top_p"):
-        gen_cfg.top_p = None
-    if tokenizer.pad_token_id is not None:
-        gen_cfg.pad_token_id = tokenizer.pad_token_id
-    if tokenizer.eos_token_id is not None:
-        gen_cfg.eos_token_id = tokenizer.eos_token_id
-
     with torch.no_grad():
         output_ids = model.generate(
             **encoded,
             max_new_tokens=MAX_NEW_TOKENS,
-            generation_config=gen_cfg,
+            do_sample=True,
+            temperature=0.3,
+            top_p=0.9,
+            pad_token_id=tokenizer.pad_token_id,
         )
 
     new_tokens = output_ids[0][encoded["input_ids"].shape[1] :]
