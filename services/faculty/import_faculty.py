@@ -5,6 +5,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]  # .../root
 sys.path.insert(0, str(PROJECT_ROOT))
 
 import argparse
+from datetime import datetime
 import logging
 from typing import Any, Dict
 
@@ -19,9 +20,9 @@ from db.db_conn import SessionLocal
 from db.models.faculty import FacultyAdditionalInfo
 from mappers.page_to_faculty import map_faculty_profile_to_dto
 from services.extract_content import run_extraction_pipeline
+from services.faculty.author_publication_fetcher import AuthorPublicationFetcher
 from services.faculty.faculty_page_crawler import crawl
 from services.faculty.profile_parser import parse_profile
-from utils.publication_enricher import get_publication_dtos_for_faculty
 from utils.thread_pool import parallel_map, resolve_pool_size
 
 # Bulk import currently enriches faculty with recent OpenAlex publications.
@@ -39,10 +40,19 @@ def _prepare_faculty_payload(link: str, *, years_back: int) -> Dict[str, Any]:
 
     pubs = []
     if full_name:
-        _author_id, pubs = get_publication_dtos_for_faculty(
-            full_name=full_name,
-            university=UNIV_NAME,
-            years_back=years_back,
+        current_year = datetime.now().year
+        if int(years_back) > 0:
+            year_from = int(current_year) - (int(years_back) - 1)
+        else:
+            year_from = 1900
+        year_to = int(current_year)
+
+        fetcher = AuthorPublicationFetcher()
+        pubs = fetcher.fetch_publications_for_name_year_range(
+            faculty_name=full_name,
+            year_from=year_from,
+            year_to=year_to,
+            org_hint=UNIV_NAME,
         )
     return {
         "link": link,
