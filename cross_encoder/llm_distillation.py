@@ -7,7 +7,7 @@ import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 # Ensure project root on sys.path for direct script execution.
 if __package__ is None or __package__ == "":
@@ -255,6 +255,7 @@ def _score_one_spec_against_all_chunks(
     spec_item: Dict[str, Any],
     chunks: Sequence[Dict[str, Any]],
     batch_size: int,
+    progress_cb: Optional[Callable[[int], None]] = None,
 ) -> Tuple[List[Dict[str, Any]], int, int]:
     candidates: List[Dict[str, Any]] = []
     json_ok_count = 0
@@ -271,6 +272,7 @@ def _score_one_spec_against_all_chunks(
             for c in batch
         ]
         outputs = llm.generate(prompts, sampling_params)
+        scored_in_batch = 0
         for chunk_item, out in zip(batch, outputs):
             raw_text = ""
             if out and getattr(out, "outputs", None):
@@ -291,6 +293,9 @@ def _score_one_spec_against_all_chunks(
                     "score": float(score),
                 }
             )
+            scored_in_batch += 1
+        if progress_cb is not None and scored_in_batch > 0:
+            progress_cb(scored_in_batch)
     return candidates, json_ok_count, fallback_count
 
 
@@ -418,7 +423,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
     p.add_argument("--max-specs", type=int, default=0, help="Limit specs for smoke run (0 = all).")
     p.add_argument("--max-chunks", type=int, default=0, help="Limit chunks for smoke run (0 = all).")
-    p.add_argument("--max-chunk-chars", type=int, default=2400, help="Trim chunk text to this many chars (0 = no trim).")
+    p.add_argument("--max-chunk-chars", type=int, default=0, help="Trim chunk text to this many chars (0 = no trim).")
     p.add_argument("--start-spec-index", type=int, default=0, help="Skip first N specs (manual resume).")
 
     p.add_argument("--pair-pos-top-k", type=int, default=4, help="Top-K positive pool per query.")
@@ -428,6 +433,7 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--pair-max-per-query", type=int, default=80, help="Cap pairwise rows generated per query.")
 
     p.add_argument("--listwise-top-k", type=int, default=0, help="Keep top-K docs in listwise output (0 = all).")
+    p.add_argument("--no-tqdm", action="store_true", help="Disable global tqdm progress bar.")
     return p
 
 
@@ -466,6 +472,7 @@ def main() -> int:
     pair_min_margin = _safe_float(args.pair_min_margin, default=0.05, minimum=0.0, maximum=1.0)
     pair_max_per_query = _safe_int(args.pair_max_per_query, default=80, minimum=1, maximum=1_000_000)
     listwise_top_k = _safe_int(args.listwise_top_k, default=0, minimum=0, maximum=10_000_000)
+    use_tqdm = not bool(args.no_tqdm)
 
     if not grant_db.exists():
         raise RuntimeError(f"Grant DB not found: {grant_db}")
@@ -516,98 +523,123 @@ def main() -> int:
     print(f"pairwise_output={pairwise_output}")
     print(f"listwise_output={listwise_output}")
 
-    with (
-        raw_output.open("w", encoding="utf-8") as raw_f,
-        pairwise_output.open("w", encoding="utf-8") as pair_f,
-        listwise_output.open("w", encoding="utf-8") as list_f,
-    ):
-        for spec_rank, spec_item in enumerate(specs, start=1):
-            candidates, json_ok, fallback = _score_one_spec_against_all_chunks(
-                llm=llm,
-                tokenizer=tokenizer,
-                sampling_params=sampling_params,
-                spec_item=spec_item,
-                chunks=chunks,
-                batch_size=batch_size,
-            )
+    tqdm_bar = None
+    if use_tqdm:
+        try:
+            from tqdm.auto import tqdm
 
-            total_scored += len(candidates)
-            total_json_ok += int(json_ok)
-            total_fallback += int(fallback)
+            tqdm_bar = tqdm(total=total_pairs, desc="Scoring pairs", unit="pair", dynamic_ncols=True)
+        except Exception:
+            print("tqdm_unavailable=true")
 
-            raw_obj = {
-                "grant_id": _clean_text(spec_item.get("grant_id")),
-                "spec_idx": int(spec_item.get("spec_idx") or 0),
-                "spec_text": _clean_text(spec_item.get("spec_text")),
-                "candidates": [
-                    {
-                        "fac_id": int(c["fac_id"]),
-                        "chunk_id": int(c["chunk_id"]),
-                        "chunk_index": int(c["chunk_index"]),
-                        "source_type": _clean_text(c["source_type"]),
-                        "chunk_text": _clean_text(c["chunk_text"]),
-                        "score": float(c["score"]),
-                    }
-                    for c in candidates
-                ],
-            }
-            raw_f.write(json.dumps(raw_obj, ensure_ascii=False) + "\n")
+    def _update_progress(step: int) -> None:
+        if tqdm_bar is not None:
+            tqdm_bar.update(int(max(0, step)))
 
-            sorted_candidates = sorted(
-                candidates,
-                key=lambda x: float(x.get("score") or 0.0),
-                reverse=True,
-            )
-
-            docs = sorted_candidates
-            if listwise_top_k > 0:
-                docs = docs[: min(listwise_top_k, len(docs))]
-            listwise_obj = {
-                "grant_id": _clean_text(spec_item.get("grant_id")),
-                "spec_idx": int(spec_item.get("spec_idx") or 0),
-                "query_text": _clean_text(spec_item.get("query_text")),
-                "docs": [
-                    {
-                        "text": _clean_text(d["chunk_text"]),
-                        "teacher_score": float(d["score"]),
-                        "fac_id": int(d["fac_id"]),
-                        "chunk_id": int(d["chunk_id"]),
-                        "chunk_index": int(d["chunk_index"]),
-                        "source_type": _clean_text(d["source_type"]),
-                    }
-                    for d in docs
-                ],
-            }
-            list_f.write(json.dumps(listwise_obj, ensure_ascii=False) + "\n")
-
-            pairwise_rows = _build_pairwise_records(
-                query_text=_clean_text(spec_item.get("query_text")),
-                grant_id=_clean_text(spec_item.get("grant_id")),
-                spec_idx=int(spec_item.get("spec_idx") or 0),
-                sorted_candidates=sorted_candidates,
-                pos_top_k=pair_pos_top_k,
-                weak_bottom_k=pair_weak_bottom_k,
-                hard_neg_k=pair_hard_neg_k,
-                min_margin=pair_min_margin,
-                max_pairs_per_query=pair_max_per_query,
-            )
-            for row in pairwise_rows:
-                pair_f.write(json.dumps(row, ensure_ascii=False) + "\n")
-            total_pairwise += len(pairwise_rows)
-
-            raw_f.flush()
-            list_f.flush()
-            pair_f.flush()
-
-            if spec_rank % 10 == 0 or spec_rank == len(specs):
-                elapsed = max(1e-6, time.time() - started)
-                speed = total_scored / elapsed
-                print(
-                    f"spec_progress={spec_rank}/{len(specs)} "
-                    f"scored_pairs={total_scored}/{total_pairs} "
-                    f"pairwise_rows={total_pairwise} "
-                    f"speed={speed:.2f} pairs/sec"
+    try:
+        with (
+            raw_output.open("w", encoding="utf-8") as raw_f,
+            pairwise_output.open("w", encoding="utf-8") as pair_f,
+            listwise_output.open("w", encoding="utf-8") as list_f,
+        ):
+            for spec_rank, spec_item in enumerate(specs, start=1):
+                candidates, json_ok, fallback = _score_one_spec_against_all_chunks(
+                    llm=llm,
+                    tokenizer=tokenizer,
+                    sampling_params=sampling_params,
+                    spec_item=spec_item,
+                    chunks=chunks,
+                    batch_size=batch_size,
+                    progress_cb=_update_progress,
                 )
+
+                total_scored += len(candidates)
+                total_json_ok += int(json_ok)
+                total_fallback += int(fallback)
+
+                raw_obj = {
+                    "grant_id": _clean_text(spec_item.get("grant_id")),
+                    "spec_idx": int(spec_item.get("spec_idx") or 0),
+                    "spec_text": _clean_text(spec_item.get("spec_text")),
+                    "candidates": [
+                        {
+                            "fac_id": int(c["fac_id"]),
+                            "chunk_id": int(c["chunk_id"]),
+                            "chunk_index": int(c["chunk_index"]),
+                            "source_type": _clean_text(c["source_type"]),
+                            "chunk_text": _clean_text(c["chunk_text"]),
+                            "score": float(c["score"]),
+                        }
+                        for c in candidates
+                    ],
+                }
+                raw_f.write(json.dumps(raw_obj, ensure_ascii=False) + "\n")
+
+                sorted_candidates = sorted(
+                    candidates,
+                    key=lambda x: float(x.get("score") or 0.0),
+                    reverse=True,
+                )
+
+                docs = sorted_candidates
+                if listwise_top_k > 0:
+                    docs = docs[: min(listwise_top_k, len(docs))]
+                listwise_obj = {
+                    "grant_id": _clean_text(spec_item.get("grant_id")),
+                    "spec_idx": int(spec_item.get("spec_idx") or 0),
+                    "query_text": _clean_text(spec_item.get("query_text")),
+                    "docs": [
+                        {
+                            "text": _clean_text(d["chunk_text"]),
+                            "teacher_score": float(d["score"]),
+                            "fac_id": int(d["fac_id"]),
+                            "chunk_id": int(d["chunk_id"]),
+                            "chunk_index": int(d["chunk_index"]),
+                            "source_type": _clean_text(d["source_type"]),
+                        }
+                        for d in docs
+                    ],
+                }
+                list_f.write(json.dumps(listwise_obj, ensure_ascii=False) + "\n")
+
+                pairwise_rows = _build_pairwise_records(
+                    query_text=_clean_text(spec_item.get("query_text")),
+                    grant_id=_clean_text(spec_item.get("grant_id")),
+                    spec_idx=int(spec_item.get("spec_idx") or 0),
+                    sorted_candidates=sorted_candidates,
+                    pos_top_k=pair_pos_top_k,
+                    weak_bottom_k=pair_weak_bottom_k,
+                    hard_neg_k=pair_hard_neg_k,
+                    min_margin=pair_min_margin,
+                    max_pairs_per_query=pair_max_per_query,
+                )
+                for row in pairwise_rows:
+                    pair_f.write(json.dumps(row, ensure_ascii=False) + "\n")
+                total_pairwise += len(pairwise_rows)
+
+                raw_f.flush()
+                list_f.flush()
+                pair_f.flush()
+
+                if spec_rank % 10 == 0 or spec_rank == len(specs):
+                    elapsed = max(1e-6, time.time() - started)
+                    speed = total_scored / elapsed
+                    if tqdm_bar is not None:
+                        tqdm_bar.set_postfix(
+                            {
+                                "spec": f"{spec_rank}/{len(specs)}",
+                                "pairs_per_s": f"{speed:.2f}",
+                            }
+                        )
+                    print(
+                        f"spec_progress={spec_rank}/{len(specs)} "
+                        f"scored_pairs={total_scored}/{total_pairs} "
+                        f"pairwise_rows={total_pairwise} "
+                        f"speed={speed:.2f} pairs/sec"
+                    )
+    finally:
+        if tqdm_bar is not None:
+            tqdm_bar.close()
 
     elapsed = max(1e-6, time.time() - started)
     manifest = {
