@@ -1,10 +1,14 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
+import math
+import random
 import re
 import sys
 import time
+from collections import Counter, defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
@@ -29,42 +33,19 @@ MANIFEST_OUTPUT_DEFAULT = "cross_encoder/dataset/llm_distill_manifest.json"
 
 
 SYSTEM_PROMPT = """
-You are evaluating whether a candidate text chunk satisfies a specialization requirement.
-
-This is NOT general similarity — it is REQUIREMENT MATCHING.
+Score whether a faculty chunk satisfies a grant specialization requirement.
 
 Return ONLY strict JSON:
-{
-  "score": <float between 0.0 and 1.0>,
-  "reason": "<one short sentence>"
-}
+{"score": <float between 0.0 and 1.0>}
 
-Evaluation rules:
+Scoring:
+- 0.90-1.00: direct strong specialization match
+- 0.70-0.89: strong related match with minor gap
+- 0.40-0.69: partial match
+- 0.10-0.39: weak overlap
+- 0.00-0.09: unrelated
 
-1. Identify core requirements:
-   - learning-based methods (RL, multimodal learning)
-   - sim-to-real transfer
-   - contact-rich manipulation
-   - humanoid locomotion control
-
-2. Scoring principles:
-   - Strong match requires BOTH domain AND method alignment.
-   - Domain-only overlap (e.g., robotics/control without learning) is weak, not zero.
-
-3. Penalties (soft, not absolute):
-   - Missing learning-based methods → score should NOT exceed 0.4
-   - Missing sim-to-real → score should NOT exceed 0.5
-   - Missing multiple core elements → push score toward lower range (0.1–0.3)
-
-4. Scoring meaning:
-- 0.9–1.0: strong match with required methods
-- 0.7–0.89: good match, minor gaps
-- 0.4–0.69: partial match
-- 0.1–0.39: domain overlap only
-- 0.0–0.09: completely unrelated
-
-IMPORTANT:
-Do NOT assign 0.0 unless the topic is completely unrelated.
+Do not output explanation text.
 """
 
 USER_PROMPT_TEMPLATE = """
@@ -240,6 +221,162 @@ def _flatten_chunks(
         if max_chunks > 0 and len(out) >= max_chunks:
             return out
     return out
+
+
+def _tokenize_for_sparse(text: str) -> List[str]:
+    return re.findall(r"[a-z0-9]+", _clean_text(text).lower())
+
+
+def _build_sparse_chunk_index(chunks: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
+    """
+    Build a lightweight BM25-style sparse index for fast prefiltering.
+    """
+    postings: Dict[str, List[Tuple[int, int]]] = {}
+    doc_len: List[int] = []
+    n_docs = len(chunks)
+
+    for idx, chunk in enumerate(chunks):
+        tokens = _tokenize_for_sparse(_clean_text(chunk.get("chunk_text")))
+        tf = Counter(tokens)
+        doc_len.append(len(tokens))
+        for term, freq in tf.items():
+            postings.setdefault(term, []).append((idx, int(freq)))
+
+    avg_doc_len = (sum(doc_len) / float(max(1, n_docs))) if n_docs > 0 else 1.0
+    idf: Dict[str, float] = {}
+    for term, plist in postings.items():
+        df = len(plist)
+        if df <= 0:
+            continue
+        # Standard BM25-style IDF variant with +1 smoothing inside log.
+        idf[term] = float(math.log(1.0 + ((n_docs - df + 0.5) / float(df + 0.5))))
+
+    return {
+        "n_docs": int(n_docs),
+        "avg_doc_len": float(max(1.0, avg_doc_len)),
+        "postings": postings,
+        "idf": idf,
+        "doc_len": doc_len,
+    }
+
+
+def _rank_chunk_indices_for_spec(
+    spec_text: str,
+    *,
+    sparse_index: Dict[str, Any],
+    k1: float = 1.2,
+    b: float = 0.75,
+) -> List[int]:
+    postings: Dict[str, List[Tuple[int, int]]] = sparse_index["postings"]
+    idf: Dict[str, float] = sparse_index["idf"]
+    doc_len: List[int] = sparse_index["doc_len"]
+    avg_doc_len: float = float(sparse_index["avg_doc_len"])
+
+    query_terms = list(set(_tokenize_for_sparse(spec_text)))
+    scores: Dict[int, float] = defaultdict(float)
+
+    for term in query_terms:
+        plist = postings.get(term)
+        if not plist:
+            continue
+        term_idf = float(idf.get(term, 0.0))
+        if term_idf <= 0.0:
+            continue
+        for doc_idx, tf in plist:
+            dl = float(doc_len[doc_idx] if doc_idx < len(doc_len) else 1)
+            denom = float(tf) + float(k1) * (1.0 - float(b) + float(b) * (dl / max(1.0, avg_doc_len)))
+            if denom <= 0.0:
+                continue
+            scores[doc_idx] += term_idf * ((float(tf) * (float(k1) + 1.0)) / denom)
+
+    ranked = sorted(scores.items(), key=lambda x: x[1], reverse=True)
+    return [int(i) for i, _ in ranked]
+
+
+def _rng_for_spec(*, base_seed: int, grant_id: str, spec_idx: int) -> random.Random:
+    seed_text = f"{int(base_seed)}::{_clean_text(grant_id)}::{int(spec_idx)}"
+    digest = hashlib.sha1(seed_text.encode("utf-8")).hexdigest()[:16]
+    seed_int = int(digest, 16)
+    return random.Random(seed_int)
+
+
+def _select_chunk_candidates_for_spec(
+    *,
+    spec_item: Dict[str, Any],
+    chunks: Sequence[Dict[str, Any]],
+    sparse_index: Optional[Dict[str, Any]],
+    top_k: int,
+    mid_k: int,
+    rand_k: int,
+    base_seed: int,
+) -> List[Dict[str, Any]]:
+    total = len(chunks)
+    if total <= 0:
+        return []
+
+    t = max(0, int(top_k))
+    m = max(0, int(mid_k))
+    r = max(0, int(rand_k))
+    target = t + m + r
+    if target <= 0 or target >= total or sparse_index is None:
+        return list(chunks)
+
+    grant_id = _clean_text(spec_item.get("grant_id"))
+    spec_idx = int(spec_item.get("spec_idx") or 0)
+    rng = _rng_for_spec(base_seed=base_seed, grant_id=grant_id, spec_idx=spec_idx)
+
+    ranked = _rank_chunk_indices_for_spec(_clean_text(spec_item.get("spec_text")), sparse_index=sparse_index)
+    selected: List[int] = []
+    selected_set = set()
+
+    def _add(idx: int) -> None:
+        if idx in selected_set:
+            return
+        if idx < 0 or idx >= total:
+            return
+        selected.append(idx)
+        selected_set.add(idx)
+
+    # 1) Strong candidates from sparse rank top.
+    for idx in ranked[: min(t, len(ranked))]:
+        _add(idx)
+
+    # 2) Medium band candidates from middle of non-top ranked pool.
+    if m > 0:
+        non_top = ranked[min(t, len(ranked)) :]
+        if non_top:
+            start = len(non_top) // 3
+            end = (2 * len(non_top)) // 3
+            mid_pool = non_top[start:end] if end > start else non_top
+            if mid_pool:
+                pick = min(m, len(mid_pool))
+                for idx in rng.sample(mid_pool, k=pick):
+                    _add(idx)
+
+    # 3) Easy/diverse negatives from full remainder.
+    if r > 0:
+        remainder = [i for i in range(total) if i not in selected_set]
+        if remainder:
+            pick = min(r, len(remainder))
+            for idx in rng.sample(remainder, k=pick):
+                _add(idx)
+
+    # Backfill if collisions reduced count.
+    if len(selected) < target:
+        for idx in ranked:
+            if len(selected) >= target:
+                break
+            _add(idx)
+    if len(selected) < target:
+        remainder = [i for i in range(total) if i not in selected_set]
+        if remainder:
+            rng.shuffle(remainder)
+            for idx in remainder:
+                if len(selected) >= target:
+                    break
+                _add(idx)
+
+    return [chunks[i] for i in selected[:target]]
 
 
 def _chunked(items: Sequence[Any], batch_size: int) -> List[Sequence[Any]]:
@@ -426,6 +563,30 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--max-chunks", type=int, default=0, help="Limit chunks for smoke run (0 = all).")
     p.add_argument("--max-chunk-chars", type=int, default=0, help="Trim chunk text to this many chars (0 = no trim).")
     p.add_argument("--start-spec-index", type=int, default=0, help="Skip first N specs (manual resume).")
+    p.add_argument(
+        "--prefilter-top-k",
+        type=int,
+        default=0,
+        help="Sparse prefilter top-k chunks per spec before LLM scoring (0 disables prefiltering).",
+    )
+    p.add_argument(
+        "--prefilter-mid-k",
+        type=int,
+        default=0,
+        help="Additional medium-band chunks sampled per spec for diversity.",
+    )
+    p.add_argument(
+        "--prefilter-rand-k",
+        type=int,
+        default=0,
+        help="Additional random chunks per spec for easy/low-score coverage.",
+    )
+    p.add_argument(
+        "--prefilter-seed",
+        type=int,
+        default=42,
+        help="Base random seed for deterministic per-spec prefilter sampling.",
+    )
 
     p.add_argument("--pair-pos-top-k", type=int, default=4, help="Top-K positive pool per query.")
     p.add_argument("--pair-weak-bottom-k", type=int, default=4, help="Bottom-K weak negative pool per query.")
@@ -471,6 +632,11 @@ def main() -> int:
     max_chunks = _safe_int(args.max_chunks, default=0, minimum=0, maximum=50_000_000)
     max_chunk_chars = _safe_int(args.max_chunk_chars, default=2400, minimum=0, maximum=1_000_000)
     start_spec_index = _safe_int(args.start_spec_index, default=0, minimum=0, maximum=50_000_000)
+    prefilter_top_k = _safe_int(args.prefilter_top_k, default=0, minimum=0, maximum=200_000)
+    prefilter_mid_k = _safe_int(args.prefilter_mid_k, default=0, minimum=0, maximum=200_000)
+    prefilter_rand_k = _safe_int(args.prefilter_rand_k, default=0, minimum=0, maximum=200_000)
+    prefilter_seed = _safe_int(args.prefilter_seed, default=42, minimum=0, maximum=2_147_483_647)
+    use_prefilter = (prefilter_top_k + prefilter_mid_k + prefilter_rand_k) > 0
 
     pair_pos_top_k = _safe_int(args.pair_pos_top_k, default=4, minimum=1, maximum=10_000)
     pair_weak_bottom_k = _safe_int(args.pair_weak_bottom_k, default=4, minimum=1, maximum=10_000)
@@ -500,7 +666,18 @@ def main() -> int:
     if not specs:
         raise RuntimeError("No specs left after start-spec-index filtering.")
 
-    total_pairs = int(len(specs) * len(chunks))
+    full_total_pairs = int(len(specs) * len(chunks))
+    sparse_index: Optional[Dict[str, Any]] = None
+    if use_prefilter:
+        sparse_index = _build_sparse_chunk_index(chunks)
+        prefilter_target_per_spec = min(
+            len(chunks),
+            int(prefilter_top_k + prefilter_mid_k + prefilter_rand_k),
+        )
+    else:
+        prefilter_target_per_spec = len(chunks)
+
+    total_pairs = int(len(specs) * prefilter_target_per_spec)
 
     raw_output.parent.mkdir(parents=True, exist_ok=True)
     pairwise_output.parent.mkdir(parents=True, exist_ok=True)
@@ -521,11 +698,22 @@ def main() -> int:
     total_pairwise = 0
     total_json_ok = 0
     total_fallback = 0
+    sum_candidates_per_spec = 0
+    min_candidates_per_spec = 2_147_483_647
+    max_candidates_per_spec = 0
 
     print(f"model_id={model_id}")
     print(f"spec_count={len(specs)}")
     print(f"chunk_count={len(chunks)}")
+    print(f"full_total_pairs={full_total_pairs}")
     print(f"total_pairs={total_pairs}")
+    print(f"use_prefilter={use_prefilter}")
+    if use_prefilter:
+        print(
+            "prefilter_k="
+            f"top:{prefilter_top_k},mid:{prefilter_mid_k},rand:{prefilter_rand_k} "
+            f"(target_per_spec={prefilter_target_per_spec})"
+        )
     print(f"batch_size={batch_size}")
     print(f"raw_output={raw_output}")
     print(f"pairwise_output={pairwise_output}")
@@ -551,12 +739,25 @@ def main() -> int:
             listwise_output.open("w", encoding="utf-8") as list_f,
         ):
             for spec_rank, spec_item in enumerate(specs, start=1):
+                if use_prefilter:
+                    selected_chunks = _select_chunk_candidates_for_spec(
+                        spec_item=spec_item,
+                        chunks=chunks,
+                        sparse_index=sparse_index,
+                        top_k=prefilter_top_k,
+                        mid_k=prefilter_mid_k,
+                        rand_k=prefilter_rand_k,
+                        base_seed=prefilter_seed,
+                    )
+                else:
+                    selected_chunks = list(chunks)
+
                 candidates, json_ok, fallback = _score_one_spec_against_all_chunks(
                     llm=llm,
                     tokenizer=tokenizer,
                     sampling_params=sampling_params,
                     spec_item=spec_item,
-                    chunks=chunks,
+                    chunks=selected_chunks,
                     batch_size=batch_size,
                     progress_cb=_update_progress,
                     use_vllm_tqdm=use_vllm_tqdm,
@@ -565,6 +766,9 @@ def main() -> int:
                 total_scored += len(candidates)
                 total_json_ok += int(json_ok)
                 total_fallback += int(fallback)
+                sum_candidates_per_spec += len(candidates)
+                min_candidates_per_spec = min(min_candidates_per_spec, len(candidates))
+                max_candidates_per_spec = max(max_candidates_per_spec, len(candidates))
 
                 raw_obj = {
                     "grant_id": _clean_text(spec_item.get("grant_id")),
@@ -633,16 +837,19 @@ def main() -> int:
                 if spec_rank % 10 == 0 or spec_rank == len(specs):
                     elapsed = max(1e-6, time.time() - started)
                     speed = total_scored / elapsed
+                    avg_cand = (sum_candidates_per_spec / float(max(1, spec_rank)))
                     if tqdm_bar is not None:
                         tqdm_bar.set_postfix(
                             {
                                 "spec": f"{spec_rank}/{len(specs)}",
+                                "cand/spec": f"{avg_cand:.1f}",
                                 "pairs_per_s": f"{speed:.2f}",
                             }
                         )
                     print(
                         f"spec_progress={spec_rank}/{len(specs)} "
                         f"scored_pairs={total_scored}/{total_pairs} "
+                        f"avg_candidates_per_spec={avg_cand:.2f} "
                         f"pairwise_rows={total_pairwise} "
                         f"speed={speed:.2f} pairs/sec"
                     )
@@ -651,6 +858,9 @@ def main() -> int:
             tqdm_bar.close()
 
     elapsed = max(1e-6, time.time() - started)
+    avg_candidates = float(sum_candidates_per_spec / float(max(1, len(specs))))
+    if min_candidates_per_spec == 2_147_483_647:
+        min_candidates_per_spec = 0
     manifest = {
         "created_at_utc": datetime.now(timezone.utc).isoformat(),
         "model_id": model_id,
@@ -661,8 +871,19 @@ def main() -> int:
         "listwise_output": str(listwise_output),
         "spec_count": int(len(specs)),
         "chunk_count": int(len(chunks)),
+        "full_total_pairs": int(full_total_pairs),
         "total_pairs": int(total_pairs),
         "total_scored_pairs": int(total_scored),
+        "reduction_ratio_vs_full": float(total_scored / float(max(1, full_total_pairs))),
+        "use_prefilter": bool(use_prefilter),
+        "prefilter_top_k": int(prefilter_top_k),
+        "prefilter_mid_k": int(prefilter_mid_k),
+        "prefilter_rand_k": int(prefilter_rand_k),
+        "prefilter_target_per_spec": int(prefilter_target_per_spec),
+        "prefilter_seed": int(prefilter_seed),
+        "avg_candidates_per_spec": float(avg_candidates),
+        "min_candidates_per_spec": int(min_candidates_per_spec),
+        "max_candidates_per_spec": int(max_candidates_per_spec),
         "total_pairwise_rows": int(total_pairwise),
         "parsed_json_ok_count": int(total_json_ok),
         "parsed_fallback_count": int(total_fallback),
@@ -687,6 +908,9 @@ def main() -> int:
 
     print("done=true")
     print(f"total_scored_pairs={total_scored}")
+    print(f"full_total_pairs={full_total_pairs}")
+    print(f"reduction_ratio_vs_full={(total_scored / float(max(1, full_total_pairs))):.6f}")
+    print(f"avg_candidates_per_spec={avg_candidates:.2f}")
     print(f"total_pairwise_rows={total_pairwise}")
     print(f"parsed_json_ok_count={total_json_ok}")
     print(f"parsed_fallback_count={total_fallback}")
