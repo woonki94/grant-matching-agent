@@ -493,7 +493,11 @@ def main() -> int:
     listwise_output.parent.mkdir(parents=True, exist_ok=True)
     manifest_output.parent.mkdir(parents=True, exist_ok=True)
 
-    llm = LLM(model_id, tensor_parallel_size=tensor_parallel_size)
+    llm = LLM(
+        model_id,
+        tensor_parallel_size=tensor_parallel_size,
+        max_model_len=4096,
+    )
     tokenizer = llm.get_tokenizer()
     sampling_params = SamplingParams(max_tokens=max_new_tokens, temperature=temperature)
 
