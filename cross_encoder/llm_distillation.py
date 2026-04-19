@@ -256,6 +256,7 @@ def _score_one_spec_against_all_chunks(
     chunks: Sequence[Dict[str, Any]],
     batch_size: int,
     progress_cb: Optional[Callable[[int], None]] = None,
+    use_vllm_tqdm: bool = False,
 ) -> Tuple[List[Dict[str, Any]], int, int]:
     candidates: List[Dict[str, Any]] = []
     json_ok_count = 0
@@ -271,7 +272,7 @@ def _score_one_spec_against_all_chunks(
             )
             for c in batch
         ]
-        outputs = llm.generate(prompts, sampling_params)
+        outputs = llm.generate(prompts, sampling_params, use_tqdm=bool(use_vllm_tqdm))
         scored_in_batch = 0
         for chunk_item, out in zip(batch, outputs):
             raw_text = ""
@@ -434,6 +435,11 @@ def _build_parser() -> argparse.ArgumentParser:
 
     p.add_argument("--listwise-top-k", type=int, default=0, help="Keep top-K docs in listwise output (0 = all).")
     p.add_argument("--no-tqdm", action="store_true", help="Disable global tqdm progress bar.")
+    p.add_argument(
+        "--vllm-tqdm",
+        action="store_true",
+        help="Enable vLLM internal tqdm bars (off by default so global tqdm stays clean).",
+    )
     return p
 
 
@@ -473,6 +479,7 @@ def main() -> int:
     pair_max_per_query = _safe_int(args.pair_max_per_query, default=80, minimum=1, maximum=1_000_000)
     listwise_top_k = _safe_int(args.listwise_top_k, default=0, minimum=0, maximum=10_000_000)
     use_tqdm = not bool(args.no_tqdm)
+    use_vllm_tqdm = bool(args.vllm_tqdm)
 
     if not grant_db.exists():
         raise RuntimeError(f"Grant DB not found: {grant_db}")
@@ -502,8 +509,9 @@ def main() -> int:
 
     llm = LLM(
         model_id,
-        tensor_parallel_size=tensor_parallel_size,
+        tensor_parallel_size=2,
         max_model_len=4096,
+        gpu_memory_utilization=0.9,
     )
     tokenizer = llm.get_tokenizer()
     sampling_params = SamplingParams(max_tokens=max_new_tokens, temperature=temperature)
@@ -551,6 +559,7 @@ def main() -> int:
                     chunks=chunks,
                     batch_size=batch_size,
                     progress_cb=_update_progress,
+                    use_vllm_tqdm=use_vllm_tqdm,
                 )
 
                 total_scored += len(candidates)
