@@ -30,6 +30,7 @@ RAW_OUTPUT_DEFAULT = "cross_encoder/dataset/llm_distill_raw_scores.jsonl"
 PAIRWISE_OUTPUT_DEFAULT = "cross_encoder/dataset/llm_distill_pairwise.jsonl"
 LISTWISE_OUTPUT_DEFAULT = "cross_encoder/dataset/llm_distill_listwise.jsonl"
 MANIFEST_OUTPUT_DEFAULT = "cross_encoder/dataset/llm_distill_manifest.json"
+PREFILTER_SCORE_CACHE_DEFAULT = "cross_encoder/dataset/spec_chunk_cosine_cache.jsonl"
 
 
 SYSTEM_PROMPT = """
@@ -221,6 +222,176 @@ def _flatten_chunks(
         if max_chunks > 0 and len(out) >= max_chunks:
             return out
     return out
+
+
+def _chunk_key(*, fac_id: int, source_type: str, chunk_id: int, chunk_index: int) -> Tuple[int, str, int, int]:
+    return (
+        int(fac_id),
+        _clean_text(source_type) or "unknown",
+        int(chunk_id),
+        int(chunk_index),
+    )
+
+
+def _spec_key(spec_item: Dict[str, Any]) -> Tuple[str, int]:
+    return (
+        _clean_text(spec_item.get("grant_id")),
+        _safe_int(spec_item.get("spec_idx"), default=0, minimum=0, maximum=50_000_000),
+    )
+
+
+def _load_prefilter_score_cache(
+    *,
+    cache_path: Path,
+    chunks: Sequence[Dict[str, Any]],
+) -> Tuple[Dict[Tuple[str, int], List[int]], Dict[str, int]]:
+    chunk_idx_by_key: Dict[Tuple[int, str, int, int], int] = {}
+    for idx, chunk in enumerate(chunks):
+        key = _chunk_key(
+            fac_id=int(chunk["fac_id"]),
+            source_type=_clean_text(chunk["source_type"]),
+            chunk_id=int(chunk["chunk_id"]),
+            chunk_index=int(chunk["chunk_index"]),
+        )
+        chunk_idx_by_key[key] = int(idx)
+
+    out: Dict[Tuple[str, int], List[int]] = {}
+    line_count = 0
+    spec_kept = 0
+    candidate_seen = 0
+    candidate_matched = 0
+    with cache_path.open("r", encoding="utf-8") as f:
+        for raw_line in f:
+            line = _clean_text(raw_line)
+            if not line:
+                continue
+            line_count += 1
+            try:
+                obj = json.loads(line)
+            except Exception:
+                continue
+            if not isinstance(obj, dict):
+                continue
+            grant_id = _clean_text(obj.get("grant_id"))
+            spec_idx = _safe_int(obj.get("spec_idx"), default=0, minimum=0, maximum=50_000_000)
+            if not grant_id:
+                continue
+
+            ranked: List[int] = []
+            seen_local = set()
+            for cand in list(obj.get("candidates") or []):
+                if not isinstance(cand, dict):
+                    continue
+                candidate_seen += 1
+                key = _chunk_key(
+                    fac_id=_safe_int(cand.get("fac_id"), default=0, minimum=0, maximum=2_147_483_647),
+                    source_type=_clean_text(cand.get("source_type")) or "unknown",
+                    chunk_id=_safe_int(cand.get("chunk_id"), default=0, minimum=0, maximum=2_147_483_647),
+                    chunk_index=_safe_int(cand.get("chunk_index"), default=0, minimum=0, maximum=1_000_000),
+                )
+                chunk_idx = chunk_idx_by_key.get(key)
+                if chunk_idx is None:
+                    continue
+                candidate_matched += 1
+                if chunk_idx in seen_local:
+                    continue
+                seen_local.add(chunk_idx)
+                ranked.append(int(chunk_idx))
+
+            if ranked:
+                out[(grant_id, spec_idx)] = ranked
+                spec_kept += 1
+
+    stats = {
+        "cache_line_count": int(line_count),
+        "cache_spec_count": int(spec_kept),
+        "cache_candidate_seen": int(candidate_seen),
+        "cache_candidate_matched": int(candidate_matched),
+    }
+    return out, stats
+
+
+def _select_chunk_candidates_from_ranked_indices(
+    *,
+    spec_item: Dict[str, Any],
+    chunks: Sequence[Dict[str, Any]],
+    ranked_indices: Sequence[int],
+    top_k: int,
+    mid_k: int,
+    rand_k: int,
+    base_seed: int,
+) -> List[Dict[str, Any]]:
+    total = len(chunks)
+    if total <= 0:
+        return []
+    t = max(0, int(top_k))
+    m = max(0, int(mid_k))
+    r = max(0, int(rand_k))
+    target = t + m + r
+    if target <= 0 or target >= total:
+        return list(chunks)
+
+    grant_id = _clean_text(spec_item.get("grant_id"))
+    spec_idx = int(spec_item.get("spec_idx") or 0)
+    rng = _rng_for_spec(base_seed=base_seed, grant_id=grant_id, spec_idx=spec_idx)
+
+    ranked = [int(i) for i in ranked_indices if 0 <= int(i) < total]
+    selected: List[int] = []
+    selected_set = set()
+
+    def _add(idx: int) -> None:
+        if idx in selected_set:
+            return
+        if idx < 0 or idx >= total:
+            return
+        selected.append(idx)
+        selected_set.add(idx)
+
+    for idx in ranked[: min(t, len(ranked))]:
+        _add(idx)
+
+    if m > 0:
+        non_top = ranked[min(t, len(ranked)) :]
+        if non_top:
+            start = len(non_top) // 3
+            end = (2 * len(non_top)) // 3
+            mid_pool = non_top[start:end] if end > start else non_top
+            avail = [i for i in mid_pool if i not in selected_set]
+            if avail:
+                pick = min(m, len(avail))
+                if pick == len(avail):
+                    for idx in avail:
+                        _add(idx)
+                else:
+                    for idx in rng.sample(avail, k=pick):
+                        _add(idx)
+
+    if r > 0:
+        remainder = [i for i in range(total) if i not in selected_set]
+        if remainder:
+            pick = min(r, len(remainder))
+            if pick == len(remainder):
+                for idx in remainder:
+                    _add(idx)
+            else:
+                for idx in rng.sample(remainder, k=pick):
+                    _add(idx)
+
+    if len(selected) < target:
+        for idx in ranked:
+            if len(selected) >= target:
+                break
+            _add(idx)
+    if len(selected) < target:
+        remainder = [i for i in range(total) if i not in selected_set]
+        if remainder:
+            rng.shuffle(remainder)
+            for idx in remainder:
+                if len(selected) >= target:
+                    break
+                _add(idx)
+
+    return [chunks[i] for i in selected[:target]]
 
 
 def _tokenize_for_sparse(text: str) -> List[str]:
@@ -567,7 +738,7 @@ def _build_parser() -> argparse.ArgumentParser:
         "--prefilter-top-k",
         type=int,
         default=0,
-        help="Sparse prefilter top-k chunks per spec before LLM scoring (0 disables prefiltering).",
+        help="Top-k chunks per spec before LLM scoring (used with score-cache ranking or sparse ranking).",
     )
     p.add_argument(
         "--prefilter-mid-k",
@@ -586,6 +757,12 @@ def _build_parser() -> argparse.ArgumentParser:
         type=int,
         default=42,
         help="Base random seed for deterministic per-spec prefilter sampling.",
+    )
+    p.add_argument(
+        "--prefilter-score-cache",
+        type=str,
+        default=PREFILTER_SCORE_CACHE_DEFAULT,
+        help="Optional JSONL cache file with precomputed cosine-ranked candidates per (grant_id, spec_idx).",
     )
 
     p.add_argument("--pair-pos-top-k", type=int, default=4, help="Top-K positive pool per query.")
@@ -636,6 +813,7 @@ def main() -> int:
     prefilter_mid_k = _safe_int(args.prefilter_mid_k, default=0, minimum=0, maximum=200_000)
     prefilter_rand_k = _safe_int(args.prefilter_rand_k, default=0, minimum=0, maximum=200_000)
     prefilter_seed = _safe_int(args.prefilter_seed, default=42, minimum=0, maximum=2_147_483_647)
+    prefilter_score_cache_path = Path(_clean_text(args.prefilter_score_cache)).expanduser().resolve() if _clean_text(args.prefilter_score_cache) else None
     use_prefilter = (prefilter_top_k + prefilter_mid_k + prefilter_rand_k) > 0
 
     pair_pos_top_k = _safe_int(args.pair_pos_top_k, default=4, minimum=1, maximum=10_000)
@@ -667,9 +845,25 @@ def main() -> int:
         raise RuntimeError("No specs left after start-spec-index filtering.")
 
     full_total_pairs = int(len(specs) * len(chunks))
+    prefilter_score_cache: Dict[Tuple[str, int], List[int]] = {}
+    prefilter_score_cache_stats: Dict[str, int] = {}
+    if prefilter_score_cache_path is not None:
+        if not prefilter_score_cache_path.exists():
+            raise RuntimeError(f"prefilter score cache not found: {prefilter_score_cache_path}")
+        prefilter_score_cache, prefilter_score_cache_stats = _load_prefilter_score_cache(
+            cache_path=prefilter_score_cache_path,
+            chunks=chunks,
+        )
+
     sparse_index: Optional[Dict[str, Any]] = None
-    if use_prefilter:
+    use_prefilter_score_cache = bool(prefilter_score_cache)
+    if use_prefilter and (not use_prefilter_score_cache):
         sparse_index = _build_sparse_chunk_index(chunks)
+        prefilter_target_per_spec = min(
+            len(chunks),
+            int(prefilter_top_k + prefilter_mid_k + prefilter_rand_k),
+        )
+    elif use_prefilter:
         prefilter_target_per_spec = min(
             len(chunks),
             int(prefilter_top_k + prefilter_mid_k + prefilter_rand_k),
@@ -686,7 +880,7 @@ def main() -> int:
 
     llm = LLM(
         model_id,
-        tensor_parallel_size=2,
+        tensor_parallel_size=tensor_parallel_size,
         max_model_len=4096,
         gpu_memory_utilization=0.9,
     )
@@ -709,6 +903,13 @@ def main() -> int:
     print(f"total_pairs={total_pairs}")
     print(f"use_prefilter={use_prefilter}")
     if use_prefilter:
+        print(f"use_prefilter_score_cache={use_prefilter_score_cache}")
+        if prefilter_score_cache_path is not None:
+            print(f"prefilter_score_cache_path={prefilter_score_cache_path}")
+            print(f"prefilter_score_cache_spec_count={len(prefilter_score_cache)}")
+            if prefilter_score_cache_stats:
+                print(f"prefilter_score_cache_candidate_seen={prefilter_score_cache_stats.get('cache_candidate_seen')}")
+                print(f"prefilter_score_cache_candidate_matched={prefilter_score_cache_stats.get('cache_candidate_matched')}")
         print(
             "prefilter_k="
             f"top:{prefilter_top_k},mid:{prefilter_mid_k},rand:{prefilter_rand_k} "
@@ -740,15 +941,27 @@ def main() -> int:
         ):
             for spec_rank, spec_item in enumerate(specs, start=1):
                 if use_prefilter:
-                    selected_chunks = _select_chunk_candidates_for_spec(
-                        spec_item=spec_item,
-                        chunks=chunks,
-                        sparse_index=sparse_index,
-                        top_k=prefilter_top_k,
-                        mid_k=prefilter_mid_k,
-                        rand_k=prefilter_rand_k,
-                        base_seed=prefilter_seed,
-                    )
+                    ranked_indices = prefilter_score_cache.get(_spec_key(spec_item)) if use_prefilter_score_cache else None
+                    if use_prefilter_score_cache:
+                        selected_chunks = _select_chunk_candidates_from_ranked_indices(
+                            spec_item=spec_item,
+                            chunks=chunks,
+                            ranked_indices=ranked_indices or [],
+                            top_k=prefilter_top_k,
+                            mid_k=prefilter_mid_k,
+                            rand_k=prefilter_rand_k,
+                            base_seed=prefilter_seed,
+                        )
+                    else:
+                        selected_chunks = _select_chunk_candidates_for_spec(
+                            spec_item=spec_item,
+                            chunks=chunks,
+                            sparse_index=sparse_index,
+                            top_k=prefilter_top_k,
+                            mid_k=prefilter_mid_k,
+                            rand_k=prefilter_rand_k,
+                            base_seed=prefilter_seed,
+                        )
                 else:
                     selected_chunks = list(chunks)
 
@@ -881,6 +1094,10 @@ def main() -> int:
         "prefilter_rand_k": int(prefilter_rand_k),
         "prefilter_target_per_spec": int(prefilter_target_per_spec),
         "prefilter_seed": int(prefilter_seed),
+        "use_prefilter_score_cache": bool(use_prefilter_score_cache),
+        "prefilter_score_cache_path": str(prefilter_score_cache_path) if prefilter_score_cache_path is not None else "",
+        "prefilter_score_cache_spec_count": int(len(prefilter_score_cache)),
+        "prefilter_score_cache_stats": prefilter_score_cache_stats,
         "avg_candidates_per_spec": float(avg_candidates),
         "min_candidates_per_spec": int(min_candidates_per_spec),
         "max_candidates_per_spec": int(max_candidates_per_spec),
