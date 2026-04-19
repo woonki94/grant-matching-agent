@@ -19,6 +19,11 @@ from torch.optim import AdamW
 from torch.utils.data import DataLoader, Dataset
 from transformers import AutoModelForSequenceClassification, AutoTokenizer
 
+try:
+    from tqdm.auto import tqdm
+except Exception:
+    tqdm = None  # type: ignore[assignment]
+
 
 MODEL_ID_DEFAULT = "BAAI/bge-reranker-base"
 RAW_INPUT_DEFAULT = "cross_encoder/dataset/llm_distill_raw_scores.jsonl"
@@ -811,6 +816,7 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--num-workers", type=int, default=0)
     p.add_argument("--bf16", action="store_true", help="Use bfloat16 autocast on CUDA.")
     p.add_argument("--fp16", action="store_true", help="Use float16 autocast on CUDA.")
+    p.add_argument("--no-tqdm", action="store_true", help="Disable tqdm progress bars.")
     p.add_argument("--no-wandb", action="store_true", help="Disable Weights & Biases logging.")
     p.add_argument("--wandb-project", type=str, default=WANDB_PROJECT_DEFAULT, help="W&B project name.")
     p.add_argument("--wandb-entity", type=str, default="", help="W&B entity/team (optional).")
@@ -876,6 +882,10 @@ def main() -> int:
     max_length = _safe_int(args.max_length, default=512, minimum=16, maximum=8192)
     val_ratio = _safe_float(args.val_ratio, default=0.1, minimum=0.0, maximum=0.5)
     log_every_steps = _safe_int(args.log_every_steps, default=50, minimum=1, maximum=1_000_000)
+    use_tqdm = not bool(args.no_tqdm)
+    if use_tqdm and tqdm is None:
+        print("tqdm_unavailable=true")
+        use_tqdm = False
 
     wandb_run: Any = None
     wandb_enabled = not bool(args.no_wandb)
@@ -922,6 +932,7 @@ def main() -> int:
     print(f"raw_input={raw_path}")
     print(f"pairwise_input={pairwise_path} exists={pairwise_path.exists()}")
     print(f"output_dir={output_dir}")
+    print(f"use_tqdm={use_tqdm}")
 
     groups_all = _load_raw_groups(raw_path, max_queries=max_train_queries)
     if not groups_all:
@@ -1072,7 +1083,19 @@ def main() -> int:
             optimizer.zero_grad(set_to_none=True)
             accum_counter = 0
 
-            for step, batch in enumerate(pair_train_loader, start=1):
+            stage1_iter: Any = pair_train_loader
+            stage1_bar: Any = None
+            if use_tqdm:
+                stage1_bar = tqdm(
+                    pair_train_loader,
+                    total=len(pair_train_loader),
+                    desc=f"Stage1 {epoch}/{stage1_epochs}",
+                    dynamic_ncols=True,
+                    leave=False,
+                )
+                stage1_iter = stage1_bar
+
+            for step, batch in enumerate(stage1_iter, start=1):
                 pos = _to_device(batch["pos"], device)
                 neg = _to_device(batch["neg"], device)
                 margins = batch["margins"].to(device)
@@ -1111,6 +1134,14 @@ def main() -> int:
                             },
                             step=global_step,
                         )
+                if stage1_bar is not None and (step % 10 == 0):
+                    recent_pair = sum(epoch_losses[-10:]) / max(1, min(10, len(epoch_losses)))
+                    stage1_bar.set_postfix(
+                        {
+                            "loss_pair": f"{recent_pair:.4f}",
+                            "gs": int(global_step),
+                        }
+                    )
 
             if accum_counter > 0:
                 if max_grad_norm > 0.0:
@@ -1118,6 +1149,8 @@ def main() -> int:
                 optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
                 global_step += 1
+            if stage1_bar is not None:
+                stage1_bar.close()
 
             train_loss = float(sum(epoch_losses) / max(1, len(epoch_losses)))
             val_pair_loss = eval_pairwise_margin(pair_val_loader) if val_pairs else 0.0
@@ -1189,7 +1222,19 @@ def main() -> int:
 
             loss_hist: Dict[str, List[float]] = {"total": [], "kl": [], "pair": [], "mse": []}
 
-            for step, list_batch in enumerate(epoch_loader, start=1):
+            stage2_iter: Any = epoch_loader
+            stage2_bar: Any = None
+            if use_tqdm:
+                stage2_bar = tqdm(
+                    epoch_loader,
+                    total=len(epoch_loader),
+                    desc=f"Stage2 {epoch}/{stage2_epochs}",
+                    dynamic_ncols=True,
+                    leave=False,
+                )
+                stage2_iter = stage2_bar
+
+            for step, list_batch in enumerate(stage2_iter, start=1):
                 if list_batch.get("enc") is None:
                     continue
 
@@ -1262,6 +1307,20 @@ def main() -> int:
                             },
                             step=global_step,
                         )
+                if stage2_bar is not None and (step % 10 == 0):
+                    recent_total = sum(loss_hist["total"][-10:]) / max(1, min(10, len(loss_hist["total"])))
+                    recent_kl = sum(loss_hist["kl"][-10:]) / max(1, min(10, len(loss_hist["kl"])))
+                    recent_pair = sum(loss_hist["pair"][-10:]) / max(1, min(10, len(loss_hist["pair"])))
+                    recent_mse = sum(loss_hist["mse"][-10:]) / max(1, min(10, len(loss_hist["mse"])))
+                    stage2_bar.set_postfix(
+                        {
+                            "loss": f"{recent_total:.4f}",
+                            "kl": f"{recent_kl:.4f}",
+                            "pair": f"{recent_pair:.4f}",
+                            "mse": f"{recent_mse:.4f}",
+                            "gs": int(global_step),
+                        }
+                    )
 
             if accum_counter > 0:
                 if max_grad_norm > 0.0:
@@ -1269,6 +1328,8 @@ def main() -> int:
                 optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
                 global_step += 1
+            if stage2_bar is not None:
+                stage2_bar.close()
 
             eval_metrics = _evaluate(
                 model=model,
@@ -1354,6 +1415,7 @@ def main() -> int:
         "weight_decay": float(weight_decay),
         "max_length": int(max_length),
         "device": str(device),
+        "use_tqdm": bool(use_tqdm),
         "use_amp": bool(use_amp),
         "amp_dtype": str(amp_dtype) if use_amp else "",
         "best_ndcg@10": float(best_ndcg),
