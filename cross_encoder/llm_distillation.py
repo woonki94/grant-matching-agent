@@ -30,6 +30,7 @@ RAW_OUTPUT_DEFAULT = "cross_encoder/dataset/llm_distill_raw_scores.jsonl"
 PAIRWISE_OUTPUT_DEFAULT = "cross_encoder/dataset/llm_distill_pairwise.jsonl"
 LISTWISE_OUTPUT_DEFAULT = "cross_encoder/dataset/llm_distill_listwise.jsonl"
 MANIFEST_OUTPUT_DEFAULT = "cross_encoder/dataset/llm_distill_manifest.json"
+PREFILTER_COSINE_MODEL_DEFAULT = "BAAI/bge-small-en-v1.5"
 
 
 SYSTEM_PROMPT = """
@@ -293,6 +294,74 @@ def _rank_chunk_indices_for_spec(
     return [int(i) for i, _ in ranked]
 
 
+def _build_cosine_chunk_index(
+    chunks: Sequence[Dict[str, Any]],
+    *,
+    model_id: str,
+    encode_batch_size: int,
+) -> Optional[Dict[str, Any]]:
+    """
+    Build dense-normalized chunk embeddings for cosine prefiltering.
+    Returns None if sentence-transformers is unavailable.
+    """
+    try:
+        from sentence_transformers import SentenceTransformer
+    except Exception:
+        return None
+
+    texts = [_clean_text(c.get("chunk_text")) for c in chunks]
+    model = SentenceTransformer(_clean_text(model_id))
+    embs = model.encode(
+        texts,
+        batch_size=max(1, int(encode_batch_size)),
+        show_progress_bar=True,
+        normalize_embeddings=True,
+        convert_to_numpy=True,
+    )
+    return {
+        "model_id": _clean_text(model_id),
+        "model": model,
+        "chunk_embs": embs,
+        "rank_cache": {},  # spec_text -> ranked indices
+    }
+
+
+def _rank_chunk_indices_for_spec_cosine(
+    spec_text: str,
+    *,
+    cosine_index: Dict[str, Any],
+) -> List[int]:
+    cache: Dict[str, List[int]] = cosine_index["rank_cache"]
+    key = _clean_text(spec_text)
+    if key in cache:
+        return list(cache[key])
+
+    model = cosine_index["model"]
+    chunk_embs = cosine_index["chunk_embs"]
+    q = model.encode(
+        [key],
+        batch_size=1,
+        show_progress_bar=False,
+        normalize_embeddings=True,
+        convert_to_numpy=True,
+    )[0]
+    # embeddings are normalized, so dot product == cosine.
+    sims = chunk_embs @ q
+    ranked = list(((-sims).argsort()).tolist())
+    cache[key] = ranked
+    return ranked
+
+
+def _split_bm25_cosine_counts(k: int, use_cosine_mix: bool) -> Tuple[int, int]:
+    if k <= 0:
+        return 0, 0
+    if not use_cosine_mix:
+        return int(k), 0
+    bm25_k = (int(k) + 1) // 2  # ceil(k/2)
+    cos_k = int(k) // 2         # floor(k/2)
+    return bm25_k, cos_k
+
+
 def _rng_for_spec(*, base_seed: int, grant_id: str, spec_idx: int) -> random.Random:
     seed_text = f"{int(base_seed)}::{_clean_text(grant_id)}::{int(spec_idx)}"
     digest = hashlib.sha1(seed_text.encode("utf-8")).hexdigest()[:16]
@@ -305,6 +374,7 @@ def _select_chunk_candidates_for_spec(
     spec_item: Dict[str, Any],
     chunks: Sequence[Dict[str, Any]],
     sparse_index: Optional[Dict[str, Any]],
+    cosine_index: Optional[Dict[str, Any]],
     top_k: int,
     mid_k: int,
     rand_k: int,
@@ -318,14 +388,30 @@ def _select_chunk_candidates_for_spec(
     m = max(0, int(mid_k))
     r = max(0, int(rand_k))
     target = t + m + r
-    if target <= 0 or target >= total or sparse_index is None:
+    if target <= 0 or target >= total or (sparse_index is None and cosine_index is None):
         return list(chunks)
+
+    use_cosine_mix = cosine_index is not None and sparse_index is not None
 
     grant_id = _clean_text(spec_item.get("grant_id"))
     spec_idx = int(spec_item.get("spec_idx") or 0)
     rng = _rng_for_spec(base_seed=base_seed, grant_id=grant_id, spec_idx=spec_idx)
 
-    ranked = _rank_chunk_indices_for_spec(_clean_text(spec_item.get("spec_text")), sparse_index=sparse_index)
+    spec_text = _clean_text(spec_item.get("spec_text"))
+    ranked_bm25 = (
+        _rank_chunk_indices_for_spec(spec_text, sparse_index=sparse_index)
+        if sparse_index is not None
+        else []
+    )
+    ranked_cos = (
+        _rank_chunk_indices_for_spec_cosine(spec_text, cosine_index=cosine_index)
+        if cosine_index is not None
+        else []
+    )
+
+    top_b, top_c = _split_bm25_cosine_counts(t, use_cosine_mix=use_cosine_mix)
+    mid_b, mid_c = _split_bm25_cosine_counts(m, use_cosine_mix=use_cosine_mix)
+    rand_b, rand_c = _split_bm25_cosine_counts(r, use_cosine_mix=use_cosine_mix)
     selected: List[int] = []
     selected_set = set()
 
@@ -337,36 +423,69 @@ def _select_chunk_candidates_for_spec(
         selected.append(idx)
         selected_set.add(idx)
 
-    # 1) Strong candidates from sparse rank top.
-    for idx in ranked[: min(t, len(ranked))]:
+    # 1) Strong candidates: top bm25 + top cosine.
+    for idx in ranked_bm25[: min(top_b, len(ranked_bm25))]:
+        _add(idx)
+    for idx in ranked_cos[: min(top_c, len(ranked_cos))]:
         _add(idx)
 
-    # 2) Medium band candidates from middle of non-top ranked pool.
-    if m > 0:
-        non_top = ranked[min(t, len(ranked)) :]
-        if non_top:
-            start = len(non_top) // 3
-            end = (2 * len(non_top)) // 3
-            mid_pool = non_top[start:end] if end > start else non_top
-            if mid_pool:
-                pick = min(m, len(mid_pool))
-                for idx in rng.sample(mid_pool, k=pick):
-                    _add(idx)
-
-    # 3) Easy/diverse negatives from full remainder.
-    if r > 0:
-        remainder = [i for i in range(total) if i not in selected_set]
-        if remainder:
-            pick = min(r, len(remainder))
-            for idx in rng.sample(remainder, k=pick):
+    def _sample_mid_from_rank(ranked: List[int], already_top: int, need: int) -> None:
+        if need <= 0 or not ranked:
+            return
+        non_top = ranked[min(already_top, len(ranked)) :]
+        if not non_top:
+            return
+        start = len(non_top) // 3
+        end = (2 * len(non_top)) // 3
+        pool = non_top[start:end] if end > start else non_top
+        avail = [i for i in pool if i not in selected_set]
+        if not avail:
+            return
+        pick = min(need, len(avail))
+        if pick == len(avail):
+            for idx in avail:
                 _add(idx)
+            return
+        for idx in rng.sample(avail, k=pick):
+            _add(idx)
+
+    # 2) Medium band: mix bm25 middle and cosine middle.
+    _sample_mid_from_rank(ranked_bm25, top_b, mid_b)
+    _sample_mid_from_rank(ranked_cos, top_c, mid_c)
+
+    def _sample_tail_from_rank(ranked: List[int], need: int) -> None:
+        if need <= 0 or not ranked:
+            return
+        tail_start = (2 * len(ranked)) // 3
+        pool = ranked[tail_start:] if tail_start < len(ranked) else ranked
+        avail = [i for i in pool if i not in selected_set]
+        if not avail:
+            return
+        pick = min(need, len(avail))
+        if pick == len(avail):
+            for idx in avail:
+                _add(idx)
+            return
+        for idx in rng.sample(avail, k=pick):
+            _add(idx)
+
+    # 3) Easy/diverse negatives: mix random tail bm25 and random tail cosine.
+    _sample_tail_from_rank(ranked_bm25, rand_b)
+    _sample_tail_from_rank(ranked_cos, rand_c)
 
     # Backfill if collisions reduced count.
     if len(selected) < target:
-        for idx in ranked:
+        # Prefer highest ranked first (bm25 then cosine interleaving) before global random.
+        max_len = max(len(ranked_bm25), len(ranked_cos))
+        for i in range(max_len):
+            if i < len(ranked_bm25):
+                _add(ranked_bm25[i])
             if len(selected) >= target:
                 break
-            _add(idx)
+            if i < len(ranked_cos):
+                _add(ranked_cos[i])
+            if len(selected) >= target:
+                break
     if len(selected) < target:
         remainder = [i for i in range(total) if i not in selected_set]
         if remainder:
@@ -587,6 +706,23 @@ def _build_parser() -> argparse.ArgumentParser:
         default=42,
         help="Base random seed for deterministic per-spec prefilter sampling.",
     )
+    p.add_argument(
+        "--prefilter-cosine-model-id",
+        type=str,
+        default=PREFILTER_COSINE_MODEL_DEFAULT,
+        help="Sentence-Transformers model id for cosine prefilter mixing.",
+    )
+    p.add_argument(
+        "--prefilter-cosine-batch-size",
+        type=int,
+        default=256,
+        help="Batch size for chunk/query embedding encode in cosine prefilter.",
+    )
+    p.add_argument(
+        "--prefilter-no-cosine",
+        action="store_true",
+        help="Disable cosine prefilter and use BM25-only prefiltering.",
+    )
 
     p.add_argument("--pair-pos-top-k", type=int, default=4, help="Top-K positive pool per query.")
     p.add_argument("--pair-weak-bottom-k", type=int, default=4, help="Bottom-K weak negative pool per query.")
@@ -636,6 +772,9 @@ def main() -> int:
     prefilter_mid_k = _safe_int(args.prefilter_mid_k, default=0, minimum=0, maximum=200_000)
     prefilter_rand_k = _safe_int(args.prefilter_rand_k, default=0, minimum=0, maximum=200_000)
     prefilter_seed = _safe_int(args.prefilter_seed, default=42, minimum=0, maximum=2_147_483_647)
+    prefilter_cosine_model_id = _clean_text(args.prefilter_cosine_model_id) or PREFILTER_COSINE_MODEL_DEFAULT
+    prefilter_cosine_batch_size = _safe_int(args.prefilter_cosine_batch_size, default=256, minimum=1, maximum=8192)
+    prefilter_no_cosine = bool(args.prefilter_no_cosine)
     use_prefilter = (prefilter_top_k + prefilter_mid_k + prefilter_rand_k) > 0
 
     pair_pos_top_k = _safe_int(args.pair_pos_top_k, default=4, minimum=1, maximum=10_000)
@@ -668,8 +807,15 @@ def main() -> int:
 
     full_total_pairs = int(len(specs) * len(chunks))
     sparse_index: Optional[Dict[str, Any]] = None
+    cosine_index: Optional[Dict[str, Any]] = None
     if use_prefilter:
         sparse_index = _build_sparse_chunk_index(chunks)
+        if not prefilter_no_cosine:
+            cosine_index = _build_cosine_chunk_index(
+                chunks,
+                model_id=prefilter_cosine_model_id,
+                encode_batch_size=prefilter_cosine_batch_size,
+            )
         prefilter_target_per_spec = min(
             len(chunks),
             int(prefilter_top_k + prefilter_mid_k + prefilter_rand_k),
@@ -709,6 +855,9 @@ def main() -> int:
     print(f"total_pairs={total_pairs}")
     print(f"use_prefilter={use_prefilter}")
     if use_prefilter:
+        print(f"use_cosine_prefilter={cosine_index is not None}")
+        if (not prefilter_no_cosine) and cosine_index is None:
+            print("cosine_prefilter_unavailable=true")
         print(
             "prefilter_k="
             f"top:{prefilter_top_k},mid:{prefilter_mid_k},rand:{prefilter_rand_k} "
@@ -744,6 +893,7 @@ def main() -> int:
                         spec_item=spec_item,
                         chunks=chunks,
                         sparse_index=sparse_index,
+                        cosine_index=cosine_index,
                         top_k=prefilter_top_k,
                         mid_k=prefilter_mid_k,
                         rand_k=prefilter_rand_k,
@@ -881,6 +1031,10 @@ def main() -> int:
         "prefilter_rand_k": int(prefilter_rand_k),
         "prefilter_target_per_spec": int(prefilter_target_per_spec),
         "prefilter_seed": int(prefilter_seed),
+        "prefilter_cosine_model_id": str(prefilter_cosine_model_id),
+        "prefilter_cosine_batch_size": int(prefilter_cosine_batch_size),
+        "prefilter_no_cosine": bool(prefilter_no_cosine),
+        "use_cosine_prefilter": bool(cosine_index is not None),
         "avg_candidates_per_spec": float(avg_candidates),
         "min_candidates_per_spec": int(min_candidates_per_spec),
         "max_candidates_per_spec": int(max_candidates_per_spec),
