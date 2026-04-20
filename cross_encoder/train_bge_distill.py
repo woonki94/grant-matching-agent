@@ -221,6 +221,43 @@ def _parse_csv_items(value: Any) -> List[str]:
     return [x.strip() for x in raw.split(",") if x.strip()]
 
 
+def _float_token(value: float) -> str:
+    s = f"{float(value):.6g}".lower()
+    return s.replace("-", "m").replace("+", "").replace(".", "p")
+
+
+def _build_output_suffix(
+    *,
+    seed: int,
+    stage1_epochs: int,
+    stage2_epochs: int,
+    train_batch_size: int,
+    grad_accum_steps: int,
+    candidate_pool_size: int,
+    mini_list_size: int,
+    learning_rate: float,
+    teacher_temperature: float,
+    loss_kl_weight: float,
+    loss_pair_weight: float,
+    loss_mse_weight: float,
+) -> str:
+    parts = [
+        f"sd{int(seed)}",
+        f"s1{int(stage1_epochs)}",
+        f"s2{int(stage2_epochs)}",
+        f"bs{int(train_batch_size)}",
+        f"ga{int(grad_accum_steps)}",
+        f"cp{int(candidate_pool_size)}",
+        f"ml{int(mini_list_size)}",
+        f"lr{_float_token(float(learning_rate))}",
+        f"t{_float_token(float(teacher_temperature))}",
+        f"kl{_float_token(float(loss_kl_weight))}",
+        f"pw{_float_token(float(loss_pair_weight))}",
+        f"mse{_float_token(float(loss_mse_weight))}",
+    ]
+    return "_".join(parts)
+
+
 def _wandb_log(run: Any, metrics: Dict[str, Any], *, step: Optional[int] = None) -> None:
     if run is None:
         return
@@ -764,6 +801,12 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Pairwise JSONL path (optional; if missing, pairs are derived from raw).",
     )
     p.add_argument("--output-dir", type=str, default=OUTPUT_DIR_DEFAULT, help="Output model/checkpoint directory.")
+    p.add_argument(
+        "--append-args-to-output-dir",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Append key hyperparameter args to output-dir name (default: true).",
+    )
 
     p.add_argument("--model-id", type=str, default=MODEL_ID_DEFAULT, help="Cross-encoder base model id.")
     p.add_argument("--max-length", type=int, default=512, help="Tokenizer max sequence length.")
@@ -832,8 +875,7 @@ def main() -> int:
 
     raw_path = Path(_clean_text(args.raw_input)).expanduser().resolve()
     pairwise_path = Path(_clean_text(args.pairwise_input)).expanduser().resolve()
-    output_dir = Path(_clean_text(args.output_dir)).expanduser().resolve()
-    output_dir.mkdir(parents=True, exist_ok=True)
+    output_dir_base = Path(_clean_text(args.output_dir)).expanduser().resolve()
 
     if not raw_path.exists():
         raise RuntimeError(f"raw_input not found: {raw_path}")
@@ -882,10 +924,32 @@ def main() -> int:
     max_length = _safe_int(args.max_length, default=512, minimum=16, maximum=8192)
     val_ratio = _safe_float(args.val_ratio, default=0.1, minimum=0.0, maximum=0.5)
     log_every_steps = _safe_int(args.log_every_steps, default=50, minimum=1, maximum=1_000_000)
+    append_args_to_output_dir = bool(args.append_args_to_output_dir)
     use_tqdm = not bool(args.no_tqdm)
     if use_tqdm and tqdm is None:
         print("tqdm_unavailable=true")
         use_tqdm = False
+
+    output_suffix = ""
+    if append_args_to_output_dir:
+        output_suffix = _build_output_suffix(
+            seed=seed,
+            stage1_epochs=stage1_epochs,
+            stage2_epochs=stage2_epochs,
+            train_batch_size=train_batch_size,
+            grad_accum_steps=grad_accum_steps,
+            candidate_pool_size=candidate_pool_size,
+            mini_list_size=mini_list_size,
+            learning_rate=learning_rate,
+            teacher_temperature=teacher_temperature,
+            loss_kl_weight=loss_kl_weight,
+            loss_pair_weight=loss_pair_weight,
+            loss_mse_weight=loss_mse_weight,
+        )
+        output_dir = (output_dir_base.parent / f"{output_dir_base.name}__{output_suffix}").resolve()
+    else:
+        output_dir = output_dir_base
+    output_dir.mkdir(parents=True, exist_ok=True)
 
     wandb_run: Any = None
     wandb_enabled = not bool(args.no_wandb)
@@ -896,7 +960,9 @@ def main() -> int:
             wandb_config = dict(vars(args))
             wandb_config["raw_input"] = str(raw_path)
             wandb_config["pairwise_input"] = str(pairwise_path)
+            wandb_config["output_dir_base"] = str(output_dir_base)
             wandb_config["output_dir"] = str(output_dir)
+            wandb_config["output_suffix"] = str(output_suffix)
 
             init_kwargs: Dict[str, Any] = {
                 "project": _clean_text(args.wandb_project) or WANDB_PROJECT_DEFAULT,
@@ -931,6 +997,10 @@ def main() -> int:
 
     print(f"raw_input={raw_path}")
     print(f"pairwise_input={pairwise_path} exists={pairwise_path.exists()}")
+    print(f"output_dir_base={output_dir_base}")
+    print(f"append_args_to_output_dir={append_args_to_output_dir}")
+    if output_suffix:
+        print(f"output_suffix={output_suffix}")
     print(f"output_dir={output_dir}")
     print(f"use_tqdm={use_tqdm}")
 
@@ -1447,7 +1517,10 @@ def main() -> int:
         "created_at_utc": datetime.now(timezone.utc).isoformat(),
         "raw_input": str(raw_path),
         "pairwise_input": str(pairwise_path),
+        "output_dir_base": str(output_dir_base),
         "output_dir": str(output_dir),
+        "append_args_to_output_dir": bool(append_args_to_output_dir),
+        "output_suffix": str(output_suffix),
         "model_id": _clean_text(args.model_id) or MODEL_ID_DEFAULT,
         "seed": int(seed),
         "train_queries": int(len(train_groups)),
