@@ -1052,6 +1052,16 @@ def main() -> int:
         collate_fn=PairCollator(tokenizer, max_length=max_length),
         drop_last=False,
     )
+    val_list_loader: Optional[DataLoader] = None
+    if val_list_rows:
+        val_list_loader = DataLoader(
+            ListwiseDataset(val_groups, val_list_rows),
+            batch_size=eval_batch_size,
+            shuffle=False,
+            num_workers=_safe_int(args.num_workers, default=0, minimum=0, maximum=32),
+            collate_fn=ListCollator(tokenizer, max_length=max_length),
+            drop_last=False,
+        )
 
     best_ndcg = -1.0
     history: List[Dict[str, Any]] = []
@@ -1073,6 +1083,34 @@ def main() -> int:
                 loss = _variable_margin_loss(pos_logits, neg_logits, margins)
                 vals.append(float(loss.detach().cpu().item()))
         return float(sum(vals) / max(1, len(vals)))
+
+    def eval_listwise_losses(loader: Optional[DataLoader]) -> Dict[str, float]:
+        if loader is None:
+            return {"val_kl_loss": 0.0, "val_mse_loss": 0.0, "val_list_batches": 0.0}
+        model.eval()
+        kl_vals: List[float] = []
+        mse_vals: List[float] = []
+        with torch.no_grad():
+            for batch in loader:
+                if batch.get("enc") is None:
+                    continue
+                enc = _to_device(batch["enc"], device)
+                teacher_scores = batch["teacher_scores"].to(device)
+                list_sizes = batch["list_sizes"]
+                logits_flat = model(**enc).logits.squeeze(-1)
+                kl_loss, mse_loss = _compute_listwise_kl_and_mse(
+                    logits_flat=logits_flat,
+                    teacher_scores_flat=teacher_scores,
+                    list_sizes=list_sizes,
+                    temperature=teacher_temperature,
+                )
+                kl_vals.append(float(kl_loss.detach().cpu().item()))
+                mse_vals.append(float(mse_loss.detach().cpu().item()))
+        return {
+            "val_kl_loss": float(sum(kl_vals) / max(1, len(kl_vals))),
+            "val_mse_loss": float(sum(mse_vals) / max(1, len(mse_vals))),
+            "val_list_batches": float(len(kl_vals)),
+        }
 
     # Stage 1: pairwise warm start.
     if stage1_epochs > 0:
@@ -1331,6 +1369,16 @@ def main() -> int:
             if stage2_bar is not None:
                 stage2_bar.close()
 
+            val_pair_loss = eval_pairwise_margin(pair_val_loader) if val_pairs else 0.0
+            val_list_loss = eval_listwise_losses(val_list_loader)
+            val_kl_loss = float(val_list_loss.get("val_kl_loss", 0.0))
+            val_mse_loss = float(val_list_loss.get("val_mse_loss", 0.0))
+            val_total_loss = (
+                float(loss_kl_weight) * float(val_kl_loss)
+                + float(loss_pair_weight) * float(val_pair_loss)
+                + float(loss_mse_weight) * float(val_mse_loss)
+            )
+
             eval_metrics = _evaluate(
                 model=model,
                 tokenizer=tokenizer,
@@ -1350,6 +1398,11 @@ def main() -> int:
                 "train_kl_loss": float(sum(loss_hist["kl"]) / max(1, len(loss_hist["kl"]))),
                 "train_pair_loss": float(sum(loss_hist["pair"]) / max(1, len(loss_hist["pair"]))),
                 "train_mse_loss": float(sum(loss_hist["mse"]) / max(1, len(loss_hist["mse"]))),
+                "val_total_loss": float(val_total_loss),
+                "val_kl_loss": float(val_kl_loss),
+                "val_pair_loss": float(val_pair_loss),
+                "val_mse_loss": float(val_mse_loss),
+                "val_list_batches": int(val_list_loss.get("val_list_batches", 0.0)),
                 "global_step": global_step,
             }
             metrics.update(eval_metrics)
@@ -1364,6 +1417,10 @@ def main() -> int:
                     "train/loss_kl_epoch": float(metrics["train_kl_loss"]),
                     "train/loss_pair_epoch": float(metrics["train_pair_loss"]),
                     "train/loss_mse_epoch": float(metrics["train_mse_loss"]),
+                    "eval/loss_total_epoch": float(metrics["val_total_loss"]),
+                    "eval/loss_kl_epoch": float(metrics["val_kl_loss"]),
+                    "eval/loss_pair_epoch": float(metrics["val_pair_loss"]),
+                    "eval/loss_mse_epoch": float(metrics["val_mse_loss"]),
                     "eval/ndcg@10": float(metrics.get("ndcg@10", 0.0)),
                     "eval/mrr@10": float(metrics.get("mrr@10", 0.0)),
                     "eval/recall@50": float(metrics.get("recall@50", 0.0)),
