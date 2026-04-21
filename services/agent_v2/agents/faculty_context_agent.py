@@ -216,6 +216,7 @@ class FacultyContextAgent:
                 "resolved":    List[int],   # faculty_ids ready for matching
                 "newly_added": List[str],   # emails successfully scraped + inserted
                 "failed":      List[str],   # emails whose ingestion failed
+                "missing_osu_url_emails": List[str],  # emails not in DB and missing osu_url
             }
         """
         self._call("FacultyContextAgent.resolve_and_ingest_faculties")
@@ -342,6 +343,7 @@ class FacultyContextAgent:
             "resolved": resolved,
             "newly_added": newly_added,
             "failed": failed,
+            "missing_osu_url_emails": list(unknown_without_url),
         }
 
     # ──────────────────────────────────────────────────────────────────
@@ -359,4 +361,3 @@ class FacultyContextAgent:
     def ask_for_user_reference_data(self) -> Dict[str, str]:
         self._call("FacultyContextAgent.ask_for_user_reference_data")
         return {"next_action": "ask_user_reference_data"}
-

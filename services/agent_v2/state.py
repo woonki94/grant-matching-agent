@@ -72,6 +72,7 @@ class GrantMatchWorkflowState(TypedDict, total=False):
     requested_top_k_grants_detected: Optional[int]
     faculty_ids: List[int]
     missing_emails: List[str]
+    missing_osu_url_emails: List[str]
     opportunity_id: Optional[str]
     opportunity_title: Optional[str]
     result: Dict[str, Any]

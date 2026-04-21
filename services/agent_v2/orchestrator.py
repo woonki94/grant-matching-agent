@@ -151,7 +151,11 @@ class GrantMatchOrchestrator:
         # Only fall back to asking the user when scraping itself failed (i.e., no
         # faculty IDs could be resolved at all — not merely "not in DB").
         if not ingested.get("resolved"):
-            return {"decision": "ask_user_reference_data"}
+            return {
+                "decision": "ask_user_reference_data",
+                "missing_emails": list(ingested.get("failed") or []),
+                "missing_osu_url_emails": list(ingested.get("missing_osu_url_emails") or []),
+            }
         faculty_ids = list(ingested.get("resolved") or [])
         resolved_state: GrantMatchWorkflowState = {
             "faculty_ids": faculty_ids,
@@ -182,14 +186,25 @@ class GrantMatchOrchestrator:
             cv_pdf_map=state.get("cv_pdf_map"),
             osu_url_map=state.get("osu_url_map"),
         )
-        # Proceed even if some emails failed — as long as at least one faculty resolved.
-        # Only hard-stop when no faculty could be resolved at all.
+        # Strict mode: if any provided email failed resolution, stop and ask for
+        # reference data instead of continuing with a partial team.
+        failed_emails = list(ingested.get("failed") or [])
+        if failed_emails:
+            return {
+                "decision": "ask_user_reference_data",
+                "missing_emails": failed_emails,
+                "missing_osu_url_emails": list(ingested.get("missing_osu_url_emails") or []),
+            }
         if not ingested.get("resolved"):
-            return {"decision": "ask_user_reference_data"}
+            return {
+                "decision": "ask_user_reference_data",
+                "missing_emails": failed_emails,
+                "missing_osu_url_emails": list(ingested.get("missing_osu_url_emails") or []),
+            }
         return {
             "emails": emails,
             "faculty_ids": list(ingested.get("resolved") or []),
-            "missing_emails": list(ingested.get("failed") or []),
+            "missing_emails": failed_emails,
             "decision": "generate_keywords_group",
         }
 
@@ -207,15 +222,26 @@ class GrantMatchOrchestrator:
             cv_pdf_map=state.get("cv_pdf_map"),
             osu_url_map=state.get("osu_url_map"),
         )
-        # Proceed even if some emails failed — as long as at least one faculty resolved.
-        # Only hard-stop when no faculty could be resolved at all.
+        # Strict mode: if any provided email failed resolution, stop and ask for
+        # reference data instead of continuing with a partial team.
+        failed_emails = list(ingested.get("failed") or [])
+        if failed_emails:
+            return {
+                "decision": "ask_user_reference_data",
+                "missing_emails": failed_emails,
+                "missing_osu_url_emails": list(ingested.get("missing_osu_url_emails") or []),
+            }
         if not ingested.get("resolved"):
-            return {"decision": "ask_user_reference_data"}
+            return {
+                "decision": "ask_user_reference_data",
+                "missing_emails": failed_emails,
+                "missing_osu_url_emails": list(ingested.get("missing_osu_url_emails") or []),
+            }
 
         resolved_state: GrantMatchWorkflowState = {
             "emails": emails,
             "faculty_ids": list(ingested.get("resolved") or []),
-            "missing_emails": list(ingested.get("failed") or []),
+            "missing_emails": failed_emails,
         }
 
         ident = self._resolve_grant_identifier_type(state)
@@ -241,9 +267,16 @@ class GrantMatchOrchestrator:
         self._call("GrantMatchOrchestrator._node_ask_group_emails")
         return {"result": self.faculty_agent.ask_for_group_emails()}
 
-    def _node_ask_user_reference_data(self, _: GrantMatchWorkflowState) -> GrantMatchWorkflowState:
+    def _node_ask_user_reference_data(self, state: GrantMatchWorkflowState) -> GrantMatchWorkflowState:
         self._call("GrantMatchOrchestrator._node_ask_user_reference_data")
-        return {"result": self.faculty_agent.ask_for_user_reference_data()}
+        out = dict(self.faculty_agent.ask_for_user_reference_data() or {})
+        missing_emails = list(state.get("missing_emails") or [])
+        missing_osu_url_emails = list(state.get("missing_osu_url_emails") or [])
+        if missing_emails:
+            out["missing_emails"] = missing_emails
+        if missing_osu_url_emails:
+            out["missing_osu_url_emails"] = missing_osu_url_emails
+        return {"result": out}
 
     def _node_ask_grant_identifier(self, _: GrantMatchWorkflowState) -> GrantMatchWorkflowState:
         self._call("GrantMatchOrchestrator._node_ask_grant_identifier")
