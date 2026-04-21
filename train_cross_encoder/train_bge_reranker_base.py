@@ -745,7 +745,30 @@ def train_bge_reranker(
     train_ds = Dataset.from_list(train_dicts)
     eval_ds = Dataset.from_list(val_dicts) if val_dicts else None
 
-    tokenizer = AutoTokenizer.from_pretrained(safe_model_name, trust_remote_code=True)
+    tok_last_err: Optional[Exception] = None
+    tokenizer = None
+    tok_attempts = (
+        {"use_fast": False, "fix_mistral_regex": True},
+        {"use_fast": True, "fix_mistral_regex": True},
+        {"use_fast": False},
+        {"use_fast": True},
+    )
+    for kwargs in tok_attempts:
+        try:
+            tokenizer = AutoTokenizer.from_pretrained(
+                safe_model_name,
+                trust_remote_code=True,
+                **kwargs,
+            )
+            break
+        except Exception as e:
+            tok_last_err = e
+    if tokenizer is None:
+        raise RuntimeError(
+            "Failed to load tokenizer with stable settings. "
+            "Install tokenizer deps if needed: `pip install sentencepiece tiktoken`.\n"
+            f"model={safe_model_name}, last_error={tok_last_err}"
+        )
     model = AutoModelForSequenceClassification.from_pretrained(
         safe_model_name,
         num_labels=1,
