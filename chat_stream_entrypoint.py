@@ -170,6 +170,35 @@ def _extract_frontend_justification_payload(body: Dict[str, Any]) -> Optional[Di
     return None
 
 
+def _split_existing_vs_missing_db_emails(emails: List[str]) -> Dict[str, List[str]]:
+    normalized: List[str] = []
+    for x in emails or []:
+        e = str(x or "").strip().lower()
+        if e and e not in normalized:
+            normalized.append(e)
+    if not normalized:
+        return {"existing": [], "missing": []}
+
+    existing: List[str] = []
+    missing: List[str] = []
+    try:
+        from db.db_conn import SessionLocal
+        from dao.faculty_dao import FacultyDAO
+
+        with SessionLocal() as sess:
+            dao = FacultyDAO(sess)
+            for email in normalized:
+                if dao.get_faculty_id_by_email(email) is None:
+                    missing.append(email)
+                else:
+                    existing.append(email)
+    except Exception:
+        logger.exception("Failed to classify emails by DB existence; treating as missing")
+        return {"existing": [], "missing": normalized}
+
+    return {"existing": existing, "missing": missing}
+
+
 def _maybe_send_result_email(
     *,
     recipient_emails: List[str],
@@ -360,34 +389,6 @@ def chat():
             )
             return
 
-        # Validate: every explicitly provided email must have a matching osu_url entry.
-        # This check only applies when emails are given in the request body; the
-        # orchestrator may still ask for emails later (via ask_email / ask_group_emails).
-        explicitly_provided_emails: List[str] = []
-        raw_single = str(body.get("email") or "").strip().lower()
-        if raw_single:
-            explicitly_provided_emails.append(raw_single)
-        for e in _to_email_list(body.get("emails")):
-            if e not in explicitly_provided_emails:
-                explicitly_provided_emails.append(e)
-
-        if explicitly_provided_emails:
-            missing_osu = [e for e in explicitly_provided_emails if e not in (osu_url_map or {})]
-            if missing_osu:
-                print(f"chat.request_info.missing_osu_url: {missing_osu}")
-                yield emit(
-                    "request_info",
-                    {
-                        "type": "missing_osu_url",
-                        "message": (
-                            "Please provide an OSU engineering profile URL for each faculty member. "
-                            f"Missing for: {', '.join(missing_osu)}"
-                        ),
-                        "emails_missing_osu_url": missing_osu,
-                    },
-                )
-                return
-
         orchestrator, orchestrator_error = _get_orchestrator()
         if orchestrator is None:
             print(f"chat.error.agent_v2_unavailable: {orchestrator_error}")
@@ -500,6 +501,27 @@ def chat():
             )
             return
         if next_action == "ask_user_reference_data":
+            result = decision_out.get("result") or {}
+            reported_missing = _to_email_list(result.get("missing_emails"))
+            db_missing = _split_existing_vs_missing_db_emails(reported_missing).get("missing") if reported_missing else []
+            if db_missing:
+                info_type = "email_not_in_db" if len(db_missing) == 1 else "emails_not_in_db"
+                msg = (
+                    "This faculty email was not found in DB. Please upload reference profile data."
+                    if len(db_missing) == 1
+                    else "Some faculty emails were not found in DB. Please upload reference profile data."
+                )
+                yield emit(
+                    "request_info",
+                    {
+                        "type": info_type,
+                        "message": msg,
+                        "received_emails": reported_missing,
+                        "emails_missing_in_db": db_missing,
+                        "orchestrator": decision_out,
+                    },
+                )
+                return
             yield emit(
                 "request_info",
                 {
@@ -657,11 +679,16 @@ def _resolve_opportunity_id(grant_link=None, grant_title=None):
 
 def _resolve_faculty_ids_for_team(emails, osu_url_map, cv_pdf_map):
     """
-    Resolve + optionally ingest faculty, return {email: faculty_id}.
+    Resolve + optionally ingest faculty.
+    Returns:
+      {
+        "email_to_fid": {email: faculty_id},
+        "failed_emails": [email, ...],
+      }
     Skips gracefully if emails is empty.
     """
     if not emails:
-        return {}
+        return {"email_to_fid": {}, "failed_emails": []}
     try:
         from services.agent_v2.agents.faculty_context_agent import FacultyContextAgent
         agent = FacultyContextAgent()
@@ -680,10 +707,15 @@ def _resolve_faculty_ids_for_team(emails, osu_url_map, cv_pdf_map):
                 fid = dao.get_faculty_id_by_email(email)
                 if fid:
                     email_to_fid[email] = int(fid)
-        return email_to_fid
+        failed = _to_email_list(result.get("failed"))
+        unresolved = [e for e in _to_email_list(emails) if e not in email_to_fid]
+        for e in unresolved:
+            if e not in failed:
+                failed.append(e)
+        return {"email_to_fid": email_to_fid, "failed_emails": failed}
     except Exception:
         logger.exception("_resolve_faculty_ids_for_team failed")
-        return {}
+        return {"email_to_fid": {}, "failed_emails": _to_email_list(emails)}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -706,16 +738,6 @@ def find_collaborators():
             yield _sse("request_info", {"type": "missing_emails", "message": "Please provide at least one existing team member email."})
             return
 
-        # Validate osu_url for provided emails
-        missing_osu = [e for e in emails if e not in (osu_url_map or {})]
-        if missing_osu:
-            yield _sse("request_info", {
-                "type": "missing_osu_url",
-                "message": f"Please provide an OSU profile URL for: {', '.join(missing_osu)}",
-                "emails_missing_osu_url": missing_osu,
-            })
-            return
-
         searched = grant_title or grant_link or "(none)"
         yield _sse("step_update", {"message": f"Searching for grant: {searched!r}..."})
         opp_id, opp_title = _resolve_opportunity_id(grant_link, grant_title)
@@ -730,7 +752,23 @@ def find_collaborators():
             return
 
         yield _sse("step_update", {"message": f"Grant resolved: {opp_title or opp_id}. Resolving existing team members..."})
-        email_to_fid = _resolve_faculty_ids_for_team(emails, osu_url_map, cv_pdf_map)
+        resolve_out = _resolve_faculty_ids_for_team(emails, osu_url_map, cv_pdf_map)
+        email_to_fid = dict(resolve_out.get("email_to_fid") or {})
+        failed_emails = _to_email_list(resolve_out.get("failed_emails"))
+        if failed_emails:
+            info_type = "email_not_in_db" if len(failed_emails) == 1 else "emails_not_in_db"
+            msg = (
+                "This faculty email was not found in DB. Please add reference profile data first."
+                if len(failed_emails) == 1
+                else "Some faculty emails were not found in DB. Please add reference profile data first."
+            )
+            yield _sse("request_info", {
+                "type": info_type,
+                "message": msg,
+                "received_emails": _to_email_list(emails),
+                "emails_missing_in_db": failed_emails,
+            })
+            return
         existing_ids = list(email_to_fid.values())
 
         yield _sse("step_update", {"message": f"Searching for {additional_count} collaborator(s)..."})
@@ -776,17 +814,6 @@ def form_team():
             yield _sse("request_info", {"type": "missing_grant", "message": "Please provide a grant link or title."})
             return
 
-        # If emails given, osu_url is required for each
-        if emails:
-            missing_osu = [e for e in emails if e not in (osu_url_map or {})]
-            if missing_osu:
-                yield _sse("request_info", {
-                    "type": "missing_osu_url",
-                    "message": f"Please provide an OSU profile URL for: {', '.join(missing_osu)}",
-                    "emails_missing_osu_url": missing_osu,
-                })
-                return
-
         searched = grant_title or grant_link or "(none)"
         yield _sse("step_update", {"message": f"Searching for grant: {searched!r}..."})
         opp_id, opp_title = _resolve_opportunity_id(grant_link, grant_title)
@@ -803,7 +830,23 @@ def form_team():
         existing_ids: List[int] = []
         if emails:
             yield _sse("step_update", {"message": "Resolving existing team members..."})
-            email_to_fid = _resolve_faculty_ids_for_team(emails, osu_url_map, cv_pdf_map)
+            resolve_out = _resolve_faculty_ids_for_team(emails, osu_url_map, cv_pdf_map)
+            email_to_fid = dict(resolve_out.get("email_to_fid") or {})
+            failed_emails = _to_email_list(resolve_out.get("failed_emails"))
+            if failed_emails:
+                info_type = "email_not_in_db" if len(failed_emails) == 1 else "emails_not_in_db"
+                msg = (
+                    "This faculty email was not found in DB. Please add reference profile data first."
+                    if len(failed_emails) == 1
+                    else "Some faculty emails were not found in DB. Please add reference profile data first."
+                )
+                yield _sse("request_info", {
+                    "type": info_type,
+                    "message": msg,
+                    "received_emails": _to_email_list(emails),
+                    "emails_missing_in_db": failed_emails,
+                })
+                return
             existing_ids = list(email_to_fid.values())
 
         yield _sse("step_update", {"message": f"Finding best team of {team_size} for this grant..."})
@@ -1141,4 +1184,3 @@ def create_faculty_profiles():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000, debug=True, threaded=True)
-
