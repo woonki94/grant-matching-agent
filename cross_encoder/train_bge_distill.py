@@ -470,6 +470,107 @@ def _derive_pairwise_from_groups(
     return out
 
 
+def _derive_mid_lower_mid_pairs_from_groups(
+    groups: Sequence[QueryGroup],
+    *,
+    per_query_cap: int,
+    pos_score_min: float,
+    pos_score_max: float,
+    neg_score_min: float,
+    neg_score_max: float,
+    margin_min: float,
+    margin_max: float,
+    add_easy_contrast: bool,
+) -> List[PairExample]:
+    """
+    Optional boundary-focused augmentation:
+    for each query, build pairs where a mid-ranked doc should outrank a lower-mid doc.
+    """
+    out: List[PairExample] = []
+    cap = max(1, int(per_query_cap))
+
+    for g in groups:
+        cands = list(g.candidates or [])
+        n = len(cands)
+        if n < 6:
+            continue
+
+        # Candidate list is already sorted high->low by teacher score.
+        mid_start = max(1, int(0.30 * n))
+        mid_end = min(n, max(mid_start + 1, int(0.55 * n)))
+        lower_start = min(n, max(mid_end, int(0.55 * n)))
+        lower_end = min(n, max(lower_start + 1, int(0.80 * n)))
+
+        mid_group = cands[mid_start:mid_end]
+        lower_mid_group = cands[lower_start:lower_end]
+        if not mid_group or not lower_mid_group:
+            continue
+
+        row_count = 0
+        for p in mid_group:
+            p_score = float(p.score)
+            if p_score < float(pos_score_min) or p_score > float(pos_score_max):
+                continue
+            viable = []
+            for n_item in lower_mid_group:
+                if p.chunk_id == n_item.chunk_id and p.fac_id == n_item.fac_id:
+                    continue
+                n_score = float(n_item.score)
+                if n_score < float(neg_score_min) or n_score > float(neg_score_max):
+                    continue
+                margin = float(p_score - n_score)
+                if margin <= 0.0:
+                    continue
+                if margin < float(margin_min) or margin > float(margin_max):
+                    continue
+                viable.append((margin, n_item))
+            if not viable:
+                continue
+
+            # Pick the closest boundary candidate from lower-mid (harder pair).
+            viable.sort(key=lambda x: x[0])
+            margin, neg = viable[0]
+            out.append(
+                PairExample(
+                    grant_id=g.grant_id,
+                    spec_idx=g.spec_idx,
+                    query_text=g.query_text,
+                    pos_text=p.text,
+                    neg_text=neg.text,
+                    teacher_pos_score=float(p.score),
+                    teacher_neg_score=float(neg.score),
+                        teacher_margin=float(margin),
+                        pair_type="derived_mid_vs_lower_mid",
+                    )
+                )
+            row_count += 1
+            if row_count >= cap:
+                break
+
+            # Optional: add a clear contrast pair as a second signal.
+            if add_easy_contrast and len(viable) > 1:
+                margin2, neg2 = viable[-1]
+                if margin2 != margin or neg2.chunk_id != neg.chunk_id or neg2.fac_id != neg.fac_id:
+                    out.append(
+                        PairExample(
+                            grant_id=g.grant_id,
+                            spec_idx=g.spec_idx,
+                            query_text=g.query_text,
+                            pos_text=p.text,
+                            neg_text=neg2.text,
+                            teacher_pos_score=float(p_score),
+                            teacher_neg_score=float(neg2.score),
+                            teacher_margin=float(margin2),
+                            pair_type="derived_mid_vs_lower_mid_easy",
+                        )
+                    )
+                    row_count += 1
+            if row_count >= cap:
+                break
+
+    return out
+
+
 def _compute_score_stats(scores: Sequence[float]) -> Tuple[float, float]:
     if not scores:
         return 0.0, 0.0
@@ -851,6 +952,55 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--pair-derive-hard-k", type=int, default=4)
     p.add_argument("--pair-derive-weak-k", type=int, default=4)
     p.add_argument("--pair-derive-cap", type=int, default=64)
+    p.add_argument(
+        "--pair-add-mid-lower-mid",
+        action="store_true",
+        help=(
+            "Augment pairwise rows with boundary-focused pairs derived from raw ranking: "
+            "mid-group > lower-mid-group."
+        ),
+    )
+    p.add_argument(
+        "--pair-mid-pos-score-min",
+        type=float,
+        default=0.4,
+        help="Min teacher score for mid-group positive in mid>lower-mid augmentation.",
+    )
+    p.add_argument(
+        "--pair-mid-pos-score-max",
+        type=float,
+        default=0.7,
+        help="Max teacher score for mid-group positive in mid>lower-mid augmentation.",
+    )
+    p.add_argument(
+        "--pair-mid-neg-score-min",
+        type=float,
+        default=0.2,
+        help="Min teacher score for lower-mid negative in mid>lower-mid augmentation.",
+    )
+    p.add_argument(
+        "--pair-mid-neg-score-max",
+        type=float,
+        default=0.5,
+        help="Max teacher score for lower-mid negative in mid>lower-mid augmentation.",
+    )
+    p.add_argument(
+        "--pair-mid-margin-min",
+        type=float,
+        default=0.05,
+        help="Min teacher margin for mid>lower-mid augmentation pairs.",
+    )
+    p.add_argument(
+        "--pair-mid-margin-max",
+        type=float,
+        default=0.4,
+        help="Max teacher margin for mid>lower-mid augmentation pairs.",
+    )
+    p.add_argument(
+        "--pair-mid-add-easy-contrast",
+        action="store_true",
+        help="For each mid item, also add one larger-margin lower-mid pair (if available).",
+    )
 
     p.add_argument("--mrr-rel-threshold", type=float, default=0.7)
     p.add_argument("--recall-rel-threshold", type=float, default=0.7)
@@ -920,6 +1070,20 @@ def main() -> int:
     )
     low_signal_std_threshold = _safe_float(args.low_signal_std_threshold, default=0.05, minimum=0.0, maximum=1.0)
     low_signal_keep_prob = _safe_float(args.low_signal_keep_prob, default=0.1, minimum=0.0, maximum=1.0)
+    pair_mid_pos_score_min = _safe_float(args.pair_mid_pos_score_min, default=0.4, minimum=0.0, maximum=1.0)
+    pair_mid_pos_score_max = _safe_float(args.pair_mid_pos_score_max, default=0.7, minimum=0.0, maximum=1.0)
+    pair_mid_neg_score_min = _safe_float(args.pair_mid_neg_score_min, default=0.2, minimum=0.0, maximum=1.0)
+    pair_mid_neg_score_max = _safe_float(args.pair_mid_neg_score_max, default=0.5, minimum=0.0, maximum=1.0)
+    pair_mid_margin_min = _safe_float(args.pair_mid_margin_min, default=0.05, minimum=0.0, maximum=1.0)
+    pair_mid_margin_max = _safe_float(args.pair_mid_margin_max, default=0.4, minimum=0.0, maximum=1.0)
+    pair_mid_add_easy_contrast = bool(args.pair_mid_add_easy_contrast)
+
+    if pair_mid_pos_score_max < pair_mid_pos_score_min:
+        pair_mid_pos_score_max = pair_mid_pos_score_min
+    if pair_mid_neg_score_max < pair_mid_neg_score_min:
+        pair_mid_neg_score_max = pair_mid_neg_score_min
+    if pair_mid_margin_max < pair_mid_margin_min:
+        pair_mid_margin_max = pair_mid_margin_min
 
     max_length = _safe_int(args.max_length, default=512, minimum=16, maximum=8192)
     val_ratio = _safe_float(args.val_ratio, default=0.1, minimum=0.0, maximum=0.5)
@@ -1020,6 +1184,7 @@ def main() -> int:
         raise RuntimeError("Training split is empty.")
 
     pair_rows = _load_pairwise_rows(pairwise_path, max_rows=max_pairwise_rows)
+    pair_rows_source = "pairwise_file"
     if not pair_rows:
         print("pairwise_rows_loaded=0; deriving pairwise rows from raw groups")
         pair_rows = _derive_pairwise_from_groups(
@@ -1029,6 +1194,35 @@ def main() -> int:
             per_query_weak_k=_safe_int(args.pair_derive_weak_k, default=4, minimum=1, maximum=10_000),
             per_query_cap=_safe_int(args.pair_derive_cap, default=64, minimum=1, maximum=100_000),
         )
+        pair_rows_source = "derived_from_raw"
+
+    pair_mid_lower_enabled = bool(args.pair_add_mid_lower_mid)
+    pair_mid_lower_added = 0
+    if pair_mid_lower_enabled:
+        mid_lower_rows = _derive_mid_lower_mid_pairs_from_groups(
+            groups_all,
+            per_query_cap=_safe_int(args.pair_derive_cap, default=64, minimum=1, maximum=100_000),
+            pos_score_min=pair_mid_pos_score_min,
+            pos_score_max=pair_mid_pos_score_max,
+            neg_score_min=pair_mid_neg_score_min,
+            neg_score_max=pair_mid_neg_score_max,
+            margin_min=pair_mid_margin_min,
+            margin_max=pair_mid_margin_max,
+            add_easy_contrast=pair_mid_add_easy_contrast,
+        )
+        pair_mid_lower_added = int(len(mid_lower_rows))
+        if pair_mid_lower_added > 0:
+            pair_rows = list(pair_rows) + mid_lower_rows
+        print(f"pair_mid_lower_enabled=true pair_mid_lower_added={pair_mid_lower_added}")
+        print(
+            "pair_mid_config="
+            f"pos:[{pair_mid_pos_score_min:.3f},{pair_mid_pos_score_max:.3f}] "
+            f"neg:[{pair_mid_neg_score_min:.3f},{pair_mid_neg_score_max:.3f}] "
+            f"margin:[{pair_mid_margin_min:.3f},{pair_mid_margin_max:.3f}] "
+            f"easy_contrast={pair_mid_add_easy_contrast}"
+        )
+    else:
+        print("pair_mid_lower_enabled=false")
 
     train_pairs = [r for r in pair_rows if r.grant_id in train_grants]
     val_pairs = [r for r in pair_rows if r.grant_id in val_grants]
@@ -1038,6 +1232,8 @@ def main() -> int:
     print(f"queries_total={len(groups_all)}")
     print(f"queries_train={len(train_groups)}")
     print(f"queries_val={len(val_groups)}")
+    print(f"pair_rows_source={pair_rows_source}")
+    print(f"pairwise_total_rows={len(pair_rows)}")
     print(f"pairwise_train={len(train_pairs)}")
     print(f"pairwise_val={len(val_pairs)}")
 
@@ -1083,6 +1279,16 @@ def main() -> int:
             "data/queries_val": int(len(val_groups)),
             "data/pairwise_train": int(len(train_pairs)),
             "data/pairwise_val": int(len(val_pairs)),
+            "data/pairwise_total": int(len(pair_rows)),
+            "data/pair_mid_lower_enabled": int(1 if pair_mid_lower_enabled else 0),
+            "data/pair_mid_lower_added": int(pair_mid_lower_added),
+            "data/pair_mid_pos_score_min": float(pair_mid_pos_score_min),
+            "data/pair_mid_pos_score_max": float(pair_mid_pos_score_max),
+            "data/pair_mid_neg_score_min": float(pair_mid_neg_score_min),
+            "data/pair_mid_neg_score_max": float(pair_mid_neg_score_max),
+            "data/pair_mid_margin_min": float(pair_mid_margin_min),
+            "data/pair_mid_margin_max": float(pair_mid_margin_max),
+            "data/pair_mid_add_easy_contrast": int(1 if pair_mid_add_easy_contrast else 0),
             "data/listwise_train": int(len(train_list_rows)),
             "data/listwise_val": int(len(val_list_rows)),
         },
@@ -1525,8 +1731,19 @@ def main() -> int:
         "seed": int(seed),
         "train_queries": int(len(train_groups)),
         "val_queries": int(len(val_groups)),
+        "pair_rows_source": str(pair_rows_source),
+        "pair_total_rows": int(len(pair_rows)),
         "train_pair_rows": int(len(train_pairs)),
         "val_pair_rows": int(len(val_pairs)),
+        "pair_mid_lower_enabled": bool(pair_mid_lower_enabled),
+        "pair_mid_lower_added": int(pair_mid_lower_added),
+        "pair_mid_pos_score_min": float(pair_mid_pos_score_min),
+        "pair_mid_pos_score_max": float(pair_mid_pos_score_max),
+        "pair_mid_neg_score_min": float(pair_mid_neg_score_min),
+        "pair_mid_neg_score_max": float(pair_mid_neg_score_max),
+        "pair_mid_margin_min": float(pair_mid_margin_min),
+        "pair_mid_margin_max": float(pair_mid_margin_max),
+        "pair_mid_add_easy_contrast": bool(pair_mid_add_easy_contrast),
         "candidate_pool_size": int(candidate_pool_size),
         "mini_list_size": int(mini_list_size),
         "teacher_temperature": float(teacher_temperature),
