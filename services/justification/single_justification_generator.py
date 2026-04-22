@@ -423,8 +423,9 @@ class SingleJustificationGenerator:
             }
 
         explanation_map: Dict[str, str] = {}
+        brief_map: Dict[str, str] = {}
         expl_ids = [self._norm(x) for x in list(ranked_ids or []) if self._norm(x)]
-        # Stage 2: generate grant explanations concurrently.
+        # Stage 2: generate grant explanations and briefs concurrently.
         if expl_ids:
             expl_pool = resolve_pool_size(
                 max_workers=int(self.GRANT_EXPLANATION_WORKERS),
@@ -441,9 +442,11 @@ class SingleJustificationGenerator:
                     opportunity_id=oid,
                     preview_chars=int(preview_chars),
                 )
+                brief = self._generate_grant_brief(opportunity_id=oid)
                 return {
                     "opportunity_id": oid,
                     "grant_explanation": self._norm(out.get("grant_explanation")),
+                    "grant_brief": self._norm(brief),
                 }
 
             def _on_expl_error(_index: int, oid: str, exc: Exception) -> Dict[str, str]:
@@ -452,7 +455,7 @@ class SingleJustificationGenerator:
                     json.dumps({"opportunity_id": oid}, ensure_ascii=False),
                     f"{type(exc).__name__}: {exc}",
                 )
-                return {"opportunity_id": oid, "grant_explanation": ""}
+                return {"opportunity_id": oid, "grant_explanation": "", "grant_brief": ""}
 
             expl_rows = parallel_map(
                 expl_ids,
@@ -465,6 +468,7 @@ class SingleJustificationGenerator:
                 if not oid:
                     continue
                 explanation_map[oid] = self._norm((row or {}).get("grant_explanation"))
+                brief_map[oid] = self._norm((row or {}).get("grant_brief"))
 
         logger.info(
             "JUSTIFICATION_STEP combined_justification_stage_start grants=%s",
@@ -621,6 +625,7 @@ class SingleJustificationGenerator:
                         grant_row.get("reranked_llm_score", grant_row.get("llm_score"))
                     ),
                     "grant_explanation": explanation_map.get(oid, ""),
+                    "grant_brief": brief_map.get(oid, ""),
                     "why_match": why_match_by_id.get(oid, {}),
                 }
             )
