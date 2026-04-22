@@ -424,6 +424,7 @@ def chat():
                 if "desired_broad_category" in body
                 else body.get("broad_category_filter")
             ),
+            agency_filter=body.get("agency_filter") or body.get("agency"),
             topic_query=body.get("topic_query"),
             requested_team_size=_to_optional_int(body.get("requested_team_size") or body.get("team_size")),
             requested_top_k_grants=_to_optional_int(

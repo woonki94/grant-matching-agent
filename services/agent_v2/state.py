@@ -26,6 +26,7 @@ class GrantMatchRequest:
     grant_link_valid: Optional[bool] = None
     grant_title_confirmed: Optional[bool] = None
     desired_broad_category: Optional[str | List[str]] = None
+    agency_filter: Optional[str] = None
     topic_query: Optional[str] = None
     requested_team_size: Optional[int] = None
     requested_top_k_grants: Optional[int] = None
@@ -49,6 +50,7 @@ class GrantMatchWorkflowState(TypedDict, total=False):
     grant_link_valid: Optional[bool]
     grant_title_confirmed: Optional[bool]
     desired_broad_category: Optional[str | List[str]]
+    agency_filter: Optional[str]
     topic_query: Optional[str]
     requested_team_size: Optional[int]
     requested_top_k_grants: Optional[int]
@@ -67,6 +69,7 @@ class GrantMatchWorkflowState(TypedDict, total=False):
     grant_link_detected: Optional[str]
     grant_title_detected: Optional[str]
     desired_broad_category_detected: Optional[str | List[str]]
+    agency_filter_detected: Optional[str]
     topic_query_detected: Optional[str]
     requested_team_size_detected: Optional[int]
     requested_top_k_grants_detected: Optional[int]
