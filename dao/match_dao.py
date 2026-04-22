@@ -424,3 +424,14 @@ class MatchDAO:
                 "justification": str(justification),
             },
         )
+
+    def nullify_all_justifications(self) -> int:
+        """Set justification=NULL for all match_results rows.
+
+        Call this before re-generating justifications with a new format so stale
+        cached values are not served to callers.
+        """
+        result = self.session.execute(
+            text("UPDATE match_results SET justification = NULL")
+        )
+        return int(result.rowcount or 0)
