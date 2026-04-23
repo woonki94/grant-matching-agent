@@ -1,3 +1,3 @@
-from services.notifications.ses_email_service import SesEmailService
+from services.notifications.ses_email_service import SesEmailAttachment, SesEmailService
 
-__all__ = ["SesEmailService"]
+__all__ = ["SesEmailService", "SesEmailAttachment"]

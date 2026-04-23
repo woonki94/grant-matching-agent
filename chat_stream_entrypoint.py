@@ -12,6 +12,7 @@ logger = logging.getLogger(__name__)
 app = Flask(__name__)
 
 _ORCHESTRATOR = None
+_FACULTY_PROFILE_JOB_MANAGER = None
 
 NODE_STEP_MESSAGES = {
     "route": "Parsing your request...",
@@ -46,6 +47,16 @@ def _get_orchestrator():
         return _ORCHESTRATOR, None
     except Exception as e:
         return None, f"{type(e).__name__}: {e}"
+
+
+def _get_faculty_profile_job_manager():
+    global _FACULTY_PROFILE_JOB_MANAGER
+    if _FACULTY_PROFILE_JOB_MANAGER is not None:
+        return _FACULTY_PROFILE_JOB_MANAGER
+    from services.faculty.faculty_profile_job_manager import FacultyProfileUpdateJobManager
+
+    _FACULTY_PROFILE_JOB_MANAGER = FacultyProfileUpdateJobManager()
+    return _FACULTY_PROFILE_JOB_MANAGER
 
 
 def _to_optional_bool(v: Any) -> Optional[bool]:
@@ -197,6 +208,30 @@ def _split_existing_vs_missing_db_emails(emails: List[str]) -> Dict[str, List[st
         return {"existing": [], "missing": normalized}
 
     return {"existing": existing, "missing": missing}
+
+
+def _run_faculty_profile_postprocess_job(
+    *,
+    email: str,
+    faculty_id: int,
+    postprocess_plan: Dict[str, Any],
+) -> Dict[str, Any]:
+    from services.faculty.faculty_profile_service import FacultyProfileService
+
+    service = FacultyProfileService()
+    post_out = service.run_profile_postprocess(
+        faculty_id=int(faculty_id),
+        postprocess_plan=dict(postprocess_plan or {}),
+        request_email=str(email or "").strip().lower(),
+    )
+    updated = service.get_faculty_profile(faculty_id=int(faculty_id))
+    return {
+        "email": str(email or "").strip().lower(),
+        "faculty_id": int(faculty_id),
+        "faculty": updated,
+        "updated_keywords": ((updated or {}).get("all_keywords") or {}),
+        **dict(post_out or {}),
+    }
 
 
 def _maybe_send_result_email(
@@ -1114,11 +1149,30 @@ def edit_faculty_profile_by_email():
             "ok": False,
             "error": "force_regenerate_keywords must be a boolean.",
         }, 400
+    async_requested = _to_optional_bool(body.get("async"))
+    if "async" in body and async_requested is None:
+        return {
+            "ok": False,
+            "error": "async must be a boolean.",
+        }, 400
+    run_async = True if async_requested is None else bool(async_requested)
 
     try:
         from services.faculty.faculty_profile_service import FacultyProfileService
 
         service = FacultyProfileService()
+        if not run_async:
+            out = service.edit_faculty_profile(
+                email=email,
+                basic_info=basic_info,
+                data_from=data_from,
+                all_keywords=all_keywords,
+                keyword_source=keyword_source,
+                force_regenerate_keywords=force_regenerate_keywords,
+                run_postprocess=True,
+            )
+            return {"ok": True, "async": False, **out}, 200
+
         out = service.edit_faculty_profile(
             email=email,
             basic_info=basic_info,
@@ -1126,8 +1180,32 @@ def edit_faculty_profile_by_email():
             all_keywords=all_keywords,
             keyword_source=keyword_source,
             force_regenerate_keywords=force_regenerate_keywords,
+            run_postprocess=False,
         )
-        return {"ok": True, **out}, 200
+        faculty_id = int(out.get("faculty_id") or 0)
+        postprocess_plan = dict(out.get("postprocess_plan") or {})
+
+        manager = _get_faculty_profile_job_manager()
+        job_id = manager.submit(
+            job_type="faculty_profile_postprocess",
+            payload={
+                "email": email,
+                "faculty_id": int(faculty_id),
+                "postprocess_plan": postprocess_plan,
+            },
+            run_fn=lambda: _run_faculty_profile_postprocess_job(
+                email=email,
+                faculty_id=int(faculty_id),
+                postprocess_plan=postprocess_plan,
+            ),
+        )
+        return {
+            "ok": True,
+            "async": True,
+            "job_id": str(job_id),
+            "job_status": "queued",
+            **out,
+        }, 202
     except LookupError as e:
         return {"ok": False, "error": str(e), "email": email}, 404
     except ValueError as e:
@@ -1135,6 +1213,19 @@ def edit_faculty_profile_by_email():
     except Exception as e:
         logger.exception("PATCH /api/faculty/by-email failed")
         return {"ok": False, "error": f"{type(e).__name__}: {e}"}, 500
+
+
+@app.get("/api/faculty/by-email/jobs/<job_id>")
+def get_faculty_profile_update_job(job_id: str):
+    key = str(job_id or "").strip()
+    if not key:
+        return {"ok": False, "error": "job_id is required."}, 400
+
+    manager = _get_faculty_profile_job_manager()
+    row = manager.get(key)
+    if not row:
+        return {"ok": False, "error": "Job not found.", "job_id": key}, 404
+    return {"ok": True, "job": row}, 200
 
 
 

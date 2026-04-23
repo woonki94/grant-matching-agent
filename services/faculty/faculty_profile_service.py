@@ -1,12 +1,18 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Any, Dict, List, Optional, Tuple
+import logging
+import os
+import time
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from config import settings
 from dao.faculty_dao import FacultyDAO
 from db.db_conn import SessionLocal
 from db.models.faculty import Faculty, FacultyAdditionalInfo, FacultyPublication
+
+
+logger = logging.getLogger(__name__)
 
 
 class FacultyProfileService:
@@ -91,14 +97,28 @@ class FacultyProfileService:
         all_keywords: Optional[Dict[str, Any]] = None,
         keyword_source: Optional[str] = None,
         force_regenerate_keywords: Optional[bool] = None,
+        run_postprocess: bool = True,
     ) -> Dict[str, Any]:
         """
         Edit faculty profile by immutable email.
 
         Mode 1: source edits (basic_info/data_from) -> regenerate keywords.
-        Mode 2: direct all_keywords edit -> write directly to faculty keyword tables only.
+        Mode 2: direct all_keywords edit -> incremental keyword/source sync + match rebuild.
         Mode 3: force_regenerate_keywords=true -> regenerate from current sources.
         """
+        t_start = time.perf_counter()
+        stage_timings_ms: Dict[str, float] = {}
+
+        def _mark_stage(stage_name: str, stage_start: float) -> None:
+            stage_ms = round((time.perf_counter() - float(stage_start)) * 1000.0, 3)
+            stage_timings_ms[str(stage_name)] = stage_ms
+            logger.info(
+                "FacultyProfileService.edit_faculty_profile stage=%s email=%s elapsed_ms=%.3f",
+                str(stage_name),
+                str(email or ""),
+                float(stage_ms),
+            )
+
         normalized_email = (str(email or "").strip().lower() or None)
         if not normalized_email:
             raise ValueError("email is required.")
@@ -106,7 +126,6 @@ class FacultyProfileService:
         basic_info = basic_info or {}
         data_from = data_from or {}
         has_keyword_payload = all_keywords is not None
-        has_source_payload = bool(basic_info) or bool(data_from)
         force_regeneration = bool(force_regenerate_keywords)
 
         if has_keyword_payload and force_regeneration:
@@ -119,8 +138,8 @@ class FacultyProfileService:
         if has_keyword_payload:
             basic_info = {}
             data_from = {}
-            has_source_payload = False
 
+        stage_source_start = time.perf_counter()
         with self.session_factory() as sess:
             dao = FacultyDAO(sess)
             fac = dao.get_with_relations_by_email(normalized_email)
@@ -162,6 +181,7 @@ class FacultyProfileService:
             if has_keyword_payload:
                 self._apply_direct_keyword_update(
                     dao=dao,
+                    fac=fac,
                     faculty_id=int(fac.faculty_id),
                     keywords=(all_keywords or {}),
                     source=keyword_source,
@@ -170,15 +190,141 @@ class FacultyProfileService:
 
             sess.commit()
             faculty_id = int(fac.faculty_id)
+        _mark_stage("source_update", stage_source_start)
+
+        postprocess_plan = self._build_postprocess_plan(
+            source_changed=bool(source_changed),
+            direct_keyword_applied=bool(direct_keyword_applied),
+            force_regeneration=bool(force_regeneration),
+        )
+        postprocess_pending = bool(
+            (postprocess_plan.get("regenerate_keywords") or postprocess_plan.get("rebuild_matches"))
+            and not run_postprocess
+        )
+
+        post_out: Dict[str, Any] = {
+            "keyword_update_mode": (
+                "frontend_override"
+                if direct_keyword_applied
+                else (
+                    "pending_forced_regeneration"
+                    if (postprocess_pending and force_regeneration)
+                    else (
+                        "pending_regeneration_from_sources"
+                        if postprocess_pending
+                        else "none"
+                    )
+                )
+            ),
+            "keyword_regenerated": False,
+            "keyword_regeneration_forced": bool(force_regeneration),
+            "keyword_regeneration_error": None,
+            "matches_rebuilt": False,
+            "match_rows_upserted": 0,
+            "match_rebuild_error": None,
+            "postprocess_stage_timings_ms": {},
+        }
+        if run_postprocess:
+            stage_postprocess_start = time.perf_counter()
+            post_out = self.run_profile_postprocess(
+                faculty_id=int(faculty_id),
+                postprocess_plan=postprocess_plan,
+                request_email=normalized_email,
+            )
+            _mark_stage("postprocess", stage_postprocess_start)
+
+        stage_profile_read_start = time.perf_counter()
+        updated = self.get_faculty_profile(faculty_id=faculty_id)
+        _mark_stage("profile_read", stage_profile_read_start)
+        _mark_stage("total", t_start)
+
+        logger.info(
+            "FacultyProfileService.edit_faculty_profile summary email=%s faculty_id=%s "
+            "run_postprocess=%s source_changed=%s direct_keyword_applied=%s "
+            "plan=%s total_ms=%.3f",
+            normalized_email,
+            int(faculty_id),
+            bool(run_postprocess),
+            bool(source_changed),
+            bool(direct_keyword_applied),
+            postprocess_plan,
+            float(stage_timings_ms.get("total") or 0.0),
+        )
+        return {
+            "faculty": updated,
+            "faculty_id": int(faculty_id),
+            "source_changed": bool(source_changed),
+            "source_change_detail": source_detail,
+            "direct_keyword_applied": bool(direct_keyword_applied),
+            "keyword_update_mode": str(post_out.get("keyword_update_mode") or "none"),
+            "keyword_regenerated": bool(post_out.get("keyword_regenerated")),
+            "keyword_regeneration_forced": bool(post_out.get("keyword_regeneration_forced")),
+            "keyword_regeneration_error": post_out.get("keyword_regeneration_error"),
+            "updated_keywords": ((updated or {}).get("all_keywords") or {}),
+            "matches_rebuilt": bool(post_out.get("matches_rebuilt")),
+            "match_rows_upserted": int(post_out.get("match_rows_upserted") or 0),
+            "match_rebuild_error": post_out.get("match_rebuild_error"),
+            "postprocess_plan": dict(postprocess_plan or {}),
+            "postprocess_pending": bool(postprocess_pending),
+            "postprocess_executed": bool(run_postprocess),
+            "postprocess_stage_timings_ms": dict(post_out.get("postprocess_stage_timings_ms") or {}),
+            "stage_timings_ms": dict(stage_timings_ms),
+        }
+
+    @staticmethod
+    def _build_postprocess_plan(
+        *,
+        source_changed: bool,
+        direct_keyword_applied: bool,
+        force_regeneration: bool,
+    ) -> Dict[str, Any]:
+        regenerate_keywords = bool((not direct_keyword_applied) and (source_changed or force_regeneration))
+        # Direct keyword updates skip keyword regeneration but still need fresh match rows.
+        rebuild_matches = bool(regenerate_keywords or direct_keyword_applied)
+        return {
+            "regenerate_keywords": bool(regenerate_keywords),
+            "rebuild_matches": bool(rebuild_matches),
+            "force_regeneration": bool(force_regeneration),
+            "source_changed": bool(source_changed),
+            "direct_keyword_applied": bool(direct_keyword_applied),
+        }
+
+    def run_profile_postprocess(
+        self,
+        *,
+        faculty_id: int,
+        postprocess_plan: Optional[Dict[str, Any]] = None,
+        request_email: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        plan = dict(postprocess_plan or {})
+        regenerate_keywords = bool(plan.get("regenerate_keywords"))
+        rebuild_matches = bool(plan.get("rebuild_matches"))
+        force_regeneration = bool(plan.get("force_regeneration"))
+        direct_keyword_applied = bool(plan.get("direct_keyword_applied"))
+
+        stage_timings_ms: Dict[str, float] = {}
+
+        def _mark_stage(stage_name: str, stage_start: float) -> None:
+            stage_ms = round((time.perf_counter() - float(stage_start)) * 1000.0, 3)
+            stage_timings_ms[str(stage_name)] = stage_ms
+            logger.info(
+                "FacultyProfileService.run_profile_postprocess stage=%s faculty_id=%s email=%s elapsed_ms=%.3f",
+                str(stage_name),
+                int(faculty_id),
+                str(request_email or ""),
+                float(stage_ms),
+            )
 
         keyword_regenerated = False
         keyword_regeneration_error = None
         keyword_update_mode = "none"
+
         if direct_keyword_applied:
             keyword_update_mode = "frontend_override"
-        elif source_changed or force_regeneration:
+        elif regenerate_keywords:
+            stage_keyword_start = time.perf_counter()
             try:
-                self._regenerate_faculty_keywords(faculty_id=faculty_id)
+                self._regenerate_faculty_keywords(faculty_id=int(faculty_id))
                 keyword_regenerated = True
                 keyword_update_mode = (
                     "forced_regeneration"
@@ -196,34 +342,33 @@ class FacultyProfileService:
                     raise RuntimeError(
                         f"Forced keyword regeneration failed: {keyword_regeneration_error}"
                     ) from e
+            finally:
+                _mark_stage("keyword_stage", stage_keyword_start)
 
         matches_rebuilt = False
         match_rows_upserted = 0
         match_rebuild_error = None
-        # Direct keyword edits are DB-only and should not trigger downstream jobs.
-        if keyword_regenerated:
+        if rebuild_matches and (keyword_regenerated or direct_keyword_applied):
+            stage_match_start = time.perf_counter()
             try:
                 match_rows_upserted = int(
-                    self._rebuild_faculty_matches(faculty_id=faculty_id)
+                    self._rebuild_faculty_matches(faculty_id=int(faculty_id))
                 )
                 matches_rebuilt = True
             except Exception as e:
                 match_rebuild_error = f"{type(e).__name__}: {e}"
+            finally:
+                _mark_stage("match_stage", stage_match_start)
 
-        updated = self.get_faculty_profile(faculty_id=faculty_id)
         return {
-            "faculty": updated,
-            "source_changed": bool(source_changed),
-            "source_change_detail": source_detail,
-            "direct_keyword_applied": bool(direct_keyword_applied),
             "keyword_update_mode": keyword_update_mode,
             "keyword_regenerated": bool(keyword_regenerated),
             "keyword_regeneration_forced": bool(force_regeneration),
             "keyword_regeneration_error": keyword_regeneration_error,
-            "updated_keywords": ((updated or {}).get("all_keywords") or {}),
             "matches_rebuilt": bool(matches_rebuilt),
             "match_rows_upserted": int(match_rows_upserted),
             "match_rebuild_error": match_rebuild_error,
+            "postprocess_stage_timings_ms": stage_timings_ms,
         }
 
     @staticmethod
@@ -422,11 +567,33 @@ class FacultyProfileService:
                     year_from=fetch_from_year,
                     year_to=fetch_upto_year,
                 )
+                logger.info(
+                    "FacultyProfileService._apply_publication_ops range_request faculty_id=%s requested_from=%s requested_to=%s sync_from=%s sync_to=%s",
+                    int(faculty_id),
+                    fetch_from_year,
+                    fetch_upto_year,
+                    int(sync_from),
+                    int(sync_to),
+                )
                 fetched = self._fetch_publications_from_source_for_range(
                     faculty_name=str(getattr(fac, "name", "") or ""),
-                    org_hint=str(getattr(fac, "organization", "") or ""),
+                    org_hint=str(settings.university_name or ""),
                     year_from=sync_from,
                     year_to=sync_to,
+                )
+                sample_rows = [
+                    {
+                        "year": FacultyProfileService._safe_int_or_none(getattr(dto, "year", None)),
+                        "title": str(getattr(dto, "title", "") or "").strip()[:140],
+                    }
+                    for dto in list(fetched or [])[:5]
+                    if str(getattr(dto, "title", "") or "").strip()
+                ]
+                logger.info(
+                    "FacultyProfileService._apply_publication_ops fetched faculty_id=%s rows=%s sample=%s",
+                    int(faculty_id),
+                    len(list(fetched or [])),
+                    sample_rows,
                 )
                 added, updated = self._upsert_publications_from_source(
                     sess=sess,
@@ -483,6 +650,13 @@ class FacultyProfileService:
             )
             out["publications_deleted"] += int(deleted_one or 0)
 
+        logger.info(
+            "FacultyProfileService._apply_publication_ops delta faculty_id=%s added=%s updated=%s deleted=%s",
+            int(faculty_id),
+            int(out.get("publications_added") or 0),
+            int(out.get("publications_updated") or 0),
+            int(out.get("publications_deleted") or 0),
+        )
         return out
 
     @staticmethod
@@ -550,6 +724,7 @@ class FacultyProfileService:
         year_from: int,
         year_to: int,
     ) -> List["FacultyPublicationDTO"]:
+        resolved_org_hint = str(settings.university_name or "").strip() or str(org_hint or "")
         try:
             from services.faculty.author_publication_fetcher import AuthorPublicationFetcher
         except Exception:
@@ -559,16 +734,40 @@ class FacultyProfileService:
             fetcher = AuthorPublicationFetcher()
             author_id = fetcher.resolve_author_id(
                 faculty_name=str(faculty_name or ""),
-                org_hint=str(org_hint or ""),
+                org_hint=str(resolved_org_hint or ""),
             )
             if not author_id:
+                logger.info(
+                    "FacultyProfileService._fetch_publications_from_source_for_range no_author_id faculty=%s org_hint=%s year_from=%s year_to=%s",
+                    str(faculty_name or ""),
+                    str(resolved_org_hint or ""),
+                    int(year_from),
+                    int(year_to),
+                )
                 return []
-            return fetcher.fetch_publications_for_author_year_range(
+            rows = fetcher.fetch_publications_for_author_year_range(
                 author_id=author_id,
                 year_from=int(year_from),
                 year_to=int(year_to),
             )
-        except Exception:
+            logger.info(
+                "FacultyProfileService._fetch_publications_from_source_for_range fetched faculty=%s author_id=%s rows=%s year_from=%s year_to=%s",
+                str(faculty_name or ""),
+                str(author_id),
+                len(list(rows or [])),
+                int(year_from),
+                int(year_to),
+            )
+            return rows
+        except Exception as e:
+            logger.exception(
+                "FacultyProfileService._fetch_publications_from_source_for_range failed faculty=%s org_hint=%s year_from=%s year_to=%s error=%s",
+                str(faculty_name or ""),
+                str(resolved_org_hint or ""),
+                int(year_from),
+                int(year_to),
+                f"{type(e).__name__}: {e}",
+            )
             return []
 
     @staticmethod
@@ -735,45 +934,80 @@ class FacultyProfileService:
         from services.context_retrieval.context_generator import ContextGenerator
         from services.keywords.keyword_generator import FacultyKeywordGenerator
 
+        batch_workers = self._resolve_single_faculty_keyword_batch_workers()
+        logger.info(
+            "FacultyProfileService._regenerate_faculty_keywords faculty_id=%s batch_workers=%s",
+            int(faculty_id),
+            int(batch_workers),
+        )
         keyword_generator = FacultyKeywordGenerator(context_generator=ContextGenerator())
         keyword_generator.generate_faculty_keywords_for_id(
             int(faculty_id),
             force_regenerate=True,
+            batch_workers=int(batch_workers),
         )
 
     def _rebuild_faculty_matches(self, *, faculty_id: int) -> int:
         # Recompute one-to-one rows for this faculty from current keyword/embedding state.
         from services.matching.faculty_grant_matcher import FacultyGrantMatcher
 
+        rerank_chunk_workers = self._resolve_single_faculty_rerank_chunk_workers()
+        logger.info(
+            "FacultyProfileService._rebuild_faculty_matches faculty_id=%s rerank_chunk_workers=%s",
+            int(faculty_id),
+            int(rerank_chunk_workers),
+        )
         matcher = FacultyGrantMatcher(session_factory=self.session_factory)
         return int(
             matcher.run_for_faculty(
                 faculty_id=int(faculty_id),
                 k=200,
-                min_domain=0.0,
+                min_domain=0.3,
+                rerank_chunk_workers=int(rerank_chunk_workers),
             )
         )
 
-    @staticmethod
     def _apply_direct_keyword_update(
+        self,
         *,
         dao: FacultyDAO,
+        fac: Faculty,
         faculty_id: int,
         keywords: Dict[str, Any],
         source: Optional[str] = None,
-    ) -> None:
-        kw = FacultyProfileService._normalize_keywords_payload(keywords)
+    ) -> Dict[str, Any]:
         source_name = str(source or "user_edit").strip() or "user_edit"
+        current_keywords_raw = ((getattr(fac, "keyword", None) and fac.keyword.keywords) or {}) or {}
+        current_kw = self._normalize_keywords_payload(current_keywords_raw, include_sources=True)
+        requested_kw = self._normalize_keywords_payload(keywords, include_sources=False)
 
+        diff = self._diff_specialization_keywords(current=current_kw, requested=requested_kw)
+        added_sources_by_section, source_lookup_error = self._resolve_added_specialization_sources(
+            fac=fac,
+            requested_kw=requested_kw,
+            diff=diff,
+        )
+        merged_kw = self._merge_requested_keywords_with_sources(
+            current_kw=current_kw,
+            requested_kw=requested_kw,
+            added_sources_by_section=added_sources_by_section,
+        )
+
+        raw_json_payload: Dict[str, Any] = {
+            "edited": True,
+            "mode": "direct_update",
+            "diff": diff,
+            "source_lookup": {
+                "ran": bool(diff.get("added_count", 0) > 0),
+                "error": source_lookup_error,
+            },
+        }
         dao.upsert_keywords_json(
             [
                 {
                     "faculty_id": int(faculty_id),
-                    "keywords": kw,
-                    "raw_json": {
-                        "edited": True,
-                        "mode": "direct_update",
-                    },
+                    "keywords": merged_kw,
+                    "raw_json": raw_json_payload,
                     "source": source_name,
                 }
             ]
@@ -784,7 +1018,7 @@ class FacultyProfileService:
             from utils.embedder import embed_domain_bucket
             from utils.keyword_utils import extract_domains_from_keywords
 
-            r_domains, a_domains = extract_domains_from_keywords(kw)
+            r_domains, a_domains = extract_domains_from_keywords(merged_kw)
             r_vec = embed_domain_bucket(r_domains)
             a_vec = embed_domain_bucket(a_domains)
             if r_vec is not None or a_vec is not None:
@@ -800,8 +1034,250 @@ class FacultyProfileService:
             # Keyword JSON update is still valid even if embedding refresh fails.
             pass
 
+        logger.info(
+            "FacultyProfileService._apply_direct_keyword_update faculty_id=%s added=%s deleted=%s weight_changed=%s source_lookup_error=%s",
+            int(faculty_id),
+            int(diff.get("added_count") or 0),
+            int(diff.get("deleted_count") or 0),
+            int(diff.get("weight_changed_count") or 0),
+            source_lookup_error,
+        )
+        return {
+            "diff": diff,
+            "source_lookup_error": source_lookup_error,
+        }
+
+    @classmethod
+    def _resolve_added_specialization_sources(
+        cls,
+        *,
+        fac: Faculty,
+        requested_kw: Dict[str, Any],
+        diff: Dict[str, Any],
+    ) -> Tuple[Dict[str, Dict[str, List[Dict[str, Any]]]], Optional[str]]:
+        added_source_map: Dict[str, Dict[str, List[Dict[str, Any]]]] = {
+            "research": {},
+            "application": {},
+        }
+        added_total = int(diff.get("added_count") or 0)
+        if added_total <= 0:
+            return added_source_map, None
+
+        requested_by_key = {
+            sec: cls._spec_rows_by_key(list(((requested_kw.get(sec) or {}).get("specialization") or []))
+            )
+            for sec in ("research", "application")
+        }
+        added_payload = {
+            "research": {"domain": [], "specialization": []},
+            "application": {"domain": [], "specialization": []},
+        }
+        for sec in ("research", "application"):
+            added_keys = set((diff.get("added") or {}).get(sec) or [])
+            rows = requested_by_key.get(sec) or {}
+            for key in sorted(added_keys):
+                row = dict(rows.get(key) or {})
+                text = str(row.get("t") or "").strip()
+                if not text:
+                    continue
+                added_payload[sec]["specialization"].append(
+                    {
+                        "t": text,
+                        "w": float(row.get("w") or 0.0),
+                    }
+                )
+
+        if not added_payload["research"]["specialization"] and not added_payload["application"]["specialization"]:
+            return added_source_map, None
+
+        source_error: Optional[str] = None
+        try:
+            from config import get_embedding_client
+            from services.context_retrieval.context_generator import ContextGenerator
+
+            context_generator = ContextGenerator()
+            context = context_generator.build_faculty_basic_context(fac, use_rag=False)
+            embedding_client = get_embedding_client().build()
+            mapped = context_generator.attach_keyword_sources_by_cosine(
+                keywords=added_payload,
+                context=context,
+                embedding_client=embedding_client,
+                max_sources_per_specialization=4,
+                min_similarity=0.10,
+            )
+            keywords_with_sources = dict((mapped or {}).get("keywords") or {})
+            for sec in ("research", "application"):
+                rows = list(((keywords_with_sources.get(sec) or {}).get("specialization") or []))
+                for row in rows:
+                    text = str((row or {}).get("t") or "").strip()
+                    key = cls._norm_text_key(text)
+                    if not key:
+                        continue
+                    srcs = cls._normalize_sources((row or {}).get("sources"))
+                    if srcs:
+                        added_source_map[sec][key] = srcs
+        except Exception as e:
+            source_error = f"{type(e).__name__}: {e}"
+            logger.exception("FacultyProfileService direct keyword source mapping failed")
+
+        return added_source_map, source_error
+
+    @classmethod
+    def _merge_requested_keywords_with_sources(
+        cls,
+        *,
+        current_kw: Dict[str, Any],
+        requested_kw: Dict[str, Any],
+        added_sources_by_section: Dict[str, Dict[str, List[Dict[str, Any]]]],
+    ) -> Dict[str, Any]:
+        current_by_key = {
+            sec: cls._spec_rows_by_key(list(((current_kw.get(sec) or {}).get("specialization") or []))
+            )
+            for sec in ("research", "application")
+        }
+        merged: Dict[str, Any] = {}
+        for sec in ("research", "application"):
+            req_sec = dict(requested_kw.get(sec) or {})
+            merged_specs: List[Dict[str, Any]] = []
+            for raw in list(req_sec.get("specialization") or []):
+                row = dict(raw or {})
+                text = str(row.get("t") or "").strip()
+                if not text:
+                    continue
+                key = cls._norm_text_key(text)
+                if not key:
+                    continue
+                merged_row: Dict[str, Any] = {
+                    "t": text,
+                    "w": float(row.get("w") or 0.0),
+                }
+                added_sources = list((added_sources_by_section.get(sec) or {}).get(key) or [])
+                if added_sources:
+                    merged_row["sources"] = added_sources
+                else:
+                    prev = dict((current_by_key.get(sec) or {}).get(key) or {})
+                    prev_sources = cls._normalize_sources(prev.get("sources"))
+                    if prev_sources:
+                        merged_row["sources"] = prev_sources
+                merged_specs.append(merged_row)
+            merged[sec] = {
+                "domain": list(req_sec.get("domain") or []),
+                "specialization": merged_specs,
+            }
+        return merged
+
+    @classmethod
+    def _diff_specialization_keywords(
+        cls,
+        *,
+        current: Dict[str, Any],
+        requested: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        added: Dict[str, List[str]] = {"research": [], "application": []}
+        deleted: Dict[str, List[str]] = {"research": [], "application": []}
+        weight_changed: Dict[str, List[str]] = {"research": [], "application": []}
+
+        added_count = 0
+        deleted_count = 0
+        weight_changed_count = 0
+        weight_eps = 1e-9
+
+        for sec in ("research", "application"):
+            current_map = cls._spec_rows_by_key(list(((current.get(sec) or {}).get("specialization") or []))
+            )
+            requested_map = cls._spec_rows_by_key(list(((requested.get(sec) or {}).get("specialization") or []))
+            )
+
+            current_keys: Set[str] = set(current_map.keys())
+            requested_keys: Set[str] = set(requested_map.keys())
+
+            sec_added = sorted(requested_keys - current_keys)
+            sec_deleted = sorted(current_keys - requested_keys)
+            sec_common = sorted(current_keys.intersection(requested_keys))
+
+            sec_weight_changed: List[str] = []
+            for key in sec_common:
+                old_w = float((current_map.get(key) or {}).get("w") or 0.0)
+                new_w = float((requested_map.get(key) or {}).get("w") or 0.0)
+                if abs(old_w - new_w) > weight_eps:
+                    sec_weight_changed.append(key)
+
+            added[sec] = sec_added
+            deleted[sec] = sec_deleted
+            weight_changed[sec] = sec_weight_changed
+
+            added_count += len(sec_added)
+            deleted_count += len(sec_deleted)
+            weight_changed_count += len(sec_weight_changed)
+
+        return {
+            "added": added,
+            "deleted": deleted,
+            "weight_changed": weight_changed,
+            "added_count": int(added_count),
+            "deleted_count": int(deleted_count),
+            "weight_changed_count": int(weight_changed_count),
+        }
+
+    @classmethod
+    def _spec_rows_by_key(cls, rows: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+        out: Dict[str, Dict[str, Any]] = {}
+        for raw in list(rows or []):
+            row = dict(raw or {})
+            text = str(row.get("t") or row.get("text") or "").strip()
+            key = cls._norm_text_key(text)
+            if not key or key in out:
+                continue
+            out[key] = {
+                "t": text,
+                "w": float(row.get("w") or row.get("weight") or 0.0),
+                "sources": cls._normalize_sources(row.get("sources")),
+            }
+        return out
+
     @staticmethod
-    def _normalize_keywords_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
+    def _norm_text_key(value: Any) -> str:
+        return " ".join(str(value or "").strip().lower().split())
+
+    @staticmethod
+    def _normalize_sources(raw_sources: Any) -> List[Dict[str, Any]]:
+        out: List[Dict[str, Any]] = []
+        seen: Set[Tuple[int, str]] = set()
+        for row in list(raw_sources or []):
+            if not isinstance(row, dict):
+                continue
+            try:
+                src_id = int(row.get("id"))
+            except Exception:
+                continue
+            src_type = str(row.get("type") or "").strip()
+            if not src_type:
+                continue
+            key = (int(src_id), src_type)
+            if key in seen:
+                continue
+            seen.add(key)
+            try:
+                score = float(row.get("score", 0.5))
+            except Exception:
+                score = 0.5
+            score = max(0.0, min(1.0, score))
+            out.append(
+                {
+                    "id": int(src_id),
+                    "type": src_type,
+                    "score": float(score),
+                }
+            )
+        return out
+
+    @classmethod
+    def _normalize_keywords_payload(
+        cls,
+        payload: Dict[str, Any],
+        *,
+        include_sources: bool = False,
+    ) -> Dict[str, Any]:
         if not isinstance(payload, dict):
             raise ValueError("all_keywords must be an object.")
 
@@ -846,7 +1322,12 @@ class FacultyProfileService:
                     except Exception:
                         weight = 1.0
                     weight = max(0.0, min(weight, 1.0))
-                    specs.append({"t": text, "w": weight})
+                    spec_row: Dict[str, Any] = {"t": text, "w": weight}
+                    if include_sources:
+                        src = cls._normalize_sources(item.get("sources"))
+                        if src:
+                            spec_row["sources"] = src
+                    specs.append(spec_row)
                     continue
                 raise ValueError(
                     f"all_keywords.{section}.specialization items must be string or object."
@@ -1044,6 +1525,37 @@ class FacultyProfileService:
         )
         self._s3_client = session.client("s3")
         return self._s3_client
+
+    @staticmethod
+    def _safe_env_int(name: str, default: int, *, minimum: int = 1, maximum: int = 64) -> int:
+        raw = os.getenv(str(name))
+        try:
+            value = int(raw) if raw is not None else int(default)
+        except Exception:
+            value = int(default)
+        return max(int(minimum), min(int(value), int(maximum)))
+
+    @classmethod
+    def _resolve_single_faculty_keyword_batch_workers(cls) -> int:
+        cpu_hint = max(1, int(os.cpu_count() or 8))
+        default = max(8, cpu_hint * 2)
+        return cls._safe_env_int(
+            "FACULTY_SINGLE_KEYWORD_BATCH_WORKERS",
+            default,
+            minimum=1,
+            maximum=64,
+        )
+
+    @classmethod
+    def _resolve_single_faculty_rerank_chunk_workers(cls) -> int:
+        cpu_hint = max(1, int(os.cpu_count() or 8))
+        default = max(8, cpu_hint * 2)
+        return cls._safe_env_int(
+            "FACULTY_SINGLE_RERANK_CHUNK_WORKERS",
+            default,
+            minimum=1,
+            maximum=64,
+        )
 
     @staticmethod
     def _safe_int_or_none(v: Any) -> Optional[int]:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import re
 from typing import Any, Dict, List, Optional, Set
 
@@ -35,6 +36,26 @@ class MatchingExecutionAgent:
         "va": ["va", "vha", "veterans affairs", "veterans health administration"],
         "usace": ["usace", "u.s. army corps of engineers", "army corps of engineers"],
     }
+
+    @staticmethod
+    def _safe_env_int(name: str, default: int, *, minimum: int = 1, maximum: int = 64) -> int:
+        raw = os.getenv(str(name))
+        try:
+            value = int(raw) if raw is not None else int(default)
+        except Exception:
+            value = int(default)
+        return max(int(minimum), min(int(value), int(maximum)))
+
+    @classmethod
+    def _resolve_single_faculty_rerank_chunk_workers(cls) -> int:
+        cpu_hint = max(1, int(os.cpu_count() or 8))
+        default = max(8, cpu_hint * 2)
+        return cls._safe_env_int(
+            "FACULTY_SINGLE_RERANK_CHUNK_WORKERS",
+            default,
+            minimum=1,
+            maximum=64,
+        )
 
     def __init__(self, *, session_factory=SessionLocal, context_generator: Optional[ContextGenerator] = None):
         self.session_factory = session_factory
@@ -409,11 +430,13 @@ class MatchingExecutionAgent:
                 **out,
             }
         try:
+            rerank_chunk_workers = self._resolve_single_faculty_rerank_chunk_workers()
             upserted = int(
                 self.faculty_matcher.run_for_opportunity(
                     opportunity_id=str(opportunity_id),
                     faculty_ids=[int(faculty_id)],
                     min_domain=0.0,
+                    rerank_chunk_workers=int(rerank_chunk_workers),
                 )
             )
         except Exception as e:
@@ -447,11 +470,17 @@ class MatchingExecutionAgent:
                 **out,
             }
         try:
+            single_faculty_chunk_workers = (
+                int(self._resolve_single_faculty_rerank_chunk_workers())
+                if len(clean_faculty_ids) == 1
+                else None
+            )
             upserted_required = int(
                 self.faculty_matcher.run_for_opportunity(
                     opportunity_id=str(opportunity_id),
                     faculty_ids=clean_faculty_ids,
                     min_domain=0.0,
+                    rerank_chunk_workers=single_faculty_chunk_workers,
                 )
             )
             upserted_pool = 0
@@ -521,6 +550,7 @@ class MatchingExecutionAgent:
                     faculty_id=int(faculty_id),
                     k=max(prefilter_k, 20),
                     min_domain=0.0,
+                    rerank_chunk_workers=int(self._resolve_single_faculty_rerank_chunk_workers()),
                 )
 
                 with self.session_factory() as sess:
@@ -643,6 +673,7 @@ class MatchingExecutionAgent:
                     opportunity_id=opp_id,
                     faculty_ids=[int(faculty_id)],
                     min_domain=0.0,
+                    rerank_chunk_workers=int(self._resolve_single_faculty_rerank_chunk_workers()),
                 )
 
                 with self.session_factory() as sess:
