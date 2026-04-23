@@ -7,9 +7,16 @@ from typing import Any, Dict, List, Optional
 
 from flask import Flask, Response, request, stream_with_context
 
+import bcrypt
+from db.db_conn import SessionLocal
+from dao.faculty_dao import FacultyDAO
+from dao.user_dao import UserDAO
+from db.models.faculty import Faculty
+
 logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
+
 
 _ORCHESTRATOR = None
 _FACULTY_PROFILE_JOB_MANAGER = None
@@ -1078,6 +1085,26 @@ def get_faculty_profile_by_id(faculty_id: int):
         logger.exception("GET /api/faculty/<faculty_id> failed")
         return {"ok": False, "error": f"{type(e).__name__}: {e}"}, 500
 
+def _get_request_actor() -> tuple[str, str]:
+    actor_email = str(
+        request.headers.get("X-User-Email")
+        or request.headers.get("x-user-email")
+        or ""
+    ).strip().lower()
+
+    actor_role = str(
+        request.headers.get("X-User-Role")
+        or request.headers.get("x-user-role")
+        or "normal_user"
+    ).strip().lower()
+
+    return actor_email, actor_role
+
+
+def _can_access_target_email(actor_email: str, actor_role: str, target_email: str) -> bool:
+    if actor_role == "admin":
+        return True
+    return actor_email == str(target_email or "").strip().lower()
 
 @app.get("/api/faculty/by-email")
 @app.post("/api/faculty/by-email")
@@ -1106,6 +1133,14 @@ def get_faculty_profile_by_email():
             "ok": False,
             "error": "email is required.",
         }, 400
+
+    actor_email, actor_role = _get_request_actor()
+    if not _can_access_target_email(actor_email, actor_role, email):
+        return {
+            "ok": False,
+            "error": "You are not allowed to view this profile.",
+        }, 403
+
     try:
         from services.faculty.faculty_profile_service import FacultyProfileService
 
@@ -1138,6 +1173,14 @@ def edit_faculty_profile_by_email():
             "ok": False,
             "error": "email is required.",
         }, 400
+    
+    actor_email, actor_role = _get_request_actor()
+    if not _can_access_target_email(actor_email, actor_role, email):
+        return {
+            "ok": False,
+            "error": "You are not allowed to edit this profile.",
+        }, 403
+
     #print(body)
     basic_info = body.get("basic_info") or {}
     data_from = body.get("data_from") or {}
@@ -1233,6 +1276,13 @@ def get_faculty_profile_update_job(job_id: str):
 @app.post("/api/faculty/create")
 def create_faculty_profiles():
     # Parse multipart/form-data for faculty creation
+    actor_email, actor_role = _get_request_actor()
+    if actor_role != "admin":
+        return {
+            "ok": False,
+            "error": "Only admins can create faculty.",
+        }, 403
+
     content_type = (request.content_type or "").lower()
     if "multipart/form-data" not in content_type:
         return {
@@ -1313,8 +1363,149 @@ def create_faculty_profiles():
         return {"ok": False, "error": f"{type(e).__name__}: {e}"}, 500
 
 
+@app.post("/api/auth/login")
+def login():
+    body = request.get_json(silent=True) or {}
+    email = str(body.get("email") or "").strip().lower()
+    password = str(body.get("password") or "")
+
+    print("login.hit", email)
+
+    if not email or not password:
+        return {
+            "ok": False,
+            "error": "Email and password are required."
+        }, 400
+
+    if not email.endswith("@oregonstate.edu"):
+        return {
+            "ok": False,
+            "error": "Only @oregonstate.edu email addresses are allowed."
+        }, 403
+
+    try:
+        with SessionLocal() as sess:
+            print("login.db_session_open")
+
+            faculty_dao = FacultyDAO(sess)
+            user_dao = UserDAO(sess)
+
+            print("login.before_faculty_lookup")
+            faculty = faculty_dao.get_by_email(email)
+            print("login.after_faculty_lookup", faculty is not None)
+
+            if not faculty:
+                return {
+                    "ok": False,
+                    "error": "Email is not authorized."
+                }, 403
+
+            print("login.before_user_lookup")
+            user = user_dao.get_by_email(email)
+            print("login.after_user_lookup", user is not None)
+
+            if user is None or not user.password_hash:
+                return {
+                    "ok": False,
+                    "error": "No password is set for this account yet."
+                }, 401
+
+            print("login.before_password_check")
+            ok = bcrypt.checkpw(
+                password.encode("utf-8"),
+                user.password_hash.encode("utf-8")
+            )
+            print("login.after_password_check", ok)
+
+            if not ok:
+                return {
+                    "ok": False,
+                    "error": "Invalid password."
+                }, 401
+
+            print("login.success_return")
+            return {
+                "ok": True,
+                "message": "Login successful.",
+                "user": {
+                    "email": user.email,
+                    "role": user.role,
+                    "faculty_id": user.faculty_id,
+                }
+            }, 200
+
+    except Exception as e:
+        logger.exception("POST /api/auth/login failed")
+        return {
+            "ok": False,
+            "error": f"{type(e).__name__}: {e}"
+        }, 500
 
 
+@app.post("/api/auth/signup")
+def signup():
+    body = request.get_json(silent=True) or {}
+    email = str(body.get("email") or "").strip().lower()
+    password = str(body.get("password") or "")
+    confirm_password = str(body.get("confirm_password") or "")
+
+    if not email or not password or not confirm_password:
+        return {"ok": False, "error": "Email, password, and confirm password are required."}, 400
+
+    if not email.endswith("@oregonstate.edu"):
+        return {"ok": False, "error": "Use your Oregon State email."}, 403
+
+    if password != confirm_password:
+        return {"ok": False, "error": "Passwords do not match."}, 400
+
+    if len(password) < 6:
+        return {"ok": False, "error": "Password must be at least 6 characters."}, 400
+
+    try:
+        with SessionLocal() as sess:
+            faculty_dao = FacultyDAO(sess)
+            user_dao = UserDAO(sess)
+
+            existing_faculty = faculty_dao.get_by_email(email)
+            existing_user = user_dao.get_by_email(email)
+
+            if existing_faculty or existing_user:
+                return {"ok": False, "error": "An account with this email already exists. Please log in."}, 400
+
+            faculty = Faculty(
+                name="",
+                email=email,
+                source_url="pending"
+            )
+            sess.add(faculty)
+            sess.flush()
+
+            password_hash = bcrypt.hashpw(
+                password.encode("utf-8"),
+                bcrypt.gensalt()
+            ).decode("utf-8")
+
+            user = user_dao.create_user(
+                faculty_id=faculty.faculty_id,
+                email=email,
+                password_hash=password_hash,
+                role="normal_user"
+            )
+
+            sess.commit()
+
+            return {
+                "ok": True,
+                "message": "Signup successful.",
+                "user": {
+                    "email": user.email,
+                    "role": user.role,
+                    "faculty_id": user.faculty_id,
+                }
+            }, 200
+    except Exception as e:
+        logger.exception("POST /api/auth/signup failed")
+        return {"ok": False, "error": f"{type(e).__name__}: {e}"}, 500
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000, debug=True, threaded=True)
