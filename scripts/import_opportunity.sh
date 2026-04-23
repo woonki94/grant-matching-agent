@@ -1,5 +1,4 @@
 #!/usr/bin/env bash
-# ───────────────────────────────────────────────
 # Run the opportunity import + extraction pipeline
 #
 # Usage:
@@ -11,7 +10,6 @@
 #   ./scripts/import_opportunity.sh --page-size 200 --query "education"
 #   ./scripts/import_opportunity.sh --page-size 200 --query "education" --agencies "HHS-NIH11,NSF"
 #   ./scripts/import_opportunity.sh --page-size 200 --query "education" --agencies "HHS-NIH11,NSF" --fetch-workers 10 --extract-workers 6
-# ───────────────────────────────────────────────
 
 set -euo pipefail
 
