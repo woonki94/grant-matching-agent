@@ -34,8 +34,8 @@ class GroupJustificationEngine:
     def __init__(
         self,
         *,
-        odao: OpportunityDAO,
-        fdao: FacultyDAO,
+        odao: Optional[OpportunityDAO] = None,
+        fdao: Optional[FacultyDAO] = None,
         context_generator: Optional[ContextGenerator] = None,
     ):
         self.odao = odao
@@ -142,7 +142,7 @@ class GroupJustificationEngine:
 
         # Check grant_brief cache — skip Haiku call if already stored.
         cached_brief: Optional[str] = None
-        if grant_id:
+        if grant_id and self.odao is not None:
             kw_row = self.odao.get_opportunity_keyword(str(grant_id))
             cached_brief = self._norm(getattr(kw_row, "grant_brief", None) or "")
 
@@ -197,7 +197,7 @@ class GroupJustificationEngine:
                 grant_brief = section_outputs["grant_brief"]
                 # Persist for future requests.
                 brief_text = self._norm(getattr(grant_brief, "grant_quick_explanation", "") or "")
-                if brief_text and grant_id:
+                if brief_text and grant_id and self.odao is not None:
                     try:
                         self.odao.save_grant_brief(opportunity_id=str(grant_id), brief=brief_text)
                         self.odao.session.commit()
