@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
@@ -16,6 +17,26 @@ logger = logging.getLogger(__name__)
 
 _STALE_DAYS = 30
 _MAX_SCRAPE_WORKERS = 5
+
+
+def _safe_env_int(name: str, default: int, *, minimum: int = 1, maximum: int = 64) -> int:
+    raw = os.getenv(str(name))
+    try:
+        value = int(raw) if raw is not None else int(default)
+    except Exception:
+        value = int(default)
+    return max(int(minimum), min(int(value), int(maximum)))
+
+
+def _resolve_single_faculty_keyword_batch_workers() -> int:
+    cpu_hint = max(1, int(os.cpu_count() or 8))
+    default = max(8, cpu_hint * 2)
+    return _safe_env_int(
+        "FACULTY_SINGLE_KEYWORD_BATCH_WORKERS",
+        default,
+        minimum=1,
+        maximum=64,
+    )
 
 
 class FacultyContextAgent:
@@ -297,16 +318,28 @@ class FacultyContextAgent:
 
         # ── 3. Sequential keyword generation ─────────────────────────
         if keyword_generator is not None:
+            batch_workers = _resolve_single_faculty_keyword_batch_workers()
             for email in newly_added:
                 fid = email_to_fid.get(email)
                 if not fid:
                     continue
                 try:
-                    keyword_generator.generate_faculty_keywords_for_id(
-                        fid, force_regenerate=True
-                    )
+                    try:
+                        keyword_generator.generate_faculty_keywords_for_id(
+                            fid,
+                            force_regenerate=True,
+                            batch_workers=int(batch_workers),
+                        )
+                    except TypeError:
+                        # Backward compatibility for alternate generator implementations.
+                        keyword_generator.generate_faculty_keywords_for_id(
+                            fid,
+                            force_regenerate=True,
+                        )
                     logger.info(
-                        "FacultyContextAgent: keywords generated for faculty_id=%s", fid
+                        "FacultyContextAgent: keywords generated for faculty_id=%s batch_workers=%s",
+                        fid,
+                        int(batch_workers),
                     )
                 except Exception:
                     logger.exception(

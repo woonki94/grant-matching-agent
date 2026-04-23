@@ -95,14 +95,10 @@ class FacultyGrantMatcher:
         faculty_specs: Dict[str, List[str]],
         covered_threshold: float,
     ) -> Dict[str, Any]:
-        covered: Dict[str, Dict[str, float]] = {"application": {}, "research": {}}
-        missing: Dict[str, List[int]] = {"application": [], "research": []}
-
-        evidence_sections: Dict[str, Dict[str, Dict[str, Any]]] = {"application": {}, "research": {}}
-        weighted_pair_sum = 0.0
-        total_pair_weight = 0.0
-        pair_count = 0
-
+        pair_scores_by_req_section: Dict[str, Dict[int, List[Tuple[int, float]]]] = {
+            "application": {},
+            "research": {},
+        }
         for sec in ("application", "research"):
             req_rows = list(requirements.get(sec) or [])
             fac_rows = list(faculty_specs.get(sec) or [])
@@ -127,12 +123,39 @@ class FacultyGrantMatcher:
                 for (req_idx, fac_idx), score in zip(pair_index_meta, pair_scores):
                     score_val = max(0.0, min(1.0, float(score)))
                     pair_scores_by_req.setdefault(req_idx, []).append((int(fac_idx), score_val))
+            pair_scores_by_req_section[sec] = pair_scores_by_req
 
+        return self._build_spec_payload_from_pair_scores(
+            requirements=requirements,
+            faculty_specs=faculty_specs,
+            pair_scores_by_req_section=pair_scores_by_req_section,
+            covered_threshold=covered_threshold,
+        )
+
+    def _build_spec_payload_from_pair_scores(
+        self,
+        *,
+        requirements: Dict[str, List[Dict[str, Any]]],
+        faculty_specs: Dict[str, List[str]],
+        pair_scores_by_req_section: Dict[str, Dict[int, List[Tuple[int, float]]]],
+        covered_threshold: float,
+    ) -> Dict[str, Any]:
+        covered: Dict[str, Dict[str, float]] = {"application": {}, "research": {}}
+        missing: Dict[str, List[int]] = {"application": [], "research": []}
+        evidence_sections: Dict[str, Dict[str, Dict[str, Any]]] = {"application": {}, "research": {}}
+        weighted_pair_sum = 0.0
+        total_pair_weight = 0.0
+        pair_count = 0
+
+        for sec in ("application", "research"):
+            req_rows = list(requirements.get(sec) or [])
+            fac_rows = list(faculty_specs.get(sec) or [])
+            req_pair_map = dict((pair_scores_by_req_section or {}).get(sec) or {})
             for req in req_rows:
                 req_idx = int(req["idx"])
                 req_text = str(req.get("text") or "").strip()
                 weight = self._safe_weight(req.get("weight", 1.0))
-                req_pair_scores = list(pair_scores_by_req.get(req_idx) or [])
+                req_pair_scores = list(req_pair_map.get(req_idx) or [])
 
                 if req_pair_scores:
                     c = sum(float(s) for _, s in req_pair_scores) / float(len(req_pair_scores))
@@ -218,6 +241,96 @@ class FacultyGrantMatcher:
             "evidence": evidence,
         }
 
+    def _score_specialization_coverage_bulk_for_candidates(
+        self,
+        *,
+        candidates: List[Tuple[str, float]],
+        opp_map: Dict[str, Any],
+        faculty_specs: Dict[str, List[str]],
+        covered_threshold: float,
+    ) -> Dict[str, Dict[str, Any]]:
+        """
+        Score many candidate opportunities in bulk for one faculty.
+
+        This aggressively reduces per-opportunity model calls by scoring unique
+        (requirement, faculty specialization) pairs once per section.
+        """
+        requirements_by_opp: Dict[str, Dict[str, List[Dict[str, Any]]]] = {}
+        for opp_id, _ in list(candidates or []):
+            oid = str(opp_id)
+            if oid in requirements_by_opp:
+                continue
+            opp = opp_map.get(oid)
+            if not opp:
+                continue
+            requirements_by_opp[oid] = self._opportunity_requirements_by_section(opp)
+
+        req_pair_scores_by_opp: Dict[str, Dict[str, Dict[int, List[Tuple[int, float]]]]] = {
+            oid: {"application": {}, "research": {}}
+            for oid in requirements_by_opp.keys()
+        }
+
+        for sec in ("application", "research"):
+            fac_rows = list(faculty_specs.get(sec) or [])
+            if not fac_rows:
+                continue
+
+            pair_to_idx: Dict[Tuple[str, str], int] = {}
+            unique_pairs: List[Tuple[str, str]] = []
+            usages: List[Tuple[str, int, int, int]] = []
+
+            for oid, reqs in list(requirements_by_opp.items()):
+                req_rows = list((reqs or {}).get(sec) or [])
+                for req in req_rows:
+                    req_idx = int(req.get("idx") or 0)
+                    req_text = str(req.get("text") or "").strip()
+                    if not req_text:
+                        continue
+                    for fac_idx, fac_text_raw in enumerate(fac_rows):
+                        fac_text = str(fac_text_raw or "").strip()
+                        if not fac_text:
+                            continue
+                        key = (req_text, fac_text)
+                        pair_idx = pair_to_idx.get(key)
+                        if pair_idx is None:
+                            pair_idx = len(unique_pairs)
+                            pair_to_idx[key] = pair_idx
+                            unique_pairs.append(key)
+                        usages.append((oid, req_idx, int(fac_idx), int(pair_idx)))
+
+            if not unique_pairs:
+                continue
+
+            logger.info(
+                "Bulk specialization scoring section=%s candidates=%s unique_pairs=%s",
+                sec,
+                len(requirements_by_opp),
+                len(unique_pairs),
+            )
+            scores = self.spec_scorer.score_pairs(unique_pairs)
+            for oid, req_idx, fac_idx, pair_idx in usages:
+                score_raw = scores[pair_idx] if 0 <= int(pair_idx) < len(scores) else 0.0
+                score_val = max(0.0, min(1.0, float(score_raw)))
+                sec_map = req_pair_scores_by_opp.setdefault(
+                    str(oid),
+                    {"application": {}, "research": {}},
+                )
+                req_map = sec_map.setdefault(sec, {})
+                req_map.setdefault(int(req_idx), []).append((int(fac_idx), float(score_val)))
+
+        out: Dict[str, Dict[str, Any]] = {}
+        for oid, reqs in list(requirements_by_opp.items()):
+            out[str(oid)] = self._build_spec_payload_from_pair_scores(
+                requirements=reqs,
+                faculty_specs=faculty_specs,
+                pair_scores_by_req_section=req_pair_scores_by_opp.get(
+                    str(oid),
+                    {"application": {}, "research": {}},
+                ),
+                covered_threshold=covered_threshold,
+            )
+        return out
+
     def _build_rows_for_faculty_candidates(
         self,
         *,
@@ -229,17 +342,25 @@ class FacultyGrantMatcher:
         faculty_specs = self._faculty_specs_by_section(fac)
         covered_threshold = self._resolve_covered_threshold()
         out_rows: List[Dict[str, Any]] = []
+        payload_by_opp = self._score_specialization_coverage_bulk_for_candidates(
+            candidates=candidates,
+            opp_map=opp_map,
+            faculty_specs=faculty_specs,
+            covered_threshold=covered_threshold,
+        )
 
         for opp_id, domain_sim in candidates:
             opp = opp_map.get(str(opp_id))
             if not opp:
                 continue
-            reqs = self._opportunity_requirements_by_section(opp)
-            spec_score_payload = self._score_specialization_coverage(
-                requirements=reqs,
-                faculty_specs=faculty_specs,
-                covered_threshold=covered_threshold,
-            )
+            spec_score_payload = payload_by_opp.get(str(opp_id))
+            if not isinstance(spec_score_payload, dict):
+                reqs = self._opportunity_requirements_by_section(opp)
+                spec_score_payload = self._score_specialization_coverage(
+                    requirements=reqs,
+                    faculty_specs=faculty_specs,
+                    covered_threshold=covered_threshold,
+                )
             out_rows.append(
                 self._build_match_row(
                     grant_id=str(opp_id),
@@ -300,9 +421,15 @@ class FacultyGrantMatcher:
         sess,
         match_dao: MatchDAO,
         faculty_id: int,
+        rerank_chunk_workers: Optional[int] = None,
     ) -> int:
         try:
-            rerank_result = self.llm_reranker.rerank_for_faculty(faculty_id=int(faculty_id))
+            rerank_result = self.llm_reranker.rerank_for_faculty(
+                faculty_id=int(faculty_id),
+                chunk_workers=int(rerank_chunk_workers)
+                if rerank_chunk_workers is not None
+                else self.llm_reranker.DEFAULT_CHUNK_WORKERS,
+            )
         except Exception as exc:
             logger.exception(
                 "LLM reranker failed for faculty_id=%s: %s",
@@ -336,6 +463,7 @@ class FacultyGrantMatcher:
         *,
         faculty_ids: List[int],
         workers: int = DEFAULT_RERANK_WORKERS,
+        rerank_chunk_workers: Optional[int] = None,
     ) -> int:
         """Apply one-to-one LLM reranked scores for multiple faculty in parallel."""
         target_ids = sorted({int(x) for x in list(faculty_ids or []) if x is not None})
@@ -356,6 +484,7 @@ class FacultyGrantMatcher:
                     sess=sess,
                     match_dao=match_dao,
                     faculty_id=int(fid),
+                    rerank_chunk_workers=rerank_chunk_workers,
                 )
                 sess.commit()
                 return {
@@ -453,6 +582,7 @@ class FacultyGrantMatcher:
         faculty_id: int,
         k: int = 10,
         min_domain: float = 0.30,
+        rerank_chunk_workers: Optional[int] = None,
     ) -> int:
         """
         Generate one-to-one match rows for exactly one faculty.
@@ -492,6 +622,7 @@ class FacultyGrantMatcher:
                     sess=sess,
                     match_dao=match_dao,
                     faculty_id=int(faculty_id),
+                    rerank_chunk_workers=rerank_chunk_workers,
                 )
                 sess.commit()
 
@@ -505,6 +636,7 @@ class FacultyGrantMatcher:
         k: int = 200,
         min_domain: float = 0.30,
         rerank_workers: int = DEFAULT_RERANK_WORKERS,
+        rerank_chunk_workers: Optional[int] = None,
     ) -> int:
         """
         Generate one-to-one match rows for exactly one grant.
@@ -570,5 +702,6 @@ class FacultyGrantMatcher:
                 self._apply_reranked_scores_for_faculties(
                     faculty_ids=rerank_faculty_ids,
                     workers=int(rerank_workers),
+                    rerank_chunk_workers=rerank_chunk_workers,
                 )
             return len(out_rows)

@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import hashlib
 import logging
+import os
 import re
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -58,13 +59,27 @@ ContextBuilder = Callable[[Any], Dict[str, Any]]
 logger = logging.getLogger(__name__)
 
 
+def _safe_env_int(name: str, default: int) -> int:
+    raw = os.getenv(name)
+    try:
+        return int(raw) if raw is not None else int(default)
+    except Exception:
+        return int(default)
+
+
 class _KeywordGeneratorBase:
     """Shared keyword-generation pipeline used by faculty and opportunity generators."""
 
     KEYWORD_MAX_CONTEXT_CHARS = 50_000
     KEYWORD_MAX_CANDIDATES_PER_BATCH = 50
     KEYWORD_MAX_BATCH_KEYWORDS = 20
-    KEYWORD_BATCH_WORKERS = 2
+    KEYWORD_BATCH_WORKERS = max(
+        1,
+        min(
+            _safe_env_int("KEYWORD_BATCH_WORKERS", 4),
+            16,
+        ),
+    )
 
     def __init__(self, *, context_generator: ContextGenerator, force_regenerate: bool = False):
         self.context_generator = context_generator
@@ -275,6 +290,7 @@ class _KeywordGeneratorBase:
         research_weighted_merge_chain=None,
         application_weighted_merge_chain=None,
         source_embedding_client: Optional[Any] = None,
+        batch_workers: Optional[int] = None,
     ) -> Tuple[dict, dict]:
         """Run full keyword pipeline and return (keywords_with_sources, raw_debug_payload)."""
         obj_id = (
@@ -301,21 +317,21 @@ class _KeywordGeneratorBase:
         )
 
         #=================================
-        # 2. Run each batch in parallel (batch worker count is fixed to 2)
+        # 2. Run each batch in parallel (worker count is configurable)
         #    Each batch executes: candidate -> keyword -> weight
         #=================================
         batch_items: List[Tuple[int, Dict[str, Any]]] = [
             (int(i), dict(ctx or {}))
             for i, ctx in enumerate(list(context_batches), start=1)
         ]
-        batch_workers = resolve_pool_size(
-            max_workers=int(self.KEYWORD_BATCH_WORKERS),
+        resolved_batch_workers = resolve_pool_size(
+            max_workers=int(batch_workers or self.KEYWORD_BATCH_WORKERS),
             task_count=len(batch_items),
         )
         logger.info(
             "Keyword generation batch parallel obj=%s workers=%s batches=%s",
             obj_tag,
-            batch_workers,
+            resolved_batch_workers,
             len(batch_items),
         )
 
@@ -537,7 +553,7 @@ class _KeywordGeneratorBase:
 
         batch_results = parallel_map(
             batch_items,
-            max_workers=max(1, int(batch_workers or 1)),
+            max_workers=max(1, int(resolved_batch_workers or 1)),
             run_item=_run_one_batch,
             on_error=_on_batch_error,
         )
@@ -834,7 +850,13 @@ class _KeywordGeneratorBase:
 
 
 class FacultyKeywordGenerator(_KeywordGeneratorBase):
-    def generate_faculty_keywords_for_id(self, faculty_id: int, *, force_regenerate: Optional[bool] = None) -> Optional[dict]:
+    def generate_faculty_keywords_for_id(
+        self,
+        faculty_id: int,
+        *,
+        force_regenerate: Optional[bool] = None,
+        batch_workers: Optional[int] = None,
+    ) -> Optional[dict]:
         """Generate and persist keywords for one faculty id."""
         if not faculty_id:
             return None
@@ -895,6 +917,7 @@ class FacultyKeywordGenerator(_KeywordGeneratorBase):
                 application_merge_chain=faculty_a_merge_chain,
                 research_weighted_merge_chain=faculty_r_weighted_merge_chain,
                 application_weighted_merge_chain=faculty_a_weighted_merge_chain,
+                batch_workers=batch_workers,
             )
 
             source_model = settings.haiku
