@@ -152,27 +152,32 @@ Evaluation steps (IMPORTANT — follow strictly):
    - Keep them short (2–6 key phrases)
    - Do NOT invent new concepts
 
-2. For each required concept:
-   - Check if the candidate clearly expresses it
+2. For each extracted concept:
+   - Classify it as:
+     - CORE (central to the requirement)
+     - SUPPORTING (secondary detail)
+
+3. For each concept:
+   - Check if the candidate expresses it
    - Mark as: FULL, PARTIAL, or MISSING
 
-3. Count coverage:
-   - FULL match = strong evidence
-   - PARTIAL = vague or indirect mention
-   - MISSING = not present
+4. Evaluate coverage with priority:
+   - First consider CORE concepts
+   - Missing a CORE concept should significantly reduce the score
+   - SUPPORTING concepts influence the score only after CORE coverage is considered
 
-4. Score based on coverage:
-   - All FULL → 0.9–1.0
-   - Mostly FULL + some PARTIAL → 0.75–0.9
-   - Mix of PARTIAL + MISSING → 0.5–0.75
-   - Mostly PARTIAL → 0.35–0.55
-   - Mostly MISSING → 0.1–0.35
-   - No overlap → 0.0–0.1
+5. Score based on coverage:
+   - All CORE = FULL → 0.9–1.0
+   - CORE mostly FULL + minor gaps → 0.75–0.9
+   - Some CORE PARTIAL/MISSING → 0.5–0.75
+   - Most CORE MISSING but some SUPPORTING overlap → 0.1–0.5
+   - No meaningful overlap → 0.0–0.1
 
 IMPORTANT:
 - Only evaluate concepts present in the requirement
 - Do NOT penalize for unrelated missing topics
 - Avoid assigning identical scores when coverage differs
+- Prefer slightly different scores when candidates differ in which CORE concepts they satisfy
 """
 
 USER_PROMPT_TEMPLATE = """
