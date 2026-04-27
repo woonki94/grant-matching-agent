@@ -5,6 +5,7 @@ import hashlib
 import json
 import math
 import random
+import sys
 import time
 from contextlib import nullcontext
 from dataclasses import dataclass
@@ -25,10 +26,24 @@ except Exception:
     tqdm = None  # type: ignore[assignment]
 
 
+# Ensure project root on sys.path for direct script execution.
+def _find_project_root() -> Path:
+    here = Path(__file__).resolve()
+    for parent in (here.parent, *here.parents):
+        if (parent / "cross_encoder").is_dir():
+            return parent
+    return here.parent
+
+
+PROJECT_ROOT = _find_project_root()
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+
 MODEL_ID_DEFAULT = "BAAI/bge-reranker-base"
-RAW_INPUT_DEFAULT = "cross_encoder/dataset/llm_distill_raw_scores.jsonl"
-PAIRWISE_INPUT_DEFAULT = "cross_encoder/dataset/llm_distill_pairwise.jsonl"
-OUTPUT_DIR_DEFAULT = "cross_encoder/models/bge_reranker_distill"
+RAW_INPUT_DEFAULT = "cross_encoder/spec_to_spec/dataset/llm_distill_raw_scores.jsonl"
+PAIRWISE_INPUT_DEFAULT = "cross_encoder/spec_to_spec/dataset/llm_distill_pairwise.jsonl"
+OUTPUT_DIR_DEFAULT = "cross_encoder/spec_to_spec/models/bge_reranker_distill"
 WANDB_PROJECT_DEFAULT = "cross_encoder_distill"
 
 
@@ -178,6 +193,13 @@ def _clean_text(value: Any) -> str:
     return str(value or "").strip()
 
 
+def _resolve_path(value: Any) -> Path:
+    path = Path(_clean_text(value)).expanduser()
+    if not path.is_absolute():
+        path = PROJECT_ROOT / path
+    return path.resolve()
+
+
 def _safe_int(value: Any, *, default: int, minimum: int, maximum: int) -> int:
     try:
         out = int(value)
@@ -317,17 +339,29 @@ def _load_raw_groups(path: Path, *, max_queries: int = 0) -> List[QueryGroup]:
             for c in cand_raw:
                 if not isinstance(c, dict):
                     continue
-                doc_text = _clean_text(c.get("chunk_text") or c.get("text"))
+                doc_text = _clean_text(c.get("chunk_text") or c.get("fac_spec_text") or c.get("text"))
                 if not doc_text:
                     continue
+                doc_id = _safe_int(
+                    c.get("chunk_id") if ("chunk_id" in c) else c.get("fac_spec_id"),
+                    default=0,
+                    minimum=0,
+                    maximum=2_147_483_647,
+                )
+                doc_index = _safe_int(
+                    c.get("chunk_index") if ("chunk_index" in c) else c.get("fac_spec_idx"),
+                    default=0,
+                    minimum=0,
+                    maximum=10_000_000,
+                )
                 cands.append(
                     Candidate(
                         text=doc_text,
                         score=_clamp_01(c.get("score") if "score" in c else c.get("teacher_score")),
                         fac_id=_safe_int(c.get("fac_id"), default=0, minimum=0, maximum=2_147_483_647),
-                        chunk_id=_safe_int(c.get("chunk_id"), default=0, minimum=0, maximum=2_147_483_647),
-                        chunk_index=_safe_int(c.get("chunk_index"), default=0, minimum=0, maximum=10_000_000),
-                        source_type=_clean_text(c.get("source_type")) or "unknown",
+                        chunk_id=doc_id,
+                        chunk_index=doc_index,
+                        source_type=_clean_text(c.get("source_type") or c.get("section")) or "unknown",
                     )
                 )
 
@@ -1023,9 +1057,9 @@ def _build_parser() -> argparse.ArgumentParser:
 def main() -> int:
     args = _build_parser().parse_args()
 
-    raw_path = Path(_clean_text(args.raw_input)).expanduser().resolve()
-    pairwise_path = Path(_clean_text(args.pairwise_input)).expanduser().resolve()
-    output_dir_base = Path(_clean_text(args.output_dir)).expanduser().resolve()
+    raw_path = _resolve_path(args.raw_input)
+    pairwise_path = _resolve_path(args.pairwise_input)
+    output_dir_base = _resolve_path(args.output_dir)
 
     if not raw_path.exists():
         raise RuntimeError(f"raw_input not found: {raw_path}")

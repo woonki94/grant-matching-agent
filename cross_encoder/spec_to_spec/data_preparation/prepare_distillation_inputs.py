@@ -10,19 +10,37 @@ from pathlib import Path
 from typing import Any, Dict, List
 
 
-PROJECT_ROOT = Path(__file__).resolve().parents[3]
-EXPORT_SCRIPT = PROJECT_ROOT / "cross_encoder" / "pipelines" / "spec_facspec" / "export_db.py"
-PREFILTER_SCRIPT = PROJECT_ROOT / "cross_encoder" / "pipelines" / "spec_facspec" / "build_prefilter_cache.py"
-LLM_DISTILL_SCRIPT = PROJECT_ROOT / "cross_encoder" / "pipelines" / "spec_facspec" / "llm_distillation.py"
+def _find_project_root() -> Path:
+    here = Path(__file__).resolve()
+    for parent in (here.parent, *here.parents):
+        if (parent / "cross_encoder").is_dir():
+            return parent
+    return here.parent
 
-GRANT_DB_DEFAULT = "cross_encoder/dataset/spec_facspec/grant_keywords_spec_keywords_db.json"
-FAC_DB_DEFAULT = "cross_encoder/dataset/spec_facspec/fac_specs_db.json"
-PREFILTER_OUTPUT_DEFAULT = "cross_encoder/dataset/spec_facspec/spec_facspec_cosine_cache.jsonl"
-PREFILTER_MANIFEST_DEFAULT = "cross_encoder/dataset/spec_facspec/spec_facspec_cosine_cache.manifest.json"
+
+PROJECT_ROOT = _find_project_root()
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+EXPORT_SCRIPT = PROJECT_ROOT / "cross_encoder" / "spec_to_spec" / "data_preparation" / "export_db.py"
+PREFILTER_SCRIPT = PROJECT_ROOT / "cross_encoder" / "spec_to_spec" / "data_preparation" / "build_prefilter_cache.py"
+LLM_DISTILL_SCRIPT = PROJECT_ROOT / "cross_encoder" / "spec_to_spec" / "llm_distillation" / "llm_distillation.py"
+
+GRANT_DB_DEFAULT = "cross_encoder/spec_to_spec/dataset/grant_keywords_spec_keywords_db.json"
+FAC_DB_DEFAULT = "cross_encoder/spec_to_spec/dataset/fac_specs_db.json"
+PREFILTER_OUTPUT_DEFAULT = "cross_encoder/spec_to_spec/dataset/spec_facspec_cosine_cache.jsonl"
+PREFILTER_MANIFEST_DEFAULT = "cross_encoder/spec_to_spec/dataset/spec_facspec_cosine_cache.manifest.json"
 
 
 def _clean_text(value: Any) -> str:
     return str(value or "").strip()
+
+
+def _resolve_path(value: Any) -> Path:
+    path = Path(_clean_text(value)).expanduser()
+    if not path.is_absolute():
+        path = PROJECT_ROOT / path
+    return path.resolve()
 
 
 def _safe_int(value: Any, *, default: int, minimum: int, maximum: int) -> int:
@@ -78,7 +96,7 @@ def _file_size_mb(path: Path) -> float:
 def _build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         description=(
-            "Prepare all prerequisite artifacts for spec_facspec llm_distillation: "
+            "Prepare all prerequisite artifacts for spec_to_spec llm_distillation: "
             "JSON DB export + cosine prefilter cache."
         )
     )
@@ -110,10 +128,10 @@ def _build_parser() -> argparse.ArgumentParser:
 def main() -> int:
     args = _build_parser().parse_args()
 
-    grant_db = Path(_clean_text(args.grant_db)).expanduser().resolve()
-    fac_db = Path(_clean_text(args.fac_db)).expanduser().resolve()
-    prefilter_output = Path(_clean_text(args.prefilter_output)).expanduser().resolve()
-    prefilter_manifest = Path(_clean_text(args.prefilter_manifest)).expanduser().resolve()
+    grant_db = _resolve_path(args.grant_db)
+    fac_db = _resolve_path(args.fac_db)
+    prefilter_output = _resolve_path(args.prefilter_output)
+    prefilter_manifest = _resolve_path(args.prefilter_manifest)
 
     limit_grants = _safe_int(args.limit_grants, default=0, minimum=0, maximum=5_000_000)
     limit_faculties = _safe_int(args.limit_faculties, default=0, minimum=0, maximum=5_000_000)

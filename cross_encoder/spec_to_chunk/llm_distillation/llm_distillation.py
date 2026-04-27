@@ -14,23 +14,30 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 # Ensure project root on sys.path for direct script execution.
-if __package__ is None or __package__ == "":
-    project_root = Path(__file__).resolve().parents[1]
-    if str(project_root) not in sys.path:
-        sys.path.insert(0, str(project_root))
+def _find_project_root() -> Path:
+    here = Path(__file__).resolve()
+    for parent in (here.parent, *here.parents):
+        if (parent / "cross_encoder").is_dir():
+            return parent
+    return here.parent
+
+
+PROJECT_ROOT = _find_project_root()
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
 
 # Requested model family (closest available instruct model in this setup).
-MODEL_ID_DEFAULT = "Qwen/Qwen2.5-32B-Instruct"
+MODEL_ID_DEFAULT = "Qwen/Qwen2.5-14B-Instruct"
 
-GRANT_DB_DEFAULT = "cross_encoder/dataset/grant_keywords_spec_keywords_db.json"
-FAC_DB_DEFAULT = "cross_encoder/dataset/fac_chunks_db.json"
+GRANT_DB_DEFAULT = "cross_encoder/spec_to_chunk/dataset/grant_keywords_spec_keywords_db.json"
+FAC_DB_DEFAULT = "cross_encoder/spec_to_chunk/dataset/fac_chunks_db.json"
 
-RAW_OUTPUT_DEFAULT = "cross_encoder/dataset/llm_distill_raw_scores.jsonl"
-PAIRWISE_OUTPUT_DEFAULT = "cross_encoder/dataset/llm_distill_pairwise.jsonl"
-LISTWISE_OUTPUT_DEFAULT = "cross_encoder/dataset/llm_distill_listwise.jsonl"
-MANIFEST_OUTPUT_DEFAULT = "cross_encoder/dataset/llm_distill_manifest.json"
-PREFILTER_SCORE_CACHE_DEFAULT = "cross_encoder/dataset/spec_chunk_cosine_cache.jsonl"
+RAW_OUTPUT_DEFAULT = "cross_encoder/spec_to_chunk/dataset/llm_distill_raw_scores.jsonl"
+PAIRWISE_OUTPUT_DEFAULT = "cross_encoder/spec_to_chunk/dataset/llm_distill_pairwise.jsonl"
+LISTWISE_OUTPUT_DEFAULT = "cross_encoder/spec_to_chunk/dataset/llm_distill_listwise.jsonl"
+MANIFEST_OUTPUT_DEFAULT = "cross_encoder/spec_to_chunk/dataset/llm_distill_manifest.json"
+PREFILTER_SCORE_CACHE_DEFAULT = "cross_encoder/spec_to_chunk/dataset/spec_chunk_cosine_cache.jsonl"
 
 
 SYSTEM_PROMPT = """
@@ -60,6 +67,13 @@ Faculty chunk:
 
 def _clean_text(value: Any) -> str:
     return str(value or "").strip()
+
+
+def _resolve_path(value: Any) -> Path:
+    path = Path(_clean_text(value)).expanduser()
+    if not path.is_absolute():
+        path = PROJECT_ROOT / path
+    return path.resolve()
 
 
 def _safe_int(value: Any, *, default: int, minimum: int, maximum: int) -> int:
@@ -792,12 +806,12 @@ def main() -> int:
             "Install `vllm` in your runtime, then rerun."
         ) from e
 
-    grant_db = Path(_clean_text(args.grant_db)).expanduser().resolve()
-    fac_db = Path(_clean_text(args.fac_db)).expanduser().resolve()
-    raw_output = Path(_clean_text(args.raw_output)).expanduser().resolve()
-    pairwise_output = Path(_clean_text(args.pairwise_output)).expanduser().resolve()
-    listwise_output = Path(_clean_text(args.listwise_output)).expanduser().resolve()
-    manifest_output = Path(_clean_text(args.manifest_output)).expanduser().resolve()
+    grant_db = _resolve_path(args.grant_db)
+    fac_db = _resolve_path(args.fac_db)
+    raw_output = _resolve_path(args.raw_output)
+    pairwise_output = _resolve_path(args.pairwise_output)
+    listwise_output = _resolve_path(args.listwise_output)
+    manifest_output = _resolve_path(args.manifest_output)
 
     model_id = _clean_text(args.model_id) or MODEL_ID_DEFAULT
     tensor_parallel_size = _safe_int(args.tensor_parallel_size, default=1, minimum=1, maximum=64)
@@ -813,7 +827,7 @@ def main() -> int:
     prefilter_mid_k = _safe_int(args.prefilter_mid_k, default=0, minimum=0, maximum=200_000)
     prefilter_rand_k = _safe_int(args.prefilter_rand_k, default=0, minimum=0, maximum=200_000)
     prefilter_seed = _safe_int(args.prefilter_seed, default=42, minimum=0, maximum=2_147_483_647)
-    prefilter_score_cache_path = Path(_clean_text(args.prefilter_score_cache)).expanduser().resolve() if _clean_text(args.prefilter_score_cache) else None
+    prefilter_score_cache_path = _resolve_path(args.prefilter_score_cache) if _clean_text(args.prefilter_score_cache) else None
     use_prefilter = (prefilter_top_k + prefilter_mid_k + prefilter_rand_k) > 0
 
     pair_pos_top_k = _safe_int(args.pair_pos_top_k, default=4, minimum=1, maximum=10_000)

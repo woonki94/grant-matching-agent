@@ -2,29 +2,138 @@ from __future__ import annotations
 
 import json
 import re
+import sys
+from pathlib import Path
 from typing import Any, Dict, Optional
 
 from vllm import LLM, SamplingParams
+
+# Ensure project root on sys.path for direct script execution.
+def _find_project_root() -> Path:
+    here = Path(__file__).resolve()
+    for parent in (here.parent, *here.parents):
+        if (parent / "cross_encoder").is_dir():
+            return parent
+    return here.parent
+
+
+PROJECT_ROOT = _find_project_root()
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
 # ------------------------------------------------------------
 # Edit these manually
 # ------------------------------------------------------------
 KEYWORD_SET_TEXT = """
-- multimodal robot learning
-- sim-to-real transfer
-- humanoid locomotion control
-- reinforcement learning for contact-rich manipulation
+
+Reinforcement learning combined with symbolic planning and reasoning for long-horizon decision-making in dynamic, uncertain real-world environments
+
 """.strip()
 
-FAC_SPEC_TEXT = """
-Our lab develops model-based and learning-based control for humanoid robots,
-including sim-to-real adaptation, robust gait generation, and manipulation under
-contact uncertainty.
+# --- PERFECT MATCH ---
+
+FAC_SPEC_TEXT1 = """
+
+Reinforcement learning integrated with symbolic planning and reasoning for long-horizon sequential decision-making in dynamic and uncertain environments, including structured representations for goal decomposition and constraint-aware policy learning
+
 """.strip()
-FAC_SPEC_TEXTS = [FAC_SPEC_TEXT]  # Add more faculty specialization strings for batched scoring.
+
+# Expected score: 0.92 ~ 0.97
+
+# Reason: exact coverage of RL + planning + reasoning + long-horizon + uncertainty
+
+# --- VERY STRONG (near paraphrase, slight shift in wording) ---
+
+FAC_SPEC_TEXT2 = """
+
+Hybrid reinforcement learning and planning methods for multi-step decision-making in dynamic environments, leveraging structured reasoning and learned policies to improve long-horizon performance and adaptability under uncertainty
+
+""".strip()
+
+# Expected score: 0.85 ~ 0.92
+
+# Reason: all components present, reasoning slightly implicit
+
+# --- PARTIAL (missing explicit reasoning) ---
+
+FAC_SPEC_TEXT3 = """
+
+Reinforcement learning for long-horizon decision-making in dynamic environments using hierarchical policies, temporal abstraction, and adaptive control strategies for complex sequential tasks
+
+""".strip()
+
+# Expected score: 0.70 ~ 0.80
+
+# Reason: RL + long-horizon present, but no planning/reasoning
+
+# --- PARTIAL (planning + reasoning, no RL) ---
+
+FAC_SPEC_TEXT4 = """
+
+Symbolic planning and reasoning for long-horizon decision-making in dynamic environments using structured representations, search-based methods, and constraint-driven task decomposition
+
+""".strip()
+
+# Expected score: 0.65 ~ 0.75
+
+# Reason: planning + reasoning strong, RL missing
+
+# --- MISLEADING OVERLAP (RL but different objective) ---
+
+FAC_SPEC_TEXT5 = """
+
+Reinforcement learning for optimizing decision-making policies in dynamic environments with emphasis on cost efficiency, reward shaping, and scalable policy optimization across large state spaces
+
+""".strip()
+
+# Expected score: 0.60 ~ 0.70
+
+# Reason: RL + dynamic env present, but no planning/reasoning focus
+
+# --- WEAK (short-horizon RL) ---
+
+FAC_SPEC_TEXT6 = """
+
+Reinforcement learning for reactive control and short-horizon decision-making in dynamic systems with focus on fast adaptation and stability in real-time environments
+
+""".strip()
+
+# Expected score: 0.45 ~ 0.60
+
+# Reason: lacks long-horizon, planning, reasoning
+
+# --- IRRELEVANT ---
+
+FAC_SPEC_TEXT7 = """
+
+Statistical forecasting and optimization for supply chain systems including demand prediction, inventory control, and logistics planning using probabilistic models and operations research techniques
+
+""".strip()
+
+# Expected score: 0.05 ~ 0.20
+
+# Reason: completely different domain
+
+FAC_SPEC_TEXTS = [
+
+    FAC_SPEC_TEXT1,
+
+    FAC_SPEC_TEXT2,
+
+    FAC_SPEC_TEXT3,
+
+    FAC_SPEC_TEXT4,
+
+    FAC_SPEC_TEXT5,
+
+    FAC_SPEC_TEXT6,
+
+    FAC_SPEC_TEXT7,
+
+] # Add more faculty specialization strings for batched scoring.
 
 # Hugging Face model id (Qwen2.5 32B Instruct)
-MODEL_ID = "Qwen/Qwen2.5-32B-Instruct"
+MODEL_ID = "Qwen/Qwen2.5-14B-Instruct"
 
 SYSTEM_PROMPT = """
 You are evaluating whether a candidate faculty specialization text satisfies a specialization requirement.

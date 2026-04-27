@@ -1,19 +1,33 @@
 from __future__ import annotations
 
+import sys
 from pathlib import Path
 from typing import Any, Dict, List
 
 import torch
 from transformers import AutoModelForSequenceClassification, AutoTokenizer
 
+# Ensure project root on sys.path for direct script execution.
+def _find_project_root() -> Path:
+    here = Path(__file__).resolve()
+    for parent in (here.parent, *here.parents):
+        if (parent / "cross_encoder").is_dir():
+            return parent
+    return here.parent
+
+
+PROJECT_ROOT = _find_project_root()
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
 
 # Edit these three fields directly.
-FINETUNED_MODEL_PATH = "cross_encoder/models/bge_reranker_distill/best"
+FINETUNED_MODEL_PATH = "cross_encoder/spec_to_spec/models/bge_reranker_distill/best"
 QUERY_TEXT = "Replace this with one grant specialization keyword phrase."
 DOC_TEXTS = [
-    "Replace this with faculty chunk text #1.",
-    "Replace this with faculty chunk text #2.",
-    "Replace this with faculty chunk text #3.",
+    "Replace this with faculty specialization text #1.",
+    "Replace this with faculty specialization text #2.",
+    "Replace this with faculty specialization text #3.",
 ]
 
 # Optional settings.
@@ -24,6 +38,13 @@ SORT_DESCENDING = True
 
 def _clean_text(value: Any) -> str:
     return str(value or "").strip()
+
+
+def _resolve_path(value: Any) -> Path:
+    path = Path(_clean_text(value)).expanduser()
+    if not path.is_absolute():
+        path = PROJECT_ROOT / path
+    return path.resolve()
 
 
 def _pick_device() -> torch.device:
@@ -82,7 +103,7 @@ def _score_docs(
 
 
 def main() -> int:
-    model_path = Path(_clean_text(FINETUNED_MODEL_PATH)).expanduser()
+    model_path = _resolve_path(FINETUNED_MODEL_PATH)
     query = _clean_text(QUERY_TEXT)
     docs = [_clean_text(x) for x in DOC_TEXTS if _clean_text(x)]
 

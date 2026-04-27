@@ -10,16 +10,30 @@ from typing import Any, Dict, List
 from sqlalchemy import bindparam, text
 
 # Ensure project root on sys.path for direct script execution.
-if __package__ is None or __package__ == "":
-    project_root = Path(__file__).resolve().parents[3]
-    if str(project_root) not in sys.path:
-        sys.path.insert(0, str(project_root))
+def _find_project_root() -> Path:
+    here = Path(__file__).resolve()
+    for parent in (here.parent, *here.parents):
+        if (parent / "cross_encoder").is_dir():
+            return parent
+    return here.parent
+
+
+PROJECT_ROOT = _find_project_root()
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
 from db.db_conn import SessionLocal
 
 
 def _clean_text(value: Any) -> str:
     return str(value or "").strip()
+
+
+def _resolve_path(value: Any) -> Path:
+    path = Path(_clean_text(value)).expanduser()
+    if not path.is_absolute():
+        path = PROJECT_ROOT / path
+    return path.resolve()
 
 
 def _safe_int(value: Any, *, default: int, minimum: int, maximum: int) -> int:
@@ -437,13 +451,13 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--grant-output",
         type=str,
-        default="cross_encoder/dataset/spec_facspec/grant_keywords_spec_keywords_db.json",
+        default="cross_encoder/spec_to_spec/dataset/grant_keywords_spec_keywords_db.json",
         help="Output JSON path for grant keywords/spec keywords.",
     )
     p.add_argument(
         "--fac-output",
         type=str,
-        default="cross_encoder/dataset/spec_facspec/fac_specs_db.json",
+        default="cross_encoder/spec_to_spec/dataset/fac_specs_db.json",
         help="Output JSON path for faculty specialization texts.",
     )
     p.add_argument(
@@ -481,8 +495,8 @@ def _build_parser() -> argparse.ArgumentParser:
 
 def main() -> int:
     args = _build_parser().parse_args()
-    grant_output = Path(_clean_text(args.grant_output)).expanduser().resolve()
-    fac_output = Path(_clean_text(args.fac_output)).expanduser().resolve()
+    grant_output = _resolve_path(args.grant_output)
+    fac_output = _resolve_path(args.fac_output)
     limit_grants = _safe_int(args.limit_grants, default=0, minimum=0, maximum=5_000_000)
     limit_faculties = _safe_int(args.limit_faculties, default=0, minimum=0, maximum=5_000_000)
     min_spec_weight = _safe_float(args.min_spec_weight, default=0.0, minimum=0.0, maximum=1.0)

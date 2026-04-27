@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import sys
 import time
 from datetime import datetime, timezone
@@ -12,22 +13,36 @@ import numpy as np
 from sqlalchemy import bindparam, text
 
 # Ensure project root on sys.path for direct script execution.
-if __package__ is None or __package__ == "":
-    project_root = Path(__file__).resolve().parents[3]
-    if str(project_root) not in sys.path:
-        sys.path.insert(0, str(project_root))
+def _find_project_root() -> Path:
+    here = Path(__file__).resolve()
+    for parent in (here.parent, *here.parents):
+        if (parent / "cross_encoder").is_dir():
+            return parent
+    return here.parent
+
+
+PROJECT_ROOT = _find_project_root()
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
 from db.db_conn import SessionLocal
 
 
-GRANT_DB_DEFAULT = "cross_encoder/dataset/spec_facspec/grant_keywords_spec_keywords_db.json"
-FAC_DB_DEFAULT = "cross_encoder/dataset/spec_facspec/fac_specs_db.json"
-OUTPUT_DEFAULT = "cross_encoder/dataset/spec_facspec/spec_facspec_cosine_cache.jsonl"
-MANIFEST_DEFAULT = "cross_encoder/dataset/spec_facspec/spec_facspec_cosine_cache.manifest.json"
+GRANT_DB_DEFAULT = "cross_encoder/spec_to_chunk/dataset/grant_keywords_spec_keywords_db.json"
+FAC_DB_DEFAULT = "cross_encoder/spec_to_chunk/dataset/fac_chunks_db.json"
+OUTPUT_DEFAULT = "cross_encoder/spec_to_chunk/dataset/spec_chunk_cosine_cache.jsonl"
+MANIFEST_DEFAULT = "cross_encoder/spec_to_chunk/dataset/spec_chunk_cosine_cache.manifest.json"
 
 
 def _clean_text(value: Any) -> str:
     return str(value or "").strip()
+
+
+def _resolve_path(value: Any) -> Path:
+    path = Path(_clean_text(value)).expanduser()
+    if not path.is_absolute():
+        path = PROJECT_ROOT / path
+    return path.resolve()
 
 
 def _safe_int(value: Any, *, default: int, minimum: int, maximum: int) -> int:
@@ -35,6 +50,18 @@ def _safe_int(value: Any, *, default: int, minimum: int, maximum: int) -> int:
         parsed = int(value)
     except Exception:
         parsed = int(default)
+    if parsed < minimum:
+        return minimum
+    if parsed > maximum:
+        return maximum
+    return parsed
+
+
+def _safe_float(value: Any, *, default: float, minimum: float, maximum: float) -> float:
+    try:
+        parsed = float(value)
+    except Exception:
+        parsed = float(default)
     if parsed < minimum:
         return minimum
     if parsed > maximum:
@@ -108,31 +135,33 @@ def _flatten_specs(grant_payload: Dict[str, Any]) -> List[Dict[str, Any]]:
     return out
 
 
-def _flatten_fac_specs(fac_payload: Dict[str, Any]) -> List[Dict[str, Any]]:
+def _flatten_chunks(fac_payload: Dict[str, Any]) -> List[Dict[str, Any]]:
     out: List[Dict[str, Any]] = []
-    for fac_spec in list(fac_payload.get("fac_specs") or []):
-        if not isinstance(fac_spec, dict):
+    for chunk in list(fac_payload.get("fac_chunks") or []):
+        if not isinstance(chunk, dict):
             continue
-        fac_id = _safe_int(fac_spec.get("fac_id"), default=0, minimum=0, maximum=2_147_483_647)
-        fac_spec_id = _safe_int(fac_spec.get("fac_spec_id"), default=0, minimum=0, maximum=9_223_372_036_854_775_807)
-        fac_spec_idx = _safe_int(fac_spec.get("fac_spec_idx"), default=0, minimum=0, maximum=50_000_000)
-        section = _clean_text(fac_spec.get("section")) or "unknown"
-        spec_text = _clean_text(fac_spec.get("text"))
-        if fac_id <= 0 or fac_spec_id <= 0 or not spec_text:
+        chunk_text = _clean_text(chunk.get("text"))
+        if not chunk_text:
+            continue
+        fac_id = _safe_int(chunk.get("fac_id"), default=0, minimum=0, maximum=2_147_483_647)
+        chunk_id = _safe_int(chunk.get("chunk_id"), default=0, minimum=0, maximum=2_147_483_647)
+        chunk_index = _safe_int(chunk.get("chunk_index"), default=0, minimum=0, maximum=1_000_000)
+        source_type = _clean_text(chunk.get("source_type")) or "unknown"
+        if fac_id <= 0 or chunk_id <= 0:
             continue
         out.append(
             {
                 "fac_id": fac_id,
-                "fac_spec_id": fac_spec_id,
-                "fac_spec_idx": fac_spec_idx,
-                "section": section,
-                "fac_spec_text": spec_text,
+                "chunk_id": chunk_id,
+                "chunk_index": chunk_index,
+                "source_type": source_type,
+                "chunk_text": chunk_text,
             }
         )
     return out
 
 
-def _load_grant_spec_vec_map(
+def _load_spec_vec_map(
     *,
     specs: List[Dict[str, Any]],
     model_id: str,
@@ -187,46 +216,75 @@ def _load_grant_spec_vec_map(
     return out
 
 
-def _load_fac_spec_vec_map(
+def _load_chunk_vec_map(
     *,
-    fac_specs: List[Dict[str, Any]],
-    model_id: str,
-) -> Dict[int, np.ndarray]:
-    if not fac_specs:
-        return {}
+    chunks: List[Dict[str, Any]],
+) -> Dict[Tuple[int, str, int, int], np.ndarray]:
+    additional_ids = sorted(
+        {
+            int(c["chunk_id"])
+            for c in chunks
+            if _clean_text(c.get("source_type")) == "additional_info"
+        }
+    )
+    publication_ids = sorted(
+        {
+            int(c["chunk_id"])
+            for c in chunks
+            if _clean_text(c.get("source_type")) == "publication_abstract"
+        }
+    )
 
-    fac_spec_ids = sorted({int(x["fac_spec_id"]) for x in fac_specs if int(x.get("fac_spec_id") or 0) > 0})
-    if not fac_spec_ids:
-        return {}
+    out: Dict[Tuple[int, str, int, int], np.ndarray] = {}
 
-    sql_text = """
-        SELECT
-            fse.id AS fac_spec_id,
-            fse.spec_vec AS spec_vec
-        FROM faculty_specialization_embedding fse
-        WHERE fse.id IN :fac_spec_ids
-          AND fse.spec_vec IS NOT NULL
-    """
-    if _clean_text(model_id):
-        sql_text += "\n  AND COALESCE(fse.model, '') = :model_id"
+    if additional_ids:
+        sql = text(
+            """
+            SELECT
+                fai.id AS chunk_id,
+                fai.faculty_id AS fac_id,
+                COALESCE(fai.chunk_index, 0) AS chunk_index,
+                fai.content_embedding AS chunk_vec
+            FROM faculty_additional_info fai
+            WHERE fai.id IN :chunk_ids
+              AND fai.content_embedding IS NOT NULL
+            """
+        ).bindparams(bindparam("chunk_ids", expanding=True))
+        with SessionLocal() as sess:
+            rows = sess.execute(sql, {"chunk_ids": additional_ids}).mappings().all()
 
-    sql = text(sql_text).bindparams(bindparam("fac_spec_ids", expanding=True))
-    params: Dict[str, Any] = {"fac_spec_ids": fac_spec_ids}
-    if _clean_text(model_id):
-        params["model_id"] = _clean_text(model_id)
+        for row in rows:
+            fac_id = _safe_int(row.get("fac_id"), default=0, minimum=0, maximum=2_147_483_647)
+            chunk_id = _safe_int(row.get("chunk_id"), default=0, minimum=0, maximum=2_147_483_647)
+            chunk_index = _safe_int(row.get("chunk_index"), default=0, minimum=0, maximum=1_000_000)
+            vec = _to_vec(row.get("chunk_vec"))
+            if fac_id <= 0 or chunk_id <= 0 or vec is None:
+                continue
+            out[(fac_id, "additional_info", chunk_id, chunk_index)] = vec
 
-    with SessionLocal() as sess:
-        rows = sess.execute(sql, params).mappings().all()
+    if publication_ids:
+        sql = text(
+            """
+            SELECT
+                fp.id AS chunk_id,
+                fp.faculty_id AS fac_id,
+                fp.abstract_embedding AS chunk_vec
+            FROM faculty_publication fp
+            WHERE fp.id IN :chunk_ids
+              AND fp.abstract_embedding IS NOT NULL
+            """
+        ).bindparams(bindparam("chunk_ids", expanding=True))
+        with SessionLocal() as sess:
+            rows = sess.execute(sql, {"chunk_ids": publication_ids}).mappings().all()
 
-    out: Dict[int, np.ndarray] = {}
-    for row in rows:
-        fac_spec_id = _safe_int(row.get("fac_spec_id"), default=0, minimum=0, maximum=9_223_372_036_854_775_807)
-        if fac_spec_id <= 0 or fac_spec_id in out:
-            continue
-        vec = _to_vec(row.get("spec_vec"))
-        if vec is None:
-            continue
-        out[fac_spec_id] = vec
+        for row in rows:
+            fac_id = _safe_int(row.get("fac_id"), default=0, minimum=0, maximum=2_147_483_647)
+            chunk_id = _safe_int(row.get("chunk_id"), default=0, minimum=0, maximum=2_147_483_647)
+            vec = _to_vec(row.get("chunk_vec"))
+            if fac_id <= 0 or chunk_id <= 0 or vec is None:
+                continue
+            out[(fac_id, "publication_abstract", chunk_id, 0)] = vec
+
     return out
 
 
@@ -234,7 +292,7 @@ def _try_tqdm(total: int) -> Any:
     try:
         from tqdm.auto import tqdm
 
-        return tqdm(total=total, desc="Spec facspec cosine cache", unit="spec", dynamic_ncols=True)
+        return tqdm(total=total, desc="Spec cosine cache", unit="spec", dynamic_ncols=True)
     except Exception:
         return None
 
@@ -252,66 +310,73 @@ def build_cache(
     fac_payload = _load_json(fac_db_path)
 
     specs = _flatten_specs(grant_payload)
-    fac_specs_raw = _flatten_fac_specs(fac_payload)
+    chunks_raw = _flatten_chunks(fac_payload)
     if not specs:
         raise RuntimeError("No specs found in grant DB JSON.")
-    if not fac_specs_raw:
-        raise RuntimeError("No fac specs found in faculty DB JSON.")
+    if not chunks_raw:
+        raise RuntimeError("No chunks found in fac DB JSON.")
 
-    grant_spec_vec_map = _load_grant_spec_vec_map(specs=specs, model_id=model_id)
-    fac_spec_vec_map = _load_fac_spec_vec_map(fac_specs=fac_specs_raw, model_id=model_id)
+    spec_vec_map = _load_spec_vec_map(specs=specs, model_id=model_id)
+    chunk_vec_map = _load_chunk_vec_map(chunks=chunks_raw)
 
+    # Align to rows with vectors in both spaces.
     spec_rows: List[Dict[str, Any]] = []
     missing_spec_vec_count = 0
     dims_counter_spec: Dict[int, int] = {}
     for spec in specs:
         key = (_clean_text(spec.get("grant_id")), _normalize_text(spec.get("spec_text")))
-        vec = grant_spec_vec_map.get(key)
+        vec = spec_vec_map.get(key)
         if vec is None:
             missing_spec_vec_count += 1
             continue
         dims_counter_spec[len(vec)] = int(dims_counter_spec.get(len(vec), 0) + 1)
         spec_rows.append({**spec, "spec_vec": vec})
 
-    fac_spec_rows: List[Dict[str, Any]] = []
-    missing_fac_spec_vec_count = 0
-    dims_counter_fac_spec: Dict[int, int] = {}
-    for fac_spec in fac_specs_raw:
-        fac_spec_id = int(fac_spec["fac_spec_id"])
-        vec = fac_spec_vec_map.get(fac_spec_id)
+    chunk_rows: List[Dict[str, Any]] = []
+    missing_chunk_vec_count = 0
+    dims_counter_chunk: Dict[int, int] = {}
+    for chunk in chunks_raw:
+        key = (
+            int(chunk["fac_id"]),
+            _clean_text(chunk["source_type"]),
+            int(chunk["chunk_id"]),
+            int(chunk["chunk_index"]),
+        )
+        vec = chunk_vec_map.get(key)
         if vec is None:
-            missing_fac_spec_vec_count += 1
+            missing_chunk_vec_count += 1
             continue
-        dims_counter_fac_spec[len(vec)] = int(dims_counter_fac_spec.get(len(vec), 0) + 1)
-        fac_spec_rows.append({**fac_spec, "fac_spec_vec": vec})
+        dims_counter_chunk[len(vec)] = int(dims_counter_chunk.get(len(vec), 0) + 1)
+        chunk_rows.append({**chunk, "chunk_vec": vec})
 
     if not spec_rows:
-        raise RuntimeError("No grant specs with vectors after DB alignment.")
-    if not fac_spec_rows:
-        raise RuntimeError("No faculty specs with vectors after DB alignment.")
+        raise RuntimeError("No specs with vectors after DB alignment.")
+    if not chunk_rows:
+        raise RuntimeError("No chunks with vectors after DB alignment.")
 
-    common_dims = sorted(set(dims_counter_spec.keys()) & set(dims_counter_fac_spec.keys()))
+    # Pick common dim present in both tables to avoid mismatch rows.
+    common_dims = sorted(set(dims_counter_spec.keys()) & set(dims_counter_chunk.keys()))
     if not common_dims:
         raise RuntimeError(
             f"No shared embedding dimension. spec_dims={sorted(dims_counter_spec.keys())}, "
-            f"fac_spec_dims={sorted(dims_counter_fac_spec.keys())}"
+            f"chunk_dims={sorted(dims_counter_chunk.keys())}"
         )
-
     dim = int(common_dims[-1])
     spec_rows = [x for x in spec_rows if int(len(x["spec_vec"])) == dim]
-    fac_spec_rows = [x for x in fac_spec_rows if int(len(x["fac_spec_vec"])) == dim]
-    if not spec_rows or not fac_spec_rows:
+    chunk_rows = [x for x in chunk_rows if int(len(x["chunk_vec"])) == dim]
+    if not spec_rows or not chunk_rows:
         raise RuntimeError("No rows left after filtering to common embedding dimension.")
 
-    fac_matrix = np.asarray([x["fac_spec_vec"] for x in fac_spec_rows], dtype=np.float32)
-    fac_norms = np.linalg.norm(fac_matrix, axis=1, keepdims=True)
-    fac_matrix = fac_matrix / np.clip(fac_norms, a_min=1e-12, a_max=None)
+    # Build normalized chunk matrix for fast cosine via dot-product.
+    chunk_matrix = np.asarray([x["chunk_vec"] for x in chunk_rows], dtype=np.float32)
+    chunk_norms = np.linalg.norm(chunk_matrix, axis=1, keepdims=True)
+    chunk_matrix = chunk_matrix / np.clip(chunk_norms, a_min=1e-12, a_max=None)
 
     safe_top_k = _safe_int(top_k_per_spec, default=0, minimum=0, maximum=2_000_000)
     if safe_top_k > 0:
-        keep_k = min(safe_top_k, len(fac_spec_rows))
+        keep_k = min(safe_top_k, len(chunk_rows))
     else:
-        keep_k = len(fac_spec_rows)
+        keep_k = len(chunk_rows)
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     manifest_path.parent.mkdir(parents=True, exist_ok=True)
@@ -324,18 +389,18 @@ def build_cache(
         for spec in spec_rows:
             vec = np.asarray(spec["spec_vec"], dtype=np.float32)
             vec = vec / max(1e-12, float(np.linalg.norm(vec)))
-            sims = fac_matrix @ vec
+            sims = chunk_matrix @ vec  # cosine since normalized
             order = np.argsort(-sims)[:keep_k]
 
             candidates = []
             for idx in order.tolist():
-                fac_spec = fac_spec_rows[int(idx)]
+                chunk = chunk_rows[int(idx)]
                 candidates.append(
                     {
-                        "fac_id": int(fac_spec["fac_id"]),
-                        "fac_spec_id": int(fac_spec["fac_spec_id"]),
-                        "fac_spec_idx": int(fac_spec["fac_spec_idx"]),
-                        "section": _clean_text(fac_spec["section"]),
+                        "fac_id": int(chunk["fac_id"]),
+                        "source_type": _clean_text(chunk["source_type"]),
+                        "chunk_id": int(chunk["chunk_id"]),
+                        "chunk_index": int(chunk["chunk_index"]),
                         "cosine_score": float(sims[int(idx)]),
                     }
                 )
@@ -367,13 +432,13 @@ def build_cache(
         "candidate_count_per_spec": int(keep_k),
         "total_written_candidates": int(spec_count_written * keep_k),
         "input_spec_count": int(len(specs)),
-        "input_fac_spec_count": int(len(fac_specs_raw)),
+        "input_chunk_count": int(len(chunks_raw)),
         "aligned_spec_count": int(len(spec_rows)),
-        "aligned_fac_spec_count": int(len(fac_spec_rows)),
+        "aligned_chunk_count": int(len(chunk_rows)),
         "missing_spec_vector_count": int(missing_spec_vec_count),
-        "missing_fac_spec_vector_count": int(missing_fac_spec_vec_count),
+        "missing_chunk_vector_count": int(missing_chunk_vec_count),
         "spec_dim_counts": dims_counter_spec,
-        "fac_spec_dim_counts": dims_counter_fac_spec,
+        "chunk_dim_counts": dims_counter_chunk,
         "common_dim": int(dim),
         "elapsed_seconds": float(elapsed),
         "specs_per_second": float(spec_count_written / elapsed),
@@ -385,35 +450,35 @@ def build_cache(
 def _build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         description=(
-            "Build reusable spec x faculty-spec cosine score cache using DB embeddings "
-            "(opportunity_specialization_embedding.spec_vec and faculty_specialization_embedding.spec_vec)."
+            "Build reusable spec x faculty-chunk cosine score cache using DB embeddings "
+            "(opportunity_specialization_embedding.spec_vec and faculty chunk embeddings)."
         )
     )
     p.add_argument("--grant-db", type=str, default=GRANT_DB_DEFAULT, help="Grant JSON DB path.")
-    p.add_argument("--fac-db", type=str, default=FAC_DB_DEFAULT, help="Faculty spec JSON DB path.")
+    p.add_argument("--fac-db", type=str, default=FAC_DB_DEFAULT, help="Faculty chunk JSON DB path.")
     p.add_argument("--output", type=str, default=OUTPUT_DEFAULT, help="Output JSONL cache path.")
     p.add_argument("--manifest", type=str, default=MANIFEST_DEFAULT, help="Output manifest JSON path.")
     p.add_argument(
         "--model-id",
         type=str,
         default="",
-        help="Optional embedding model filter for both specialization embedding tables.",
+        help="Optional embedding model filter for opportunity_specialization_embedding.model.",
     )
     p.add_argument(
         "--top-k-per-spec",
         type=int,
         default=0,
-        help="Keep only top-k candidates per spec in cache (0 = all aligned faculty specs).",
+        help="Keep only top-k candidates per spec in cache (0 = all aligned chunks).",
     )
     return p
 
 
 def main() -> int:
     args = _build_parser().parse_args()
-    grant_db = Path(_clean_text(args.grant_db)).expanduser().resolve()
-    fac_db = Path(_clean_text(args.fac_db)).expanduser().resolve()
-    output = Path(_clean_text(args.output)).expanduser().resolve()
-    manifest = Path(_clean_text(args.manifest)).expanduser().resolve()
+    grant_db = _resolve_path(args.grant_db)
+    fac_db = _resolve_path(args.fac_db)
+    output = _resolve_path(args.output)
+    manifest = _resolve_path(args.manifest)
 
     if not grant_db.exists():
         raise RuntimeError(f"Grant DB JSON not found: {grant_db}")
@@ -435,7 +500,7 @@ def main() -> int:
     print(f"candidate_count_per_spec={result.get('candidate_count_per_spec')}")
     print(f"total_written_candidates={result.get('total_written_candidates')}")
     print(f"aligned_spec_count={result.get('aligned_spec_count')}")
-    print(f"aligned_fac_spec_count={result.get('aligned_fac_spec_count')}")
+    print(f"aligned_chunk_count={result.get('aligned_chunk_count')}")
     print(f"common_dim={result.get('common_dim')}")
     print(f"elapsed_seconds={result.get('elapsed_seconds')}")
     return 0
