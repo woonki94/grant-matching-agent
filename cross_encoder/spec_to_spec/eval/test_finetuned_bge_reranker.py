@@ -23,11 +23,16 @@ if str(PROJECT_ROOT) not in sys.path:
 
 # Edit these three fields directly.
 FINETUNED_MODEL_PATH = "cross_encoder/spec_to_spec/models/bge_reranker_distill/best"
-QUERY_TEXT = "Replace this with one grant specialization keyword phrase."
+QUERY_TEXT = "Reinforcement learning combined with symbolic planning and reasoning for long-horizon decision-making in dynamic, uncertain real-world environments."
 DOC_TEXTS = [
-    "Replace this with faculty specialization text #1.",
-    "Replace this with faculty specialization text #2.",
-    "Replace this with faculty specialization text #3.",
+    "Reinforcement learning combined with symbolic planning and reasoning for long-horizon decision-making in dynamic, uncertain real-world environments",
+    "Reinforcement learning integrated with symbolic planning and reasoning for long-horizon sequential decision-making in dynamic and uncertain environments, including structured representations for goal decomposition and constraint-aware policy learning",
+    "Hybrid reinforcement learning and planning methods for multi-step decision-making in dynamic environments, leveraging structured reasoning and learned policies to improve long-horizon performance and adaptability under uncertainty",
+    "Reinforcement learning for long-horizon decision-making in dynamic environments using hierarchical policies, temporal abstraction, and adaptive control strategies for complex sequential tasks",
+    "Symbolic planning and reasoning for long-horizon decision-making in dynamic environments using structured representations, search-based methods, and constraint-driven task decomposition",
+    "Reinforcement learning for optimizing decision-making policies in dynamic environments with emphasis on cost efficiency, reward shaping, and scalable policy optimization across large state spaces",
+    "Reinforcement learning for reactive control and short-horizon decision-making in dynamic systems with focus on fast adaptation and stability in real-time environments",
+    "Statistical forecasting and optimization for supply chain systems including demand prediction, inventory control, and logistics planning using probabilistic models and operations research techniques",
 ]
 
 # Optional settings.
