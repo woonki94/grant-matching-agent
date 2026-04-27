@@ -27,3 +27,7 @@ __pycache__/
 /finetune_cross_encoder/dataset
 
 /wandb
+
+# cross_encoder generated artifacts
+/cross_encoder/**/dataset/
+/cross_encoder/**/models/
