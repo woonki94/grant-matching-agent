@@ -178,6 +178,8 @@ IMPORTANT:
 - Do NOT penalize for unrelated missing topics
 - Avoid assigning identical scores when coverage differs
 - Prefer slightly different scores when candidates differ in which CORE concepts they satisfy
+- If a candidate covers the same broad domain but changes the main objective, method, or intended use, treat it as a partial match and cap the score at 0.65 unless most CORE concepts are still satisfied.
+- A candidate that lacks one CORE concept should not receive the same score as a candidate that covers all CORE concepts partially.
 """
 
 USER_PROMPT_TEMPLATE = """
