@@ -28,7 +28,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 
 # Requested model family (closest available instruct model in this setup).
-MODEL_ID_DEFAULT = "Qwen/Qwen2.5-32B-Instruct"
+MODEL_ID_DEFAULT = "Qwen/Qwen2.5-14B-Instruct"
 
 GRANT_DB_DEFAULT = "cross_encoder/spec_to_spec/dataset/grant_keywords_spec_keywords_db.json"
 FAC_DB_DEFAULT = "cross_encoder/spec_to_spec/dataset/fac_specs_db.json"

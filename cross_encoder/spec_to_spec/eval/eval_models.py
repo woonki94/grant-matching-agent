@@ -136,39 +136,53 @@ FAC_SPEC_TEXTS = [
 MODEL_ID = "Qwen/Qwen2.5-14B-Instruct"
 
 SYSTEM_PROMPT = """
-You are evaluating whether a candidate faculty specialization text satisfies a specialization requirement.
+You are evaluating whether a candidate faculty specialization satisfies a requirement.
 
 This is NOT general similarity — it is REQUIREMENT MATCHING.
 
 Return ONLY strict JSON:
+
 {
+
   "score": <float between 0.0 and 1.0>,
+
   "reason": "<one short sentence>"
+
 }
 
 Evaluation rules:
 
-1. Identify core requirements:
-   - learning-based methods (RL, multimodal learning)
-   - sim-to-real transfer
-   - contact-rich manipulation
-   - humanoid locomotion control
+1. Extract the REQUIRED concepts from the requirement text.
 
-2. Scoring principles:
-   - Strong match requires BOTH domain AND method alignment.
-   - Domain-only overlap (e.g., robotics/control without learning) is weak, not zero.
+   - These define what must be present.
 
-3. Penalties (soft, not absolute):
-   - Missing learning-based methods → score should NOT exceed 0.4
-   - Missing sim-to-real → score should NOT exceed 0.5
-   - Missing multiple core elements → push score toward lower range (0.1–0.3)
+   - Do NOT introduce external concepts.
 
-4. Scoring meaning:
-- 0.9–1.0: strong match with required methods
-- 0.7–0.89: good match, minor gaps
-- 0.4–0.69: partial match
+2. Compare candidate against these extracted requirements:
+
+   - Full match → all key concepts present
+
+   - Partial match → some concepts missing
+
+   - Weak match → only general domain overlap
+
+3. Scoring:
+
+- 0.9–1.0: covers all required concepts
+
+- 0.7–0.89: strong but missing minor aspects
+
+- 0.4–0.69: partial coverage
+
 - 0.1–0.39: domain overlap only
-- 0.0–0.09: completely unrelated
+
+- 0.0–0.09: unrelated
+
+IMPORTANT:
+
+- Only evaluate against what is explicitly required.
+
+- Do NOT penalize for concepts not mentioned in the requirement.
 
 IMPORTANT:
 Do NOT assign 0.0 unless the topic is completely unrelated.
@@ -253,6 +267,8 @@ def main() -> int:
     llm = LLM(
         MODEL_ID,
         tensor_parallel_size=TENSOR_PARALLEL_SIZE,
+        max_model_len=4096,
+        gpu_memory_utilization=0.9,
     )
     tokenizer = llm.get_tokenizer()
 
