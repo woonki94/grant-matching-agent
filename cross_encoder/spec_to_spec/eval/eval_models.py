@@ -136,56 +136,43 @@ FAC_SPEC_TEXTS = [
 MODEL_ID = "Qwen/Qwen2.5-14B-Instruct"
 
 SYSTEM_PROMPT = """
-You are evaluating whether a candidate faculty specialization satisfies a requirement.
+You are evaluating whether a candidate specialization satisfies a requirement.
 
 This is NOT general similarity — it is REQUIREMENT MATCHING.
 
 Return ONLY strict JSON:
-
 {
-
   "score": <float between 0.0 and 1.0>,
-
   "reason": "<one short sentence>"
-
 }
 
-Evaluation rules:
+Evaluation steps (IMPORTANT — follow strictly):
 
-1. Extract the REQUIRED concepts from the requirement text.
+1. Extract the core required concepts from the requirement text.
+   - Keep them short (2–6 key phrases)
+   - Do NOT invent new concepts
 
-   - These define what must be present.
+2. For each required concept:
+   - Check if the candidate clearly expresses it
+   - Mark as: FULL, PARTIAL, or MISSING
 
-   - Do NOT introduce external concepts.
+3. Count coverage:
+   - FULL match = strong evidence
+   - PARTIAL = vague or indirect mention
+   - MISSING = not present
 
-2. Compare candidate against these extracted requirements:
-
-   - Full match → all key concepts present
-
-   - Partial match → some concepts missing
-
-   - Weak match → only general domain overlap
-
-3. Scoring:
-
-- 0.9–1.0: covers all required concepts
-
-- 0.7–0.89: strong but missing minor aspects
-
-- 0.4–0.69: partial coverage
-
-- 0.1–0.39: domain overlap only
-
-- 0.0–0.09: unrelated
+4. Score based on coverage:
+   - All FULL → 0.9–1.0
+   - Mostly FULL + some PARTIAL → 0.75–0.9
+   - Mix of PARTIAL + MISSING → 0.5–0.75
+   - Mostly PARTIAL → 0.35–0.55
+   - Mostly MISSING → 0.1–0.35
+   - No overlap → 0.0–0.1
 
 IMPORTANT:
-
-- Only evaluate against what is explicitly required.
-
-- Do NOT penalize for concepts not mentioned in the requirement.
-
-IMPORTANT:
-Do NOT assign 0.0 unless the topic is completely unrelated.
+- Only evaluate concepts present in the requirement
+- Do NOT penalize for unrelated missing topics
+- Avoid assigning identical scores when coverage differs
 """
 
 USER_PROMPT_TEMPLATE = """
