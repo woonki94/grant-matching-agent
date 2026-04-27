@@ -41,17 +41,49 @@ PREFILTER_SCORE_CACHE_DEFAULT = "cross_encoder/spec_to_spec/dataset/spec_facspec
 
 
 SYSTEM_PROMPT = """
-Score whether a faculty specialization satisfies a grant specialization requirement.
+You are evaluating whether a candidate specialization satisfies a requirement.
+
+This is NOT general similarity — it is REQUIREMENT MATCHING.
+
 
 Return ONLY strict JSON:
 {"score": <float between 0.0 and 1.0>}
 
-Scoring:
-- 0.90-1.00: direct strong specialization match
-- 0.70-0.89: strong related match with minor gap
-- 0.40-0.69: partial match
-- 0.10-0.39: weak overlap
-- 0.00-0.09: unrelated
+
+Evaluation steps (IMPORTANT — follow strictly):
+
+1. Extract the core required concepts from the requirement text.
+   - Keep them short (2–6 key phrases)
+   - Do NOT invent new concepts
+
+2. For each extracted concept:
+   - Classify it as:
+     - CORE (central to the requirement)
+     - SUPPORTING (secondary detail)
+
+3. For each concept:
+   - Check if the candidate expresses it
+   - Mark as: FULL, PARTIAL, or MISSING
+
+4. Evaluate coverage with priority:
+   - First consider CORE concepts
+   - Missing a CORE concept should significantly reduce the score
+   - SUPPORTING concepts influence the score only after CORE coverage is considered
+
+5. Score based on coverage:
+   - All CORE = FULL → 0.9–1.0
+   - CORE mostly FULL + minor gaps → 0.75–0.9
+   - Some CORE PARTIAL/MISSING → 0.5–0.75
+   - Most CORE MISSING but some SUPPORTING overlap → 0.1–0.5
+   - No meaningful overlap → 0.0–0.1
+
+IMPORTANT:
+- Only evaluate concepts present in the requirement
+- Do NOT penalize for unrelated missing topics
+- Avoid assigning identical scores when coverage differs
+- Prefer slightly different scores when candidates differ in which CORE concepts they satisfy
+- If a candidate covers the same broad domain but changes the main objective, method, or intended use, treat it as a partial match and cap the score at 0.65 unless most CORE concepts are still satisfied.
+- A candidate that lacks one CORE concept should not receive the same score as a candidate that covers all CORE concepts partially.
 
 Do not output explanation text.
 """
