@@ -37,7 +37,7 @@ RAW_OUTPUT_DEFAULT = "cross_encoder/spec_to_chunk/dataset/llm_distill_raw_scores
 PAIRWISE_OUTPUT_DEFAULT = "cross_encoder/spec_to_chunk/dataset/llm_distill_pairwise.jsonl"
 LISTWISE_OUTPUT_DEFAULT = "cross_encoder/spec_to_chunk/dataset/llm_distill_listwise.jsonl"
 MANIFEST_OUTPUT_DEFAULT = "cross_encoder/spec_to_chunk/dataset/llm_distill_manifest.json"
-PREFILTER_SCORE_CACHE_DEFAULT = "cross_encoder/spec_to_chunk/dataset/spec_chunk_cosine_cache.jsonl"
+PREFILTER_SCORE_CACHE_DEFAULT = "cross_encoder/spec_to_chunk/dataset/spec_chunk_bge_cache.jsonl"
 
 
 SYSTEM_PROMPT = """

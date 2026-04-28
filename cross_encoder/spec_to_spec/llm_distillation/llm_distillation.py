@@ -37,7 +37,7 @@ RAW_OUTPUT_DEFAULT = "cross_encoder/spec_to_spec/dataset/llm_distill_raw_scores.
 PAIRWISE_OUTPUT_DEFAULT = "cross_encoder/spec_to_spec/dataset/llm_distill_pairwise.jsonl"
 LISTWISE_OUTPUT_DEFAULT = "cross_encoder/spec_to_spec/dataset/llm_distill_listwise.jsonl"
 MANIFEST_OUTPUT_DEFAULT = "cross_encoder/spec_to_spec/dataset/llm_distill_manifest.json"
-PREFILTER_SCORE_CACHE_DEFAULT = "cross_encoder/spec_to_spec/dataset/spec_facspec_cosine_cache.jsonl"
+PREFILTER_SCORE_CACHE_DEFAULT = "cross_encoder/spec_to_spec/dataset/spec_facspec_bge_cache.jsonl"
 
 
 SYSTEM_PROMPT = """
@@ -517,6 +517,159 @@ def _rng_for_spec(*, base_seed: int, grant_id: str, spec_idx: int) -> random.Ran
     return random.Random(seed_int)
 
 
+def _build_fac_spec_global_index_map(fac_specs: Sequence[Dict[str, Any]]) -> Dict[Tuple[int, str, int, int], int]:
+    out: Dict[Tuple[int, str, int, int], int] = {}
+    for idx, fac_spec in enumerate(fac_specs):
+        key = _fac_spec_key(
+            fac_id=_safe_int(fac_spec.get("fac_id"), default=0, minimum=0, maximum=2_147_483_647),
+            section=_clean_text(fac_spec.get("section")) or "unknown",
+            fac_spec_id=_safe_int(fac_spec.get("fac_spec_id"), default=0, minimum=0, maximum=9_223_372_036_854_775_807),
+            fac_spec_idx=_safe_int(fac_spec.get("fac_spec_idx"), default=0, minimum=0, maximum=1_000_000),
+        )
+        out[key] = int(idx)
+    return out
+
+
+def _dedupe_fac_specs_by_key(items: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    seen = set()
+    for item in items:
+        key = _fac_spec_key(
+            fac_id=_safe_int(item.get("fac_id"), default=0, minimum=0, maximum=2_147_483_647),
+            section=_clean_text(item.get("section")) or "unknown",
+            fac_spec_id=_safe_int(item.get("fac_spec_id"), default=0, minimum=0, maximum=9_223_372_036_854_775_807),
+            fac_spec_idx=_safe_int(item.get("fac_spec_idx"), default=0, minimum=0, maximum=1_000_000),
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(dict(item))
+    return out
+
+
+def _inject_global_random_fac_specs(
+    *,
+    spec_item: Dict[str, Any],
+    selected_fac_specs: Sequence[Dict[str, Any]],
+    all_fac_specs: Sequence[Dict[str, Any]],
+    base_seed: int,
+    random_prob: float,
+    random_count: int,
+) -> List[Dict[str, Any]]:
+    out = _dedupe_fac_specs_by_key(selected_fac_specs)
+    p = float(max(0.0, min(1.0, random_prob)))
+    n = max(0, int(random_count))
+    if p <= 0.0 or n <= 0 or not all_fac_specs:
+        return out
+
+    grant_id = _clean_text(spec_item.get("grant_id"))
+    spec_idx = _safe_int(spec_item.get("spec_idx"), default=0, minimum=0, maximum=50_000_000)
+    rng = _rng_for_spec(base_seed=int(base_seed), grant_id=grant_id, spec_idx=spec_idx)
+    if rng.random() >= p:
+        return out
+
+    selected_keys = {
+        _fac_spec_key(
+            fac_id=_safe_int(x.get("fac_id"), default=0, minimum=0, maximum=2_147_483_647),
+            section=_clean_text(x.get("section")) or "unknown",
+            fac_spec_id=_safe_int(x.get("fac_spec_id"), default=0, minimum=0, maximum=9_223_372_036_854_775_807),
+            fac_spec_idx=_safe_int(x.get("fac_spec_idx"), default=0, minimum=0, maximum=1_000_000),
+        )
+        for x in out
+    }
+    pool = []
+    for x in all_fac_specs:
+        key = _fac_spec_key(
+            fac_id=_safe_int(x.get("fac_id"), default=0, minimum=0, maximum=2_147_483_647),
+            section=_clean_text(x.get("section")) or "unknown",
+            fac_spec_id=_safe_int(x.get("fac_spec_id"), default=0, minimum=0, maximum=9_223_372_036_854_775_807),
+            fac_spec_idx=_safe_int(x.get("fac_spec_idx"), default=0, minimum=0, maximum=1_000_000),
+        )
+        if key not in selected_keys:
+            pool.append(x)
+    if not pool:
+        return out
+
+    pick = min(len(pool), n)
+    for item in rng.sample(pool, k=pick):
+        out.append(dict(item))
+    return out
+
+
+def _build_rank_map_from_indices(ranked_indices: Sequence[int]) -> Dict[int, int]:
+    out: Dict[int, int] = {}
+    for i, idx in enumerate(ranked_indices):
+        key = int(idx)
+        if key not in out:
+            out[key] = int(i)
+    return out
+
+
+def _annotate_selected_fac_specs_with_bge_rank(
+    *,
+    selected_fac_specs: Sequence[Dict[str, Any]],
+    fac_global_index_map: Dict[Tuple[int, str, int, int], int],
+    rank_map: Dict[int, int],
+) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    for item in selected_fac_specs:
+        key = _fac_spec_key(
+            fac_id=_safe_int(item.get("fac_id"), default=0, minimum=0, maximum=2_147_483_647),
+            section=_clean_text(item.get("section")) or "unknown",
+            fac_spec_id=_safe_int(item.get("fac_spec_id"), default=0, minimum=0, maximum=9_223_372_036_854_775_807),
+            fac_spec_idx=_safe_int(item.get("fac_spec_idx"), default=0, minimum=0, maximum=1_000_000),
+        )
+        global_idx = fac_global_index_map.get(key)
+        rank = rank_map.get(int(global_idx)) if global_idx is not None else None
+        cloned = dict(item)
+        cloned["bge_rank"] = int(rank) if rank is not None else -1
+        out.append(cloned)
+    return out
+
+
+def _normalize_and_tag_candidates(
+    *,
+    candidates: Sequence[Dict[str, Any]],
+    strong_threshold: float,
+    mid_threshold: float,
+    disagree_rank_top_k: int,
+    disagree_low_score_threshold: float,
+) -> List[Dict[str, Any]]:
+    out = [dict(c) for c in candidates]
+    if not out:
+        return out
+
+    vals = [float(x.get("score") or 0.0) for x in out]
+    mn = float(min(vals))
+    mx = float(max(vals))
+    denom = float(mx - mn)
+    for x in out:
+        raw = float(x.get("score") or 0.0)
+        x["score_raw"] = float(raw)
+        if denom > 1e-12:
+            x["score"] = float((raw - mn) / denom)
+        else:
+            x["score"] = float(raw)
+
+        s = float(x["score"])
+        if s >= float(strong_threshold):
+            band = "strong"
+        elif s >= float(mid_threshold):
+            band = "boundary"
+        else:
+            band = "weak"
+        bge_rank = _safe_int(x.get("bge_rank"), default=-1, minimum=-1, maximum=1_000_000_000)
+        is_disagreement = (
+            bge_rank >= 0
+            and bge_rank < int(max(1, disagree_rank_top_k))
+            and raw < float(disagree_low_score_threshold)
+        )
+        x["band"] = band
+        x["is_disagreement"] = bool(is_disagreement)
+        x["type"] = "hard_negative" if is_disagreement else band
+    return out
+
+
 def _select_fac_spec_candidates_for_spec(
     *,
     spec_item: Dict[str, Any],
@@ -645,6 +798,7 @@ def _score_one_spec_against_all_fac_specs(
                     "fac_spec_idx": int(fac_spec_item["fac_spec_idx"]),
                     "section": _clean_text(fac_spec_item["section"]),
                     "fac_spec_text": _clean_text(fac_spec_item["fac_spec_text"]),
+                    "bge_rank": _safe_int(fac_spec_item.get("bge_rank"), default=-1, minimum=-1, maximum=1_000_000_000),
                     "score": float(score),
                 }
             )
@@ -665,6 +819,10 @@ def _build_pairwise_records(
     hard_neg_k: int,
     min_margin: float,
     max_pairs_per_query: int,
+    strong_threshold: float,
+    mid_threshold: float,
+    disagreement_top_rank_k: int,
+    disagreement_low_score_threshold: float,
 ) -> List[Dict[str, Any]]:
     if not sorted_candidates:
         return []
@@ -674,82 +832,110 @@ def _build_pairwise_records(
     hard_k = max(0, int(hard_neg_k))
     max_pairs = max(1, int(max_pairs_per_query))
 
-    positives = list(sorted_candidates[: min(pos_k, len(sorted_candidates))])
-    weak_negatives = list(sorted_candidates[-min(weak_k, len(sorted_candidates)) :])
+    positives = [x for x in sorted_candidates if float(x.get("score") or 0.0) >= float(strong_threshold)]
+    if not positives:
+        positives = list(sorted_candidates[: min(pos_k, len(sorted_candidates))])
+    else:
+        positives = positives[: min(pos_k, len(positives))]
+
+    weak_negatives = [x for x in sorted_candidates if float(x.get("score") or 0.0) < float(mid_threshold)]
+    if not weak_negatives:
+        weak_negatives = list(sorted_candidates[-min(weak_k, len(sorted_candidates)) :])
+    else:
+        weak_negatives = weak_negatives[: min(weak_k, len(weak_negatives))]
     weak_negatives.sort(key=lambda x: float(x.get("score") or 0.0))
+
+    boundary_negatives = [
+        x
+        for x in sorted_candidates
+        if float(mid_threshold) <= float(x.get("score") or 0.0) < float(strong_threshold)
+    ]
+
+    disagreement_negatives = [x for x in sorted_candidates if bool(x.get("is_disagreement"))]
+    disagreement_negatives.sort(
+        key=lambda x: (
+            _safe_int(x.get("bge_rank"), default=1_000_000_000, minimum=-1, maximum=1_000_000_000),
+            float(x.get("score_raw") if x.get("score_raw") is not None else x.get("score") or 0.0),
+        )
+    )
 
     hard_start = min(len(sorted_candidates), len(positives))
     hard_end = min(len(sorted_candidates), hard_start + hard_k)
     hard_negatives = list(sorted_candidates[hard_start:hard_end])
 
     out: List[Dict[str, Any]] = []
+    emitted = set()
+
+    def _append_pair(pos: Dict[str, Any], neg: Dict[str, Any], *, pair_type: str) -> bool:
+        pos_id = (
+            int(pos.get("fac_id") or 0),
+            int(pos.get("fac_spec_id") or 0),
+            int(pos.get("fac_spec_idx") or 0),
+        )
+        neg_id = (
+            int(neg.get("fac_id") or 0),
+            int(neg.get("fac_spec_id") or 0),
+            int(neg.get("fac_spec_idx") or 0),
+        )
+        if pos_id == neg_id:
+            return False
+        sig = (pair_type, pos_id, neg_id)
+        if sig in emitted:
+            return False
+        p_score = float(pos.get("score") or 0.0)
+        n_score = float(neg.get("score") or 0.0)
+        margin = p_score - n_score
+        if margin <= 0:
+            return False
+        if pair_type in {"strong_vs_hard", "strong_vs_boundary", "llm_disagreement"} and margin < float(min_margin):
+            return False
+
+        out.append(
+            {
+                "grant_id": grant_id,
+                "spec_idx": int(spec_idx),
+                "query_text": query_text,
+                "pos_text": _clean_text(pos.get("fac_spec_text")),
+                "neg_text": _clean_text(neg.get("fac_spec_text")),
+                "teacher_pos_score": p_score,
+                "teacher_neg_score": n_score,
+                "teacher_margin": float(margin),
+                "pair_type": pair_type,
+                "pos_fac_id": int(pos.get("fac_id") or 0),
+                "pos_fac_spec_id": int(pos.get("fac_spec_id") or 0),
+                "pos_fac_spec_idx": int(pos.get("fac_spec_idx") or 0),
+                "pos_section": _clean_text(pos.get("section")) or "unknown",
+                "pos_bge_rank": _safe_int(pos.get("bge_rank"), default=-1, minimum=-1, maximum=1_000_000_000),
+                "pos_type": _clean_text(pos.get("type")) or "unknown",
+                "neg_fac_id": int(neg.get("fac_id") or 0),
+                "neg_fac_spec_id": int(neg.get("fac_spec_id") or 0),
+                "neg_fac_spec_idx": int(neg.get("fac_spec_idx") or 0),
+                "neg_section": _clean_text(neg.get("section")) or "unknown",
+                "neg_bge_rank": _safe_int(neg.get("bge_rank"), default=-1, minimum=-1, maximum=1_000_000_000),
+                "neg_type": _clean_text(neg.get("type")) or "unknown",
+            }
+        )
+        emitted.add(sig)
+        return True
 
     for pos in positives:
-        p_score = float(pos.get("score") or 0.0)
+        for neg in disagreement_negatives:
+            _append_pair(pos, neg, pair_type="llm_disagreement")
+            if len(out) >= max_pairs:
+                return out
+
+        for neg in boundary_negatives:
+            _append_pair(pos, neg, pair_type="strong_vs_boundary")
+            if len(out) >= max_pairs:
+                return out
 
         for neg in weak_negatives:
-            if int(pos.get("fac_spec_id") or 0) == int(neg.get("fac_spec_id") or 0) and int(pos.get("fac_id") or 0) == int(
-                neg.get("fac_id") or 0
-            ):
-                continue
-            n_score = float(neg.get("score") or 0.0)
-            margin = p_score - n_score
-            if margin <= 0:
-                continue
-            out.append(
-                {
-                    "grant_id": grant_id,
-                    "spec_idx": int(spec_idx),
-                    "query_text": query_text,
-                    "pos_text": _clean_text(pos.get("fac_spec_text")),
-                    "neg_text": _clean_text(neg.get("fac_spec_text")),
-                    "teacher_pos_score": p_score,
-                    "teacher_neg_score": n_score,
-                    "teacher_margin": float(margin),
-                    "pair_type": "strong_vs_weak",
-                    "pos_fac_id": int(pos.get("fac_id") or 0),
-                    "pos_fac_spec_id": int(pos.get("fac_spec_id") or 0),
-                    "pos_fac_spec_idx": int(pos.get("fac_spec_idx") or 0),
-                    "pos_section": _clean_text(pos.get("section")) or "unknown",
-                    "neg_fac_id": int(neg.get("fac_id") or 0),
-                    "neg_fac_spec_id": int(neg.get("fac_spec_id") or 0),
-                    "neg_fac_spec_idx": int(neg.get("fac_spec_idx") or 0),
-                    "neg_section": _clean_text(neg.get("section")) or "unknown",
-                }
-            )
+            _append_pair(pos, neg, pair_type="strong_vs_weak")
             if len(out) >= max_pairs:
                 return out
 
         for neg in hard_negatives:
-            if int(pos.get("fac_spec_id") or 0) == int(neg.get("fac_spec_id") or 0) and int(pos.get("fac_id") or 0) == int(
-                neg.get("fac_id") or 0
-            ):
-                continue
-            n_score = float(neg.get("score") or 0.0)
-            margin = p_score - n_score
-            if margin < float(min_margin):
-                continue
-            out.append(
-                {
-                    "grant_id": grant_id,
-                    "spec_idx": int(spec_idx),
-                    "query_text": query_text,
-                    "pos_text": _clean_text(pos.get("fac_spec_text")),
-                    "neg_text": _clean_text(neg.get("fac_spec_text")),
-                    "teacher_pos_score": p_score,
-                    "teacher_neg_score": n_score,
-                    "teacher_margin": float(margin),
-                    "pair_type": "strong_vs_hard",
-                    "pos_fac_id": int(pos.get("fac_id") or 0),
-                    "pos_fac_spec_id": int(pos.get("fac_spec_id") or 0),
-                    "pos_fac_spec_idx": int(pos.get("fac_spec_idx") or 0),
-                    "pos_section": _clean_text(pos.get("section")) or "unknown",
-                    "neg_fac_id": int(neg.get("fac_id") or 0),
-                    "neg_fac_spec_id": int(neg.get("fac_spec_id") or 0),
-                    "neg_fac_spec_idx": int(neg.get("fac_spec_idx") or 0),
-                    "neg_section": _clean_text(neg.get("section")) or "unknown",
-                }
-            )
+            _append_pair(pos, neg, pair_type="strong_vs_hard")
             if len(out) >= max_pairs:
                 return out
 
@@ -783,19 +969,19 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--prefilter-top-k",
         type=int,
-        default=0,
+        default=5,
         help="Top-k faculty specs per spec before LLM scoring (used with score-cache ranking or sparse ranking).",
     )
     p.add_argument(
         "--prefilter-mid-k",
         type=int,
-        default=0,
+        default=10,
         help="Additional medium-band faculty specs sampled per spec for diversity.",
     )
     p.add_argument(
         "--prefilter-rand-k",
         type=int,
-        default=0,
+        default=5,
         help="Additional random faculty specs per spec for easy/low-score coverage.",
     )
     p.add_argument(
@@ -808,7 +994,19 @@ def _build_parser() -> argparse.ArgumentParser:
         "--prefilter-score-cache",
         type=str,
         default=PREFILTER_SCORE_CACHE_DEFAULT,
-        help="Optional JSONL cache file with precomputed cosine-ranked candidates per (grant_id, spec_idx).",
+        help="Optional JSONL cache file with precomputed ranked candidates per (grant_id, spec_idx).",
+    )
+    p.add_argument(
+        "--prefilter-global-rand-prob",
+        type=float,
+        default=0.05,
+        help="Per-query probability to inject extra global-random faculty specs beyond top/mid/rand.",
+    )
+    p.add_argument(
+        "--prefilter-global-rand-count",
+        type=int,
+        default=1,
+        help="How many extra global-random faculty specs to inject when triggered.",
     )
 
     p.add_argument("--pair-pos-top-k", type=int, default=4, help="Top-K positive pool per query.")
@@ -816,6 +1014,20 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--pair-hard-neg-k", type=int, default=4, help="Near-top hard negative pool per query.")
     p.add_argument("--pair-min-margin", type=float, default=0.05, help="Minimum margin for strong_vs_hard pairs.")
     p.add_argument("--pair-max-per-query", type=int, default=80, help="Cap pairwise rows generated per query.")
+    p.add_argument("--pair-strong-threshold", type=float, default=0.8, help="Normalized score threshold for strong positives.")
+    p.add_argument("--pair-mid-threshold", type=float, default=0.4, help="Normalized score threshold separating boundary vs weak.")
+    p.add_argument(
+        "--disagreement-top-rank-k",
+        type=int,
+        default=5,
+        help="Candidates with bge_rank < K and low LLM score are disagreement hard negatives.",
+    )
+    p.add_argument(
+        "--disagreement-low-score-threshold",
+        type=float,
+        default=0.4,
+        help="Raw LLM score threshold below which high-rank candidates are tagged disagreement.",
+    )
 
     p.add_argument("--listwise-top-k", type=int, default=0, help="Keep top-K docs in listwise output (0 = all).")
     p.add_argument("--no-tqdm", action="store_true", help="Disable global tqdm progress bar.")
@@ -860,6 +1072,8 @@ def main() -> int:
     prefilter_rand_k = _safe_int(args.prefilter_rand_k, default=0, minimum=0, maximum=200_000)
     prefilter_seed = _safe_int(args.prefilter_seed, default=42, minimum=0, maximum=2_147_483_647)
     prefilter_score_cache_path = _resolve_path(args.prefilter_score_cache) if _clean_text(args.prefilter_score_cache) else None
+    prefilter_global_rand_prob = _safe_float(args.prefilter_global_rand_prob, default=0.05, minimum=0.0, maximum=1.0)
+    prefilter_global_rand_count = _safe_int(args.prefilter_global_rand_count, default=1, minimum=0, maximum=100)
     use_prefilter = (prefilter_top_k + prefilter_mid_k + prefilter_rand_k) > 0
 
     pair_pos_top_k = _safe_int(args.pair_pos_top_k, default=4, minimum=1, maximum=10_000)
@@ -867,6 +1081,12 @@ def main() -> int:
     pair_hard_neg_k = _safe_int(args.pair_hard_neg_k, default=4, minimum=0, maximum=10_000)
     pair_min_margin = _safe_float(args.pair_min_margin, default=0.05, minimum=0.0, maximum=1.0)
     pair_max_per_query = _safe_int(args.pair_max_per_query, default=80, minimum=1, maximum=1_000_000)
+    pair_strong_threshold = _safe_float(args.pair_strong_threshold, default=0.8, minimum=0.0, maximum=1.0)
+    pair_mid_threshold = _safe_float(args.pair_mid_threshold, default=0.4, minimum=0.0, maximum=1.0)
+    disagreement_top_rank_k = _safe_int(args.disagreement_top_rank_k, default=5, minimum=1, maximum=100_000)
+    disagreement_low_score_threshold = _safe_float(args.disagreement_low_score_threshold, default=0.4, minimum=0.0, maximum=1.0)
+    if pair_strong_threshold < pair_mid_threshold:
+        pair_strong_threshold = pair_mid_threshold
     listwise_top_k = _safe_int(args.listwise_top_k, default=0, minimum=0, maximum=10_000_000)
     use_tqdm = not bool(args.no_tqdm)
     use_vllm_tqdm = bool(args.vllm_tqdm)
@@ -894,6 +1114,7 @@ def main() -> int:
     if not specs:
         raise RuntimeError("No specs left after start-spec-index filtering.")
 
+    fac_global_index_map = _build_fac_spec_global_index_map(fac_specs)
     full_total_pairs = int(len(specs) * len(fac_specs))
     prefilter_score_cache: Dict[Tuple[str, int], List[int]] = {}
     prefilter_score_cache_stats: Dict[str, int] = {}
@@ -921,7 +1142,10 @@ def main() -> int:
     else:
         prefilter_target_per_spec = len(fac_specs)
 
-    total_pairs = int(len(specs) * prefilter_target_per_spec)
+    total_pairs_per_spec = int(prefilter_target_per_spec)
+    if use_prefilter and prefilter_global_rand_prob > 0.0 and prefilter_global_rand_count > 0:
+        total_pairs_per_spec += int(prefilter_global_rand_count)
+    total_pairs = int(len(specs) * total_pairs_per_spec)
 
     raw_output.parent.mkdir(parents=True, exist_ok=True)
     pairwise_output.parent.mkdir(parents=True, exist_ok=True)
@@ -942,6 +1166,11 @@ def main() -> int:
     total_pairwise = 0
     total_json_ok = 0
     total_fallback = 0
+    total_disagreement_candidates = 0
+    total_boundary_candidates = 0
+    total_strong_candidates = 0
+    total_pair_llm_disagreement = 0
+    total_pair_strong_vs_boundary = 0
     sum_candidates_per_spec = 0
     min_candidates_per_spec = 2_147_483_647
     max_candidates_per_spec = 0
@@ -965,6 +1194,14 @@ def main() -> int:
             f"top:{prefilter_top_k},mid:{prefilter_mid_k},rand:{prefilter_rand_k} "
             f"(target_per_spec={prefilter_target_per_spec})"
         )
+        print(f"prefilter_global_rand_prob={prefilter_global_rand_prob}")
+        print(f"prefilter_global_rand_count={prefilter_global_rand_count}")
+    print(
+        "pair_bands="
+        f"strong>={pair_strong_threshold:.3f}, "
+        f"boundary>={pair_mid_threshold:.3f}, "
+        f"disagree(rank<{disagreement_top_rank_k},raw_score<{disagreement_low_score_threshold:.3f})"
+    )
     print(f"batch_size={batch_size}")
     print(f"raw_output={raw_output}")
     print(f"pairwise_output={pairwise_output}")
@@ -990,19 +1227,24 @@ def main() -> int:
             listwise_output.open("w", encoding="utf-8") as list_f,
         ):
             for spec_rank, spec_item in enumerate(specs, start=1):
+                ranked_indices: List[int] = []
                 if use_prefilter:
-                    ranked_indices = prefilter_score_cache.get(_spec_key(spec_item)) if use_prefilter_score_cache else None
                     if use_prefilter_score_cache:
+                        ranked_indices = list(prefilter_score_cache.get(_spec_key(spec_item)) or [])
                         selected_fac_specs = _select_fac_spec_candidates_from_ranked_indices(
                             spec_item=spec_item,
                             fac_specs=fac_specs,
-                            ranked_indices=ranked_indices or [],
+                            ranked_indices=ranked_indices,
                             top_k=prefilter_top_k,
                             mid_k=prefilter_mid_k,
                             rand_k=prefilter_rand_k,
                             base_seed=prefilter_seed,
                         )
                     else:
+                        ranked_indices = _rank_fac_spec_indices_for_spec(
+                            _clean_text(spec_item.get("spec_text")),
+                            sparse_index=sparse_index or {},
+                        ) if sparse_index is not None else []
                         selected_fac_specs = _select_fac_spec_candidates_for_spec(
                             spec_item=spec_item,
                             fac_specs=fac_specs,
@@ -1013,7 +1255,23 @@ def main() -> int:
                             base_seed=prefilter_seed,
                         )
                 else:
+                    ranked_indices = []
                     selected_fac_specs = list(fac_specs)
+
+                selected_fac_specs = _inject_global_random_fac_specs(
+                    spec_item=spec_item,
+                    selected_fac_specs=selected_fac_specs,
+                    all_fac_specs=fac_specs,
+                    base_seed=prefilter_seed + 991,
+                    random_prob=prefilter_global_rand_prob,
+                    random_count=prefilter_global_rand_count,
+                )
+                rank_map = _build_rank_map_from_indices(ranked_indices)
+                selected_fac_specs = _annotate_selected_fac_specs_with_bge_rank(
+                    selected_fac_specs=selected_fac_specs,
+                    fac_global_index_map=fac_global_index_map,
+                    rank_map=rank_map,
+                )
 
                 candidates, json_ok, fallback = _score_one_spec_against_all_fac_specs(
                     llm=llm,
@@ -1025,6 +1283,13 @@ def main() -> int:
                     progress_cb=_update_progress,
                     use_vllm_tqdm=use_vllm_tqdm,
                 )
+                candidates = _normalize_and_tag_candidates(
+                    candidates=candidates,
+                    strong_threshold=pair_strong_threshold,
+                    mid_threshold=pair_mid_threshold,
+                    disagree_rank_top_k=disagreement_top_rank_k,
+                    disagree_low_score_threshold=disagreement_low_score_threshold,
+                )
 
                 total_scored += len(candidates)
                 total_json_ok += int(json_ok)
@@ -1032,6 +1297,15 @@ def main() -> int:
                 sum_candidates_per_spec += len(candidates)
                 min_candidates_per_spec = min(min_candidates_per_spec, len(candidates))
                 max_candidates_per_spec = max(max_candidates_per_spec, len(candidates))
+                total_disagreement_candidates += int(
+                    sum(1 for c in candidates if bool(c.get("is_disagreement")))
+                )
+                total_strong_candidates += int(
+                    sum(1 for c in candidates if _clean_text(c.get("band")) == "strong")
+                )
+                total_boundary_candidates += int(
+                    sum(1 for c in candidates if _clean_text(c.get("band")) == "boundary")
+                )
 
                 raw_obj = {
                     "grant_id": _clean_text(spec_item.get("grant_id")),
@@ -1044,7 +1318,12 @@ def main() -> int:
                             "fac_spec_idx": int(c["fac_spec_idx"]),
                             "section": _clean_text(c["section"]),
                             "fac_spec_text": _clean_text(c["fac_spec_text"]),
+                            "bge_rank": _safe_int(c.get("bge_rank"), default=-1, minimum=-1, maximum=1_000_000_000),
+                            "score_raw": float(c.get("score_raw") if c.get("score_raw") is not None else c.get("score")),
                             "score": float(c["score"]),
+                            "band": _clean_text(c.get("band")) or "unknown",
+                            "type": _clean_text(c.get("type")) or "unknown",
+                            "is_disagreement": bool(c.get("is_disagreement")),
                         }
                         for c in candidates
                     ],
@@ -1068,10 +1347,15 @@ def main() -> int:
                         {
                             "text": _clean_text(d["fac_spec_text"]),
                             "teacher_score": float(d["score"]),
+                            "teacher_score_raw": float(d.get("score_raw") if d.get("score_raw") is not None else d.get("score")),
                             "fac_id": int(d["fac_id"]),
                             "fac_spec_id": int(d["fac_spec_id"]),
                             "fac_spec_idx": int(d["fac_spec_idx"]),
                             "section": _clean_text(d["section"]),
+                            "bge_rank": _safe_int(d.get("bge_rank"), default=-1, minimum=-1, maximum=1_000_000_000),
+                            "band": _clean_text(d.get("band")) or "unknown",
+                            "type": _clean_text(d.get("type")) or "unknown",
+                            "is_disagreement": bool(d.get("is_disagreement")),
                         }
                         for d in docs
                     ],
@@ -1088,10 +1372,20 @@ def main() -> int:
                     hard_neg_k=pair_hard_neg_k,
                     min_margin=pair_min_margin,
                     max_pairs_per_query=pair_max_per_query,
+                    strong_threshold=pair_strong_threshold,
+                    mid_threshold=pair_mid_threshold,
+                    disagreement_top_rank_k=disagreement_top_rank_k,
+                    disagreement_low_score_threshold=disagreement_low_score_threshold,
                 )
                 for row in pairwise_rows:
                     pair_f.write(json.dumps(row, ensure_ascii=False) + "\n")
                 total_pairwise += len(pairwise_rows)
+                total_pair_llm_disagreement += int(
+                    sum(1 for r in pairwise_rows if _clean_text(r.get("pair_type")) == "llm_disagreement")
+                )
+                total_pair_strong_vs_boundary += int(
+                    sum(1 for r in pairwise_rows if _clean_text(r.get("pair_type")) == "strong_vs_boundary")
+                )
 
                 raw_f.flush()
                 list_f.flush()
@@ -1143,7 +1437,10 @@ def main() -> int:
         "prefilter_mid_k": int(prefilter_mid_k),
         "prefilter_rand_k": int(prefilter_rand_k),
         "prefilter_target_per_spec": int(prefilter_target_per_spec),
+        "prefilter_total_pairs_per_spec_estimate": int(total_pairs_per_spec),
         "prefilter_seed": int(prefilter_seed),
+        "prefilter_global_rand_prob": float(prefilter_global_rand_prob),
+        "prefilter_global_rand_count": int(prefilter_global_rand_count),
         "use_prefilter_score_cache": bool(use_prefilter_score_cache),
         "prefilter_score_cache_path": str(prefilter_score_cache_path) if prefilter_score_cache_path is not None else "",
         "prefilter_score_cache_spec_count": int(len(prefilter_score_cache)),
@@ -1151,7 +1448,12 @@ def main() -> int:
         "avg_candidates_per_spec": float(avg_candidates),
         "min_candidates_per_spec": int(min_candidates_per_spec),
         "max_candidates_per_spec": int(max_candidates_per_spec),
+        "total_disagreement_candidates": int(total_disagreement_candidates),
+        "total_strong_candidates": int(total_strong_candidates),
+        "total_boundary_candidates": int(total_boundary_candidates),
         "total_pairwise_rows": int(total_pairwise),
+        "total_pair_llm_disagreement": int(total_pair_llm_disagreement),
+        "total_pair_strong_vs_boundary": int(total_pair_strong_vs_boundary),
         "parsed_json_ok_count": int(total_json_ok),
         "parsed_fallback_count": int(total_fallback),
         "tensor_parallel_size": int(tensor_parallel_size),
@@ -1167,6 +1469,11 @@ def main() -> int:
         "pair_hard_neg_k": int(pair_hard_neg_k),
         "pair_min_margin": float(pair_min_margin),
         "pair_max_per_query": int(pair_max_per_query),
+        "pair_strong_threshold": float(pair_strong_threshold),
+        "pair_mid_threshold": float(pair_mid_threshold),
+        "disagreement_top_rank_k": int(disagreement_top_rank_k),
+        "disagreement_low_score_threshold": float(disagreement_low_score_threshold),
+        "disagreement_score_mode": "raw",
         "listwise_top_k": int(listwise_top_k),
         "elapsed_seconds": float(elapsed),
         "pairs_per_second": float(total_scored / elapsed),
@@ -1179,6 +1486,9 @@ def main() -> int:
     print(f"reduction_ratio_vs_full={(total_scored / float(max(1, full_total_pairs))):.6f}")
     print(f"avg_candidates_per_spec={avg_candidates:.2f}")
     print(f"total_pairwise_rows={total_pairwise}")
+    print(f"total_pair_llm_disagreement={total_pair_llm_disagreement}")
+    print(f"total_pair_strong_vs_boundary={total_pair_strong_vs_boundary}")
+    print(f"total_disagreement_candidates={total_disagreement_candidates}")
     print(f"parsed_json_ok_count={total_json_ok}")
     print(f"parsed_fallback_count={total_fallback}")
     print(f"elapsed_seconds={elapsed:.2f}")

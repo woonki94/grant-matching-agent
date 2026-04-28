@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import sys
 from pathlib import Path
 from typing import Any, Dict, List
@@ -22,7 +23,8 @@ if str(PROJECT_ROOT) not in sys.path:
 
 
 # Edit these three fields directly.
-FINETUNED_MODEL_PATH = "cross_encoder/spec_to_chunk/models/bge_reranker_distill/best"
+FINETUNED_MODEL_PATH = "cross_encoder/spec_to_chunk/models/spec_to_chunk_finetuned_ce"
+PURE_BGE_MODEL_ID = "BAAI/bge-reranker-base"
 QUERY_TEXT = "Reinforcement learning combined with symbolic planning and reasoning for long-horizon decision-making in dynamic, uncertain real-world environments."
 
 DOC_TEXTS = [
@@ -60,6 +62,26 @@ def _resolve_path(value: Any) -> Path:
     if not path.is_absolute():
         path = PROJECT_ROOT / path
     return path.resolve()
+
+
+def _resolve_model_ref(*, model_ref: str, use_pure_bge: bool) -> str:
+    selected = _clean_text(model_ref)
+    if not selected:
+        selected = PURE_BGE_MODEL_ID if bool(use_pure_bge) else _clean_text(FINETUNED_MODEL_PATH)
+
+    if not selected:
+        raise RuntimeError("Model reference is empty.")
+
+    path_candidate = Path(selected).expanduser()
+    if path_candidate.exists():
+        return str(path_candidate.resolve())
+
+    project_candidate = _resolve_path(selected)
+    if project_candidate.exists():
+        return str(project_candidate)
+
+    # Fallback to Hugging Face model id.
+    return selected
 
 
 def _pick_device() -> torch.device:
@@ -117,13 +139,31 @@ def _score_docs(
     return rows
 
 
+def _build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        description="Test CE scoring with either a local finetuned checkpoint or a pure BGE reranker model ID."
+    )
+    p.add_argument(
+        "--use-pure-bge",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=f"Use pure BGE CE model ({PURE_BGE_MODEL_ID}) instead of local finetuned checkpoint.",
+    )
+    p.add_argument(
+        "--model-ref",
+        type=str,
+        default="",
+        help="Optional explicit model ref (local path or Hugging Face model id). Overrides --use-pure-bge.",
+    )
+    return p
+
+
 def main() -> int:
-    model_path = _resolve_path(FINETUNED_MODEL_PATH)
+    args = _build_parser().parse_args()
+    model_ref = _resolve_model_ref(model_ref=str(args.model_ref), use_pure_bge=bool(args.use_pure_bge))
     query = _clean_text(QUERY_TEXT)
     docs = [_clean_text(x) for x in DOC_TEXTS if _clean_text(x)]
 
-    if not model_path.exists():
-        raise RuntimeError(f"Model path not found: {model_path}")
     if not query:
         raise RuntimeError("QUERY_TEXT is empty. Paste one query string in the file.")
     if not docs:
@@ -131,8 +171,8 @@ def main() -> int:
 
     device = _pick_device()
 
-    tokenizer = AutoTokenizer.from_pretrained(str(model_path))
-    model = AutoModelForSequenceClassification.from_pretrained(str(model_path), num_labels=1)
+    tokenizer = AutoTokenizer.from_pretrained(str(model_ref))
+    model = AutoModelForSequenceClassification.from_pretrained(str(model_ref), num_labels=1)
     model.to(device)
     model.eval()
 
@@ -149,7 +189,7 @@ def main() -> int:
     rows.sort(key=lambda x: float(x["score"]), reverse=bool(SORT_DESCENDING))
 
     print(f"device={device}")
-    print(f"model_path={model_path.resolve()}")
+    print(f"model_ref={model_ref}")
     print(f"query={query}")
     print(f"doc_count={len(rows)}")
     print("\nScores:")

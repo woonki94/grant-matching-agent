@@ -28,8 +28,8 @@ LLM_DISTILL_SCRIPT = PROJECT_ROOT / "cross_encoder" / "spec_to_chunk" / "llm_dis
 
 GRANT_DB_DEFAULT = "cross_encoder/spec_to_chunk/dataset/grant_keywords_spec_keywords_db.json"
 FAC_DB_DEFAULT = "cross_encoder/spec_to_chunk/dataset/fac_chunks_db.json"
-PREFILTER_OUTPUT_DEFAULT = "cross_encoder/spec_to_chunk/dataset/spec_chunk_cosine_cache.jsonl"
-PREFILTER_MANIFEST_DEFAULT = "cross_encoder/spec_to_chunk/dataset/spec_chunk_cosine_cache.manifest.json"
+PREFILTER_OUTPUT_DEFAULT = "cross_encoder/spec_to_chunk/dataset/spec_chunk_bge_cache.jsonl"
+PREFILTER_MANIFEST_DEFAULT = "cross_encoder/spec_to_chunk/dataset/spec_chunk_bge_cache.manifest.json"
 
 
 def _clean_text(value: Any) -> str:
@@ -97,7 +97,7 @@ def _build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         description=(
             "Prepare all prerequisite artifacts for spec_to_chunk llm_distillation: "
-            "JSON DB export + cosine prefilter cache."
+            "JSON DB export + BGE prefilter cache."
         )
     )
 
@@ -119,6 +119,10 @@ def _build_parser() -> argparse.ArgumentParser:
 
     p.add_argument("--prefilter-model-id", type=str, default="")
     p.add_argument("--prefilter-top-k-per-spec", type=int, default=0)
+    p.add_argument("--prefilter-method", type=str, default="bge")
+    p.add_argument("--prefilter-bge-model-id", type=str, default="BAAI/bge-reranker-base")
+    p.add_argument("--prefilter-bge-batch-size", type=int, default=64)
+    p.add_argument("--prefilter-bge-max-length", type=int, default=512)
 
     p.add_argument("--suggest-prefilter-top-k", type=int, default=40)
     p.add_argument("--suggest-prefilter-mid-k", type=int, default=12)
@@ -142,6 +146,10 @@ def main() -> int:
     max_chars_per_chunk = _safe_int(args.max_chars_per_chunk, default=6000, minimum=0, maximum=500_000)
     indent = _safe_int(args.indent, default=2, minimum=0, maximum=16)
     prefilter_top_k_per_spec = _safe_int(args.prefilter_top_k_per_spec, default=0, minimum=0, maximum=2_000_000)
+    prefilter_method = _clean_text(args.prefilter_method) or "bge"
+    prefilter_bge_model_id = _clean_text(args.prefilter_bge_model_id) or "BAAI/bge-reranker-base"
+    prefilter_bge_batch_size = _safe_int(args.prefilter_bge_batch_size, default=64, minimum=1, maximum=4096)
+    prefilter_bge_max_length = _safe_int(args.prefilter_bge_max_length, default=512, minimum=32, maximum=4096)
 
     suggest_top_k = _safe_int(args.suggest_prefilter_top_k, default=40, minimum=0, maximum=200_000)
     suggest_mid_k = _safe_int(args.suggest_prefilter_mid_k, default=12, minimum=0, maximum=200_000)
@@ -195,6 +203,14 @@ def main() -> int:
             str(prefilter_manifest),
             "--top-k-per-spec",
             str(prefilter_top_k_per_spec),
+            "--prefilter-method",
+            str(prefilter_method),
+            "--bge-model-id",
+            str(prefilter_bge_model_id),
+            "--bge-batch-size",
+            str(prefilter_bge_batch_size),
+            "--bge-max-length",
+            str(prefilter_bge_max_length),
         ]
         model_id = _clean_text(args.prefilter_model_id)
         if model_id:
