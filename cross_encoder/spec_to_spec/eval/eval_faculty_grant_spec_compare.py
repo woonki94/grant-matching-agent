@@ -35,6 +35,7 @@ PURE_BGE_MODEL_ID = "BAAI/bge-reranker-base"
 OUTPUT_DIR_DEFAULT = "cross_encoder/spec_to_spec/eval/results"
 DISTILL_INPUT_DEFAULT = "cross_encoder/spec_to_spec/dataset/llm_distill_raw_scores.jsonl"
 DISTILL_INPUT_FALLBACK = "cross_encoder/spec_to_spec/dataset/llm_distill_listwise.jsonl"
+DISTILL_TEST_INPUT_DEFAULT = "cross_encoder/spec_to_spec/dataset/llm_distill_test.jsonl"
 
 
 def _clean_text(value: Any) -> str:
@@ -463,6 +464,7 @@ def _reservoir_sample_distill_pairs(
         "mid": max(0, int(sample_mid)),
         "low": max(0, int(sample_low)),
     }
+    keep_all_map = {band: (int(k_map[band]) == 0) for band in ("high", "mid", "low")}
     reservoirs: Dict[str, List[Dict[str, Any]]] = {"high": [], "mid": [], "low": []}
     seen_by_band = {"high": 0, "mid": 0, "low": 0}
     total_by_band = {"high": 0, "mid": 0, "low": 0}
@@ -472,6 +474,9 @@ def _reservoir_sample_distill_pairs(
 
     def _maybe_add(item: Dict[str, Any], band: str) -> None:
         seen_by_band[band] += 1
+        if bool(keep_all_map.get(band)):
+            reservoirs[band].append(dict(item))
+            return
         k = int(k_map[band])
         if k <= 0:
             return
@@ -921,16 +926,19 @@ def _format_distill_pairs_table(
 def _run_distill_eval(args: argparse.Namespace) -> int:
     batch_size = _safe_int(args.batch_size, default=32, minimum=1, maximum=4096)
     max_length = _safe_int(args.max_length, default=512, minimum=64, maximum=4096)
-    sample_high = _safe_int(args.distill_sample_high, default=150, minimum=0, maximum=1_000_000)
-    sample_mid = _safe_int(args.distill_sample_mid, default=150, minimum=0, maximum=1_000_000)
-    sample_low = _safe_int(args.distill_sample_low, default=150, minimum=0, maximum=1_000_000)
+    sample_high = _safe_int(args.distill_sample_high, default=0, minimum=0, maximum=1_000_000)
+    sample_mid = _safe_int(args.distill_sample_mid, default=0, minimum=0, maximum=1_000_000)
+    sample_low = _safe_int(args.distill_sample_low, default=0, minimum=0, maximum=1_000_000)
     high_threshold = _safe_float(args.distill_high_threshold, default=0.67, minimum=0.0, maximum=1.0)
     mid_threshold = _safe_float(args.distill_mid_threshold, default=0.34, minimum=0.0, maximum=1.0)
     if mid_threshold > high_threshold:
         mid_threshold = high_threshold
     max_pairs_scan = _safe_int(args.distill_max_pairs_scan, default=0, minimum=0, maximum=50_000_000)
     seed = _safe_int(args.distill_seed, default=42, minimum=0, maximum=2_147_483_647)
-    print_per_band = _safe_int(args.distill_print_rows_per_band, default=30, minimum=1, maximum=100_000)
+    print_pair_tables = bool(args.distill_print_pair_tables)
+    save_pair_tables = bool(args.distill_save_pair_tables)
+    print_per_band = _safe_int(args.distill_print_rows_per_band, default=30, minimum=0, maximum=1_000_000)
+    save_rows_per_band = _safe_int(args.distill_save_rows_per_band, default=0, minimum=0, maximum=5_000_000)
     order_top_k = _safe_int(args.distill_order_top_k, default=5, minimum=1, maximum=100)
     pair_eps = _safe_float(args.distill_pair_eps, default=0.01, minimum=0.0, maximum=1.0)
     hard_gap_max = _safe_float(args.distill_hard_gap_max, default=0.15, minimum=0.0, maximum=1.0)
@@ -944,7 +952,9 @@ def _run_distill_eval(args: argparse.Namespace) -> int:
     finetuned_ref = _resolve_model_ref(_clean_text(args.finetuned_model) or FINETUNED_MODEL_DEFAULT)
     base_ref = _resolve_model_ref(_clean_text(args.base_model) or PURE_BGE_MODEL_ID)
 
-    distill_input = _resolve_path(args.distill_input)
+    distill_input = _resolve_path(args.distill_test_input)
+    if not distill_input.exists():
+        distill_input = _resolve_path(args.distill_input)
     if not distill_input.exists():
         fallback = _resolve_path(DISTILL_INPUT_FALLBACK)
         if fallback.exists():
@@ -1084,61 +1094,63 @@ def _run_distill_eval(args: argparse.Namespace) -> int:
         _format_raw_sanity_table(finetuned=raw_sanity_finetuned, base=raw_sanity_base),
     ]
 
-    blocks_print.append(
-        _format_distill_pairs_table(
-            rows=by_band["high"],
-            title="High Score Pairs",
-            max_rows=print_per_band,
-            text_width=140,
-            truncate_text=True,
+    if print_pair_tables:
+        blocks_print.append(
+            _format_distill_pairs_table(
+                rows=by_band["high"],
+                title="High Score Pairs",
+                max_rows=print_per_band,
+                text_width=140,
+                truncate_text=True,
+            )
         )
-    )
-    blocks_print.append(
-        _format_distill_pairs_table(
-            rows=by_band["mid"],
-            title="Mid Score Pairs",
-            max_rows=print_per_band,
-            text_width=140,
-            truncate_text=True,
+        blocks_print.append(
+            _format_distill_pairs_table(
+                rows=by_band["mid"],
+                title="Mid Score Pairs",
+                max_rows=print_per_band,
+                text_width=140,
+                truncate_text=True,
+            )
         )
-    )
-    blocks_print.append(
-        _format_distill_pairs_table(
-            rows=by_band["low"],
-            title="Low Score Pairs",
-            max_rows=print_per_band,
-            text_width=140,
-            truncate_text=True,
+        blocks_print.append(
+            _format_distill_pairs_table(
+                rows=by_band["low"],
+                title="Low Score Pairs",
+                max_rows=print_per_band,
+                text_width=140,
+                truncate_text=True,
+            )
         )
-    )
 
-    blocks_save.append(
-        _format_distill_pairs_table(
-            rows=by_band["high"],
-            title="High Score Pairs",
-            max_rows=print_per_band,
-            text_width=140,
-            truncate_text=False,
+    if save_pair_tables:
+        blocks_save.append(
+            _format_distill_pairs_table(
+                rows=by_band["high"],
+                title="High Score Pairs",
+                max_rows=save_rows_per_band,
+                text_width=140,
+                truncate_text=False,
+            )
         )
-    )
-    blocks_save.append(
-        _format_distill_pairs_table(
-            rows=by_band["mid"],
-            title="Mid Score Pairs",
-            max_rows=print_per_band,
-            text_width=140,
-            truncate_text=False,
+        blocks_save.append(
+            _format_distill_pairs_table(
+                rows=by_band["mid"],
+                title="Mid Score Pairs",
+                max_rows=save_rows_per_band,
+                text_width=140,
+                truncate_text=False,
+            )
         )
-    )
-    blocks_save.append(
-        _format_distill_pairs_table(
-            rows=by_band["low"],
-            title="Low Score Pairs",
-            max_rows=print_per_band,
-            text_width=140,
-            truncate_text=False,
+        blocks_save.append(
+            _format_distill_pairs_table(
+                rows=by_band["low"],
+                title="Low Score Pairs",
+                max_rows=save_rows_per_band,
+                text_width=140,
+                truncate_text=False,
+            )
         )
-    )
     report_text_print = "\n".join(blocks_print).strip() + "\n"
     report_text_save = "\n".join(blocks_save).strip() + "\n"
 
@@ -1155,6 +1167,10 @@ def _run_distill_eval(args: argparse.Namespace) -> int:
                 "sample_high": int(sample_high),
                 "sample_mid": int(sample_mid),
                 "sample_low": int(sample_low),
+                "distill_print_pair_tables": bool(print_pair_tables),
+                "distill_save_pair_tables": bool(save_pair_tables),
+                "distill_print_rows_per_band": int(print_per_band),
+                "distill_save_rows_per_band": int(save_rows_per_band),
                 "high_threshold": float(high_threshold),
                 "mid_threshold": float(mid_threshold),
                 "order_top_k": int(order_top_k),
@@ -1193,7 +1209,7 @@ def _build_parser() -> argparse.ArgumentParser:
             "(LLM-distilled pairs with teacher-score margin analysis)."
         )
     )
-    p.add_argument("--eval-source", type=str, default="db", choices=["db", "distill"], help="Evaluation source mode.")
+    p.add_argument("--eval-source", type=str, default="distill", choices=["db", "distill"], help="Evaluation source mode.")
     p.add_argument("--faculty-id", type=int, default=0, help="Target faculty_id (required in db mode).")
     p.add_argument("--domain-threshold", type=float, default=0.3, help="match_results.domain_score threshold.")
     p.add_argument("--max-grants", type=int, default=0, help="Optional cap on grants selected (0 = all over threshold).")
@@ -1209,19 +1225,35 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--cluster-strong-min", type=float, default=0.67, help="Finetuned score threshold for strong cluster.")
     p.add_argument("--cluster-mid-min", type=float, default=0.34, help="Finetuned score threshold for mid cluster.")
     p.add_argument("--margin-top-k", type=int, default=10, help="Top-k rows by absolute |finetuned-base| margin.")
-    p.add_argument("--distill-input", type=str, default=DISTILL_INPUT_DEFAULT, help="Distilled JSONL input (raw or listwise).")
+    p.add_argument("--distill-test-input", type=str, default=DISTILL_TEST_INPUT_DEFAULT, help="Preferred test JSONL for distill evaluation.")
+    p.add_argument("--distill-input", type=str, default=DISTILL_INPUT_DEFAULT, help="Fallback distilled JSONL input (raw or listwise).")
     p.add_argument(
         "--distill-ground-truth",
         type=str,
-        default="normalized",
+        default="raw",
         choices=["normalized", "raw"],
         help="Teacher score field used for margin computation.",
     )
     p.add_argument("--distill-high-threshold", type=float, default=0.67, help="High band threshold for teacher score.")
     p.add_argument("--distill-mid-threshold", type=float, default=0.34, help="Mid band lower threshold for teacher score.")
-    p.add_argument("--distill-sample-high", type=int, default=300, help="Reservoir sample size from high band.")
-    p.add_argument("--distill-sample-mid", type=int, default=300, help="Reservoir sample size from mid band.")
-    p.add_argument("--distill-sample-low", type=int, default=300, help="Reservoir sample size from low band.")
+    p.add_argument(
+        "--distill-sample-high",
+        type=int,
+        default=0,
+        help="Reservoir sample size from high band (0 = keep all available high-band pairs).",
+    )
+    p.add_argument(
+        "--distill-sample-mid",
+        type=int,
+        default=0,
+        help="Reservoir sample size from mid band (0 = keep all available mid-band pairs).",
+    )
+    p.add_argument(
+        "--distill-sample-low",
+        type=int,
+        default=0,
+        help="Reservoir sample size from low band (0 = keep all available low-band pairs).",
+    )
     p.add_argument("--distill-seed", type=int, default=42, help="Sampling seed for distill pair sampling.")
     p.add_argument(
         "--distill-max-pairs-scan",
@@ -1233,7 +1265,25 @@ def _build_parser() -> argparse.ArgumentParser:
         "--distill-print-rows-per-band",
         type=int,
         default=30,
-        help="Rows printed per high/mid/low band in distill mode.",
+        help="Rows printed per high/mid/low band in distill mode when --distill-print-pair-tables is enabled (0 = all).",
+    )
+    p.add_argument(
+        "--distill-save-rows-per-band",
+        type=int,
+        default=0,
+        help="Rows saved per high/mid/low band in distill mode (0 = all).",
+    )
+    p.add_argument(
+        "--distill-print-pair-tables",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Print full high/mid/low pair tables to console (default: false; summary only).",
+    )
+    p.add_argument(
+        "--distill-save-pair-tables",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Include high/mid/low pair tables in saved txt output (default: true).",
     )
     p.add_argument("--distill-order-top-k", type=int, default=5, help="Top-k overlap metric cutoff for order correctness.")
     p.add_argument(
