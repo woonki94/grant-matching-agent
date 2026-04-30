@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import random
 import sys
 from collections import defaultdict
@@ -591,6 +592,209 @@ def _compute_margin_stats(rows: Sequence[Dict[str, Any]]) -> Dict[str, Dict[str,
     return out
 
 
+def _group_rows_by_query(rows: Sequence[Dict[str, Any]]) -> List[List[Dict[str, Any]]]:
+    grouped: Dict[Tuple[str, int], List[Dict[str, Any]]] = defaultdict(list)
+    for row in rows:
+        key = (
+            _clean_text(row.get("grant_id")),
+            _safe_int(row.get("spec_idx"), default=0, minimum=0, maximum=1_000_000_000),
+        )
+        grouped[key].append(row)
+    return list(grouped.values())
+
+
+def _compute_order_metrics_for_model(
+    *,
+    rows: Sequence[Dict[str, Any]],
+    model_score_key: str,
+    top_k: int,
+    pair_eps: float,
+    hard_gap_max: float,
+    medium_gap_max: float,
+    mrr_rel_threshold: float,
+    recall_rel_threshold: float,
+) -> Dict[str, Any]:
+    query_groups = _group_rows_by_query(rows)
+    top_k = max(1, int(top_k))
+    eps = max(0.0, float(pair_eps))
+    hard_gap = max(eps, float(hard_gap_max))
+    med_gap = max(hard_gap, float(medium_gap_max))
+
+    query_total = 0
+    query_with_2plus = 0
+    top1_correct = 0
+    topk_overlap_sum = 0.0
+    topk_overlap_count = 0
+    mrr_sum = 0.0
+    mrr_count = 0
+    recall_sum = 0.0
+    recall_count = 0
+    ndcg_sum = 0.0
+    ndcg_count = 0
+
+    buckets = {
+        "overall": {"pairs": 0, "correct": 0, "pred_margin_sum": 0.0},
+        "hard": {"pairs": 0, "correct": 0, "pred_margin_sum": 0.0},
+        "medium": {"pairs": 0, "correct": 0, "pred_margin_sum": 0.0},
+        "easy": {"pairs": 0, "correct": 0, "pred_margin_sum": 0.0},
+    }
+
+    for group in query_groups:
+        n = len(group)
+        query_total += 1
+        if n < 2:
+            continue
+        query_with_2plus += 1
+
+        teacher_vals = [float(r.get("teacher_score_used") or 0.0) for r in group]
+        model_vals = [float(r.get(model_score_key) or 0.0) for r in group]
+
+        teacher_sorted = sorted(range(n), key=lambda i: teacher_vals[i], reverse=True)
+        model_sorted = sorted(range(n), key=lambda i: model_vals[i], reverse=True)
+
+        teacher_top_score = teacher_vals[teacher_sorted[0]]
+        teacher_top_set = {i for i, v in enumerate(teacher_vals) if abs(v - teacher_top_score) <= eps}
+        if model_sorted[0] in teacher_top_set:
+            top1_correct += 1
+
+        k_eff = min(top_k, n)
+        teacher_topk = set(teacher_sorted[:k_eff])
+        model_topk = set(model_sorted[:k_eff])
+        topk_overlap_sum += float(len(teacher_topk.intersection(model_topk)) / float(max(1, k_eff)))
+        topk_overlap_count += 1
+
+        # MRR@k with teacher relevance threshold.
+        rr = 0.0
+        for rank, idx in enumerate(model_sorted[:k_eff], start=1):
+            if teacher_vals[idx] >= float(mrr_rel_threshold):
+                rr = 1.0 / float(rank)
+                break
+        mrr_sum += float(rr)
+        mrr_count += 1
+
+        # Recall@k with teacher relevance threshold.
+        relevant = {i for i, y in enumerate(teacher_vals) if y >= float(recall_rel_threshold)}
+        if relevant:
+            pred_topk = set(model_sorted[:k_eff])
+            recall_sum += float(len(pred_topk.intersection(relevant)) / float(len(relevant)))
+            recall_count += 1
+
+        # NDCG@k with graded teacher scores as relevance.
+        def _dcg(sorted_indices: Sequence[int]) -> float:
+            s = 0.0
+            for rank, idx in enumerate(sorted_indices[:k_eff], start=1):
+                rel = float(teacher_vals[idx])
+                denom = math.log2(float(rank + 1.0))
+                if denom <= 0.0:
+                    continue
+                s += float((2.0 ** rel - 1.0) / denom)
+            return s
+
+        dcg = _dcg(model_sorted)
+        idcg = _dcg(teacher_sorted)
+        if idcg > 0.0:
+            ndcg_sum += float(dcg / idcg)
+            ndcg_count += 1
+
+        for i in range(n):
+            yi = teacher_vals[i]
+            si = model_vals[i]
+            for j in range(i + 1, n):
+                yj = teacher_vals[j]
+                sj = model_vals[j]
+                gap = abs(yi - yj)
+                if gap <= eps:
+                    continue
+                if yi > yj:
+                    pred_margin = float(si - sj)
+                else:
+                    pred_margin = float(sj - si)
+                is_correct = pred_margin > 0.0
+
+                bucket_names = ["overall"]
+                if gap <= hard_gap:
+                    bucket_names.append("hard")
+                elif gap <= med_gap:
+                    bucket_names.append("medium")
+                else:
+                    bucket_names.append("easy")
+
+                for b in bucket_names:
+                    buckets[b]["pairs"] += 1
+                    buckets[b]["correct"] += 1 if is_correct else 0
+                    buckets[b]["pred_margin_sum"] += float(pred_margin)
+
+    def _to_metrics(obj: Dict[str, Any]) -> Dict[str, float]:
+        p = int(obj.get("pairs") or 0)
+        c = int(obj.get("correct") or 0)
+        s = float(obj.get("pred_margin_sum") or 0.0)
+        return {
+            "pair_count": float(p),
+            "pair_accuracy": float(c / float(max(1, p))),
+            "mean_pred_margin": float(s / float(max(1, p))),
+        }
+
+    return {
+        "query_count_total": int(query_total),
+        "query_count_2plus_docs": int(query_with_2plus),
+        "top1_accuracy": float(top1_correct / float(max(1, query_with_2plus))),
+        "topk_overlap": float(topk_overlap_sum / float(max(1, topk_overlap_count))),
+        "mrr_at_k": float(mrr_sum / float(max(1, mrr_count))),
+        "ndcg_at_k": float(ndcg_sum / float(max(1, ndcg_count))),
+        "recall_at_k": float(recall_sum / float(max(1, recall_count))),
+        "pair_metrics": {k: _to_metrics(v) for k, v in buckets.items()},
+        "config": {
+            "top_k": int(top_k),
+            "pair_eps": float(eps),
+            "hard_gap_max": float(hard_gap),
+            "medium_gap_max": float(med_gap),
+            "mrr_rel_threshold": float(mrr_rel_threshold),
+            "recall_rel_threshold": float(recall_rel_threshold),
+        },
+    }
+
+
+def _compute_raw_score_sanity(
+    *,
+    rows: Sequence[Dict[str, Any]],
+    model_score_key: str,
+    high_threshold: float,
+    mid_threshold: float,
+) -> Dict[str, Any]:
+    by_band: Dict[str, List[float]] = {"high": [], "mid": [], "low": []}
+    for row in rows:
+        band = _clean_text(row.get("score_band")).lower()
+        if band in by_band:
+            by_band[band].append(float(row.get(model_score_key) or 0.0))
+
+    def _avg(vals: Sequence[float]) -> float:
+        if not vals:
+            return 0.0
+        return float(sum(vals) / float(len(vals)))
+
+    avg_high = _avg(by_band["high"])
+    avg_mid = _avg(by_band["mid"])
+    avg_low = _avg(by_band["low"])
+    monotonic = bool(avg_high >= avg_mid >= avg_low)
+
+    low_vals = by_band["low"]
+    high_vals = by_band["high"]
+    weak_leak = float(sum(1 for x in low_vals if x >= float(high_threshold)) / float(max(1, len(low_vals))))
+    strong_collapse = float(sum(1 for x in high_vals if x < float(mid_threshold)) / float(max(1, len(high_vals))))
+
+    return {
+        "avg_pred_high": float(avg_high),
+        "avg_pred_mid": float(avg_mid),
+        "avg_pred_low": float(avg_low),
+        "monotonic_high_mid_low": bool(monotonic),
+        "weak_leak_rate": float(weak_leak),
+        "strong_collapse_rate": float(strong_collapse),
+        "count_high": int(len(by_band["high"])),
+        "count_mid": int(len(by_band["mid"])),
+        "count_low": int(len(by_band["low"])),
+    }
+
+
 def _format_margin_summary_table(stats: Dict[str, Dict[str, float]]) -> str:
     order = ["overall", "high", "mid", "low"]
     lines: List[str] = []
@@ -613,12 +817,82 @@ def _format_margin_summary_table(stats: Dict[str, Dict[str, float]]) -> str:
     return "\n".join(lines)
 
 
+def _format_order_summary_table(
+    *,
+    finetuned: Dict[str, Any],
+    base: Dict[str, Any],
+) -> str:
+    lines: List[str] = []
+    lines.append("")
+    lines.append("=== Order Correctness Summary ===")
+    lines.append(
+        f"queries_total={int(finetuned.get('query_count_total') or 0)} "
+        f"queries_with_2plus_docs={int(finetuned.get('query_count_2plus_docs') or 0)} "
+        f"top_k={int((finetuned.get('config') or {}).get('top_k') or 0)}"
+    )
+    lines.append(
+        f"{'MODEL':<12} {'TOP1_ACC':>9} {'OVLP@K':>8} {'MRR@K':>8} {'NDCG@K':>8} {'RECALL@K':>9} {'PAIR_ACC':>9} {'HARD_ACC':>9} {'MEAN_M':>9} {'HARD_M':>9}"
+    )
+    lines.append("-" * 112)
+
+    def _row(label: str, obj: Dict[str, Any]) -> str:
+        pm = obj.get("pair_metrics") or {}
+        overall = pm.get("overall") or {}
+        hard = pm.get("hard") or {}
+        return (
+            f"{label:<12} "
+            f"{float(obj.get('top1_accuracy') or 0.0):>9.4f} "
+            f"{float(obj.get('topk_overlap') or 0.0):>8.4f} "
+            f"{float(obj.get('mrr_at_k') or 0.0):>8.4f} "
+            f"{float(obj.get('ndcg_at_k') or 0.0):>8.4f} "
+            f"{float(obj.get('recall_at_k') or 0.0):>9.4f} "
+            f"{float(overall.get('pair_accuracy') or 0.0):>9.4f} "
+            f"{float(hard.get('pair_accuracy') or 0.0):>9.4f} "
+            f"{float(overall.get('mean_pred_margin') or 0.0):>9.4f} "
+            f"{float(hard.get('mean_pred_margin') or 0.0):>9.4f}"
+        )
+
+    lines.append(_row("finetuned", finetuned))
+    lines.append(_row("base", base))
+    return "\n".join(lines)
+
+
+def _format_raw_sanity_table(
+    *,
+    finetuned: Dict[str, Any],
+    base: Dict[str, Any],
+) -> str:
+    lines: List[str] = []
+    lines.append("")
+    lines.append("=== Raw Score Sanity Summary ===")
+    lines.append(
+        f"{'MODEL':<12} {'AVG_HIGH':>10} {'AVG_MID':>10} {'AVG_LOW':>10} {'MONOTONIC':>10} {'WEAK_LEAK':>11} {'STRONG_COLL':>12}"
+    )
+    lines.append("-" * 86)
+
+    def _row(label: str, obj: Dict[str, Any]) -> str:
+        return (
+            f"{label:<12} "
+            f"{float(obj.get('avg_pred_high') or 0.0):>10.4f} "
+            f"{float(obj.get('avg_pred_mid') or 0.0):>10.4f} "
+            f"{float(obj.get('avg_pred_low') or 0.0):>10.4f} "
+            f"{str(bool(obj.get('monotonic_high_mid_low'))):>10} "
+            f"{float(obj.get('weak_leak_rate') or 0.0):>11.4f} "
+            f"{float(obj.get('strong_collapse_rate') or 0.0):>12.4f}"
+        )
+
+    lines.append(_row("finetuned", finetuned))
+    lines.append(_row("base", base))
+    return "\n".join(lines)
+
+
 def _format_distill_pairs_table(
     *,
     rows: Sequence[Dict[str, Any]],
     title: str,
     max_rows: int,
     text_width: int,
+    truncate_text: bool,
 ) -> str:
     lines: List[str] = []
     lines.append("")
@@ -631,6 +905,7 @@ def _format_distill_pairs_table(
     for row in limited:
         pair_key = f"{_clean_text(row.get('grant_id'))}::spec#{_safe_int(row.get('spec_idx'), default=0, minimum=0, maximum=1_000_000_000)}"
         merged_text = f"Q: {_clean_text(row.get('query_text'))} || D: {_clean_text(row.get('doc_text'))}"
+        rendered_text = _shorten(merged_text, text_width) if truncate_text else merged_text
         lines.append(
             f"{pair_key:<28} "
             f"{float(row.get('teacher_score_used') or 0.0):>7.4f} "
@@ -638,7 +913,7 @@ def _format_distill_pairs_table(
             f"{float(row.get('base_score') or 0.0):>10.4f} "
             f"{float(row.get('finetuned_abs_margin') or 0.0):>8.4f} "
             f"{float(row.get('base_abs_margin') or 0.0):>9.4f} "
-            f"{_shorten(merged_text, text_width):<{text_width}}"
+            f"{rendered_text:<{text_width}}"
         )
     return "\n".join(lines)
 
@@ -656,6 +931,12 @@ def _run_distill_eval(args: argparse.Namespace) -> int:
     max_pairs_scan = _safe_int(args.distill_max_pairs_scan, default=0, minimum=0, maximum=50_000_000)
     seed = _safe_int(args.distill_seed, default=42, minimum=0, maximum=2_147_483_647)
     print_per_band = _safe_int(args.distill_print_rows_per_band, default=30, minimum=1, maximum=100_000)
+    order_top_k = _safe_int(args.distill_order_top_k, default=5, minimum=1, maximum=100)
+    pair_eps = _safe_float(args.distill_pair_eps, default=0.01, minimum=0.0, maximum=1.0)
+    hard_gap_max = _safe_float(args.distill_hard_gap_max, default=0.15, minimum=0.0, maximum=1.0)
+    medium_gap_max = _safe_float(args.distill_medium_gap_max, default=0.40, minimum=0.0, maximum=1.0)
+    if medium_gap_max < hard_gap_max:
+        medium_gap_max = hard_gap_max
     ground_truth_mode = _clean_text(args.distill_ground_truth).lower() or "normalized"
     if ground_truth_mode not in {"normalized", "raw"}:
         ground_truth_mode = "normalized"
@@ -727,6 +1008,39 @@ def _run_distill_eval(args: argparse.Namespace) -> int:
         rows.append(row)
 
     stats = _compute_margin_stats(rows)
+    order_metrics_finetuned = _compute_order_metrics_for_model(
+        rows=rows,
+        model_score_key="finetuned_score",
+        top_k=order_top_k,
+        pair_eps=pair_eps,
+        hard_gap_max=hard_gap_max,
+        medium_gap_max=medium_gap_max,
+        mrr_rel_threshold=high_threshold,
+        recall_rel_threshold=mid_threshold,
+    )
+    order_metrics_base = _compute_order_metrics_for_model(
+        rows=rows,
+        model_score_key="base_score",
+        top_k=order_top_k,
+        pair_eps=pair_eps,
+        hard_gap_max=hard_gap_max,
+        medium_gap_max=medium_gap_max,
+        mrr_rel_threshold=high_threshold,
+        recall_rel_threshold=mid_threshold,
+    )
+    raw_sanity_finetuned = _compute_raw_score_sanity(
+        rows=rows,
+        model_score_key="finetuned_score",
+        high_threshold=high_threshold,
+        mid_threshold=mid_threshold,
+    )
+    raw_sanity_base = _compute_raw_score_sanity(
+        rows=rows,
+        model_score_key="base_score",
+        high_threshold=high_threshold,
+        mid_threshold=mid_threshold,
+    )
+
     by_band: Dict[str, List[Dict[str, Any]]] = {"high": [], "mid": [], "low": []}
     for row in rows:
         band = _clean_text(row.get("score_band")).lower()
@@ -751,40 +1065,85 @@ def _run_distill_eval(args: argparse.Namespace) -> int:
         f"available_high={int(sample_meta.get('available_by_band', {}).get('high', 0))} "
         f"available_mid={int(sample_meta.get('available_by_band', {}).get('mid', 0))} "
         f"available_low={int(sample_meta.get('available_by_band', {}).get('low', 0))}\n"
+        f"order_top_k={order_top_k} pair_eps={pair_eps} hard_gap_max={hard_gap_max} medium_gap_max={medium_gap_max}\n"
         f"finetuned_model={finetuned_ref}\n"
         f"base_model={base_ref}\n"
         f"device={device}\n"
     )
 
-    blocks: List[str] = [meta_header, _format_margin_summary_table(stats)]
-    blocks.append(
+    blocks_print: List[str] = [
+        meta_header,
+        _format_order_summary_table(finetuned=order_metrics_finetuned, base=order_metrics_base),
+        _format_margin_summary_table(stats),
+        _format_raw_sanity_table(finetuned=raw_sanity_finetuned, base=raw_sanity_base),
+    ]
+    blocks_save: List[str] = [
+        meta_header,
+        _format_order_summary_table(finetuned=order_metrics_finetuned, base=order_metrics_base),
+        _format_margin_summary_table(stats),
+        _format_raw_sanity_table(finetuned=raw_sanity_finetuned, base=raw_sanity_base),
+    ]
+
+    blocks_print.append(
         _format_distill_pairs_table(
             rows=by_band["high"],
             title="High Score Pairs",
             max_rows=print_per_band,
             text_width=140,
+            truncate_text=True,
         )
     )
-    blocks.append(
+    blocks_print.append(
         _format_distill_pairs_table(
             rows=by_band["mid"],
             title="Mid Score Pairs",
             max_rows=print_per_band,
             text_width=140,
+            truncate_text=True,
         )
     )
-    blocks.append(
+    blocks_print.append(
         _format_distill_pairs_table(
             rows=by_band["low"],
             title="Low Score Pairs",
             max_rows=print_per_band,
             text_width=140,
+            truncate_text=True,
         )
     )
-    report_text = "\n".join(blocks).strip() + "\n"
+
+    blocks_save.append(
+        _format_distill_pairs_table(
+            rows=by_band["high"],
+            title="High Score Pairs",
+            max_rows=print_per_band,
+            text_width=140,
+            truncate_text=False,
+        )
+    )
+    blocks_save.append(
+        _format_distill_pairs_table(
+            rows=by_band["mid"],
+            title="Mid Score Pairs",
+            max_rows=print_per_band,
+            text_width=140,
+            truncate_text=False,
+        )
+    )
+    blocks_save.append(
+        _format_distill_pairs_table(
+            rows=by_band["low"],
+            title="Low Score Pairs",
+            max_rows=print_per_band,
+            text_width=140,
+            truncate_text=False,
+        )
+    )
+    report_text_print = "\n".join(blocks_print).strip() + "\n"
+    report_text_save = "\n".join(blocks_save).strip() + "\n"
 
     if bool(args.print):
-        print(report_text)
+        print(report_text_print)
     if bool(args.save):
         payload = {
             "meta": {
@@ -798,6 +1157,10 @@ def _run_distill_eval(args: argparse.Namespace) -> int:
                 "sample_low": int(sample_low),
                 "high_threshold": float(high_threshold),
                 "mid_threshold": float(mid_threshold),
+                "order_top_k": int(order_top_k),
+                "pair_eps": float(pair_eps),
+                "hard_gap_max": float(hard_gap_max),
+                "medium_gap_max": float(medium_gap_max),
                 "finetuned_model": finetuned_ref,
                 "base_model": base_ref,
                 "device": str(device),
@@ -805,11 +1168,19 @@ def _run_distill_eval(args: argparse.Namespace) -> int:
                 "max_length": int(max_length),
                 "output_txt": str(output_txt),
             },
+            "order_metrics": {
+                "finetuned": order_metrics_finetuned,
+                "base": order_metrics_base,
+            },
             "margin_stats": stats,
+            "raw_score_sanity": {
+                "finetuned": raw_sanity_finetuned,
+                "base": raw_sanity_base,
+            },
             "rows": rows,
         }
         output_json.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-        output_txt.write_text(report_text, encoding="utf-8")
+        output_txt.write_text(report_text_save, encoding="utf-8")
         print(f"saved_json={output_json}")
         print(f"saved_txt={output_txt}")
     return 0
@@ -848,9 +1219,9 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("--distill-high-threshold", type=float, default=0.67, help="High band threshold for teacher score.")
     p.add_argument("--distill-mid-threshold", type=float, default=0.34, help="Mid band lower threshold for teacher score.")
-    p.add_argument("--distill-sample-high", type=int, default=150, help="Reservoir sample size from high band.")
-    p.add_argument("--distill-sample-mid", type=int, default=150, help="Reservoir sample size from mid band.")
-    p.add_argument("--distill-sample-low", type=int, default=150, help="Reservoir sample size from low band.")
+    p.add_argument("--distill-sample-high", type=int, default=300, help="Reservoir sample size from high band.")
+    p.add_argument("--distill-sample-mid", type=int, default=300, help="Reservoir sample size from mid band.")
+    p.add_argument("--distill-sample-low", type=int, default=300, help="Reservoir sample size from low band.")
     p.add_argument("--distill-seed", type=int, default=42, help="Sampling seed for distill pair sampling.")
     p.add_argument(
         "--distill-max-pairs-scan",
@@ -863,6 +1234,25 @@ def _build_parser() -> argparse.ArgumentParser:
         type=int,
         default=30,
         help="Rows printed per high/mid/low band in distill mode.",
+    )
+    p.add_argument("--distill-order-top-k", type=int, default=5, help="Top-k overlap metric cutoff for order correctness.")
+    p.add_argument(
+        "--distill-pair-eps",
+        type=float,
+        default=0.01,
+        help="Minimum teacher score gap to count a pair in pairwise order correctness.",
+    )
+    p.add_argument(
+        "--distill-hard-gap-max",
+        type=float,
+        default=0.15,
+        help="Teacher-gap upper bound for hard/boundary pair bucket.",
+    )
+    p.add_argument(
+        "--distill-medium-gap-max",
+        type=float,
+        default=0.40,
+        help="Teacher-gap upper bound for medium pair bucket (above this = easy bucket).",
     )
 
     p.add_argument("--save", action=argparse.BooleanOptionalAction, default=True, help="Save results to files.")
