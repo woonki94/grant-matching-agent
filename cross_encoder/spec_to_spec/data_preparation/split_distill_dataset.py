@@ -6,7 +6,7 @@ import json
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple
 
 
 def _find_project_root() -> Path:
@@ -30,6 +30,12 @@ PAIR_TRAIN_BASENAME = "llm_distill_pairwise_train.jsonl"
 PAIR_VAL_BASENAME = "llm_distill_pairwise_val.jsonl"
 PAIR_TEST_BASENAME = "llm_distill_pairwise_test.jsonl"
 MANIFEST_BASENAME = "llm_distill_split_manifest.json"
+
+HIGH_THRESHOLD_DEFAULT = 0.67
+MID_THRESHOLD_DEFAULT = 0.34
+
+SPLITS: Tuple[str, str, str] = ("train", "val", "test")
+BANDS: Tuple[str, str, str] = ("high", "mid", "low")
 
 
 @dataclass
@@ -55,34 +61,121 @@ def _resolve_path(value: Any) -> Path:
     return p.resolve()
 
 
+def _safe_int(value: Any, *, default: int = 0) -> int:
+    try:
+        return int(value)
+    except Exception:
+        return int(default)
+
+
+def _safe_float(value: Any, *, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except Exception:
+        return float(default)
+
+
+def _clamp_01(value: float) -> float:
+    x = float(value)
+    if x < 0.0:
+        return 0.0
+    if x > 1.0:
+        return 1.0
+    return x
+
+
 def _hash_to_unit_interval(text: str) -> float:
     h = hashlib.sha1(text.encode("utf-8")).hexdigest()[:8]
     return int(h, 16) / float(0xFFFFFFFF)
 
 
-def _split_grants(
-    grant_ids: Sequence[str],
-    *,
-    val_ratio: float,
-    test_ratio: float,
-    seed: int,
-) -> Tuple[Set[str], Set[str], Set[str]]:
-    uniq = sorted({_clean_text(x) for x in grant_ids if _clean_text(x)})
-    if not uniq:
-        return set(), set(), set()
+def _build_split_paths(split_dir: Path) -> SplitPaths:
+    d = split_dir.resolve()
+    return SplitPaths(
+        split_dir=d,
+        raw_train=d / RAW_TRAIN_BASENAME,
+        raw_val=d / RAW_VAL_BASENAME,
+        raw_test=d / RAW_TEST_BASENAME,
+        pair_train=d / PAIR_TRAIN_BASENAME,
+        pair_val=d / PAIR_VAL_BASENAME,
+        pair_test=d / PAIR_TEST_BASENAME,
+        manifest=d / MANIFEST_BASENAME,
+    )
 
+
+def _parse_json_line(line: str) -> Optional[Dict[str, Any]]:
+    text = _clean_text(line)
+    if not text:
+        return None
+    try:
+        obj = json.loads(text)
+    except Exception:
+        return None
+    if not isinstance(obj, dict):
+        return None
+    return obj
+
+
+def _extract_query_key(obj: Dict[str, Any]) -> str:
+    grant_id = _clean_text(obj.get("grant_id"))
+    if not grant_id:
+        return ""
+    spec_idx = _safe_int(obj.get("spec_idx"), default=0)
+    if spec_idx < 0:
+        spec_idx = 0
+    return f"{grant_id}::spec#{spec_idx}"
+
+
+def _score_from_raw_obj(obj: Dict[str, Any]) -> Optional[float]:
+    best: Optional[float] = None
+    candidates = obj.get("candidates")
+    if isinstance(candidates, list):
+        for cand in candidates:
+            if not isinstance(cand, dict):
+                continue
+            for key in ("score_raw", "score", "teacher_score_raw", "teacher_score"):
+                if key in cand:
+                    val = _clamp_01(_safe_float(cand.get(key), default=-1.0))
+                    if best is None or val > best:
+                        best = val
+                    break
+    if best is not None:
+        return float(best)
+
+    for key in ("teacher_score_used", "teacher_score_raw", "teacher_score", "score_raw", "score"):
+        if key in obj:
+            return float(_clamp_01(_safe_float(obj.get(key), default=0.0)))
+    return None
+
+
+def _score_from_pair_obj(obj: Dict[str, Any]) -> Optional[float]:
+    for key in ("teacher_pos_score_raw", "teacher_pos_score", "teacher_score_used", "teacher_score_raw", "teacher_score", "score"):
+        if key in obj:
+            return float(_clamp_01(_safe_float(obj.get(key), default=0.0)))
+    return None
+
+
+def _band_from_score(score: float, *, high_threshold: float, mid_threshold: float) -> str:
+    s = _clamp_01(score)
+    if s >= high_threshold:
+        return "high"
+    if s >= mid_threshold:
+        return "mid"
+    return "low"
+
+
+def _empty_band_counts() -> Dict[str, int]:
+    return {"high": 0, "mid": 0, "low": 0, "total": 0}
+
+
+def _split_sizes(n: int, *, val_ratio: float, test_ratio: float) -> Tuple[int, int, int]:
+    if n <= 0:
+        return 0, 0, 0
     vr = max(0.0, min(0.49, float(val_ratio)))
     tr = max(0.0, min(0.49, float(test_ratio)))
     if vr + tr >= 0.99:
         tr = max(0.0, 0.99 - vr)
 
-    tagged: List[Tuple[float, str]] = []
-    for gid in uniq:
-        roll = _hash_to_unit_interval(f"{int(seed)}::{gid}")
-        tagged.append((roll, gid))
-    tagged.sort(key=lambda x: (x[0], x[1]))
-
-    n = len(tagged)
     n_test = int(round(float(n) * tr))
     n_val = int(round(float(n) * vr))
 
@@ -101,67 +194,116 @@ def _split_grants(
             if overflow > 0:
                 n_val = max(0, n_val - overflow)
 
-    test_ids = [gid for _, gid in tagged[:n_test]]
-    val_ids = [gid for _, gid in tagged[n_test : n_test + n_val]]
-    train_ids = [gid for _, gid in tagged[n_test + n_val :]]
-
-    if not train_ids:
-        if val_ids:
-            train_ids.append(val_ids.pop())
-        elif test_ids:
-            train_ids.append(test_ids.pop())
-
-    train_set = set(train_ids)
-    val_set = set(val_ids)
-    test_set = set(test_ids)
-
-    val_set.difference_update(train_set)
-    test_set.difference_update(train_set)
-    test_set.difference_update(val_set)
-    return train_set, val_set, test_set
+    n_train = n - n_val - n_test
+    if n_train <= 0:
+        if n_val > 0:
+            n_val -= 1
+            n_train += 1
+        elif n_test > 0:
+            n_test -= 1
+            n_train += 1
+    return int(n_train), int(n_val), int(n_test)
 
 
-def _build_split_paths(split_dir: Path) -> SplitPaths:
-    d = split_dir.resolve()
-    return SplitPaths(
-        split_dir=d,
-        raw_train=d / RAW_TRAIN_BASENAME,
-        raw_val=d / RAW_VAL_BASENAME,
-        raw_test=d / RAW_TEST_BASENAME,
-        pair_train=d / PAIR_TRAIN_BASENAME,
-        pair_val=d / PAIR_VAL_BASENAME,
-        pair_test=d / PAIR_TEST_BASENAME,
-        manifest=d / MANIFEST_BASENAME,
-    )
+def _collect_query_score_bands(
+    raw_input: Path,
+    *,
+    high_threshold: float,
+    mid_threshold: float,
+) -> Tuple[Dict[str, str], Dict[str, Any]]:
+    query_best_score: Dict[str, float] = {}
+    stats: Dict[str, Any] = {
+        "raw_rows_total": 0,
+        "raw_parse_fail": 0,
+        "raw_missing_query_key": 0,
+        "raw_missing_score": 0,
+        "raw_duplicate_query_key": 0,
+    }
 
-
-def _extract_grant_id(line: str) -> str:
-    s = _clean_text(line)
-    if not s:
-        return ""
-    try:
-        obj = json.loads(s)
-    except Exception:
-        return ""
-    if not isinstance(obj, dict):
-        return ""
-    return _clean_text(obj.get("grant_id"))
-
-
-def _collect_unique_grants(raw_input: Path) -> List[str]:
-    out: List[str] = []
-    seen: Set[str] = set()
     with raw_input.open("r", encoding="utf-8") as f:
         for line in f:
-            gid = _extract_grant_id(line)
-            if not gid or gid in seen:
+            stats["raw_rows_total"] += 1
+            obj = _parse_json_line(line)
+            if obj is None:
+                stats["raw_parse_fail"] += 1
                 continue
-            seen.add(gid)
-            out.append(gid)
-    return sorted(out)
+
+            query_key = _extract_query_key(obj)
+            if not query_key:
+                stats["raw_missing_query_key"] += 1
+                continue
+
+            score = _score_from_raw_obj(obj)
+            if score is None:
+                stats["raw_missing_score"] += 1
+                continue
+
+            prev = query_best_score.get(query_key)
+            if prev is not None:
+                stats["raw_duplicate_query_key"] += 1
+                if score <= prev:
+                    continue
+            query_best_score[query_key] = float(score)
+
+    query_band_map: Dict[str, str] = {}
+    overall_counts = _empty_band_counts()
+    for key, score in query_best_score.items():
+        band = _band_from_score(score, high_threshold=high_threshold, mid_threshold=mid_threshold)
+        query_band_map[key] = band
+        overall_counts[band] += 1
+        overall_counts["total"] += 1
+
+    stats["query_count"] = int(len(query_band_map))
+    stats["query_band_counts"] = overall_counts
+    return query_band_map, stats
 
 
-def _write_split_jsonl(
+def _split_query_keys_stratified(
+    query_band_map: Dict[str, str],
+    *,
+    val_ratio: float,
+    test_ratio: float,
+    seed: int,
+) -> Tuple[Dict[str, str], Dict[str, Dict[str, int]]]:
+    keys_by_band: Dict[str, List[str]] = {b: [] for b in BANDS}
+    for key, band in query_band_map.items():
+        if band not in keys_by_band:
+            band = "low"
+        keys_by_band[band].append(key)
+
+    split_lookup: Dict[str, str] = {}
+    split_band_counts: Dict[str, Dict[str, int]] = {s: _empty_band_counts() for s in SPLITS}
+
+    for band in BANDS:
+        keys = list(keys_by_band[band])
+        keys.sort(key=lambda x: (_hash_to_unit_interval(f"{int(seed)}::{band}::{x}"), x))
+
+        _, n_val, n_test = _split_sizes(len(keys), val_ratio=val_ratio, test_ratio=test_ratio)
+        test_keys = keys[:n_test]
+        val_keys = keys[n_test : n_test + n_val]
+        train_keys = keys[n_test + n_val :]
+
+        for k in train_keys:
+            split_lookup[k] = "train"
+        for k in val_keys:
+            split_lookup[k] = "val"
+        for k in test_keys:
+            split_lookup[k] = "test"
+
+        split_band_counts["train"][band] += int(len(train_keys))
+        split_band_counts["val"][band] += int(len(val_keys))
+        split_band_counts["test"][band] += int(len(test_keys))
+
+    for split in SPLITS:
+        split_band_counts[split]["total"] = (
+            int(split_band_counts[split]["high"])
+            + int(split_band_counts[split]["mid"])
+            + int(split_band_counts[split]["low"])
+        )
+    return split_lookup, split_band_counts
+
+
+def _write_split_jsonl_by_query_key(
     *,
     input_path: Path,
     split_lookup: Dict[str, str],
@@ -172,7 +314,15 @@ def _write_split_jsonl(
     for p in output_map.values():
         p.parent.mkdir(parents=True, exist_ok=True)
 
-    counts = {"total": 0, "written_train": 0, "written_val": 0, "written_test": 0, "missing_grant": 0, "parse_fail": 0}
+    counts = {
+        "total": 0,
+        "written_train": 0,
+        "written_val": 0,
+        "written_test": 0,
+        "missing_query_key": 0,
+        "parse_fail": 0,
+        "missing_split_assignment": 0,
+    }
 
     handles: Dict[str, Any] = {
         "train": tmp_map["train"].open("w", encoding="utf-8"),
@@ -183,13 +333,17 @@ def _write_split_jsonl(
         with input_path.open("r", encoding="utf-8") as src:
             for raw_line in src:
                 counts["total"] += 1
-                gid = _extract_grant_id(raw_line)
-                if not gid:
+                obj = _parse_json_line(raw_line)
+                if obj is None:
                     counts["parse_fail"] += 1
                     continue
-                split = split_lookup.get(gid)
+                query_key = _extract_query_key(obj)
+                if not query_key:
+                    counts["missing_query_key"] += 1
+                    continue
+                split = split_lookup.get(query_key)
                 if split not in {"train", "val", "test"}:
-                    counts["missing_grant"] += 1
+                    counts["missing_split_assignment"] += 1
                     continue
                 handles[split].write(raw_line.rstrip("\n") + "\n")
                 counts[f"written_{split}"] += 1
@@ -197,9 +351,95 @@ def _write_split_jsonl(
         for h in handles.values():
             h.close()
 
-    for key in ("train", "val", "test"):
+    for key in SPLITS:
         tmp_map[key].replace(output_map[key])
     return counts
+
+
+def _count_score_bands_in_file(
+    path: Path,
+    *,
+    score_getter: Callable[[Dict[str, Any]], Optional[float]],
+    high_threshold: float,
+    mid_threshold: float,
+) -> Dict[str, int]:
+    out = _empty_band_counts()
+    out["parse_fail"] = 0
+    out["missing_score"] = 0
+    if not path.exists():
+        return out
+
+    with path.open("r", encoding="utf-8") as f:
+        for line in f:
+            obj = _parse_json_line(line)
+            if obj is None:
+                out["parse_fail"] += 1
+                continue
+            score = score_getter(obj)
+            if score is None:
+                out["missing_score"] += 1
+                continue
+            band = _band_from_score(score, high_threshold=high_threshold, mid_threshold=mid_threshold)
+            out[band] += 1
+            out["total"] += 1
+    return out
+
+
+def _collect_file_band_counts(
+    paths: SplitPaths,
+    *,
+    need_pairwise: bool,
+    high_threshold: float,
+    mid_threshold: float,
+) -> Dict[str, Dict[str, Dict[str, int]]]:
+    raw_counts = {
+        "train": _count_score_bands_in_file(
+            paths.raw_train,
+            score_getter=_score_from_raw_obj,
+            high_threshold=high_threshold,
+            mid_threshold=mid_threshold,
+        ),
+        "val": _count_score_bands_in_file(
+            paths.raw_val,
+            score_getter=_score_from_raw_obj,
+            high_threshold=high_threshold,
+            mid_threshold=mid_threshold,
+        ),
+        "test": _count_score_bands_in_file(
+            paths.raw_test,
+            score_getter=_score_from_raw_obj,
+            high_threshold=high_threshold,
+            mid_threshold=mid_threshold,
+        ),
+    }
+
+    pair_counts: Dict[str, Dict[str, int]] = {}
+    if need_pairwise:
+        pair_counts = {
+            "train": _count_score_bands_in_file(
+                paths.pair_train,
+                score_getter=_score_from_pair_obj,
+                high_threshold=high_threshold,
+                mid_threshold=mid_threshold,
+            ),
+            "val": _count_score_bands_in_file(
+                paths.pair_val,
+                score_getter=_score_from_pair_obj,
+                high_threshold=high_threshold,
+                mid_threshold=mid_threshold,
+            ),
+            "test": _count_score_bands_in_file(
+                paths.pair_test,
+                score_getter=_score_from_pair_obj,
+                high_threshold=high_threshold,
+                mid_threshold=mid_threshold,
+            ),
+        }
+
+    return {
+        "raw_file_band_counts": raw_counts,
+        "pair_file_band_counts": pair_counts,
+    }
 
 
 def _required_exist(paths: SplitPaths, need_pairwise: bool) -> bool:
@@ -218,6 +458,8 @@ def ensure_split_files(
     test_ratio: float,
     seed: int,
     overwrite: bool = False,
+    high_threshold: float = HIGH_THRESHOLD_DEFAULT,
+    mid_threshold: float = MID_THRESHOLD_DEFAULT,
 ) -> Dict[str, Any]:
     raw_input = raw_input.resolve()
     pairwise_input = pairwise_input.resolve() if pairwise_input is not None else None
@@ -227,30 +469,48 @@ def ensure_split_files(
         raise RuntimeError(f"raw_input not found: {raw_input}")
 
     need_pairwise = bool(pairwise_input is not None and pairwise_input.exists())
+    high_threshold = _clamp_01(_safe_float(high_threshold, default=HIGH_THRESHOLD_DEFAULT))
+    mid_threshold = _clamp_01(_safe_float(mid_threshold, default=MID_THRESHOLD_DEFAULT))
+    if mid_threshold > high_threshold:
+        mid_threshold = high_threshold
+
     if (not overwrite) and _required_exist(paths, need_pairwise):
+        existing_manifest: Dict[str, Any] = {}
+        if paths.manifest.exists():
+            try:
+                existing_manifest = json.loads(paths.manifest.read_text(encoding="utf-8"))
+            except Exception:
+                existing_manifest = {}
+        band_stats = _collect_file_band_counts(
+            paths,
+            need_pairwise=need_pairwise,
+            high_threshold=high_threshold,
+            mid_threshold=mid_threshold,
+        )
         return {
             "generated": False,
             "paths": paths,
             "need_pairwise": bool(need_pairwise),
+            "manifest": existing_manifest,
+            **band_stats,
         }
 
-    uniq_grants = _collect_unique_grants(raw_input)
-    train_set, val_set, test_set = _split_grants(
-        uniq_grants,
+    query_band_map, query_stats = _collect_query_score_bands(
+        raw_input,
+        high_threshold=high_threshold,
+        mid_threshold=mid_threshold,
+    )
+    if not query_band_map:
+        raise RuntimeError("No valid query keys were extracted from raw_input.")
+
+    split_lookup, split_query_band_counts = _split_query_keys_stratified(
+        query_band_map,
         val_ratio=val_ratio,
         test_ratio=test_ratio,
         seed=seed,
     )
 
-    split_lookup: Dict[str, str] = {}
-    for gid in train_set:
-        split_lookup[gid] = "train"
-    for gid in val_set:
-        split_lookup[gid] = "val"
-    for gid in test_set:
-        split_lookup[gid] = "test"
-
-    raw_counts = _write_split_jsonl(
+    raw_counts = _write_split_jsonl_by_query_key(
         input_path=raw_input,
         split_lookup=split_lookup,
         output_map={
@@ -260,9 +520,9 @@ def ensure_split_files(
         },
     )
 
-    pair_counts: Dict[str, int] = {}
+    pairwise_counts: Dict[str, int] = {}
     if need_pairwise and pairwise_input is not None:
-        pair_counts = _write_split_jsonl(
+        pairwise_counts = _write_split_jsonl_by_query_key(
             input_path=pairwise_input,
             split_lookup=split_lookup,
             output_map={
@@ -272,23 +532,32 @@ def ensure_split_files(
             },
         )
 
+    file_band_counts = _collect_file_band_counts(
+        paths,
+        need_pairwise=need_pairwise,
+        high_threshold=high_threshold,
+        mid_threshold=mid_threshold,
+    )
+
     manifest = {
         "created_at_utc": datetime.now(timezone.utc).isoformat(),
         "raw_input": str(raw_input),
         "pairwise_input": str(pairwise_input) if pairwise_input is not None else "",
         "split_dir": str(paths.split_dir),
-        "split_policy": "deterministic_hash_by_grant_id",
+        "split_policy": "stratified_by_query_score_band",
+        "split_unit": "grant_id + spec_idx",
         "seed": int(seed),
         "val_ratio": float(val_ratio),
         "test_ratio": float(test_ratio),
-        "grant_counts": {
-            "total": int(len(uniq_grants)),
-            "train": int(len(train_set)),
-            "val": int(len(val_set)),
-            "test": int(len(test_set)),
+        "score_band_thresholds": {
+            "high_min": float(high_threshold),
+            "mid_min": float(mid_threshold),
         },
+        "query_stats": query_stats,
+        "query_band_counts_by_split": split_query_band_counts,
         "raw_counts": raw_counts,
-        "pairwise_counts": pair_counts,
+        "pairwise_counts": pairwise_counts,
+        **file_band_counts,
         "outputs": {
             "raw_train": str(paths.raw_train),
             "raw_val": str(paths.raw_val),
@@ -306,6 +575,7 @@ def ensure_split_files(
         "paths": paths,
         "need_pairwise": bool(need_pairwise),
         "manifest": manifest,
+        **file_band_counts,
     }
 
 
@@ -317,8 +587,20 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--val-ratio", type=float, default=0.1)
     p.add_argument("--test-ratio", type=float, default=0.1)
     p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--high-threshold", type=float, default=HIGH_THRESHOLD_DEFAULT)
+    p.add_argument("--mid-threshold", type=float, default=MID_THRESHOLD_DEFAULT)
     p.add_argument("--overwrite", action=argparse.BooleanOptionalAction, default=False)
     return p
+
+
+def _print_band_counts(title: str, data: Dict[str, Dict[str, int]]) -> None:
+    print(title)
+    for split in SPLITS:
+        c = data.get(split) or {}
+        print(
+            f"  {split}: total={int(c.get('total', 0))} "
+            f"high={int(c.get('high', 0))} mid={int(c.get('mid', 0))} low={int(c.get('low', 0))}"
+        )
 
 
 def main() -> int:
@@ -336,6 +618,8 @@ def main() -> int:
         test_ratio=float(args.test_ratio),
         seed=int(args.seed),
         overwrite=bool(args.overwrite),
+        high_threshold=float(args.high_threshold),
+        mid_threshold=float(args.mid_threshold),
     )
 
     paths: SplitPaths = result["paths"]
@@ -349,6 +633,14 @@ def main() -> int:
         print(f"pair_val={paths.pair_val}")
         print(f"pair_test={paths.pair_test}")
     print(f"manifest={paths.manifest}")
+
+    raw_file_band_counts = result.get("raw_file_band_counts") or {}
+    if isinstance(raw_file_band_counts, dict):
+        _print_band_counts("raw_file_band_counts", raw_file_band_counts)
+
+    pair_file_band_counts = result.get("pair_file_band_counts") or {}
+    if bool(result.get("need_pairwise")) and isinstance(pair_file_band_counts, dict):
+        _print_band_counts("pair_file_band_counts", pair_file_band_counts)
     return 0
 
 

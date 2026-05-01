@@ -1248,6 +1248,7 @@ def main() -> int:
     pair_test_override_path = _resolve_path(args.pairwise_test_input)
     split_policy = "deterministic_hash_by_grant_id"
     split_generated = False
+    split_result: Optional[Dict[str, Any]] = None
     split_manifest_path: Optional[Path] = None
     split_raw_train_path = raw_train_override_path
     split_raw_val_path = raw_val_override_path
@@ -1362,6 +1363,25 @@ def main() -> int:
         print(f"pair_split_train={split_pair_train_path} exists={split_pair_train_path.exists()}")
         print(f"pair_split_val={split_pair_val_path} exists={split_pair_val_path.exists()}")
         print(f"pair_split_test={split_pair_test_path} exists={split_pair_test_path.exists()}")
+        if split_result is not None:
+            raw_band_counts = split_result.get("raw_file_band_counts") or {}
+            if isinstance(raw_band_counts, dict):
+                print("raw_file_band_counts:")
+                for name in ("train", "val", "test"):
+                    c = raw_band_counts.get(name) or {}
+                    print(
+                        f"  {name}: total={int(c.get('total', 0))} "
+                        f"high={int(c.get('high', 0))} mid={int(c.get('mid', 0))} low={int(c.get('low', 0))}"
+                    )
+            pair_band_counts = split_result.get("pair_file_band_counts") or {}
+            if isinstance(pair_band_counts, dict) and pair_band_counts:
+                print("pair_file_band_counts:")
+                for name in ("train", "val", "test"):
+                    c = pair_band_counts.get(name) or {}
+                    print(
+                        f"  {name}: total={int(c.get('total', 0))} "
+                        f"high={int(c.get('high', 0))} mid={int(c.get('mid', 0))} low={int(c.get('low', 0))}"
+                    )
 
     if use_prepared_splits:
         train_groups = _load_raw_groups(split_raw_train_path, max_queries=max_train_queries)
