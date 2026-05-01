@@ -35,7 +35,7 @@ PURE_BGE_MODEL_ID = "BAAI/bge-reranker-base"
 OUTPUT_DIR_DEFAULT = "cross_encoder/spec_to_spec/eval/results"
 DISTILL_INPUT_DEFAULT = "cross_encoder/spec_to_spec/dataset/llm_distill_raw_scores.jsonl"
 DISTILL_INPUT_FALLBACK = "cross_encoder/spec_to_spec/dataset/llm_distill_listwise.jsonl"
-DISTILL_TEST_INPUT_DEFAULT = "cross_encoder/spec_to_spec/dataset/llm_distill_test.jsonl"
+DISTILL_TEST_INPUT_DEFAULT = "cross_encoder/spec_to_spec/dataset/splits/llm_distill_raw_test.jsonl"
 
 
 def _clean_text(value: Any) -> str:
