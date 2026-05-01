@@ -43,6 +43,7 @@ if str(PROJECT_ROOT) not in sys.path:
 MODEL_ID_DEFAULT = "BAAI/bge-reranker-base"
 RAW_INPUT_DEFAULT = "cross_encoder/spec_to_chunk/dataset/llm_distill_raw_scores.jsonl"
 PAIRWISE_INPUT_DEFAULT = "cross_encoder/spec_to_chunk/dataset/llm_distill_pairwise.jsonl"
+SPLIT_DIR_DEFAULT = "cross_encoder/spec_to_chunk/dataset/splits"
 OUTPUT_DIR_DEFAULT = "cross_encoder/spec_to_chunk/models/bge_reranker_distill"
 WANDB_PROJECT_DEFAULT = "cross_encoder_distill"
 
@@ -298,20 +299,63 @@ def _hash_to_unit_interval(text: str) -> float:
     return int(h, 16) / float(0xFFFFFFFF)
 
 
-def _split_grants(grant_ids: Sequence[str], *, val_ratio: float, seed: int) -> Tuple[set[str], set[str]]:
+def _split_grants(
+    grant_ids: Sequence[str],
+    *,
+    val_ratio: float,
+    test_ratio: float,
+    seed: int,
+) -> Tuple[set[str], set[str], set[str]]:
     uniq = sorted({_clean_text(x) for x in grant_ids if _clean_text(x)})
     if not uniq:
-        return set(), set()
-    rng = random.Random(int(seed))
-    rng.shuffle(uniq)
-    n_val = max(1, int(round(len(uniq) * float(val_ratio))))
-    n_val = min(len(uniq) - 1, n_val) if len(uniq) > 1 else 1
-    val_set = set(uniq[:n_val])
-    train_set = set(uniq[n_val:])
-    if not train_set:
-        train_set = set(uniq)
-        val_set = set()
-    return train_set, val_set
+        return set(), set(), set()
+
+    vr = max(0.0, min(0.49, float(val_ratio)))
+    tr = max(0.0, min(0.49, float(test_ratio)))
+    if vr + tr >= 0.99:
+        tr = max(0.0, 0.99 - vr)
+
+    tagged: List[Tuple[float, str]] = []
+    for gid in uniq:
+        roll = _hash_to_unit_interval(f"{int(seed)}::{gid}")
+        tagged.append((roll, gid))
+    tagged.sort(key=lambda x: (x[0], x[1]))
+
+    n = len(tagged)
+    n_test = int(round(float(n) * tr))
+    n_val = int(round(float(n) * vr))
+    if n >= 3:
+        if tr > 0.0:
+            n_test = max(1, n_test)
+        if vr > 0.0:
+            n_val = max(1, n_val)
+    if n_test + n_val >= n:
+        overflow = n_test + n_val - (n - 1)
+        if overflow > 0:
+            reduce_test = min(overflow, n_test)
+            n_test -= reduce_test
+            overflow -= reduce_test
+            if overflow > 0:
+                n_val = max(0, n_val - overflow)
+
+    test_ids = [gid for _, gid in tagged[:n_test]]
+    val_ids = [gid for _, gid in tagged[n_test : n_test + n_val]]
+    train_ids = [gid for _, gid in tagged[n_test + n_val :]]
+
+    if not train_ids:
+        if val_ids:
+            train_ids.append(val_ids.pop())
+        elif test_ids:
+            train_ids.append(test_ids.pop())
+
+    train_set = set(train_ids)
+    val_set = set(val_ids)
+    test_set = set(test_ids)
+
+    val_set.difference_update(train_set)
+    test_set.difference_update(train_set)
+    test_set.difference_update(val_set)
+    return train_set, val_set, test_set
 
 
 def _load_raw_groups(path: Path, *, max_queries: int = 0) -> List[QueryGroup]:
@@ -936,6 +980,25 @@ def _build_parser() -> argparse.ArgumentParser:
 
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--val-ratio", type=float, default=0.1)
+    p.add_argument("--test-ratio", type=float, default=0.1)
+    p.add_argument(
+        "--split-dir",
+        type=str,
+        default=SPLIT_DIR_DEFAULT,
+        help="Directory for deterministic split files (train/val/test JSONL).",
+    )
+    p.add_argument(
+        "--use-prepared-splits",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Use pre-generated split files. If missing, generate automatically.",
+    )
+    p.add_argument(
+        "--regenerate-splits",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Force regeneration of split files before training.",
+    )
     p.add_argument("--max-train-queries", type=int, default=0, help="Cap raw query groups loaded (0=all).")
     p.add_argument("--max-pairwise-rows", type=int, default=0, help="Cap pairwise rows loaded (0=all).")
 
@@ -1028,6 +1091,12 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--recall-rel-threshold", type=float, default=0.7)
 
     p.add_argument("--log-every-steps", type=int, default=50)
+    p.add_argument(
+        "--eval-every-steps",
+        type=int,
+        default=100,
+        help="Run validation losses every N optimizer steps (0 disables step validation).",
+    )
     p.add_argument("--num-workers", type=int, default=0)
     p.add_argument("--bf16", action="store_true", help="Use bfloat16 autocast on CUDA.")
     p.add_argument("--fp16", action="store_true", help="Use float16 autocast on CUDA.")
@@ -1109,7 +1178,11 @@ def main() -> int:
 
     max_length = _safe_int(args.max_length, default=512, minimum=16, maximum=8192)
     val_ratio = _safe_float(args.val_ratio, default=0.1, minimum=0.0, maximum=0.5)
+    test_ratio = _safe_float(args.test_ratio, default=0.1, minimum=0.0, maximum=0.5)
+    if val_ratio + test_ratio >= 0.99:
+        test_ratio = max(0.0, 0.99 - val_ratio)
     log_every_steps = _safe_int(args.log_every_steps, default=50, minimum=1, maximum=1_000_000)
+    eval_every_steps = _safe_int(args.eval_every_steps, default=100, minimum=0, maximum=1_000_000)
     append_args_to_output_dir = bool(args.append_args_to_output_dir)
     use_tqdm = not bool(args.no_tqdm)
     if use_tqdm and tqdm is None:
@@ -1137,6 +1210,43 @@ def main() -> int:
         output_dir = output_dir_base
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    use_prepared_splits = bool(args.use_prepared_splits)
+    regenerate_splits = bool(args.regenerate_splits)
+    split_dir = _resolve_path(args.split_dir)
+    split_policy = "deterministic_hash_by_grant_id"
+    split_generated = False
+    split_manifest_path: Optional[Path] = None
+    split_raw_train_path = raw_path
+    split_raw_val_path = raw_path
+    split_raw_test_path = raw_path
+    split_pair_train_path = pairwise_path
+    split_pair_val_path = pairwise_path
+    split_pair_test_path = pairwise_path
+
+    if use_prepared_splits:
+        from cross_encoder.spec_to_chunk.data_preparation.split_distill_dataset import ensure_split_files
+
+        split_result = ensure_split_files(
+            raw_input=raw_path,
+            pairwise_input=pairwise_path if pairwise_path.exists() else None,
+            split_dir=split_dir,
+            val_ratio=val_ratio,
+            test_ratio=test_ratio,
+            seed=seed,
+            overwrite=regenerate_splits,
+        )
+        split_paths = split_result["paths"]
+        split_generated = bool(split_result.get("generated"))
+        split_manifest_path = split_paths.manifest
+        split_policy = "prepared_split_files"
+
+        split_raw_train_path = split_paths.raw_train
+        split_raw_val_path = split_paths.raw_val
+        split_raw_test_path = split_paths.raw_test
+        split_pair_train_path = split_paths.pair_train
+        split_pair_val_path = split_paths.pair_val
+        split_pair_test_path = split_paths.pair_test
+
     wandb_run: Any = None
     wandb_enabled = not bool(args.no_wandb)
     if wandb_enabled:
@@ -1149,6 +1259,11 @@ def main() -> int:
             wandb_config["output_dir_base"] = str(output_dir_base)
             wandb_config["output_dir"] = str(output_dir)
             wandb_config["output_suffix"] = str(output_suffix)
+            wandb_config["split_dir"] = str(split_dir)
+            wandb_config["split_policy"] = str(split_policy)
+            wandb_config["use_prepared_splits"] = bool(use_prepared_splits)
+            wandb_config["regenerate_splits"] = bool(regenerate_splits)
+            wandb_config["split_generated"] = bool(split_generated)
 
             init_kwargs: Dict[str, Any] = {
                 "project": _clean_text(args.wandb_project) or WANDB_PROJECT_DEFAULT,
@@ -1189,40 +1304,93 @@ def main() -> int:
         print(f"output_suffix={output_suffix}")
     print(f"output_dir={output_dir}")
     print(f"use_tqdm={use_tqdm}")
+    print(f"use_prepared_splits={use_prepared_splits}")
+    print(f"split_policy={split_policy}")
+    print(f"split_dir={split_dir}")
+    if use_prepared_splits:
+        print(f"split_generated={split_generated}")
+        print(f"split_manifest={split_manifest_path}")
+        print(f"raw_split_train={split_raw_train_path}")
+        print(f"raw_split_val={split_raw_val_path}")
+        print(f"raw_split_test={split_raw_test_path}")
+        print(f"pair_split_train={split_pair_train_path} exists={split_pair_train_path.exists()}")
+        print(f"pair_split_val={split_pair_val_path} exists={split_pair_val_path.exists()}")
+        print(f"pair_split_test={split_pair_test_path} exists={split_pair_test_path.exists()}")
 
-    groups_all = _load_raw_groups(raw_path, max_queries=max_train_queries)
-    if not groups_all:
-        raise RuntimeError("No valid query groups loaded from raw_input.")
+    if use_prepared_splits:
+        train_groups = _load_raw_groups(split_raw_train_path, max_queries=max_train_queries)
+        val_groups = _load_raw_groups(split_raw_val_path, max_queries=0)
+        test_groups = _load_raw_groups(split_raw_test_path, max_queries=0)
+        groups_all = list(train_groups) + list(val_groups) + list(test_groups)
+    else:
+        groups_all = _load_raw_groups(raw_path, max_queries=max_train_queries)
+        if not groups_all:
+            raise RuntimeError("No valid query groups loaded from raw_input.")
 
-    train_grants, val_grants = _split_grants(
-        [g.grant_id for g in groups_all],
-        val_ratio=val_ratio,
-        seed=seed,
-    )
+        train_grants, val_grants, test_grants = _split_grants(
+            [g.grant_id for g in groups_all],
+            val_ratio=val_ratio,
+            test_ratio=test_ratio,
+            seed=seed,
+        )
+        train_groups = [g for g in groups_all if g.grant_id in train_grants]
+        val_groups = [g for g in groups_all if g.grant_id in val_grants]
+        test_groups = [g for g in groups_all if g.grant_id in test_grants]
 
-    train_groups = [g for g in groups_all if g.grant_id in train_grants]
-    val_groups = [g for g in groups_all if g.grant_id in val_grants]
     if not train_groups:
         raise RuntimeError("Training split is empty.")
 
-    pair_rows = _load_pairwise_rows(pairwise_path, max_rows=max_pairwise_rows)
+    train_grants = {g.grant_id for g in train_groups}
+    val_grants = {g.grant_id for g in val_groups}
+    test_grants = {g.grant_id for g in test_groups}
+
     pair_rows_source = "pairwise_file"
-    if not pair_rows:
+    train_pairs: List[PairExample] = []
+    val_pairs: List[PairExample] = []
+    test_pairs: List[PairExample] = []
+
+    if use_prepared_splits and split_pair_train_path.exists() and split_pair_val_path.exists() and split_pair_test_path.exists():
+        train_pairs = _load_pairwise_rows(split_pair_train_path, max_rows=max_pairwise_rows)
+        val_pairs = _load_pairwise_rows(split_pair_val_path, max_rows=0)
+        test_pairs = _load_pairwise_rows(split_pair_test_path, max_rows=0)
+        pair_rows_source = "pairwise_split_files"
+    else:
+        pair_rows_loaded = _load_pairwise_rows(pairwise_path, max_rows=max_pairwise_rows)
+        if pair_rows_loaded:
+            train_pairs = [r for r in pair_rows_loaded if r.grant_id in train_grants]
+            val_pairs = [r for r in pair_rows_loaded if r.grant_id in val_grants]
+            test_pairs = [r for r in pair_rows_loaded if r.grant_id in test_grants]
+
+    if not train_pairs:
         print("pairwise_rows_loaded=0; deriving pairwise rows from raw groups")
-        pair_rows = _derive_pairwise_from_groups(
-            groups_all,
+        train_pairs = _derive_pairwise_from_groups(
+            train_groups,
             per_query_pos_k=_safe_int(args.pair_derive_pos_k, default=4, minimum=1, maximum=10_000),
             per_query_hard_k=_safe_int(args.pair_derive_hard_k, default=4, minimum=0, maximum=10_000),
             per_query_weak_k=_safe_int(args.pair_derive_weak_k, default=4, minimum=1, maximum=10_000),
             per_query_cap=_safe_int(args.pair_derive_cap, default=64, minimum=1, maximum=100_000),
         )
-        pair_rows_source = "derived_from_raw"
+        val_pairs = _derive_pairwise_from_groups(
+            val_groups,
+            per_query_pos_k=_safe_int(args.pair_derive_pos_k, default=4, minimum=1, maximum=10_000),
+            per_query_hard_k=_safe_int(args.pair_derive_hard_k, default=4, minimum=0, maximum=10_000),
+            per_query_weak_k=_safe_int(args.pair_derive_weak_k, default=4, minimum=1, maximum=10_000),
+            per_query_cap=_safe_int(args.pair_derive_cap, default=64, minimum=1, maximum=100_000),
+        )
+        test_pairs = _derive_pairwise_from_groups(
+            test_groups,
+            per_query_pos_k=_safe_int(args.pair_derive_pos_k, default=4, minimum=1, maximum=10_000),
+            per_query_hard_k=_safe_int(args.pair_derive_hard_k, default=4, minimum=0, maximum=10_000),
+            per_query_weak_k=_safe_int(args.pair_derive_weak_k, default=4, minimum=1, maximum=10_000),
+            per_query_cap=_safe_int(args.pair_derive_cap, default=64, minimum=1, maximum=100_000),
+        )
+        pair_rows_source = "derived_from_raw_splits" if use_prepared_splits else "derived_from_raw"
 
     pair_mid_lower_enabled = bool(args.pair_add_mid_lower_mid)
     pair_mid_lower_added = 0
     if pair_mid_lower_enabled:
-        mid_lower_rows = _derive_mid_lower_mid_pairs_from_groups(
-            groups_all,
+        train_mid_rows = _derive_mid_lower_mid_pairs_from_groups(
+            train_groups,
             per_query_cap=_safe_int(args.pair_derive_cap, default=64, minimum=1, maximum=100_000),
             pos_score_min=pair_mid_pos_score_min,
             pos_score_max=pair_mid_pos_score_max,
@@ -1232,9 +1400,35 @@ def main() -> int:
             margin_max=pair_mid_margin_max,
             add_easy_contrast=pair_mid_add_easy_contrast,
         )
-        pair_mid_lower_added = int(len(mid_lower_rows))
-        if pair_mid_lower_added > 0:
-            pair_rows = list(pair_rows) + mid_lower_rows
+        val_mid_rows = _derive_mid_lower_mid_pairs_from_groups(
+            val_groups,
+            per_query_cap=_safe_int(args.pair_derive_cap, default=64, minimum=1, maximum=100_000),
+            pos_score_min=pair_mid_pos_score_min,
+            pos_score_max=pair_mid_pos_score_max,
+            neg_score_min=pair_mid_neg_score_min,
+            neg_score_max=pair_mid_neg_score_max,
+            margin_min=pair_mid_margin_min,
+            margin_max=pair_mid_margin_max,
+            add_easy_contrast=pair_mid_add_easy_contrast,
+        )
+        test_mid_rows = _derive_mid_lower_mid_pairs_from_groups(
+            test_groups,
+            per_query_cap=_safe_int(args.pair_derive_cap, default=64, minimum=1, maximum=100_000),
+            pos_score_min=pair_mid_pos_score_min,
+            pos_score_max=pair_mid_pos_score_max,
+            neg_score_min=pair_mid_neg_score_min,
+            neg_score_max=pair_mid_neg_score_max,
+            margin_min=pair_mid_margin_min,
+            margin_max=pair_mid_margin_max,
+            add_easy_contrast=pair_mid_add_easy_contrast,
+        )
+        pair_mid_lower_added = int(len(train_mid_rows) + len(val_mid_rows) + len(test_mid_rows))
+        if train_mid_rows:
+            train_pairs = list(train_pairs) + train_mid_rows
+        if val_mid_rows:
+            val_pairs = list(val_pairs) + val_mid_rows
+        if test_mid_rows:
+            test_pairs = list(test_pairs) + test_mid_rows
         print(f"pair_mid_lower_enabled=true pair_mid_lower_added={pair_mid_lower_added}")
         print(
             "pair_mid_config="
@@ -1246,18 +1440,19 @@ def main() -> int:
     else:
         print("pair_mid_lower_enabled=false")
 
-    train_pairs = [r for r in pair_rows if r.grant_id in train_grants]
-    val_pairs = [r for r in pair_rows if r.grant_id in val_grants]
     if not train_pairs:
         raise RuntimeError("No training pairwise rows available after split.")
+    pair_rows = list(train_pairs) + list(val_pairs) + list(test_pairs)
 
     print(f"queries_total={len(groups_all)}")
     print(f"queries_train={len(train_groups)}")
     print(f"queries_val={len(val_groups)}")
+    print(f"queries_test={len(test_groups)}")
     print(f"pair_rows_source={pair_rows_source}")
     print(f"pairwise_total_rows={len(pair_rows)}")
     print(f"pairwise_train={len(train_pairs)}")
     print(f"pairwise_val={len(val_pairs)}")
+    print(f"pairwise_test={len(test_pairs)}")
 
     train_list_rows = _build_sampled_list_rows(
         train_groups,
@@ -1287,20 +1482,37 @@ def main() -> int:
         low_signal_keep_prob=1.0,  # keep all val rows for stable eval.
         seed=seed + 1,
     )
+    test_list_rows = _build_sampled_list_rows(
+        test_groups,
+        candidate_pool_size=candidate_pool_size,
+        mini_list_size=mini_list_size,
+        boundary_center=_safe_float(args.boundary_center, default=0.6, minimum=0.0, maximum=1.0),
+        boundary_bandwidth=_safe_float(args.boundary_bandwidth, default=0.12, minimum=1e-6, maximum=1.0),
+        top_ratio=_safe_float(args.top_ratio, default=0.4, minimum=0.0, maximum=1.0),
+        boundary_ratio=_safe_float(args.boundary_ratio, default=0.4, minimum=0.0, maximum=1.0),
+        random_ratio=_safe_float(args.random_ratio, default=0.2, minimum=0.0, maximum=1.0),
+        low_signal_max_score_threshold=low_signal_max_score_threshold,
+        low_signal_std_threshold=low_signal_std_threshold,
+        low_signal_keep_prob=1.0,
+        seed=seed + 2,
+    )
 
     if not train_list_rows:
         raise RuntimeError("No listwise rows after filtering/sampling for training.")
 
     print(f"listwise_train={len(train_list_rows)}")
     print(f"listwise_val={len(val_list_rows)}")
+    print(f"listwise_test={len(test_list_rows)}")
     _wandb_log(
         wandb_run,
         {
             "data/queries_total": int(len(groups_all)),
             "data/queries_train": int(len(train_groups)),
             "data/queries_val": int(len(val_groups)),
+            "data/queries_test": int(len(test_groups)),
             "data/pairwise_train": int(len(train_pairs)),
             "data/pairwise_val": int(len(val_pairs)),
+            "data/pairwise_test": int(len(test_pairs)),
             "data/pairwise_total": int(len(pair_rows)),
             "data/pair_mid_lower_enabled": int(1 if pair_mid_lower_enabled else 0),
             "data/pair_mid_lower_added": int(pair_mid_lower_added),
@@ -1313,6 +1525,7 @@ def main() -> int:
             "data/pair_mid_add_easy_contrast": int(1 if pair_mid_add_easy_contrast else 0),
             "data/listwise_train": int(len(train_list_rows)),
             "data/listwise_val": int(len(val_list_rows)),
+            "data/listwise_test": int(len(test_list_rows)),
         },
         step=0,
     )
@@ -1350,10 +1563,28 @@ def main() -> int:
         collate_fn=PairCollator(tokenizer, max_length=max_length),
         drop_last=False,
     )
+    pair_test_loader = DataLoader(
+        PairwiseDataset(test_pairs),
+        batch_size=eval_batch_size,
+        shuffle=False,
+        num_workers=_safe_int(args.num_workers, default=0, minimum=0, maximum=32),
+        collate_fn=PairCollator(tokenizer, max_length=max_length),
+        drop_last=False,
+    )
     val_list_loader: Optional[DataLoader] = None
     if val_list_rows:
         val_list_loader = DataLoader(
             ListwiseDataset(val_groups, val_list_rows),
+            batch_size=eval_batch_size,
+            shuffle=False,
+            num_workers=_safe_int(args.num_workers, default=0, minimum=0, maximum=32),
+            collate_fn=ListCollator(tokenizer, max_length=max_length),
+            drop_last=False,
+        )
+    test_list_loader: Optional[DataLoader] = None
+    if test_list_rows:
+        test_list_loader = DataLoader(
+            ListwiseDataset(test_groups, test_list_rows),
             batch_size=eval_batch_size,
             shuffle=False,
             num_workers=_safe_int(args.num_workers, default=0, minimum=0, maximum=32),
@@ -1367,6 +1598,7 @@ def main() -> int:
     start_time = time.time()
 
     def eval_pairwise_margin(loader: DataLoader) -> float:
+        was_training = bool(model.training)
         model.eval()
         vals: List[float] = []
         with torch.no_grad():
@@ -1380,11 +1612,14 @@ def main() -> int:
                 neg_logits = model(**neg).logits.squeeze(-1)
                 loss = _variable_margin_loss(pos_logits, neg_logits, margins)
                 vals.append(float(loss.detach().cpu().item()))
+        if was_training:
+            model.train()
         return float(sum(vals) / max(1, len(vals)))
 
     def eval_listwise_losses(loader: Optional[DataLoader]) -> Dict[str, float]:
         if loader is None:
             return {"val_kl_loss": 0.0, "val_mse_loss": 0.0, "val_list_batches": 0.0}
+        was_training = bool(model.training)
         model.eval()
         kl_vals: List[float] = []
         mse_vals: List[float] = []
@@ -1404,11 +1639,62 @@ def main() -> int:
                 )
                 kl_vals.append(float(kl_loss.detach().cpu().item()))
                 mse_vals.append(float(mse_loss.detach().cpu().item()))
+        if was_training:
+            model.train()
         return {
             "val_kl_loss": float(sum(kl_vals) / max(1, len(kl_vals))),
             "val_mse_loss": float(sum(mse_vals) / max(1, len(mse_vals))),
             "val_list_batches": float(len(kl_vals)),
         }
+
+    def run_step_validation(*, stage: int, epoch: int, global_step_now: int) -> None:
+        if int(eval_every_steps) <= 0:
+            return
+        if int(global_step_now) <= 0:
+            return
+        if int(global_step_now) % int(eval_every_steps) != 0:
+            return
+
+        val_pair_loss = eval_pairwise_margin(pair_val_loader) if val_pairs else 0.0
+        if int(stage) == 1:
+            print(
+                f"stage=1 epoch={epoch}/{stage1_epochs} step={global_step_now} "
+                f"val_pair_loss={val_pair_loss:.6f}"
+            )
+            _wandb_log(
+                wandb_run,
+                {
+                    "stage": 1,
+                    "eval/loss_pair_step": float(val_pair_loss),
+                },
+                step=int(global_step_now),
+            )
+            return
+
+        val_list_loss = eval_listwise_losses(val_list_loader)
+        val_kl_loss = float(val_list_loss.get("val_kl_loss", 0.0))
+        val_mse_loss = float(val_list_loss.get("val_mse_loss", 0.0))
+        val_total_loss = (
+            float(loss_kl_weight) * float(val_kl_loss)
+            + float(loss_pair_weight) * float(val_pair_loss)
+            + float(loss_mse_weight) * float(val_mse_loss)
+        )
+        print(
+            f"stage=2 epoch={epoch}/{stage2_epochs} step={global_step_now} "
+            f"val_total_loss={val_total_loss:.6f} val_kl_loss={val_kl_loss:.6f} "
+            f"val_pair_loss={val_pair_loss:.6f} val_mse_loss={val_mse_loss:.6f}"
+        )
+        _wandb_log(
+            wandb_run,
+            {
+                "stage": 2,
+                "eval/loss_total_step": float(val_total_loss),
+                "eval/loss_kl_step": float(val_kl_loss),
+                "eval/loss_pair_step": float(val_pair_loss),
+                "eval/loss_mse_step": float(val_mse_loss),
+            },
+            step=int(global_step_now),
+        )
 
     # Stage 1: pairwise warm start.
     if stage1_epochs > 0:
@@ -1470,6 +1756,7 @@ def main() -> int:
                             },
                             step=global_step,
                         )
+                    run_step_validation(stage=1, epoch=epoch, global_step_now=global_step)
                 if stage1_bar is not None and (step % 10 == 0):
                     recent_pair = sum(epoch_losses[-10:]) / max(1, min(10, len(epoch_losses)))
                     stage1_bar.set_postfix(
@@ -1485,6 +1772,7 @@ def main() -> int:
                 optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
                 global_step += 1
+                run_step_validation(stage=1, epoch=epoch, global_step_now=global_step)
             if stage1_bar is not None:
                 stage1_bar.close()
 
@@ -1643,6 +1931,7 @@ def main() -> int:
                             },
                             step=global_step,
                         )
+                    run_step_validation(stage=2, epoch=epoch, global_step_now=global_step)
                 if stage2_bar is not None and (step % 10 == 0):
                     recent_total = sum(loss_hist["total"][-10:]) / max(1, min(10, len(loss_hist["total"])))
                     recent_kl = sum(loss_hist["kl"][-10:]) / max(1, min(10, len(loss_hist["kl"])))
@@ -1664,6 +1953,7 @@ def main() -> int:
                 optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
                 global_step += 1
+                run_step_validation(stage=2, epoch=epoch, global_step_now=global_step)
             if stage2_bar is not None:
                 stage2_bar.close()
 
@@ -1739,6 +2029,53 @@ def main() -> int:
                 model.save_pretrained(best_dir)
                 tokenizer.save_pretrained(best_dir)
 
+    test_pair_loss = eval_pairwise_margin(pair_test_loader) if test_pairs else 0.0
+    test_list_loss = eval_listwise_losses(test_list_loader)
+    test_kl_loss = float(test_list_loss.get("val_kl_loss", 0.0))
+    test_mse_loss = float(test_list_loss.get("val_mse_loss", 0.0))
+    test_total_loss = (
+        float(loss_kl_weight) * float(test_kl_loss)
+        + float(loss_pair_weight) * float(test_pair_loss)
+        + float(loss_mse_weight) * float(test_mse_loss)
+    )
+    test_eval_metrics = _evaluate(
+        model=model,
+        tokenizer=tokenizer,
+        groups=test_groups,
+        device=device,
+        max_length=max_length,
+        eval_batch_size=eval_batch_size,
+        candidate_pool_size=candidate_pool_size,
+        mrr_rel_threshold=_safe_float(args.mrr_rel_threshold, default=0.7, minimum=0.0, maximum=1.0),
+        recall_rel_threshold=_safe_float(args.recall_rel_threshold, default=0.7, minimum=0.0, maximum=1.0),
+    ) if test_groups else {"ndcg@10": 0.0, "mrr@10": 0.0, "recall@50": 0.0, "eval_queries": 0}
+    test_metrics = {
+        "stage": "test",
+        "test_total_loss": float(test_total_loss),
+        "test_kl_loss": float(test_kl_loss),
+        "test_pair_loss": float(test_pair_loss),
+        "test_mse_loss": float(test_mse_loss),
+        "test_list_batches": int(test_list_loss.get("val_list_batches", 0.0)),
+        "global_step": global_step,
+    }
+    test_metrics.update(test_eval_metrics)
+    history.append(test_metrics)
+    print(json.dumps(test_metrics, ensure_ascii=False))
+    _wandb_log(
+        wandb_run,
+        {
+            "test/loss_total": float(test_metrics["test_total_loss"]),
+            "test/loss_kl": float(test_metrics["test_kl_loss"]),
+            "test/loss_pair": float(test_metrics["test_pair_loss"]),
+            "test/loss_mse": float(test_metrics["test_mse_loss"]),
+            "test/ndcg@10": float(test_metrics.get("ndcg@10", 0.0)),
+            "test/mrr@10": float(test_metrics.get("mrr@10", 0.0)),
+            "test/recall@50": float(test_metrics.get("recall@50", 0.0)),
+            "test/queries": int(test_metrics.get("eval_queries", 0)),
+        },
+        step=global_step if global_step > 0 else None,
+    )
+
     elapsed = max(1e-6, time.time() - start_time)
 
     run_manifest = {
@@ -1751,12 +2088,31 @@ def main() -> int:
         "output_suffix": str(output_suffix),
         "model_id": _clean_text(args.model_id) or MODEL_ID_DEFAULT,
         "seed": int(seed),
+        "split_policy": str(split_policy),
+        "use_prepared_splits": bool(use_prepared_splits),
+        "regenerate_splits": bool(regenerate_splits),
+        "split_generated": bool(split_generated),
+        "split_dir": str(split_dir),
+        "split_manifest": str(split_manifest_path) if split_manifest_path is not None else "",
+        "split_raw_train_path": str(split_raw_train_path),
+        "split_raw_val_path": str(split_raw_val_path),
+        "split_raw_test_path": str(split_raw_test_path),
+        "split_pair_train_path": str(split_pair_train_path),
+        "split_pair_val_path": str(split_pair_val_path),
+        "split_pair_test_path": str(split_pair_test_path),
+        "val_ratio": float(val_ratio),
+        "test_ratio": float(test_ratio),
         "train_queries": int(len(train_groups)),
         "val_queries": int(len(val_groups)),
+        "test_queries": int(len(test_groups)),
         "pair_rows_source": str(pair_rows_source),
         "pair_total_rows": int(len(pair_rows)),
         "train_pair_rows": int(len(train_pairs)),
         "val_pair_rows": int(len(val_pairs)),
+        "test_pair_rows": int(len(test_pairs)),
+        "train_list_rows": int(len(train_list_rows)),
+        "val_list_rows": int(len(val_list_rows)),
+        "test_list_rows": int(len(test_list_rows)),
         "pair_mid_lower_enabled": bool(pair_mid_lower_enabled),
         "pair_mid_lower_added": int(pair_mid_lower_added),
         "pair_mid_pos_score_min": float(pair_mid_pos_score_min),
@@ -1779,6 +2135,7 @@ def main() -> int:
         "stage2_epochs": int(stage2_epochs),
         "train_batch_size": int(train_batch_size),
         "eval_batch_size": int(eval_batch_size),
+        "eval_every_steps": int(eval_every_steps),
         "grad_accum_steps": int(grad_accum_steps),
         "learning_rate": float(learning_rate),
         "weight_decay": float(weight_decay),
@@ -1788,6 +2145,7 @@ def main() -> int:
         "use_amp": bool(use_amp),
         "amp_dtype": str(amp_dtype) if use_amp else "",
         "best_ndcg@10": float(best_ndcg),
+        "test_metrics": test_metrics,
         "elapsed_seconds": float(elapsed),
         "history": history,
         "wandb": {

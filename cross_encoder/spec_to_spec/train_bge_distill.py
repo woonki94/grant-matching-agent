@@ -43,6 +43,7 @@ if str(PROJECT_ROOT) not in sys.path:
 MODEL_ID_DEFAULT = "BAAI/bge-reranker-base"
 RAW_INPUT_DEFAULT = "cross_encoder/spec_to_spec/dataset/llm_distill_raw_scores.jsonl"
 PAIRWISE_INPUT_DEFAULT = "cross_encoder/spec_to_spec/dataset/llm_distill_pairwise.jsonl"
+SPLIT_DIR_DEFAULT = "cross_encoder/spec_to_spec/dataset/splits"
 OUTPUT_DIR_DEFAULT = "cross_encoder/spec_to_spec/models/bge_reranker_distill"
 WANDB_PROJECT_DEFAULT = "cross_encoder_distill"
 
@@ -992,6 +993,24 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--val-ratio", type=float, default=0.1)
     p.add_argument("--test-ratio", type=float, default=0.1)
+    p.add_argument(
+        "--split-dir",
+        type=str,
+        default=SPLIT_DIR_DEFAULT,
+        help="Directory for deterministic split files (train/val/test JSONL).",
+    )
+    p.add_argument(
+        "--use-prepared-splits",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Use pre-generated split files. If missing, generate automatically.",
+    )
+    p.add_argument(
+        "--regenerate-splits",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Force regeneration of split files before training.",
+    )
     p.add_argument("--max-train-queries", type=int, default=0, help="Cap raw query groups loaded (0=all).")
     p.add_argument("--max-pairwise-rows", type=int, default=0, help="Cap pairwise rows loaded (0=all).")
 
@@ -1203,6 +1222,43 @@ def main() -> int:
         output_dir = output_dir_base
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    use_prepared_splits = bool(args.use_prepared_splits)
+    regenerate_splits = bool(args.regenerate_splits)
+    split_dir = _resolve_path(args.split_dir)
+    split_policy = "deterministic_hash_by_grant_id"
+    split_generated = False
+    split_manifest_path: Optional[Path] = None
+    split_raw_train_path = raw_path
+    split_raw_val_path = raw_path
+    split_raw_test_path = raw_path
+    split_pair_train_path = pairwise_path
+    split_pair_val_path = pairwise_path
+    split_pair_test_path = pairwise_path
+
+    if use_prepared_splits:
+        from cross_encoder.spec_to_spec.data_preparation.split_distill_dataset import ensure_split_files
+
+        split_result = ensure_split_files(
+            raw_input=raw_path,
+            pairwise_input=pairwise_path if pairwise_path.exists() else None,
+            split_dir=split_dir,
+            val_ratio=val_ratio,
+            test_ratio=test_ratio,
+            seed=seed,
+            overwrite=regenerate_splits,
+        )
+        split_paths = split_result["paths"]
+        split_generated = bool(split_result.get("generated"))
+        split_manifest_path = split_paths.manifest
+        split_policy = "prepared_split_files"
+
+        split_raw_train_path = split_paths.raw_train
+        split_raw_val_path = split_paths.raw_val
+        split_raw_test_path = split_paths.raw_test
+        split_pair_train_path = split_paths.pair_train
+        split_pair_val_path = split_paths.pair_val
+        split_pair_test_path = split_paths.pair_test
+
     wandb_run: Any = None
     wandb_enabled = not bool(args.no_wandb)
     if wandb_enabled:
@@ -1215,6 +1271,11 @@ def main() -> int:
             wandb_config["output_dir_base"] = str(output_dir_base)
             wandb_config["output_dir"] = str(output_dir)
             wandb_config["output_suffix"] = str(output_suffix)
+            wandb_config["split_dir"] = str(split_dir)
+            wandb_config["split_policy"] = str(split_policy)
+            wandb_config["use_prepared_splits"] = bool(use_prepared_splits)
+            wandb_config["regenerate_splits"] = bool(regenerate_splits)
+            wandb_config["split_generated"] = bool(split_generated)
 
             init_kwargs: Dict[str, Any] = {
                 "project": _clean_text(args.wandb_project) or WANDB_PROJECT_DEFAULT,
@@ -1255,42 +1316,93 @@ def main() -> int:
         print(f"output_suffix={output_suffix}")
     print(f"output_dir={output_dir}")
     print(f"use_tqdm={use_tqdm}")
+    print(f"use_prepared_splits={use_prepared_splits}")
+    print(f"split_policy={split_policy}")
+    print(f"split_dir={split_dir}")
+    if use_prepared_splits:
+        print(f"split_generated={split_generated}")
+        print(f"split_manifest={split_manifest_path}")
+        print(f"raw_split_train={split_raw_train_path}")
+        print(f"raw_split_val={split_raw_val_path}")
+        print(f"raw_split_test={split_raw_test_path}")
+        print(f"pair_split_train={split_pair_train_path} exists={split_pair_train_path.exists()}")
+        print(f"pair_split_val={split_pair_val_path} exists={split_pair_val_path.exists()}")
+        print(f"pair_split_test={split_pair_test_path} exists={split_pair_test_path.exists()}")
 
-    groups_all = _load_raw_groups(raw_path, max_queries=max_train_queries)
-    if not groups_all:
-        raise RuntimeError("No valid query groups loaded from raw_input.")
+    if use_prepared_splits:
+        train_groups = _load_raw_groups(split_raw_train_path, max_queries=max_train_queries)
+        val_groups = _load_raw_groups(split_raw_val_path, max_queries=0)
+        test_groups = _load_raw_groups(split_raw_test_path, max_queries=0)
+        groups_all = list(train_groups) + list(val_groups) + list(test_groups)
+    else:
+        groups_all = _load_raw_groups(raw_path, max_queries=max_train_queries)
+        if not groups_all:
+            raise RuntimeError("No valid query groups loaded from raw_input.")
 
-    train_grants, val_grants, test_grants = _split_grants(
-        [g.grant_id for g in groups_all],
-        val_ratio=val_ratio,
-        test_ratio=test_ratio,
-        seed=seed,
-    )
+        train_grants, val_grants, test_grants = _split_grants(
+            [g.grant_id for g in groups_all],
+            val_ratio=val_ratio,
+            test_ratio=test_ratio,
+            seed=seed,
+        )
+        train_groups = [g for g in groups_all if g.grant_id in train_grants]
+        val_groups = [g for g in groups_all if g.grant_id in val_grants]
+        test_groups = [g for g in groups_all if g.grant_id in test_grants]
 
-    train_groups = [g for g in groups_all if g.grant_id in train_grants]
-    val_groups = [g for g in groups_all if g.grant_id in val_grants]
-    test_groups = [g for g in groups_all if g.grant_id in test_grants]
     if not train_groups:
         raise RuntimeError("Training split is empty.")
 
-    pair_rows = _load_pairwise_rows(pairwise_path, max_rows=max_pairwise_rows)
+    train_grants = {g.grant_id for g in train_groups}
+    val_grants = {g.grant_id for g in val_groups}
+    test_grants = {g.grant_id for g in test_groups}
+
     pair_rows_source = "pairwise_file"
-    if not pair_rows:
+    train_pairs: List[PairExample] = []
+    val_pairs: List[PairExample] = []
+    test_pairs: List[PairExample] = []
+
+    if use_prepared_splits and split_pair_train_path.exists() and split_pair_val_path.exists() and split_pair_test_path.exists():
+        train_pairs = _load_pairwise_rows(split_pair_train_path, max_rows=max_pairwise_rows)
+        val_pairs = _load_pairwise_rows(split_pair_val_path, max_rows=0)
+        test_pairs = _load_pairwise_rows(split_pair_test_path, max_rows=0)
+        pair_rows_source = "pairwise_split_files"
+    else:
+        pair_rows_loaded = _load_pairwise_rows(pairwise_path, max_rows=max_pairwise_rows)
+        if pair_rows_loaded:
+            train_pairs = [r for r in pair_rows_loaded if r.grant_id in train_grants]
+            val_pairs = [r for r in pair_rows_loaded if r.grant_id in val_grants]
+            test_pairs = [r for r in pair_rows_loaded if r.grant_id in test_grants]
+
+    if not train_pairs:
         print("pairwise_rows_loaded=0; deriving pairwise rows from raw groups")
-        pair_rows = _derive_pairwise_from_groups(
-            groups_all,
+        train_pairs = _derive_pairwise_from_groups(
+            train_groups,
             per_query_pos_k=_safe_int(args.pair_derive_pos_k, default=4, minimum=1, maximum=10_000),
             per_query_hard_k=_safe_int(args.pair_derive_hard_k, default=4, minimum=0, maximum=10_000),
             per_query_weak_k=_safe_int(args.pair_derive_weak_k, default=4, minimum=1, maximum=10_000),
             per_query_cap=_safe_int(args.pair_derive_cap, default=64, minimum=1, maximum=100_000),
         )
-        pair_rows_source = "derived_from_raw"
+        val_pairs = _derive_pairwise_from_groups(
+            val_groups,
+            per_query_pos_k=_safe_int(args.pair_derive_pos_k, default=4, minimum=1, maximum=10_000),
+            per_query_hard_k=_safe_int(args.pair_derive_hard_k, default=4, minimum=0, maximum=10_000),
+            per_query_weak_k=_safe_int(args.pair_derive_weak_k, default=4, minimum=1, maximum=10_000),
+            per_query_cap=_safe_int(args.pair_derive_cap, default=64, minimum=1, maximum=100_000),
+        )
+        test_pairs = _derive_pairwise_from_groups(
+            test_groups,
+            per_query_pos_k=_safe_int(args.pair_derive_pos_k, default=4, minimum=1, maximum=10_000),
+            per_query_hard_k=_safe_int(args.pair_derive_hard_k, default=4, minimum=0, maximum=10_000),
+            per_query_weak_k=_safe_int(args.pair_derive_weak_k, default=4, minimum=1, maximum=10_000),
+            per_query_cap=_safe_int(args.pair_derive_cap, default=64, minimum=1, maximum=100_000),
+        )
+        pair_rows_source = "derived_from_raw_splits" if use_prepared_splits else "derived_from_raw"
 
     pair_mid_lower_enabled = bool(args.pair_add_mid_lower_mid)
     pair_mid_lower_added = 0
     if pair_mid_lower_enabled:
-        mid_lower_rows = _derive_mid_lower_mid_pairs_from_groups(
-            groups_all,
+        train_mid_rows = _derive_mid_lower_mid_pairs_from_groups(
+            train_groups,
             per_query_cap=_safe_int(args.pair_derive_cap, default=64, minimum=1, maximum=100_000),
             pos_score_min=pair_mid_pos_score_min,
             pos_score_max=pair_mid_pos_score_max,
@@ -1300,9 +1412,35 @@ def main() -> int:
             margin_max=pair_mid_margin_max,
             add_easy_contrast=pair_mid_add_easy_contrast,
         )
-        pair_mid_lower_added = int(len(mid_lower_rows))
-        if pair_mid_lower_added > 0:
-            pair_rows = list(pair_rows) + mid_lower_rows
+        val_mid_rows = _derive_mid_lower_mid_pairs_from_groups(
+            val_groups,
+            per_query_cap=_safe_int(args.pair_derive_cap, default=64, minimum=1, maximum=100_000),
+            pos_score_min=pair_mid_pos_score_min,
+            pos_score_max=pair_mid_pos_score_max,
+            neg_score_min=pair_mid_neg_score_min,
+            neg_score_max=pair_mid_neg_score_max,
+            margin_min=pair_mid_margin_min,
+            margin_max=pair_mid_margin_max,
+            add_easy_contrast=pair_mid_add_easy_contrast,
+        )
+        test_mid_rows = _derive_mid_lower_mid_pairs_from_groups(
+            test_groups,
+            per_query_cap=_safe_int(args.pair_derive_cap, default=64, minimum=1, maximum=100_000),
+            pos_score_min=pair_mid_pos_score_min,
+            pos_score_max=pair_mid_pos_score_max,
+            neg_score_min=pair_mid_neg_score_min,
+            neg_score_max=pair_mid_neg_score_max,
+            margin_min=pair_mid_margin_min,
+            margin_max=pair_mid_margin_max,
+            add_easy_contrast=pair_mid_add_easy_contrast,
+        )
+        pair_mid_lower_added = int(len(train_mid_rows) + len(val_mid_rows) + len(test_mid_rows))
+        if train_mid_rows:
+            train_pairs = list(train_pairs) + train_mid_rows
+        if val_mid_rows:
+            val_pairs = list(val_pairs) + val_mid_rows
+        if test_mid_rows:
+            test_pairs = list(test_pairs) + test_mid_rows
         print(f"pair_mid_lower_enabled=true pair_mid_lower_added={pair_mid_lower_added}")
         print(
             "pair_mid_config="
@@ -1314,11 +1452,9 @@ def main() -> int:
     else:
         print("pair_mid_lower_enabled=false")
 
-    train_pairs = [r for r in pair_rows if r.grant_id in train_grants]
-    val_pairs = [r for r in pair_rows if r.grant_id in val_grants]
-    test_pairs = [r for r in pair_rows if r.grant_id in test_grants]
     if not train_pairs:
         raise RuntimeError("No training pairwise rows available after split.")
+    pair_rows = list(train_pairs) + list(val_pairs) + list(test_pairs)
 
     print(f"queries_total={len(groups_all)}")
     print(f"queries_train={len(train_groups)}")
@@ -1964,7 +2100,18 @@ def main() -> int:
         "output_suffix": str(output_suffix),
         "model_id": _clean_text(args.model_id) or MODEL_ID_DEFAULT,
         "seed": int(seed),
-        "split_policy": "deterministic_hash_by_grant_id",
+        "split_policy": str(split_policy),
+        "use_prepared_splits": bool(use_prepared_splits),
+        "regenerate_splits": bool(regenerate_splits),
+        "split_generated": bool(split_generated),
+        "split_dir": str(split_dir),
+        "split_manifest": str(split_manifest_path) if split_manifest_path is not None else "",
+        "split_raw_train_path": str(split_raw_train_path),
+        "split_raw_val_path": str(split_raw_val_path),
+        "split_raw_test_path": str(split_raw_test_path),
+        "split_pair_train_path": str(split_pair_train_path),
+        "split_pair_val_path": str(split_pair_val_path),
+        "split_pair_test_path": str(split_pair_test_path),
         "val_ratio": float(val_ratio),
         "test_ratio": float(test_ratio),
         "train_queries": int(len(train_groups)),
