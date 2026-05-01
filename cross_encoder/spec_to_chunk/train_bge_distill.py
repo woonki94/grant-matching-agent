@@ -44,6 +44,12 @@ MODEL_ID_DEFAULT = "BAAI/bge-reranker-base"
 RAW_INPUT_DEFAULT = "cross_encoder/spec_to_chunk/dataset/llm_distill_raw_scores.jsonl"
 PAIRWISE_INPUT_DEFAULT = "cross_encoder/spec_to_chunk/dataset/llm_distill_pairwise.jsonl"
 SPLIT_DIR_DEFAULT = "cross_encoder/spec_to_chunk/dataset/splits"
+RAW_TRAIN_INPUT_DEFAULT = f"{SPLIT_DIR_DEFAULT}/llm_distill_raw_train.jsonl"
+RAW_VAL_INPUT_DEFAULT = f"{SPLIT_DIR_DEFAULT}/llm_distill_raw_val.jsonl"
+RAW_TEST_INPUT_DEFAULT = f"{SPLIT_DIR_DEFAULT}/llm_distill_raw_test.jsonl"
+PAIRWISE_TRAIN_INPUT_DEFAULT = f"{SPLIT_DIR_DEFAULT}/llm_distill_pairwise_train.jsonl"
+PAIRWISE_VAL_INPUT_DEFAULT = f"{SPLIT_DIR_DEFAULT}/llm_distill_pairwise_val.jsonl"
+PAIRWISE_TEST_INPUT_DEFAULT = f"{SPLIT_DIR_DEFAULT}/llm_distill_pairwise_test.jsonl"
 OUTPUT_DIR_DEFAULT = "cross_encoder/spec_to_chunk/models/bge_reranker_distill"
 WANDB_PROJECT_DEFAULT = "cross_encoder_distill"
 
@@ -999,6 +1005,27 @@ def _build_parser() -> argparse.ArgumentParser:
         default=False,
         help="Force regeneration of split files before training.",
     )
+    p.add_argument("--raw-train-input", type=str, default=RAW_TRAIN_INPUT_DEFAULT, help="Prepared raw train JSONL path.")
+    p.add_argument("--raw-val-input", type=str, default=RAW_VAL_INPUT_DEFAULT, help="Prepared raw val/eval JSONL path.")
+    p.add_argument("--raw-test-input", type=str, default=RAW_TEST_INPUT_DEFAULT, help="Prepared raw test JSONL path.")
+    p.add_argument(
+        "--pairwise-train-input",
+        type=str,
+        default=PAIRWISE_TRAIN_INPUT_DEFAULT,
+        help="Prepared pairwise train JSONL path.",
+    )
+    p.add_argument(
+        "--pairwise-val-input",
+        type=str,
+        default=PAIRWISE_VAL_INPUT_DEFAULT,
+        help="Prepared pairwise val/eval JSONL path.",
+    )
+    p.add_argument(
+        "--pairwise-test-input",
+        type=str,
+        default=PAIRWISE_TEST_INPUT_DEFAULT,
+        help="Prepared pairwise test JSONL path.",
+    )
     p.add_argument("--max-train-queries", type=int, default=0, help="Cap raw query groups loaded (0=all).")
     p.add_argument("--max-pairwise-rows", type=int, default=0, help="Cap pairwise rows loaded (0=all).")
 
@@ -1213,39 +1240,58 @@ def main() -> int:
     use_prepared_splits = bool(args.use_prepared_splits)
     regenerate_splits = bool(args.regenerate_splits)
     split_dir = _resolve_path(args.split_dir)
+    raw_train_override_path = _resolve_path(args.raw_train_input)
+    raw_val_override_path = _resolve_path(args.raw_val_input)
+    raw_test_override_path = _resolve_path(args.raw_test_input)
+    pair_train_override_path = _resolve_path(args.pairwise_train_input)
+    pair_val_override_path = _resolve_path(args.pairwise_val_input)
+    pair_test_override_path = _resolve_path(args.pairwise_test_input)
     split_policy = "deterministic_hash_by_grant_id"
     split_generated = False
     split_manifest_path: Optional[Path] = None
-    split_raw_train_path = raw_path
-    split_raw_val_path = raw_path
-    split_raw_test_path = raw_path
-    split_pair_train_path = pairwise_path
-    split_pair_val_path = pairwise_path
-    split_pair_test_path = pairwise_path
+    split_raw_train_path = raw_train_override_path
+    split_raw_val_path = raw_val_override_path
+    split_raw_test_path = raw_test_override_path
+    split_pair_train_path = pair_train_override_path
+    split_pair_val_path = pair_val_override_path
+    split_pair_test_path = pair_test_override_path
 
     if use_prepared_splits:
-        from cross_encoder.spec_to_chunk.data_preparation.split_distill_dataset import ensure_split_files
-
-        split_result = ensure_split_files(
-            raw_input=raw_path,
-            pairwise_input=pairwise_path if pairwise_path.exists() else None,
-            split_dir=split_dir,
-            val_ratio=val_ratio,
-            test_ratio=test_ratio,
-            seed=seed,
-            overwrite=regenerate_splits,
+        split_raw_ready = (
+            split_raw_train_path.exists()
+            and split_raw_val_path.exists()
+            and split_raw_test_path.exists()
         )
-        split_paths = split_result["paths"]
-        split_generated = bool(split_result.get("generated"))
-        split_manifest_path = split_paths.manifest
-        split_policy = "prepared_split_files"
+        split_pair_ready = (
+            split_pair_train_path.exists()
+            and split_pair_val_path.exists()
+            and split_pair_test_path.exists()
+        )
+        if split_raw_ready and (split_pair_ready or not pairwise_path.exists()) and not regenerate_splits:
+            split_policy = "prepared_split_files_manual_paths"
+        else:
+            from cross_encoder.spec_to_chunk.data_preparation.split_distill_dataset import ensure_split_files
 
-        split_raw_train_path = split_paths.raw_train
-        split_raw_val_path = split_paths.raw_val
-        split_raw_test_path = split_paths.raw_test
-        split_pair_train_path = split_paths.pair_train
-        split_pair_val_path = split_paths.pair_val
-        split_pair_test_path = split_paths.pair_test
+            split_result = ensure_split_files(
+                raw_input=raw_path,
+                pairwise_input=pairwise_path if pairwise_path.exists() else None,
+                split_dir=split_dir,
+                val_ratio=val_ratio,
+                test_ratio=test_ratio,
+                seed=seed,
+                overwrite=regenerate_splits,
+            )
+            split_paths = split_result["paths"]
+            split_generated = bool(split_result.get("generated"))
+            split_manifest_path = split_paths.manifest
+            split_policy = "prepared_split_files"
+
+            split_raw_train_path = split_paths.raw_train
+            split_raw_val_path = split_paths.raw_val
+            split_raw_test_path = split_paths.raw_test
+            split_pair_train_path = split_paths.pair_train
+            split_pair_val_path = split_paths.pair_val
+            split_pair_test_path = split_paths.pair_test
 
     wandb_run: Any = None
     wandb_enabled = not bool(args.no_wandb)
