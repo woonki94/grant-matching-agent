@@ -13,6 +13,10 @@ from typing import Any, Dict, List, Sequence, Tuple
 import torch
 from sqlalchemy import bindparam, text
 from transformers import AutoModelForSequenceClassification, AutoTokenizer
+try:
+    from sentence_transformers import CrossEncoder as STCrossEncoder
+except Exception:
+    STCrossEncoder = None  # type: ignore[assignment]
 
 
 def _find_project_root() -> Path:
@@ -31,7 +35,7 @@ from db.db_conn import SessionLocal
 
 
 FINETUNED_MODEL_DEFAULT = "cross_encoder/spec_to_spec/models/spec_to_spec_finetuned_ce"
-PURE_BGE_MODEL_ID = "BAAI/bge-reranker-base"
+PURE_BGE_MODEL_ID = "dleemiller/ModernCE-large-sts"
 OUTPUT_DIR_DEFAULT = "cross_encoder/spec_to_spec/eval/results"
 DISTILL_INPUT_DEFAULT = "cross_encoder/spec_to_spec/dataset/llm_distill_raw_scores.jsonl"
 DISTILL_INPUT_FALLBACK = "cross_encoder/spec_to_spec/dataset/llm_distill_listwise.jsonl"
@@ -127,6 +131,22 @@ def _score_docs_for_query(
     batch_size: int,
     max_length: int,
 ) -> List[float]:
+    # sentence-transformers CrossEncoder path
+    if tokenizer is None and hasattr(model, "predict"):
+        sentence_pairs = [(query_text, d) for d in doc_texts]
+        preds = model.predict(
+            sentence_pairs,
+            batch_size=max(1, int(batch_size)),
+            show_progress_bar=False,
+        )
+        if hasattr(preds, "tolist"):
+            preds = preds.tolist()
+        return [float(x) for x in preds]
+
+    if tokenizer is None:
+        raise RuntimeError("Tokenizer is required for transformers-based scoring.")
+
+    # transformers AutoModelForSequenceClassification path
     out: List[float] = []
     step = max(1, int(batch_size))
     with torch.no_grad():
@@ -146,6 +166,15 @@ def _score_docs_for_query(
             probs = torch.sigmoid(logits)
             out.extend(float(x) for x in probs.detach().cpu().tolist())
     return out
+
+
+def _load_st_cross_encoder(*, model_ref: str, device: torch.device) -> Any:
+    if STCrossEncoder is None:
+        raise RuntimeError(
+            "sentence-transformers is required for base model scoring. "
+            "Install it with: pip install sentence-transformers"
+        )
+    return STCrossEncoder(model_ref, device=str(device))
 
 
 def _load_grants_for_faculty(
@@ -982,8 +1011,8 @@ def _run_distill_eval(args: argparse.Namespace) -> int:
     device = _pick_device()
     tok_finetuned = AutoTokenizer.from_pretrained(finetuned_ref)
     model_finetuned = AutoModelForSequenceClassification.from_pretrained(finetuned_ref, num_labels=1).to(device).eval()
-    tok_base = AutoTokenizer.from_pretrained(base_ref)
-    model_base = AutoModelForSequenceClassification.from_pretrained(base_ref, num_labels=1).to(device).eval()
+    tok_base = None
+    model_base = _load_st_cross_encoder(model_ref=base_ref, device=device)
 
     finetuned_scores = _score_query_doc_rows(
         model=model_finetuned,
@@ -1360,8 +1389,8 @@ def main() -> int:
     tok_finetuned = AutoTokenizer.from_pretrained(finetuned_ref)
     model_finetuned = AutoModelForSequenceClassification.from_pretrained(finetuned_ref, num_labels=1).to(device).eval()
 
-    tok_base = AutoTokenizer.from_pretrained(base_ref)
-    model_base = AutoModelForSequenceClassification.from_pretrained(base_ref, num_labels=1).to(device).eval()
+    tok_base = None
+    model_base = _load_st_cross_encoder(model_ref=base_ref, device=device)
 
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     output_dir = _resolve_path(args.output_dir)
