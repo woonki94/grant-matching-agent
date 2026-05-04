@@ -1248,6 +1248,109 @@ def _pair_key(pair: PairExample) -> str:
     return hashlib.sha1(body.encode("utf-8")).hexdigest()
 
 
+def _pair_query_key(pair: PairExample) -> str:
+    return f"{_clean_text(pair.grant_id)}::spec#{int(pair.spec_idx)}"
+
+
+def _filter_pairs_for_groups(
+    pairs: Sequence[PairExample],
+    groups: Sequence[QueryGroup],
+) -> List[PairExample]:
+    keep_keys = {_query_group_key(g) for g in groups}
+    return [p for p in pairs if _pair_query_key(p) in keep_keys]
+
+
+def _count_group_bands(
+    groups: Sequence[QueryGroup],
+    *,
+    high_threshold: float,
+    mid_threshold: float,
+) -> Dict[str, int]:
+    out = {"high": 0, "mid": 0, "low": 0, "total": 0}
+    for g in groups:
+        b = _group_band(g, high_threshold=high_threshold, mid_threshold=mid_threshold)
+        out[b] = int(out.get(b, 0)) + 1
+        out["total"] += 1
+    return out
+
+
+def _cap_low_band_groups(
+    groups: Sequence[QueryGroup],
+    *,
+    high_threshold: float,
+    mid_threshold: float,
+    low_cap_ratio_to_high: float,
+    seed: int,
+) -> Tuple[List[QueryGroup], Dict[str, Any]]:
+    ratio = max(0.0, float(low_cap_ratio_to_high))
+    before_counts = _count_group_bands(
+        groups,
+        high_threshold=high_threshold,
+        mid_threshold=mid_threshold,
+    )
+    if ratio <= 0.0:
+        return list(groups), {
+            "applied": False,
+            "reason": "ratio_disabled",
+            "ratio": float(ratio),
+            "low_cap_target": -1,
+            "before": before_counts,
+            "after": before_counts,
+        }
+
+    highs: List[QueryGroup] = []
+    mids: List[QueryGroup] = []
+    lows: List[QueryGroup] = []
+    for g in groups:
+        b = _group_band(g, high_threshold=high_threshold, mid_threshold=mid_threshold)
+        if b == "high":
+            highs.append(g)
+        elif b == "mid":
+            mids.append(g)
+        else:
+            lows.append(g)
+
+    low_cap_target = max(0, int(math.floor(float(len(highs)) * float(ratio))))
+    if len(lows) <= low_cap_target:
+        return list(groups), {
+            "applied": False,
+            "reason": "already_within_cap",
+            "ratio": float(ratio),
+            "low_cap_target": int(low_cap_target),
+            "before": before_counts,
+            "after": before_counts,
+        }
+
+    kept_lows = _sample_groups_diverse(
+        lows,
+        target=int(low_cap_target),
+        seed=int(seed + 909),
+    )
+    keep_low_keys = {_query_group_key(g) for g in kept_lows}
+    out_groups: List[QueryGroup] = []
+    for g in groups:
+        b = _group_band(g, high_threshold=high_threshold, mid_threshold=mid_threshold)
+        if b != "low":
+            out_groups.append(g)
+            continue
+        if _query_group_key(g) in keep_low_keys:
+            out_groups.append(g)
+
+    after_counts = _count_group_bands(
+        out_groups,
+        high_threshold=high_threshold,
+        mid_threshold=mid_threshold,
+    )
+    return out_groups, {
+        "applied": True,
+        "reason": "capped_low_to_high_ratio",
+        "ratio": float(ratio),
+        "low_cap_target": int(low_cap_target),
+        "before": before_counts,
+        "after": after_counts,
+    }
+
+
 def _merge_groups_unique(*parts: Sequence[QueryGroup]) -> List[QueryGroup]:
     seen: Set[str] = set()
     out: List[QueryGroup] = []
@@ -1673,6 +1776,11 @@ def _run_iterative_orchestration(args: argparse.Namespace, *, raw_argv: Sequence
     mined_gap_min = _safe_float(args.iterative_mined_gap_min, default=0.15, minimum=0.0, maximum=1.0)
     mined_boundary_bandwidth = _safe_float(args.iterative_mined_boundary_bandwidth, default=0.08, minimum=0.0, maximum=1.0)
     mined_low_max_ratio = _safe_float(args.iterative_mined_low_max_ratio, default=0.35, minimum=0.0, maximum=1.0)
+    train_band_high_threshold = _safe_float(args.train_band_high_threshold, default=0.67, minimum=0.0, maximum=1.0)
+    train_band_mid_threshold = _safe_float(args.train_band_mid_threshold, default=0.34, minimum=0.0, maximum=1.0)
+    if train_band_mid_threshold > train_band_high_threshold:
+        train_band_mid_threshold = train_band_high_threshold
+    train_low_band_cap_ratio = _safe_float(args.train_low_band_cap_ratio, default=1.0, minimum=0.0, maximum=100.0)
 
     pair_derive_pos_k = _safe_int(args.pair_derive_pos_k, default=4, minimum=1, maximum=10_000)
     pair_derive_hard_k = _safe_int(args.pair_derive_hard_k, default=4, minimum=0, maximum=10_000)
@@ -1716,6 +1824,15 @@ def _run_iterative_orchestration(args: argparse.Namespace, *, raw_argv: Sequence
     original_test_groups = _load_raw_groups(original_paths.raw_test, max_queries=0)
     if not original_train_groups:
         raise RuntimeError("Original train split is empty.")
+    original_train_groups, original_train_low_cap_stats = _cap_low_band_groups(
+        original_train_groups,
+        high_threshold=float(train_band_high_threshold),
+        mid_threshold=float(train_band_mid_threshold),
+        low_cap_ratio_to_high=float(train_low_band_cap_ratio),
+        seed=int(seed),
+    )
+    if not original_train_groups:
+        raise RuntimeError("Original train split became empty after low-band cap.")
 
     mining_dev_raw_input = _resolve_path(args.iterative_mining_input) if _clean_text(args.iterative_mining_input) else None
     final_test_raw_input = _resolve_path(args.iterative_final_test_input) if _clean_text(args.iterative_final_test_input) else None
@@ -1778,6 +1895,29 @@ def _run_iterative_orchestration(args: argparse.Namespace, *, raw_argv: Sequence
             pair_mid_add_easy_contrast=pair_mid_add_easy_contrast,
         )
 
+    original_train_pairs_before_low_cap_filter = int(len(original_train_pairs))
+    original_train_pairs = _filter_pairs_for_groups(original_train_pairs, original_train_groups)
+    original_train_pairs_after_low_cap_filter = int(len(original_train_pairs))
+    original_train_pairs_low_cap_filtered = (
+        original_train_pairs_before_low_cap_filter - original_train_pairs_after_low_cap_filter
+    )
+    if not original_train_pairs:
+        original_train_pairs = _derive_pairs_for_groups(
+            original_train_groups,
+            pair_derive_pos_k=pair_derive_pos_k,
+            pair_derive_hard_k=pair_derive_hard_k,
+            pair_derive_weak_k=pair_derive_weak_k,
+            pair_derive_cap=pair_derive_cap,
+            pair_add_mid_lower_mid=pair_add_mid_lower_mid,
+            pair_mid_pos_score_min=pair_mid_pos_score_min,
+            pair_mid_pos_score_max=pair_mid_pos_score_max,
+            pair_mid_neg_score_min=pair_mid_neg_score_min,
+            pair_mid_neg_score_max=pair_mid_neg_score_max,
+            pair_mid_margin_min=pair_mid_margin_min,
+            pair_mid_margin_max=pair_mid_margin_max,
+            pair_mid_add_easy_contrast=pair_mid_add_easy_contrast,
+        )
+
     fixed_mining_dev_pairs = _derive_pairs_for_groups(
         fixed_mining_dev_groups,
         pair_derive_pos_k=pair_derive_pos_k,
@@ -1815,6 +1955,29 @@ def _run_iterative_orchestration(args: argparse.Namespace, *, raw_argv: Sequence
     print(f"fixed_original_train_queries={len(original_train_groups)}")
     print(f"fixed_original_val_queries={len(original_val_groups)}")
     print(f"fixed_original_test_queries={len(original_test_groups)}")
+    low_cap_before = original_train_low_cap_stats.get("before") if isinstance(original_train_low_cap_stats, dict) else {}
+    low_cap_after = original_train_low_cap_stats.get("after") if isinstance(original_train_low_cap_stats, dict) else {}
+    print(
+        "fixed_original_train_low_cap="
+        f"applied={bool(original_train_low_cap_stats.get('applied'))} "
+        f"reason={_clean_text(original_train_low_cap_stats.get('reason')) or 'unknown'} "
+        f"ratio={float(original_train_low_cap_stats.get('ratio', 0.0)):.4f} "
+        f"target={int(original_train_low_cap_stats.get('low_cap_target', -1))} "
+        f"before(high={int((low_cap_before or {}).get('high', 0))},"
+        f"mid={int((low_cap_before or {}).get('mid', 0))},"
+        f"low={int((low_cap_before or {}).get('low', 0))},"
+        f"total={int((low_cap_before or {}).get('total', 0))}) "
+        f"after(high={int((low_cap_after or {}).get('high', 0))},"
+        f"mid={int((low_cap_after or {}).get('mid', 0))},"
+        f"low={int((low_cap_after or {}).get('low', 0))},"
+        f"total={int((low_cap_after or {}).get('total', 0))})"
+    )
+    print(
+        "fixed_original_train_pairs_low_cap_filter="
+        f"before={original_train_pairs_before_low_cap_filter} "
+        f"after={original_train_pairs_after_low_cap_filter} "
+        f"dropped={original_train_pairs_low_cap_filtered}"
+    )
     print(f"fixed_mining_dev_queries={len(fixed_mining_dev_groups)}")
     print(f"fixed_final_test_queries={len(fixed_final_test_groups)}")
 
@@ -2134,6 +2297,43 @@ def _run_iterative_orchestration(args: argparse.Namespace, *, raw_argv: Sequence
         next_val_pairs = list(original_val_pairs)
         next_test_pairs = list(fixed_mining_dev_pairs)
 
+        next_train_groups, next_train_low_cap_stats = _cap_low_band_groups(
+            next_train_groups,
+            high_threshold=float(train_band_high_threshold),
+            mid_threshold=float(train_band_mid_threshold),
+            low_cap_ratio_to_high=float(train_low_band_cap_ratio),
+            seed=int(seed + round_idx + 11),
+        )
+        next_train_pairs_before_low_cap_filter = int(len(next_train_pairs))
+        next_train_pairs = _filter_pairs_for_groups(next_train_pairs, next_train_groups)
+        next_train_pairs_after_low_cap_filter = int(len(next_train_pairs))
+        next_train_pairs_low_cap_filtered = (
+            next_train_pairs_before_low_cap_filter - next_train_pairs_after_low_cap_filter
+        )
+        round_low_cap_before = next_train_low_cap_stats.get("before") if isinstance(next_train_low_cap_stats, dict) else {}
+        round_low_cap_after = next_train_low_cap_stats.get("after") if isinstance(next_train_low_cap_stats, dict) else {}
+        print(
+            "round_train_low_cap="
+            f"applied={bool(next_train_low_cap_stats.get('applied'))} "
+            f"reason={_clean_text(next_train_low_cap_stats.get('reason')) or 'unknown'} "
+            f"ratio={float(next_train_low_cap_stats.get('ratio', 0.0)):.4f} "
+            f"target={int(next_train_low_cap_stats.get('low_cap_target', -1))} "
+            f"before(high={int((round_low_cap_before or {}).get('high', 0))},"
+            f"mid={int((round_low_cap_before or {}).get('mid', 0))},"
+            f"low={int((round_low_cap_before or {}).get('low', 0))},"
+            f"total={int((round_low_cap_before or {}).get('total', 0))}) "
+            f"after(high={int((round_low_cap_after or {}).get('high', 0))},"
+            f"mid={int((round_low_cap_after or {}).get('mid', 0))},"
+            f"low={int((round_low_cap_after or {}).get('low', 0))},"
+            f"total={int((round_low_cap_after or {}).get('total', 0))})"
+        )
+        print(
+            "round_train_pairs_low_cap_filter="
+            f"before={next_train_pairs_before_low_cap_filter} "
+            f"after={next_train_pairs_after_low_cap_filter} "
+            f"dropped={next_train_pairs_low_cap_filtered}"
+        )
+
         if not next_train_groups:
             round_summary["stop_reason"] = "next_train_groups_empty_after_mining_replay"
             round_summaries.append(round_summary)
@@ -2204,6 +2404,12 @@ def _run_iterative_orchestration(args: argparse.Namespace, *, raw_argv: Sequence
         round_summary["replay_groups"] = int(len(replay_groups))
         round_summary["mined_val_groups"] = int(len(mined_val_groups))
         round_summary["mined_val_pairs"] = int(len(mined_val_pairs))
+        round_summary["next_train_low_cap"] = next_train_low_cap_stats
+        round_summary["next_train_pairs_low_cap_filter"] = {
+            "before": int(next_train_pairs_before_low_cap_filter),
+            "after": int(next_train_pairs_after_low_cap_filter),
+            "dropped": int(next_train_pairs_low_cap_filtered),
+        }
         round_summary["next_train_groups"] = int(len(current_train_groups))
         round_summary["next_val_groups"] = int(len(current_val_groups))
         round_summary["next_test_groups"] = int(len(current_test_groups))
@@ -2276,6 +2482,17 @@ def _run_iterative_orchestration(args: argparse.Namespace, *, raw_argv: Sequence
             "gap_min": float(mined_gap_min),
             "boundary_bandwidth": float(mined_boundary_bandwidth),
             "low_max_ratio": float(mined_low_max_ratio),
+        },
+        "train_low_cap_policy": {
+            "train_band_high_threshold": float(train_band_high_threshold),
+            "train_band_mid_threshold": float(train_band_mid_threshold),
+            "train_low_band_cap_ratio": float(train_low_band_cap_ratio),
+            "original_train_low_cap": original_train_low_cap_stats,
+            "original_train_pairs_low_cap_filter": {
+                "before": int(original_train_pairs_before_low_cap_filter),
+                "after": int(original_train_pairs_after_low_cap_filter),
+                "dropped": int(original_train_pairs_low_cap_filtered),
+            },
         },
         "replay_policy": {
             "replay_multiplier": float(replay_multiplier),
@@ -2407,6 +2624,27 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--pair-derive-hard-k", type=int, default=4)
     p.add_argument("--pair-derive-weak-k", type=int, default=4)
     p.add_argument("--pair-derive-cap", type=int, default=64)
+    p.add_argument(
+        "--train-band-high-threshold",
+        type=float,
+        default=0.67,
+        help="Teacher-score threshold used to classify query groups as high.",
+    )
+    p.add_argument(
+        "--train-band-mid-threshold",
+        type=float,
+        default=0.34,
+        help="Teacher-score threshold used to classify query groups as mid (below high is low).",
+    )
+    p.add_argument(
+        "--train-low-band-cap-ratio",
+        type=float,
+        default=1.0,
+        help=(
+            "Cap low-band train query groups to <= high_count * ratio. "
+            "Set 0 to disable. Default 1.0 caps low to high count."
+        ),
+    )
     p.add_argument(
         "--pair-add-mid-lower-mid",
         action="store_true",
@@ -2666,6 +2904,11 @@ def main() -> int:
     )
     low_signal_std_threshold = _safe_float(args.low_signal_std_threshold, default=0.05, minimum=0.0, maximum=1.0)
     low_signal_keep_prob = _safe_float(args.low_signal_keep_prob, default=0.1, minimum=0.0, maximum=1.0)
+    train_band_high_threshold = _safe_float(args.train_band_high_threshold, default=0.67, minimum=0.0, maximum=1.0)
+    train_band_mid_threshold = _safe_float(args.train_band_mid_threshold, default=0.34, minimum=0.0, maximum=1.0)
+    if train_band_mid_threshold > train_band_high_threshold:
+        train_band_mid_threshold = train_band_high_threshold
+    train_low_band_cap_ratio = _safe_float(args.train_low_band_cap_ratio, default=1.0, minimum=0.0, maximum=100.0)
     pair_mid_pos_score_min = _safe_float(args.pair_mid_pos_score_min, default=0.4, minimum=0.0, maximum=1.0)
     pair_mid_pos_score_max = _safe_float(args.pair_mid_pos_score_max, default=0.7, minimum=0.0, maximum=1.0)
     pair_mid_neg_score_min = _safe_float(args.pair_mid_neg_score_min, default=0.2, minimum=0.0, maximum=1.0)
@@ -2884,6 +3127,34 @@ def main() -> int:
     if not train_groups:
         raise RuntimeError("Training split is empty.")
 
+    train_groups, train_low_cap_stats = _cap_low_band_groups(
+        train_groups,
+        high_threshold=float(train_band_high_threshold),
+        mid_threshold=float(train_band_mid_threshold),
+        low_cap_ratio_to_high=float(train_low_band_cap_ratio),
+        seed=int(seed),
+    )
+    if not train_groups:
+        raise RuntimeError("Training split became empty after low-band cap.")
+    low_cap_before = train_low_cap_stats.get("before") if isinstance(train_low_cap_stats, dict) else {}
+    low_cap_after = train_low_cap_stats.get("after") if isinstance(train_low_cap_stats, dict) else {}
+    print(
+        "train_low_band_cap="
+        f"applied={bool(train_low_cap_stats.get('applied'))} "
+        f"reason={_clean_text(train_low_cap_stats.get('reason')) or 'unknown'} "
+        f"ratio={float(train_low_cap_stats.get('ratio', 0.0)):.4f} "
+        f"target={int(train_low_cap_stats.get('low_cap_target', -1))} "
+        f"before(high={int((low_cap_before or {}).get('high', 0))},"
+        f"mid={int((low_cap_before or {}).get('mid', 0))},"
+        f"low={int((low_cap_before or {}).get('low', 0))},"
+        f"total={int((low_cap_before or {}).get('total', 0))}) "
+        f"after(high={int((low_cap_after or {}).get('high', 0))},"
+        f"mid={int((low_cap_after or {}).get('mid', 0))},"
+        f"low={int((low_cap_after or {}).get('low', 0))},"
+        f"total={int((low_cap_after or {}).get('total', 0))})"
+    )
+    groups_all = list(train_groups) + list(val_groups) + list(test_groups)
+
     train_grants = {g.grant_id for g in train_groups}
     val_grants = {g.grant_id for g in val_groups}
     test_grants = {g.grant_id for g in test_groups}
@@ -2904,6 +3175,18 @@ def main() -> int:
             train_pairs = [r for r in pair_rows_loaded if r.grant_id in train_grants]
             val_pairs = [r for r in pair_rows_loaded if r.grant_id in val_grants]
             test_pairs = [r for r in pair_rows_loaded if r.grant_id in test_grants]
+
+    train_pairs_before_low_cap_filter = int(len(train_pairs))
+    train_pairs = _filter_pairs_for_groups(train_pairs, train_groups)
+    train_pairs_after_low_cap_filter = int(len(train_pairs))
+    train_pairs_low_cap_filtered = train_pairs_before_low_cap_filter - train_pairs_after_low_cap_filter
+    if train_pairs_low_cap_filtered > 0:
+        print(
+            "train_pairs_low_cap_filter="
+            f"before={train_pairs_before_low_cap_filter} "
+            f"after={train_pairs_after_low_cap_filter} "
+            f"dropped={train_pairs_low_cap_filtered}"
+        )
 
     if not train_pairs:
         print("pairwise_rows_loaded=0; deriving pairwise rows from raw groups")
@@ -3067,6 +3350,20 @@ def main() -> int:
             "data/pair_mid_margin_min": float(pair_mid_margin_min),
             "data/pair_mid_margin_max": float(pair_mid_margin_max),
             "data/pair_mid_add_easy_contrast": int(1 if pair_mid_add_easy_contrast else 0),
+            "data/train_low_cap_applied": int(1 if bool(train_low_cap_stats.get("applied")) else 0),
+            "data/train_low_cap_ratio": float(train_low_cap_stats.get("ratio", 0.0)),
+            "data/train_low_cap_target": int(train_low_cap_stats.get("low_cap_target", -1)),
+            "data/train_high_before_low_cap": int((low_cap_before or {}).get("high", 0)),
+            "data/train_mid_before_low_cap": int((low_cap_before or {}).get("mid", 0)),
+            "data/train_low_before_low_cap": int((low_cap_before or {}).get("low", 0)),
+            "data/train_total_before_low_cap": int((low_cap_before or {}).get("total", 0)),
+            "data/train_high_after_low_cap": int((low_cap_after or {}).get("high", 0)),
+            "data/train_mid_after_low_cap": int((low_cap_after or {}).get("mid", 0)),
+            "data/train_low_after_low_cap": int((low_cap_after or {}).get("low", 0)),
+            "data/train_total_after_low_cap": int((low_cap_after or {}).get("total", 0)),
+            "data/train_pairs_before_low_cap_filter": int(train_pairs_before_low_cap_filter),
+            "data/train_pairs_after_low_cap_filter": int(train_pairs_after_low_cap_filter),
+            "data/train_pairs_low_cap_filtered": int(train_pairs_low_cap_filtered),
             "data/listwise_train": int(len(train_list_rows)),
             "data/listwise_val": int(len(val_list_rows)),
             "data/listwise_test": int(len(test_list_rows)),
@@ -3666,6 +3963,15 @@ def main() -> int:
         "pair_mid_margin_min": float(pair_mid_margin_min),
         "pair_mid_margin_max": float(pair_mid_margin_max),
         "pair_mid_add_easy_contrast": bool(pair_mid_add_easy_contrast),
+        "train_low_cap": {
+            "train_band_high_threshold": float(train_band_high_threshold),
+            "train_band_mid_threshold": float(train_band_mid_threshold),
+            "train_low_band_cap_ratio": float(train_low_band_cap_ratio),
+            "stats": train_low_cap_stats,
+            "train_pairs_before_low_cap_filter": int(train_pairs_before_low_cap_filter),
+            "train_pairs_after_low_cap_filter": int(train_pairs_after_low_cap_filter),
+            "train_pairs_low_cap_filtered": int(train_pairs_low_cap_filtered),
+        },
         "candidate_pool_size": int(candidate_pool_size),
         "mini_list_size": int(mini_list_size),
         "teacher_temperature": float(teacher_temperature),
