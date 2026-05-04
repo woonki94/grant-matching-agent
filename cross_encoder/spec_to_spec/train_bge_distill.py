@@ -5,13 +5,14 @@ import hashlib
 import json
 import math
 import random
+import subprocess
 import sys
 import time
 from contextlib import nullcontext
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -973,6 +974,1336 @@ def _evaluate(
     }
 
 
+def _run_command(cmd: Sequence[str], *, cwd: Optional[Path] = None) -> None:
+    cmd_list = [str(x) for x in cmd]
+    cmd_print = " ".join(cmd_list)
+    print(f"subprocess_start={cmd_print}")
+    proc = subprocess.run(cmd_list, cwd=str(cwd or PROJECT_ROOT), check=False)
+    if int(proc.returncode) != 0:
+        raise RuntimeError(f"Subprocess failed (code={proc.returncode}): {cmd_print}")
+
+
+def _resolve_round_model_dir(*, round_output_dir: Path, stage1_epochs: int, stage2_epochs: int) -> Path:
+    best_dir = round_output_dir / "best"
+    if best_dir.exists():
+        return best_dir
+
+    if int(stage2_epochs) > 0:
+        stage2_final = round_output_dir / f"stage2_epoch_{int(stage2_epochs)}"
+        if stage2_final.exists():
+            return stage2_final
+        stage2_candidates = sorted(
+            [p for p in round_output_dir.glob("stage2_epoch_*") if p.is_dir()],
+            key=lambda x: float(x.stat().st_mtime),
+            reverse=True,
+        )
+        if stage2_candidates:
+            return stage2_candidates[0]
+
+    if int(stage1_epochs) > 0:
+        stage1_final = round_output_dir / f"stage1_epoch_{int(stage1_epochs)}"
+        if stage1_final.exists():
+            return stage1_final
+        stage1_candidates = sorted(
+            [p for p in round_output_dir.glob("stage1_epoch_*") if p.is_dir()],
+            key=lambda x: float(x.stat().st_mtime),
+            reverse=True,
+        )
+        if stage1_candidates:
+            return stage1_candidates[0]
+
+    raise RuntimeError(
+        f"Unable to find trained model checkpoint directory under {round_output_dir}. "
+        "Expected best/stage2_epoch_*/stage1_epoch_*."
+    )
+
+
+def _find_latest_mismatch_json(*, eval_output_dir: Path, mismatch_target: str) -> Path:
+    pref = sorted(
+        [p for p in eval_output_dir.glob(f"distill_cluster_mismatch_{mismatch_target}_*.json") if p.is_file()],
+        key=lambda x: float(x.stat().st_mtime),
+        reverse=True,
+    )
+    if pref:
+        return pref[0]
+    any_json = sorted(
+        [p for p in eval_output_dir.glob("distill_cluster_mismatch_*.json") if p.is_file()],
+        key=lambda x: float(x.stat().st_mtime),
+        reverse=True,
+    )
+    if any_json:
+        return any_json[0]
+    raise RuntimeError(f"No mismatch eval JSON found in {eval_output_dir}")
+
+
+def _load_mismatch_rows(eval_json_path: Path) -> List[Dict[str, Any]]:
+    obj = json.loads(eval_json_path.read_text(encoding="utf-8"))
+    rows = obj.get("rows") if isinstance(obj, dict) else None
+    if not isinstance(rows, list):
+        return []
+    out: List[Dict[str, Any]] = []
+    for row in rows:
+        if isinstance(row, dict):
+            out.append(row)
+    return out
+
+
+def _build_mismatch_distill_files(
+    *,
+    rows: Sequence[Dict[str, Any]],
+    raw_out_path: Path,
+    pair_out_path: Path,
+    pair_derive_pos_k: int,
+    pair_derive_hard_k: int,
+    pair_derive_weak_k: int,
+    pair_derive_cap: int,
+    pair_add_mid_lower_mid: bool,
+    pair_mid_pos_score_min: float,
+    pair_mid_pos_score_max: float,
+    pair_mid_neg_score_min: float,
+    pair_mid_neg_score_max: float,
+    pair_mid_margin_min: float,
+    pair_mid_margin_max: float,
+    pair_mid_add_easy_contrast: bool,
+) -> Dict[str, Any]:
+    grouped: Dict[Tuple[str, int, str], QueryGroup] = {}
+    seen_docs: Dict[Tuple[str, int, str], Set[str]] = {}
+    dropped_invalid = 0
+
+    for row in rows:
+        grant_id = _clean_text(row.get("grant_id"))
+        spec_idx = _safe_int(row.get("spec_idx"), default=0, minimum=0, maximum=50_000_000)
+        query_text = _clean_text(row.get("query_text") or row.get("spec_text"))
+        doc_text = _clean_text(row.get("doc_text") or row.get("fac_spec_text") or row.get("text"))
+        if (not grant_id) or (not query_text) or (not doc_text):
+            dropped_invalid += 1
+            continue
+
+        teacher_score = _clamp_01(
+            row.get("teacher_score_used")
+            if (row.get("teacher_score_used") is not None)
+            else (row.get("teacher_score") if (row.get("teacher_score") is not None) else row.get("score"))
+        )
+        fac_id = _safe_int(row.get("fac_id"), default=0, minimum=0, maximum=2_147_483_647)
+        chunk_id = _safe_int(
+            row.get("fac_spec_id") if (row.get("fac_spec_id") is not None) else row.get("chunk_id"),
+            default=0,
+            minimum=0,
+            maximum=2_147_483_647,
+        )
+        chunk_index = _safe_int(row.get("chunk_index"), default=0, minimum=0, maximum=10_000_000)
+        source_type = _clean_text(row.get("source_band") or row.get("score_band") or row.get("source_type")) or "mismatch"
+
+        key = (grant_id, int(spec_idx), query_text)
+        if key not in grouped:
+            grouped[key] = QueryGroup(grant_id=grant_id, spec_idx=int(spec_idx), query_text=query_text, candidates=[])
+            seen_docs[key] = set()
+
+        dedup_key = f"{fac_id}::{chunk_id}::{doc_text}"
+        if dedup_key in seen_docs[key]:
+            continue
+        seen_docs[key].add(dedup_key)
+
+        grouped[key].candidates.append(
+            Candidate(
+                text=doc_text,
+                score=float(teacher_score),
+                fac_id=int(fac_id),
+                chunk_id=int(chunk_id),
+                chunk_index=int(chunk_index),
+                source_type=source_type,
+            )
+        )
+
+    raw_rows: List[Dict[str, Any]] = []
+    usable_groups: List[QueryGroup] = []
+    dropped_singleton = 0
+    for g in grouped.values():
+        cands = sorted(list(g.candidates), key=lambda x: float(x.score), reverse=True)
+        if len(cands) < 2:
+            dropped_singleton += 1
+            continue
+        group = QueryGroup(grant_id=g.grant_id, spec_idx=int(g.spec_idx), query_text=g.query_text, candidates=cands)
+        usable_groups.append(group)
+        raw_rows.append(
+            {
+                "grant_id": group.grant_id,
+                "spec_idx": int(group.spec_idx),
+                "query_text": group.query_text,
+                "spec_text": group.query_text,
+                "candidates": [
+                    {
+                        "fac_id": int(c.fac_id),
+                        "fac_spec_id": int(c.chunk_id),
+                        "chunk_id": int(c.chunk_id),
+                        "chunk_index": int(c.chunk_index),
+                        "source_type": c.source_type,
+                        "section": c.source_type,
+                        "fac_spec_text": c.text,
+                        "chunk_text": c.text,
+                        "text": c.text,
+                        "score": float(c.score),
+                        "score_raw": float(c.score),
+                        "teacher_score": float(c.score),
+                        "teacher_score_raw": float(c.score),
+                    }
+                    for c in cands
+                ],
+            }
+        )
+
+    raw_out_path.parent.mkdir(parents=True, exist_ok=True)
+    with raw_out_path.open("w", encoding="utf-8") as f:
+        for row in raw_rows:
+            f.write(json.dumps(row, ensure_ascii=False) + "\n")
+
+    pair_rows = _derive_pairwise_from_groups(
+        usable_groups,
+        per_query_pos_k=int(pair_derive_pos_k),
+        per_query_hard_k=int(pair_derive_hard_k),
+        per_query_weak_k=int(pair_derive_weak_k),
+        per_query_cap=int(pair_derive_cap),
+    )
+    if bool(pair_add_mid_lower_mid):
+        pair_rows = list(pair_rows) + _derive_mid_lower_mid_pairs_from_groups(
+            usable_groups,
+            per_query_cap=int(pair_derive_cap),
+            pos_score_min=float(pair_mid_pos_score_min),
+            pos_score_max=float(pair_mid_pos_score_max),
+            neg_score_min=float(pair_mid_neg_score_min),
+            neg_score_max=float(pair_mid_neg_score_max),
+            margin_min=float(pair_mid_margin_min),
+            margin_max=float(pair_mid_margin_max),
+            add_easy_contrast=bool(pair_mid_add_easy_contrast),
+        )
+
+    pair_out_path.parent.mkdir(parents=True, exist_ok=True)
+    with pair_out_path.open("w", encoding="utf-8") as f:
+        for p in pair_rows:
+            f.write(
+                json.dumps(
+                    {
+                        "grant_id": p.grant_id,
+                        "spec_idx": int(p.spec_idx),
+                        "query_text": p.query_text,
+                        "pos_text": p.pos_text,
+                        "neg_text": p.neg_text,
+                        "teacher_pos_score": float(p.teacher_pos_score),
+                        "teacher_neg_score": float(p.teacher_neg_score),
+                        "teacher_margin": float(p.teacher_margin),
+                        "pair_type": p.pair_type,
+                    },
+                    ensure_ascii=False,
+                )
+                + "\n"
+            )
+
+    return {
+        "input_rows": int(len(rows)),
+        "dropped_invalid_rows": int(dropped_invalid),
+        "raw_query_groups_total": int(len(grouped)),
+        "raw_query_groups_kept": int(len(usable_groups)),
+        "raw_query_groups_dropped_singleton": int(dropped_singleton),
+        "raw_rows_written": int(len(raw_rows)),
+        "pair_rows_written": int(len(pair_rows)),
+        "raw_out_path": str(raw_out_path),
+        "pair_out_path": str(pair_out_path),
+    }
+
+
+def _score_band_from_value(score: float, *, high_threshold: float, mid_threshold: float) -> str:
+    s = _clamp_01(score)
+    if s >= float(high_threshold):
+        return "high"
+    if s >= float(mid_threshold):
+        return "mid"
+    return "low"
+
+
+def _query_group_key(group: QueryGroup) -> str:
+    return f"{_clean_text(group.grant_id)}::spec#{int(group.spec_idx)}"
+
+
+def _group_band(group: QueryGroup, *, high_threshold: float, mid_threshold: float) -> str:
+    if not group.candidates:
+        return "low"
+    top_score = float(max(float(c.score) for c in group.candidates))
+    return _score_band_from_value(top_score, high_threshold=high_threshold, mid_threshold=mid_threshold)
+
+
+def _query_key_from_row(row: Dict[str, Any]) -> str:
+    return f"{_clean_text(row.get('grant_id'))}::spec#{_safe_int(row.get('spec_idx'), default=0, minimum=0, maximum=50_000_000)}"
+
+
+def _pair_key(pair: PairExample) -> str:
+    body = "||".join(
+        [
+            _clean_text(pair.grant_id),
+            str(int(pair.spec_idx)),
+            _clean_text(pair.query_text),
+            _clean_text(pair.pos_text),
+            _clean_text(pair.neg_text),
+        ]
+    )
+    return hashlib.sha1(body.encode("utf-8")).hexdigest()
+
+
+def _merge_groups_unique(*parts: Sequence[QueryGroup]) -> List[QueryGroup]:
+    seen: Set[str] = set()
+    out: List[QueryGroup] = []
+    for chunk in parts:
+        for g in chunk:
+            k = _query_group_key(g)
+            if k in seen:
+                continue
+            seen.add(k)
+            out.append(g)
+    return out
+
+
+def _merge_pairs_unique(*parts: Sequence[PairExample]) -> List[PairExample]:
+    seen: Set[str] = set()
+    out: List[PairExample] = []
+    for chunk in parts:
+        for p in chunk:
+            k = _pair_key(p)
+            if k in seen:
+                continue
+            seen.add(k)
+            out.append(p)
+    return out
+
+
+def _query_group_to_raw_obj(group: QueryGroup) -> Dict[str, Any]:
+    cands = sorted(list(group.candidates), key=lambda x: float(x.score), reverse=True)
+    return {
+        "grant_id": _clean_text(group.grant_id),
+        "spec_idx": int(group.spec_idx),
+        "query_text": _clean_text(group.query_text),
+        "spec_text": _clean_text(group.query_text),
+        "candidates": [
+            {
+                "fac_id": int(c.fac_id),
+                "fac_spec_id": int(c.chunk_id),
+                "chunk_id": int(c.chunk_id),
+                "chunk_index": int(c.chunk_index),
+                "source_type": _clean_text(c.source_type) or "unknown",
+                "section": _clean_text(c.source_type) or "unknown",
+                "fac_spec_text": _clean_text(c.text),
+                "chunk_text": _clean_text(c.text),
+                "text": _clean_text(c.text),
+                "score": float(c.score),
+                "score_raw": float(c.score),
+                "teacher_score": float(c.score),
+                "teacher_score_raw": float(c.score),
+            }
+            for c in cands
+        ],
+    }
+
+
+def _write_raw_groups_jsonl(path: Path, groups: Sequence[QueryGroup]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as f:
+        for g in groups:
+            f.write(json.dumps(_query_group_to_raw_obj(g), ensure_ascii=False) + "\n")
+
+
+def _write_pair_rows_jsonl(path: Path, pairs: Sequence[PairExample]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as f:
+        for p in pairs:
+            f.write(
+                json.dumps(
+                    {
+                        "grant_id": _clean_text(p.grant_id),
+                        "spec_idx": int(p.spec_idx),
+                        "query_text": _clean_text(p.query_text),
+                        "pos_text": _clean_text(p.pos_text),
+                        "neg_text": _clean_text(p.neg_text),
+                        "teacher_pos_score": float(p.teacher_pos_score),
+                        "teacher_neg_score": float(p.teacher_neg_score),
+                        "teacher_margin": float(p.teacher_margin),
+                        "pair_type": _clean_text(p.pair_type) or "unknown",
+                    },
+                    ensure_ascii=False,
+                )
+                + "\n"
+            )
+
+
+def _derive_pairs_for_groups(
+    groups: Sequence[QueryGroup],
+    *,
+    pair_derive_pos_k: int,
+    pair_derive_hard_k: int,
+    pair_derive_weak_k: int,
+    pair_derive_cap: int,
+    pair_add_mid_lower_mid: bool,
+    pair_mid_pos_score_min: float,
+    pair_mid_pos_score_max: float,
+    pair_mid_neg_score_min: float,
+    pair_mid_neg_score_max: float,
+    pair_mid_margin_min: float,
+    pair_mid_margin_max: float,
+    pair_mid_add_easy_contrast: bool,
+) -> List[PairExample]:
+    base_pairs = _derive_pairwise_from_groups(
+        groups,
+        per_query_pos_k=int(pair_derive_pos_k),
+        per_query_hard_k=int(pair_derive_hard_k),
+        per_query_weak_k=int(pair_derive_weak_k),
+        per_query_cap=int(pair_derive_cap),
+    )
+    if not bool(pair_add_mid_lower_mid):
+        return base_pairs
+    mid_pairs = _derive_mid_lower_mid_pairs_from_groups(
+        groups,
+        per_query_cap=int(pair_derive_cap),
+        pos_score_min=float(pair_mid_pos_score_min),
+        pos_score_max=float(pair_mid_pos_score_max),
+        neg_score_min=float(pair_mid_neg_score_min),
+        neg_score_max=float(pair_mid_neg_score_max),
+        margin_min=float(pair_mid_margin_min),
+        margin_max=float(pair_mid_margin_max),
+        add_easy_contrast=bool(pair_mid_add_easy_contrast),
+    )
+    return list(base_pairs) + list(mid_pairs)
+
+
+def _sample_groups_diverse(groups: Sequence[QueryGroup], *, target: int, seed: int) -> List[QueryGroup]:
+    k = max(0, int(target))
+    if k <= 0 or (not groups):
+        return []
+
+    by_grant: Dict[str, List[QueryGroup]] = {}
+    for g in groups:
+        gid = _clean_text(g.grant_id) or "unknown"
+        by_grant.setdefault(gid, []).append(g)
+    for gid, items in by_grant.items():
+        items.sort(key=lambda x: _hash_to_unit_interval(f"{int(seed)}::{gid}::{_query_group_key(x)}"))
+
+    grant_order = sorted(
+        list(by_grant.keys()),
+        key=lambda gid: _hash_to_unit_interval(f"{int(seed)}::grant::{gid}"),
+    )
+
+    out: List[QueryGroup] = []
+    active = list(grant_order)
+    while active and len(out) < k:
+        next_active: List[str] = []
+        for gid in active:
+            bucket = by_grant.get(gid) or []
+            if not bucket:
+                continue
+            out.append(bucket.pop(0))
+            if bucket:
+                next_active.append(gid)
+            if len(out) >= k:
+                break
+        active = next_active
+    return out
+
+
+def _sample_replay_groups(
+    *,
+    original_train_groups: Sequence[QueryGroup],
+    replay_target: int,
+    high_threshold: float,
+    mid_threshold: float,
+    high_ratio: float,
+    mid_ratio: float,
+    low_ratio: float,
+    seed: int,
+) -> List[QueryGroup]:
+    target = max(0, int(replay_target))
+    if target <= 0:
+        return []
+
+    ratios = [max(0.0, float(high_ratio)), max(0.0, float(mid_ratio)), max(0.0, float(low_ratio))]
+    ratio_sum = float(sum(ratios))
+    if ratio_sum <= 0.0:
+        ratios = [0.3, 0.4, 0.3]
+        ratio_sum = 1.0
+    ratios = [x / ratio_sum for x in ratios]
+
+    by_band: Dict[str, List[QueryGroup]] = {"high": [], "mid": [], "low": []}
+    for g in original_train_groups:
+        b = _group_band(g, high_threshold=high_threshold, mid_threshold=mid_threshold)
+        by_band[b].append(g)
+
+    plan = {
+        "high": int(round(float(target) * float(ratios[0]))),
+        "mid": int(round(float(target) * float(ratios[1]))),
+        "low": int(round(float(target) * float(ratios[2]))),
+    }
+    planned_sum = int(plan["high"] + plan["mid"] + plan["low"])
+    if planned_sum != target:
+        plan["mid"] += int(target - planned_sum)
+    if plan["mid"] < 0:
+        plan["mid"] = 0
+
+    selected: List[QueryGroup] = []
+    for band, offset in (("high", 101), ("mid", 202), ("low", 303)):
+        picked = _sample_groups_diverse(by_band[band], target=int(plan[band]), seed=int(seed + offset))
+        selected.extend(picked)
+
+    if len(selected) < target:
+        used = {_query_group_key(x) for x in selected}
+        remain = [g for g in original_train_groups if _query_group_key(g) not in used]
+        fill = _sample_groups_diverse(remain, target=int(target - len(selected)), seed=int(seed + 404))
+        selected.extend(fill)
+
+    return selected[:target]
+
+
+def _collect_ranking_mistake_query_keys(
+    rows: Sequence[Dict[str, Any]],
+    *,
+    model_score_key: str,
+    high_threshold: float,
+    mid_threshold: float,
+) -> Set[str]:
+    grouped: Dict[str, List[Dict[str, Any]]] = {}
+    for row in rows:
+        grouped.setdefault(_query_key_from_row(row), []).append(row)
+
+    bad: Set[str] = set()
+    for qk, items in grouped.items():
+        if len(items) < 2:
+            continue
+        teacher = [float(x.get("teacher_score_used") or 0.0) for x in items]
+        pred = [float(x.get(model_score_key) or 0.0) for x in items]
+        important = [i for i, t in enumerate(teacher) if t >= float(high_threshold)]
+        if not important:
+            continue
+        top_pred = max(range(len(items)), key=lambda i: float(pred[i]))
+        if top_pred not in set(important):
+            bad.add(qk)
+            continue
+        if any(float(pred[i]) < float(mid_threshold) for i in important):
+            bad.add(qk)
+    return bad
+
+
+def _filter_mined_rows_policy(
+    *,
+    rows: Sequence[Dict[str, Any]],
+    mismatch_target: str,
+    high_threshold: float,
+    mid_threshold: float,
+    gap_min: float,
+    boundary_bandwidth: float,
+    low_max_ratio: float,
+) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    target = _clean_text(mismatch_target).lower() or "finetuned"
+    if target not in {"finetuned", "base", "either", "both"}:
+        target = "finetuned"
+
+    ranking_ft = _collect_ranking_mistake_query_keys(
+        rows,
+        model_score_key="finetuned_score",
+        high_threshold=float(high_threshold),
+        mid_threshold=float(mid_threshold),
+    )
+    ranking_base = _collect_ranking_mistake_query_keys(
+        rows,
+        model_score_key="base_score",
+        high_threshold=float(high_threshold),
+        mid_threshold=float(mid_threshold),
+    )
+    if target == "base":
+        ranking_bad_keys = set(ranking_base)
+    elif target == "both":
+        ranking_bad_keys = set(ranking_ft).intersection(ranking_base)
+    elif target == "either":
+        ranking_bad_keys = set(ranking_ft).union(ranking_base)
+    else:
+        ranking_bad_keys = set(ranking_ft)
+
+    selected: List[Dict[str, Any]] = []
+    for row in rows:
+        gt = float(row.get("teacher_score_used") or 0.0)
+        ft = float(row.get("finetuned_score") or 0.0)
+        b = float(row.get("base_score") or 0.0)
+        gt_band = _clean_text(row.get("gt_cluster")) or _score_band_from_value(
+            gt,
+            high_threshold=high_threshold,
+            mid_threshold=mid_threshold,
+        )
+        ft_band = _clean_text(row.get("finetuned_cluster")) or _score_band_from_value(
+            ft,
+            high_threshold=high_threshold,
+            mid_threshold=mid_threshold,
+        )
+        b_band = _clean_text(row.get("base_cluster")) or _score_band_from_value(
+            b,
+            high_threshold=high_threshold,
+            mid_threshold=mid_threshold,
+        )
+
+        ft_mis = bool(row.get("finetuned_cluster_mismatch")) or (gt_band != ft_band)
+        b_mis = bool(row.get("base_cluster_mismatch")) or (gt_band != b_band)
+        ft_gap = abs(float(ft - gt))
+        b_gap = abs(float(b - gt))
+
+        if target == "base":
+            model_pred_band = b_band
+            cluster_mismatch = b_mis
+            gap = float(b_gap)
+        elif target == "both":
+            model_pred_band = ft_band
+            cluster_mismatch = bool(ft_mis and b_mis)
+            gap = float(max(ft_gap, b_gap))
+        elif target == "either":
+            model_pred_band = ft_band
+            cluster_mismatch = bool(ft_mis or b_mis)
+            gap = float(max(ft_gap, b_gap))
+        else:
+            model_pred_band = ft_band
+            cluster_mismatch = ft_mis
+            gap = float(ft_gap)
+
+        qk = _query_key_from_row(row)
+
+        wrong_band = bool(gt_band != model_pred_band)
+        rank_bad = bool(qk in ranking_bad_keys)
+
+        if not cluster_mismatch:
+            continue
+        if not (gap >= float(gap_min) or wrong_band or rank_bad):
+            continue
+
+        near_boundary = min(abs(float(gt) - float(high_threshold)), abs(float(gt) - float(mid_threshold))) <= float(boundary_bandwidth)
+        priority = 0.0
+        if gt_band == "high" and model_pred_band in {"mid", "low"}:
+            priority += 5.0
+        elif gt_band == "mid" and model_pred_band in {"high", "low"}:
+            priority += 4.0
+        elif gt_band == "low" and model_pred_band in {"high", "mid"}:
+            priority += 2.0
+        if near_boundary:
+            priority += 2.0
+        if rank_bad:
+            priority += 3.0
+        priority += float(gap)
+
+        copied = dict(row)
+        copied["_mine_priority"] = float(priority)
+        copied["_mine_gap"] = float(gap)
+        copied["_mine_rank_bad"] = bool(rank_bad)
+        copied["_mine_near_boundary"] = bool(near_boundary)
+        copied["_mine_gt_band"] = gt_band
+        copied["_mine_pred_band"] = model_pred_band
+        selected.append(copied)
+
+    selected.sort(key=lambda x: (float(x.get("_mine_priority") or 0.0), float(x.get("_mine_gap") or 0.0)), reverse=True)
+
+    low_ratio_cap = max(0.0, min(1.0, float(low_max_ratio)))
+    low_rows = [r for r in selected if _clean_text(r.get("_mine_gt_band")) == "low"]
+    non_low_rows = [r for r in selected if _clean_text(r.get("_mine_gt_band")) != "low"]
+    max_low = int(round(float(len(selected)) * low_ratio_cap))
+    if max_low < 0:
+        max_low = 0
+    kept_low = low_rows[:max_low] if len(low_rows) > max_low else low_rows
+    final_rows = list(non_low_rows) + list(kept_low)
+    final_rows.sort(key=lambda x: (float(x.get("_mine_priority") or 0.0), float(x.get("_mine_gap") or 0.0)), reverse=True)
+
+    stats = {
+        "mismatch_target": target,
+        "input_rows": int(len(rows)),
+        "selected_before_low_cap": int(len(selected)),
+        "selected_after_low_cap": int(len(final_rows)),
+        "ranking_mistake_queries": int(len(ranking_bad_keys)),
+        "low_cap_ratio": float(low_ratio_cap),
+        "low_rows_before_cap": int(len(low_rows)),
+        "low_rows_after_cap": int(len(kept_low)),
+    }
+    return final_rows, stats
+
+
+def _run_iterative_orchestration(args: argparse.Namespace, *, raw_argv: Sequence[str]) -> int:
+    from cross_encoder.spec_to_spec.data_preparation.split_distill_dataset import ensure_split_files
+
+    iterative_max_rounds = _safe_int(args.iterative_max_rounds, default=1, minimum=1, maximum=100)
+    if iterative_max_rounds <= 1:
+        return 0
+
+    train_script_path = Path(__file__).resolve()
+    eval_script_path = (PROJECT_ROOT / "cross_encoder" / "spec_to_spec" / "eval" / "eval_faculty_grant_spec_compare_cluster_mismatch.py").resolve()
+    if not eval_script_path.exists():
+        raise RuntimeError(f"Mismatch eval script not found: {eval_script_path}")
+
+    seed = _safe_int(args.seed, default=42, minimum=0, maximum=2_147_483_647)
+    val_ratio = _safe_float(args.val_ratio, default=0.1, minimum=0.0, maximum=0.5)
+    test_ratio = _safe_float(args.test_ratio, default=0.1, minimum=0.0, maximum=0.5)
+    if (val_ratio + test_ratio) >= 0.99:
+        test_ratio = max(0.0, 0.99 - val_ratio)
+
+    stage1_epochs = _safe_int(args.stage1_epochs, default=1, minimum=0, maximum=100)
+    stage2_epochs = _safe_int(args.stage2_epochs, default=3, minimum=0, maximum=100)
+
+    output_dir_base = _resolve_path(args.output_dir)
+    iterative_root = (output_dir_base / "iterative_rounds").resolve()
+    iterative_root.mkdir(parents=True, exist_ok=True)
+
+    original_raw_input = _resolve_path(args.raw_input)
+    original_pairwise_input = _resolve_path(args.pairwise_input)
+    original_split_dir = _resolve_path(args.split_dir)
+
+    fixed_eval_test_input = _resolve_path(args.iterative_eval_test_input) if _clean_text(args.iterative_eval_test_input) else None
+    eval_base_model = _clean_text(args.iterative_eval_base_model) or (_clean_text(args.model_id) or MODEL_ID_DEFAULT)
+    current_model_id = _clean_text(args.model_id) or MODEL_ID_DEFAULT
+
+    mismatch_target = _clean_text(args.iterative_mismatch_target).lower() or "finetuned"
+    mismatch_ground_truth = _clean_text(args.iterative_mismatch_ground_truth).lower() or "raw"
+    mismatch_high_threshold = _safe_float(args.iterative_mismatch_high_threshold, default=0.67, minimum=0.0, maximum=1.0)
+    mismatch_mid_threshold = _safe_float(args.iterative_mismatch_mid_threshold, default=0.34, minimum=0.0, maximum=1.0)
+    if mismatch_mid_threshold > mismatch_high_threshold:
+        mismatch_mid_threshold = mismatch_high_threshold
+    mismatch_pred_high_threshold = _safe_float(args.iterative_mismatch_pred_high_threshold, default=-1.0, minimum=-1.0, maximum=1.0)
+    mismatch_pred_mid_threshold = _safe_float(args.iterative_mismatch_pred_mid_threshold, default=-1.0, minimum=-1.0, maximum=1.0)
+    mismatch_sample_high = _safe_int(args.iterative_mismatch_sample_high, default=0, minimum=0, maximum=50_000_000)
+    mismatch_sample_mid = _safe_int(args.iterative_mismatch_sample_mid, default=0, minimum=0, maximum=50_000_000)
+    mismatch_sample_low = _safe_int(args.iterative_mismatch_sample_low, default=0, minimum=0, maximum=50_000_000)
+    mismatch_max_pairs_scan = _safe_int(args.iterative_mismatch_max_pairs_scan, default=0, minimum=0, maximum=200_000_000)
+    mismatch_min_rows = _safe_int(args.iterative_mismatch_min_rows, default=1, minimum=1, maximum=10_000_000)
+    mismatch_max_rows = _safe_int(args.iterative_mismatch_max_rows, default=0, minimum=0, maximum=200_000_000)
+    iterative_stop_on_empty = bool(args.iterative_stop_on_empty)
+    mined_gap_min = _safe_float(args.iterative_mined_gap_min, default=0.15, minimum=0.0, maximum=1.0)
+    mined_boundary_bandwidth = _safe_float(args.iterative_mined_boundary_bandwidth, default=0.08, minimum=0.0, maximum=1.0)
+    mined_low_max_ratio = _safe_float(args.iterative_mined_low_max_ratio, default=0.35, minimum=0.0, maximum=1.0)
+
+    pair_derive_pos_k = _safe_int(args.pair_derive_pos_k, default=4, minimum=1, maximum=10_000)
+    pair_derive_hard_k = _safe_int(args.pair_derive_hard_k, default=4, minimum=0, maximum=10_000)
+    pair_derive_weak_k = _safe_int(args.pair_derive_weak_k, default=4, minimum=1, maximum=10_000)
+    pair_derive_cap = _safe_int(args.pair_derive_cap, default=64, minimum=1, maximum=100_000)
+    pair_add_mid_lower_mid = bool(args.pair_add_mid_lower_mid)
+    pair_mid_pos_score_min = _safe_float(args.pair_mid_pos_score_min, default=0.4, minimum=0.0, maximum=1.0)
+    pair_mid_pos_score_max = _safe_float(args.pair_mid_pos_score_max, default=0.7, minimum=0.0, maximum=1.0)
+    pair_mid_neg_score_min = _safe_float(args.pair_mid_neg_score_min, default=0.2, minimum=0.0, maximum=1.0)
+    pair_mid_neg_score_max = _safe_float(args.pair_mid_neg_score_max, default=0.5, minimum=0.0, maximum=1.0)
+    pair_mid_margin_min = _safe_float(args.pair_mid_margin_min, default=0.05, minimum=0.0, maximum=1.0)
+    pair_mid_margin_max = _safe_float(args.pair_mid_margin_max, default=0.4, minimum=0.0, maximum=1.0)
+    pair_mid_add_easy_contrast = bool(args.pair_mid_add_easy_contrast)
+
+    replay_multiplier = _safe_float(args.iterative_replay_multiplier, default=0.25, minimum=0.0, maximum=10.0)
+    replay_min_groups = _safe_int(args.iterative_replay_min_groups, default=0, minimum=0, maximum=10_000_000)
+    replay_max_multiplier = _safe_float(args.iterative_replay_max_multiplier, default=0.5, minimum=0.0, maximum=10.0)
+    replay_high_ratio = _safe_float(args.iterative_replay_high_ratio, default=0.3, minimum=0.0, maximum=1.0)
+    replay_mid_ratio = _safe_float(args.iterative_replay_mid_ratio, default=0.4, minimum=0.0, maximum=1.0)
+    replay_low_ratio = _safe_float(args.iterative_replay_low_ratio, default=0.3, minimum=0.0, maximum=1.0)
+    iterative_stop_patience = _safe_int(args.iterative_stop_patience, default=2, minimum=1, maximum=20)
+
+    if not original_raw_input.exists():
+        raise RuntimeError(f"raw_input not found: {original_raw_input}")
+
+    original_split_result = ensure_split_files(
+        raw_input=original_raw_input,
+        pairwise_input=original_pairwise_input if original_pairwise_input.exists() else None,
+        split_dir=original_split_dir,
+        val_ratio=float(val_ratio),
+        test_ratio=float(test_ratio),
+        seed=int(seed),
+        overwrite=bool(args.regenerate_splits),
+        high_threshold=float(mismatch_high_threshold),
+        mid_threshold=float(mismatch_mid_threshold),
+    )
+    original_paths = original_split_result["paths"]
+
+    original_train_groups = _load_raw_groups(original_paths.raw_train, max_queries=0)
+    original_val_groups = _load_raw_groups(original_paths.raw_val, max_queries=0)
+    original_test_groups = _load_raw_groups(original_paths.raw_test, max_queries=0)
+    if not original_train_groups:
+        raise RuntimeError("Original train split is empty.")
+
+    mining_dev_raw_input = _resolve_path(args.iterative_mining_input) if _clean_text(args.iterative_mining_input) else None
+    final_test_raw_input = _resolve_path(args.iterative_final_test_input) if _clean_text(args.iterative_final_test_input) else None
+    if mining_dev_raw_input is None and fixed_eval_test_input is not None:
+        mining_dev_raw_input = fixed_eval_test_input
+    if mining_dev_raw_input is None:
+        mining_dev_raw_input = original_paths.raw_val
+    if final_test_raw_input is None:
+        final_test_raw_input = original_paths.raw_test
+    if not mining_dev_raw_input.exists():
+        raise RuntimeError(f"iterative_mining_input not found: {mining_dev_raw_input}")
+    if not final_test_raw_input.exists():
+        raise RuntimeError(f"iterative_final_test_input not found: {final_test_raw_input}")
+    if mining_dev_raw_input.resolve() == final_test_raw_input.resolve():
+        raise RuntimeError(
+            "Mining-dev input and final-test input are identical. "
+            "Use separate datasets to avoid test leakage."
+        )
+
+    fixed_mining_dev_groups = _load_raw_groups(mining_dev_raw_input, max_queries=0)
+    fixed_final_test_groups = _load_raw_groups(final_test_raw_input, max_queries=0)
+    if not fixed_mining_dev_groups:
+        raise RuntimeError("Mining-dev split is empty.")
+    if not fixed_final_test_groups:
+        raise RuntimeError("Final held-out test split is empty.")
+    fixed_eval_test_input = mining_dev_raw_input
+
+    if original_paths.pair_train.exists() and original_paths.pair_val.exists():
+        original_train_pairs = _load_pairwise_rows(original_paths.pair_train, max_rows=0)
+        original_val_pairs = _load_pairwise_rows(original_paths.pair_val, max_rows=0)
+    else:
+        original_train_pairs = _derive_pairs_for_groups(
+            original_train_groups,
+            pair_derive_pos_k=pair_derive_pos_k,
+            pair_derive_hard_k=pair_derive_hard_k,
+            pair_derive_weak_k=pair_derive_weak_k,
+            pair_derive_cap=pair_derive_cap,
+            pair_add_mid_lower_mid=pair_add_mid_lower_mid,
+            pair_mid_pos_score_min=pair_mid_pos_score_min,
+            pair_mid_pos_score_max=pair_mid_pos_score_max,
+            pair_mid_neg_score_min=pair_mid_neg_score_min,
+            pair_mid_neg_score_max=pair_mid_neg_score_max,
+            pair_mid_margin_min=pair_mid_margin_min,
+            pair_mid_margin_max=pair_mid_margin_max,
+            pair_mid_add_easy_contrast=pair_mid_add_easy_contrast,
+        )
+        original_val_pairs = _derive_pairs_for_groups(
+            original_val_groups,
+            pair_derive_pos_k=pair_derive_pos_k,
+            pair_derive_hard_k=pair_derive_hard_k,
+            pair_derive_weak_k=pair_derive_weak_k,
+            pair_derive_cap=pair_derive_cap,
+            pair_add_mid_lower_mid=pair_add_mid_lower_mid,
+            pair_mid_pos_score_min=pair_mid_pos_score_min,
+            pair_mid_pos_score_max=pair_mid_pos_score_max,
+            pair_mid_neg_score_min=pair_mid_neg_score_min,
+            pair_mid_neg_score_max=pair_mid_neg_score_max,
+            pair_mid_margin_min=pair_mid_margin_min,
+            pair_mid_margin_max=pair_mid_margin_max,
+            pair_mid_add_easy_contrast=pair_mid_add_easy_contrast,
+        )
+
+    fixed_mining_dev_pairs = _derive_pairs_for_groups(
+        fixed_mining_dev_groups,
+        pair_derive_pos_k=pair_derive_pos_k,
+        pair_derive_hard_k=pair_derive_hard_k,
+        pair_derive_weak_k=pair_derive_weak_k,
+        pair_derive_cap=pair_derive_cap,
+        pair_add_mid_lower_mid=pair_add_mid_lower_mid,
+        pair_mid_pos_score_min=pair_mid_pos_score_min,
+        pair_mid_pos_score_max=pair_mid_pos_score_max,
+        pair_mid_neg_score_min=pair_mid_neg_score_min,
+        pair_mid_neg_score_max=pair_mid_neg_score_max,
+        pair_mid_margin_min=pair_mid_margin_min,
+        pair_mid_margin_max=pair_mid_margin_max,
+        pair_mid_add_easy_contrast=pair_mid_add_easy_contrast,
+    )
+
+    current_train_groups = list(original_train_groups)
+    current_val_groups = list(original_val_groups)
+    current_test_groups = list(fixed_mining_dev_groups)
+    current_train_pairs = list(original_train_pairs)
+    current_val_pairs = list(original_val_pairs)
+    current_test_pairs = list(fixed_mining_dev_pairs)
+
+    round_summaries: List[Dict[str, Any]] = []
+    final_model_dir: Optional[Path] = None
+    best_mining_dev_ndcg = -1.0
+    rounds_without_improve = 0
+
+    print("iterative_mode=true")
+    print(f"iterative_max_rounds={iterative_max_rounds}")
+    print(f"iterative_root={iterative_root}")
+    print(f"fixed_original_split_dir={original_paths.split_dir}")
+    print(f"fixed_mining_dev_input={mining_dev_raw_input}")
+    print(f"fixed_final_test_input={final_test_raw_input}")
+    print(f"fixed_original_train_queries={len(original_train_groups)}")
+    print(f"fixed_original_val_queries={len(original_val_groups)}")
+    print(f"fixed_original_test_queries={len(original_test_groups)}")
+    print(f"fixed_mining_dev_queries={len(fixed_mining_dev_groups)}")
+    print(f"fixed_final_test_queries={len(fixed_final_test_groups)}")
+
+    for round_idx in range(iterative_max_rounds):
+        round_dir = (iterative_root / f"round_{round_idx:02d}").resolve()
+        round_output_dir = (round_dir / "model").resolve()
+        round_output_dir.mkdir(parents=True, exist_ok=True)
+        round_split_dir = (round_dir / "train_splits").resolve()
+        round_split_dir.mkdir(parents=True, exist_ok=True)
+
+        round_raw_train = round_split_dir / "llm_distill_raw_train.jsonl"
+        round_raw_val = round_split_dir / "llm_distill_raw_val.jsonl"
+        round_raw_test = round_split_dir / "llm_distill_raw_test.jsonl"
+        round_pair_train = round_split_dir / "llm_distill_pairwise_train.jsonl"
+        round_pair_val = round_split_dir / "llm_distill_pairwise_val.jsonl"
+        round_pair_test = round_split_dir / "llm_distill_pairwise_test.jsonl"
+
+        _write_raw_groups_jsonl(round_raw_train, current_train_groups)
+        _write_raw_groups_jsonl(round_raw_val, current_val_groups)
+        _write_raw_groups_jsonl(round_raw_test, current_test_groups)
+        _write_pair_rows_jsonl(round_pair_train, current_train_pairs)
+        _write_pair_rows_jsonl(round_pair_val, current_val_pairs)
+        _write_pair_rows_jsonl(round_pair_test, current_test_pairs)
+
+        print(f"iterative_round_start={round_idx}/{iterative_max_rounds - 1}")
+        print(f"round_train_queries={len(current_train_groups)}")
+        print(f"round_val_queries={len(current_val_groups)}")
+        print(f"round_test_queries={len(current_test_groups)}")
+        print(f"round_pair_train={len(current_train_pairs)}")
+        print(f"round_pair_val={len(current_val_pairs)}")
+        print(f"round_pair_test={len(current_test_pairs)}")
+        print(f"round_training_model_id={current_model_id}")
+        pairwise_hint_path = original_pairwise_input if original_pairwise_input.exists() else round_pair_train
+
+        child_cmd: List[str] = [
+            sys.executable,
+            str(train_script_path),
+            *[str(x) for x in raw_argv],
+            "--iterative-inner-run",
+            "--iterative-max-rounds",
+            "1",
+            "--output-dir",
+            str(round_output_dir),
+            "--no-append-args-to-output-dir",
+            "--model-id",
+            str(current_model_id),
+            "--raw-input",
+            str(original_raw_input),
+            "--pairwise-input",
+            str(pairwise_hint_path),
+            "--split-dir",
+            str(round_split_dir),
+            "--use-prepared-splits",
+            "--no-regenerate-splits",
+            "--raw-train-input",
+            str(round_raw_train),
+            "--raw-val-input",
+            str(round_raw_val),
+            "--raw-test-input",
+            str(round_raw_test),
+            "--pairwise-train-input",
+            str(round_pair_train),
+            "--pairwise-val-input",
+            str(round_pair_val),
+            "--pairwise-test-input",
+            str(round_pair_test),
+        ]
+        _run_command(child_cmd, cwd=PROJECT_ROOT)
+
+        round_manifest_path = round_output_dir / "train_manifest.json"
+        if not round_manifest_path.exists():
+            raise RuntimeError(f"Expected train manifest not found: {round_manifest_path}")
+        round_manifest = json.loads(round_manifest_path.read_text(encoding="utf-8"))
+
+        trained_model_dir = _resolve_round_model_dir(
+            round_output_dir=round_output_dir,
+            stage1_epochs=stage1_epochs,
+            stage2_epochs=stage2_epochs,
+        )
+        final_model_dir = trained_model_dir
+        current_model_id = str(trained_model_dir)
+        mining_dev_ndcg = float((round_manifest.get("test_metrics") or {}).get("ndcg@10", 0.0))
+        mining_dev_mrr = float((round_manifest.get("test_metrics") or {}).get("mrr@10", 0.0))
+        val_ndcg = float(round_manifest.get("best_ndcg@10", 0.0))
+
+        if mining_dev_ndcg > best_mining_dev_ndcg:
+            best_mining_dev_ndcg = mining_dev_ndcg
+            rounds_without_improve = 0
+        else:
+            rounds_without_improve += 1
+
+        round_summary: Dict[str, Any] = {
+            "round_idx": int(round_idx),
+            "round_output_dir": str(round_output_dir),
+            "round_manifest_path": str(round_manifest_path),
+            "trained_model_dir": str(trained_model_dir),
+            "train_manifest_best_ndcg@10": float(round_manifest.get("best_ndcg@10", 0.0)),
+            "fixed_val_ndcg@10": float(val_ndcg),
+            "mining_dev_ndcg@10": float(mining_dev_ndcg),
+            "mining_dev_mrr@10": float(mining_dev_mrr),
+            "rounds_without_mining_dev_improve": int(rounds_without_improve),
+            "best_mining_dev_ndcg@10": float(best_mining_dev_ndcg),
+        }
+
+        if round_idx >= (iterative_max_rounds - 1):
+            round_summaries.append(round_summary)
+            print(f"iterative_round_end={round_idx}/{iterative_max_rounds - 1} status=last_round_no_mismatch_mining")
+            break
+        if rounds_without_improve >= int(iterative_stop_patience):
+            round_summary["stop_reason"] = f"mining_dev_no_improve_patience_{int(iterative_stop_patience)}"
+            round_summaries.append(round_summary)
+            print(f"iterative_round_end={round_idx}/{iterative_max_rounds - 1} status={round_summary['stop_reason']}")
+            break
+
+        mismatch_eval_out_dir = (round_dir / "mismatch_eval").resolve()
+        mismatch_eval_out_dir.mkdir(parents=True, exist_ok=True)
+        eval_cmd: List[str] = [
+            sys.executable,
+            str(eval_script_path),
+            "--finetuned-model",
+            str(trained_model_dir),
+            "--base-model",
+            str(eval_base_model),
+            "--distill-test-input",
+            str(fixed_eval_test_input),
+            "--distill-input",
+            str(fixed_eval_test_input),
+            "--distill-ground-truth",
+            str(mismatch_ground_truth),
+            "--distill-high-threshold",
+            str(mismatch_high_threshold),
+            "--distill-mid-threshold",
+            str(mismatch_mid_threshold),
+            "--distill-sample-high",
+            str(mismatch_sample_high),
+            "--distill-sample-mid",
+            str(mismatch_sample_mid),
+            "--distill-sample-low",
+            str(mismatch_sample_low),
+            "--distill-max-pairs-scan",
+            str(mismatch_max_pairs_scan),
+            "--mismatch-target",
+            str(mismatch_target),
+            "--pred-high-threshold",
+            str(mismatch_pred_high_threshold),
+            "--pred-mid-threshold",
+            str(mismatch_pred_mid_threshold),
+            "--output-dir",
+            str(mismatch_eval_out_dir),
+            "--save",
+            "--no-print",
+            "--no-distill-print-pair-tables",
+            "--no-distill-save-pair-tables",
+        ]
+        _run_command(eval_cmd, cwd=PROJECT_ROOT)
+
+        mismatch_eval_json = _find_latest_mismatch_json(
+            eval_output_dir=mismatch_eval_out_dir,
+            mismatch_target=mismatch_target,
+        )
+        mismatch_rows_raw = _load_mismatch_rows(mismatch_eval_json)
+        mismatch_rows, mined_filter_stats = _filter_mined_rows_policy(
+            rows=mismatch_rows_raw,
+            mismatch_target=mismatch_target,
+            high_threshold=float(mismatch_high_threshold),
+            mid_threshold=float(mismatch_mid_threshold),
+            gap_min=float(mined_gap_min),
+            boundary_bandwidth=float(mined_boundary_bandwidth),
+            low_max_ratio=float(mined_low_max_ratio),
+        )
+        if mismatch_max_rows > 0:
+            mismatch_rows = mismatch_rows[: int(mismatch_max_rows)]
+
+        mismatch_row_count = int(len(mismatch_rows))
+        round_summary["mismatch_eval_json"] = str(mismatch_eval_json)
+        round_summary["mismatch_rows_raw"] = int(len(mismatch_rows_raw))
+        round_summary["mismatch_rows"] = int(mismatch_row_count)
+        round_summary["mined_filter_stats"] = mined_filter_stats
+        print(f"iterative_round_mismatch_rows={mismatch_row_count}")
+
+        if mismatch_row_count < int(mismatch_min_rows):
+            round_summary["stop_reason"] = (
+                f"mismatch_rows_below_min({mismatch_row_count}<{int(mismatch_min_rows)})"
+            )
+            round_summaries.append(round_summary)
+            print(f"iterative_round_end={round_idx}/{iterative_max_rounds - 1} status={round_summary['stop_reason']}")
+            if iterative_stop_on_empty:
+                break
+            continue
+
+        mismatch_dataset_dir = (round_dir / "mismatch_dataset").resolve()
+        mismatch_dataset_dir.mkdir(parents=True, exist_ok=True)
+        mismatch_raw_path = mismatch_dataset_dir / "llm_distill_raw_scores.jsonl"
+        mismatch_pairwise_path = mismatch_dataset_dir / "llm_distill_pairwise.jsonl"
+
+        build_stats = _build_mismatch_distill_files(
+            rows=mismatch_rows,
+            raw_out_path=mismatch_raw_path,
+            pair_out_path=mismatch_pairwise_path,
+            pair_derive_pos_k=pair_derive_pos_k,
+            pair_derive_hard_k=pair_derive_hard_k,
+            pair_derive_weak_k=pair_derive_weak_k,
+            pair_derive_cap=pair_derive_cap,
+            pair_add_mid_lower_mid=pair_add_mid_lower_mid,
+            pair_mid_pos_score_min=pair_mid_pos_score_min,
+            pair_mid_pos_score_max=pair_mid_pos_score_max,
+            pair_mid_neg_score_min=pair_mid_neg_score_min,
+            pair_mid_neg_score_max=pair_mid_neg_score_max,
+            pair_mid_margin_min=pair_mid_margin_min,
+            pair_mid_margin_max=pair_mid_margin_max,
+            pair_mid_add_easy_contrast=pair_mid_add_easy_contrast,
+        )
+        round_summary["mismatch_build_stats"] = build_stats
+        print(json.dumps({"iterative_mismatch_build": build_stats}, ensure_ascii=False))
+
+        kept_groups = int(build_stats.get("raw_query_groups_kept", 0))
+        if kept_groups <= 0:
+            round_summary["stop_reason"] = "no_usable_mismatch_query_groups_after_conversion"
+            round_summaries.append(round_summary)
+            print(f"iterative_round_end={round_idx}/{iterative_max_rounds - 1} status={round_summary['stop_reason']}")
+            if iterative_stop_on_empty:
+                break
+            continue
+
+        mismatch_split_dir = (mismatch_dataset_dir / "splits").resolve()
+        split_result = ensure_split_files(
+            raw_input=mismatch_raw_path,
+            pairwise_input=mismatch_pairwise_path,
+            split_dir=mismatch_split_dir,
+            val_ratio=float(val_ratio),
+            test_ratio=float(test_ratio),
+            seed=int(seed + round_idx),
+            overwrite=True,
+            high_threshold=float(mismatch_high_threshold),
+            mid_threshold=float(mismatch_mid_threshold),
+        )
+        split_paths = split_result["paths"]
+        round_summary["mismatch_split_dir"] = str(mismatch_split_dir)
+        round_summary["mismatch_split_manifest"] = str(split_paths.manifest)
+
+        mined_train_groups = _load_raw_groups(split_paths.raw_train, max_queries=0)
+        mined_val_groups = _load_raw_groups(split_paths.raw_val, max_queries=0)
+        if split_paths.pair_train.exists() and split_paths.pair_val.exists():
+            mined_train_pairs = _load_pairwise_rows(split_paths.pair_train, max_rows=0)
+            mined_val_pairs = _load_pairwise_rows(split_paths.pair_val, max_rows=0)
+        else:
+            mined_train_pairs = _derive_pairs_for_groups(
+                mined_train_groups,
+                pair_derive_pos_k=pair_derive_pos_k,
+                pair_derive_hard_k=pair_derive_hard_k,
+                pair_derive_weak_k=pair_derive_weak_k,
+                pair_derive_cap=pair_derive_cap,
+                pair_add_mid_lower_mid=pair_add_mid_lower_mid,
+                pair_mid_pos_score_min=pair_mid_pos_score_min,
+                pair_mid_pos_score_max=pair_mid_pos_score_max,
+                pair_mid_neg_score_min=pair_mid_neg_score_min,
+                pair_mid_neg_score_max=pair_mid_neg_score_max,
+                pair_mid_margin_min=pair_mid_margin_min,
+                pair_mid_margin_max=pair_mid_margin_max,
+                pair_mid_add_easy_contrast=pair_mid_add_easy_contrast,
+            )
+            mined_val_pairs = _derive_pairs_for_groups(
+                mined_val_groups,
+                pair_derive_pos_k=pair_derive_pos_k,
+                pair_derive_hard_k=pair_derive_hard_k,
+                pair_derive_weak_k=pair_derive_weak_k,
+                pair_derive_cap=pair_derive_cap,
+                pair_add_mid_lower_mid=pair_add_mid_lower_mid,
+                pair_mid_pos_score_min=pair_mid_pos_score_min,
+                pair_mid_pos_score_max=pair_mid_pos_score_max,
+                pair_mid_neg_score_min=pair_mid_neg_score_min,
+                pair_mid_neg_score_max=pair_mid_neg_score_max,
+                pair_mid_margin_min=pair_mid_margin_min,
+                pair_mid_margin_max=pair_mid_margin_max,
+                pair_mid_add_easy_contrast=pair_mid_add_easy_contrast,
+            )
+
+        mined_case_count = int(len(mined_train_groups))
+        replay_target = int(round(float(mined_case_count) * float(replay_multiplier)))
+        replay_target = max(int(replay_min_groups), replay_target)
+        replay_cap = int(round(float(mined_case_count) * float(replay_max_multiplier)))
+        if replay_cap > 0:
+            replay_target = min(replay_target, replay_cap)
+        replay_target = min(replay_target, int(len(original_train_groups)))
+
+        replay_groups = _sample_replay_groups(
+            original_train_groups=original_train_groups,
+            replay_target=int(replay_target),
+            high_threshold=float(mismatch_high_threshold),
+            mid_threshold=float(mismatch_mid_threshold),
+            high_ratio=float(replay_high_ratio),
+            mid_ratio=float(replay_mid_ratio),
+            low_ratio=float(replay_low_ratio),
+            seed=int(seed + round_idx + 1),
+        )
+        replay_pairs = _derive_pairs_for_groups(
+            replay_groups,
+            pair_derive_pos_k=pair_derive_pos_k,
+            pair_derive_hard_k=pair_derive_hard_k,
+            pair_derive_weak_k=pair_derive_weak_k,
+            pair_derive_cap=pair_derive_cap,
+            pair_add_mid_lower_mid=pair_add_mid_lower_mid,
+            pair_mid_pos_score_min=pair_mid_pos_score_min,
+            pair_mid_pos_score_max=pair_mid_pos_score_max,
+            pair_mid_neg_score_min=pair_mid_neg_score_min,
+            pair_mid_neg_score_max=pair_mid_neg_score_max,
+            pair_mid_margin_min=pair_mid_margin_min,
+            pair_mid_margin_max=pair_mid_margin_max,
+            pair_mid_add_easy_contrast=pair_mid_add_easy_contrast,
+        )
+
+        next_train_groups = _merge_groups_unique(mined_train_groups, replay_groups)
+        next_val_groups = list(original_val_groups)
+        next_test_groups = list(fixed_mining_dev_groups)
+
+        next_train_pairs = _merge_pairs_unique(mined_train_pairs, replay_pairs)
+        next_val_pairs = list(original_val_pairs)
+        next_test_pairs = list(fixed_mining_dev_pairs)
+
+        if not next_train_groups:
+            round_summary["stop_reason"] = "next_train_groups_empty_after_mining_replay"
+            round_summaries.append(round_summary)
+            print(f"iterative_round_end={round_idx}/{iterative_max_rounds - 1} status={round_summary['stop_reason']}")
+            break
+        if not next_train_pairs:
+            next_train_pairs = _derive_pairs_for_groups(
+                next_train_groups,
+                pair_derive_pos_k=pair_derive_pos_k,
+                pair_derive_hard_k=pair_derive_hard_k,
+                pair_derive_weak_k=pair_derive_weak_k,
+                pair_derive_cap=pair_derive_cap,
+                pair_add_mid_lower_mid=pair_add_mid_lower_mid,
+                pair_mid_pos_score_min=pair_mid_pos_score_min,
+                pair_mid_pos_score_max=pair_mid_pos_score_max,
+                pair_mid_neg_score_min=pair_mid_neg_score_min,
+                pair_mid_neg_score_max=pair_mid_neg_score_max,
+                pair_mid_margin_min=pair_mid_margin_min,
+                pair_mid_margin_max=pair_mid_margin_max,
+                pair_mid_add_easy_contrast=pair_mid_add_easy_contrast,
+            )
+        if not next_train_pairs:
+            round_summary["stop_reason"] = "next_train_pairs_empty_after_mining_replay"
+            round_summaries.append(round_summary)
+            print(f"iterative_round_end={round_idx}/{iterative_max_rounds - 1} status={round_summary['stop_reason']}")
+            break
+        if not next_val_pairs:
+            next_val_pairs = _derive_pairs_for_groups(
+                next_val_groups,
+                pair_derive_pos_k=pair_derive_pos_k,
+                pair_derive_hard_k=pair_derive_hard_k,
+                pair_derive_weak_k=pair_derive_weak_k,
+                pair_derive_cap=pair_derive_cap,
+                pair_add_mid_lower_mid=pair_add_mid_lower_mid,
+                pair_mid_pos_score_min=pair_mid_pos_score_min,
+                pair_mid_pos_score_max=pair_mid_pos_score_max,
+                pair_mid_neg_score_min=pair_mid_neg_score_min,
+                pair_mid_neg_score_max=pair_mid_neg_score_max,
+                pair_mid_margin_min=pair_mid_margin_min,
+                pair_mid_margin_max=pair_mid_margin_max,
+                pair_mid_add_easy_contrast=pair_mid_add_easy_contrast,
+            )
+        if not next_test_pairs:
+            next_test_pairs = _derive_pairs_for_groups(
+                next_test_groups,
+                pair_derive_pos_k=pair_derive_pos_k,
+                pair_derive_hard_k=pair_derive_hard_k,
+                pair_derive_weak_k=pair_derive_weak_k,
+                pair_derive_cap=pair_derive_cap,
+                pair_add_mid_lower_mid=pair_add_mid_lower_mid,
+                pair_mid_pos_score_min=pair_mid_pos_score_min,
+                pair_mid_pos_score_max=pair_mid_pos_score_max,
+                pair_mid_neg_score_min=pair_mid_neg_score_min,
+                pair_mid_neg_score_max=pair_mid_neg_score_max,
+                pair_mid_margin_min=pair_mid_margin_min,
+                pair_mid_margin_max=pair_mid_margin_max,
+                pair_mid_add_easy_contrast=pair_mid_add_easy_contrast,
+            )
+
+        current_train_groups = next_train_groups
+        current_val_groups = next_val_groups
+        current_test_groups = next_test_groups
+        current_train_pairs = next_train_pairs
+        current_val_pairs = next_val_pairs
+        current_test_pairs = next_test_pairs
+
+        round_summary["replay_target"] = int(replay_target)
+        round_summary["replay_groups"] = int(len(replay_groups))
+        round_summary["mined_val_groups"] = int(len(mined_val_groups))
+        round_summary["mined_val_pairs"] = int(len(mined_val_pairs))
+        round_summary["next_train_groups"] = int(len(current_train_groups))
+        round_summary["next_val_groups"] = int(len(current_val_groups))
+        round_summary["next_test_groups"] = int(len(current_test_groups))
+        round_summary["next_train_pairs"] = int(len(current_train_pairs))
+        round_summary["next_val_pairs"] = int(len(current_val_pairs))
+        round_summary["next_test_pairs"] = int(len(current_test_pairs))
+        round_summary["next_round_model_id"] = str(current_model_id)
+        round_summaries.append(round_summary)
+
+        print(f"iterative_round_end={round_idx}/{iterative_max_rounds - 1} status=ok")
+
+    final_test_metrics: Dict[str, Any] = {}
+    if final_model_dir is not None and fixed_final_test_groups:
+        if torch.cuda.is_available():
+            eval_device = torch.device("cuda")
+        elif torch.backends.mps.is_available():
+            eval_device = torch.device("mps")
+        else:
+            eval_device = torch.device("cpu")
+        eval_batch_size = _safe_int(args.eval_batch_size, default=32, minimum=1, maximum=4096)
+        candidate_pool_size = _safe_int(args.candidate_pool_size, default=64, minimum=2, maximum=10_000)
+        max_length = _safe_int(args.max_length, default=512, minimum=16, maximum=8192)
+        mrr_rel_threshold = _safe_float(args.mrr_rel_threshold, default=0.7, minimum=0.0, maximum=1.0)
+        recall_rel_threshold = _safe_float(args.recall_rel_threshold, default=0.7, minimum=0.0, maximum=1.0)
+
+        tok_final = AutoTokenizer.from_pretrained(str(final_model_dir))
+        model_final = AutoModelForSequenceClassification.from_pretrained(str(final_model_dir), num_labels=1)
+        model_final.to(eval_device)
+        final_test_metrics = _evaluate(
+            model=model_final,
+            tokenizer=tok_final,
+            groups=fixed_final_test_groups,
+            device=eval_device,
+            max_length=max_length,
+            eval_batch_size=eval_batch_size,
+            candidate_pool_size=candidate_pool_size,
+            mrr_rel_threshold=mrr_rel_threshold,
+            recall_rel_threshold=recall_rel_threshold,
+        )
+        final_test_metrics["device"] = str(eval_device)
+        print(json.dumps({"final_test_metrics": final_test_metrics}, ensure_ascii=False))
+
+    iterative_manifest = {
+        "created_at_utc": datetime.now(timezone.utc).isoformat(),
+        "iterative_max_rounds": int(iterative_max_rounds),
+        "iterative_root": str(iterative_root),
+        "fixed_mining_dev_input": str(mining_dev_raw_input),
+        "fixed_final_test_input": str(final_test_raw_input),
+        "original_raw_input": str(original_raw_input),
+        "original_pairwise_input": str(original_pairwise_input),
+        "original_split_dir": str(original_paths.split_dir),
+        "eval_base_model": str(eval_base_model),
+        "mismatch_target": str(mismatch_target),
+        "mismatch_ground_truth": str(mismatch_ground_truth),
+        "mismatch_thresholds": {
+            "teacher_high": float(mismatch_high_threshold),
+            "teacher_mid": float(mismatch_mid_threshold),
+            "pred_high": float(mismatch_pred_high_threshold),
+            "pred_mid": float(mismatch_pred_mid_threshold),
+        },
+        "mismatch_sampling": {
+            "sample_high": int(mismatch_sample_high),
+            "sample_mid": int(mismatch_sample_mid),
+            "sample_low": int(mismatch_sample_low),
+            "max_pairs_scan": int(mismatch_max_pairs_scan),
+            "min_rows": int(mismatch_min_rows),
+            "max_rows": int(mismatch_max_rows),
+        },
+        "mined_filter_policy": {
+            "gap_min": float(mined_gap_min),
+            "boundary_bandwidth": float(mined_boundary_bandwidth),
+            "low_max_ratio": float(mined_low_max_ratio),
+        },
+        "replay_policy": {
+            "replay_multiplier": float(replay_multiplier),
+            "replay_min_groups": int(replay_min_groups),
+            "replay_max_multiplier": float(replay_max_multiplier),
+            "replay_high_ratio": float(replay_high_ratio),
+            "replay_mid_ratio": float(replay_mid_ratio),
+            "replay_low_ratio": float(replay_low_ratio),
+        },
+        "stop_policy": {
+            "mining_dev_no_improve_patience": int(iterative_stop_patience),
+        },
+        "rounds": round_summaries,
+        "final_model_dir": str(final_model_dir) if final_model_dir is not None else "",
+        "best_mining_dev_ndcg@10": float(best_mining_dev_ndcg),
+        "final_test_metrics": final_test_metrics,
+    }
+    iterative_manifest_path = iterative_root / "iterative_manifest.json"
+    iterative_manifest_path.write_text(json.dumps(iterative_manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    print("iterative_done=true")
+    print(f"iterative_rounds_completed={len(round_summaries)}")
+    if final_model_dir is not None:
+        print(f"iterative_final_model_dir={final_model_dir}")
+    print(f"iterative_manifest={iterative_manifest_path}")
+    return 0
+
+
 def _build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         description="Fine-tune BGE cross-encoder with staged distillation (pairwise warm start + listwise KD)."
@@ -1147,11 +2478,146 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--wandb-tags", type=str, default="cross-encoder,distill,bge", help="Comma-separated W&B tags.")
     p.add_argument("--wandb-group", type=str, default="", help="W&B group name (optional).")
     p.add_argument("--wandb-dir", type=str, default="", help="W&B local directory (default: output-dir).")
+
+    p.add_argument(
+        "--iterative-max-rounds",
+        type=int,
+        default=1,
+        help=(
+            "Iterative hard-case rounds. 1 = current single run behavior. "
+            "If >1, each round trains stage1+stage2, mines cluster mismatches on mining-dev split, "
+            "rebuilds mismatch distill splits, then trains the next round."
+        ),
+    )
+    p.add_argument(
+        "--iterative-eval-test-input",
+        type=str,
+        default="",
+        help="Deprecated alias for --iterative-mining-input.",
+    )
+    p.add_argument(
+        "--iterative-mining-input",
+        type=str,
+        default="",
+        help="Raw JSONL used for hard-case mining each round (mining-dev role).",
+    )
+    p.add_argument(
+        "--iterative-final-test-input",
+        type=str,
+        default="",
+        help="Final held-out raw JSONL. Never used for mining or round-wise stopping.",
+    )
+    p.add_argument(
+        "--iterative-eval-base-model",
+        type=str,
+        default="",
+        help="Base model id/path for mismatch eval comparison (default: --model-id).",
+    )
+    p.add_argument(
+        "--iterative-mismatch-target",
+        type=str,
+        default="finetuned",
+        choices=["finetuned", "base", "either", "both"],
+        help="Mismatch condition to mine from eval output.",
+    )
+    p.add_argument(
+        "--iterative-mismatch-ground-truth",
+        type=str,
+        default="raw",
+        choices=["normalized", "raw"],
+        help="Teacher score mode used in mismatch eval.",
+    )
+    p.add_argument("--iterative-mismatch-high-threshold", type=float, default=0.67)
+    p.add_argument("--iterative-mismatch-mid-threshold", type=float, default=0.34)
+    p.add_argument(
+        "--iterative-mismatch-pred-high-threshold",
+        type=float,
+        default=-1.0,
+        help="Prediction high threshold for mismatch eval (-1 uses teacher high threshold).",
+    )
+    p.add_argument(
+        "--iterative-mismatch-pred-mid-threshold",
+        type=float,
+        default=-1.0,
+        help="Prediction mid threshold for mismatch eval (-1 uses teacher mid threshold).",
+    )
+    p.add_argument("--iterative-mismatch-sample-high", type=int, default=0)
+    p.add_argument("--iterative-mismatch-sample-mid", type=int, default=0)
+    p.add_argument("--iterative-mismatch-sample-low", type=int, default=0)
+    p.add_argument("--iterative-mismatch-max-pairs-scan", type=int, default=0)
+    p.add_argument(
+        "--iterative-mismatch-min-rows",
+        type=int,
+        default=1,
+        help="Stop iterative loop when mined mismatch rows are below this count.",
+    )
+    p.add_argument(
+        "--iterative-mismatch-max-rows",
+        type=int,
+        default=0,
+        help="Optional cap on mined mismatch rows used to build next-round dataset (0=all).",
+    )
+    p.add_argument(
+        "--iterative-stop-on-empty",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Stop loop early if mismatch mining yields no usable rows.",
+    )
+    p.add_argument(
+        "--iterative-mined-gap-min",
+        type=float,
+        default=0.15,
+        help="Minimum |teacher-student| gap used when selecting mined hard cases.",
+    )
+    p.add_argument(
+        "--iterative-mined-boundary-bandwidth",
+        type=float,
+        default=0.08,
+        help="Boundary proximity width around high/mid thresholds for mined-case prioritization.",
+    )
+    p.add_argument(
+        "--iterative-mined-low-max-ratio",
+        type=float,
+        default=0.35,
+        help="Max share of low-band cases in mined hard set.",
+    )
+    p.add_argument(
+        "--iterative-replay-multiplier",
+        type=float,
+        default=0.25,
+        help="Replay size as multiplier of mined-train query count (0.25 ~= 20% replay in mixed train).",
+    )
+    p.add_argument(
+        "--iterative-replay-min-groups",
+        type=int,
+        default=0,
+        help="Minimum replay query groups each iterative round.",
+    )
+    p.add_argument(
+        "--iterative-replay-max-multiplier",
+        type=float,
+        default=0.5,
+        help="Upper cap for replay size relative to mined-train query count.",
+    )
+    p.add_argument("--iterative-replay-high-ratio", type=float, default=0.3)
+    p.add_argument("--iterative-replay-mid-ratio", type=float, default=0.4)
+    p.add_argument("--iterative-replay-low-ratio", type=float, default=0.3)
+    p.add_argument(
+        "--iterative-stop-patience",
+        type=int,
+        default=2,
+        help="Early stop rounds without improvement on fixed held-out test ndcg@10.",
+    )
+    p.add_argument("--iterative-inner-run", action="store_true", help=argparse.SUPPRESS)
     return p
 
 
 def main() -> int:
     args = _build_parser().parse_args()
+
+    iterative_max_rounds = _safe_int(args.iterative_max_rounds, default=1, minimum=1, maximum=100)
+    if iterative_max_rounds > 1 and (not bool(args.iterative_inner_run)):
+        return _run_iterative_orchestration(args, raw_argv=sys.argv[1:])
 
     raw_path = _resolve_path(args.raw_input)
     pairwise_path = _resolve_path(args.pairwise_input)
