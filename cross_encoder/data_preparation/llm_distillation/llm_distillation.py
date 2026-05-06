@@ -1094,6 +1094,15 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--pair-strong-threshold", type=float, default=0.8, help="Normalized score threshold for strong positives.")
     p.add_argument("--pair-mid-threshold", type=float, default=0.4, help="Normalized score threshold separating boundary vs weak.")
     p.add_argument(
+        "--min-mid-high-coverage",
+        type=float,
+        default=0.60,
+        help=(
+            "Discard a spec from output datasets when actual LLM-band coverage is below this threshold "
+            "for either high or mid (coverage=actual/requested). Set 0 to disable."
+        ),
+    )
+    p.add_argument(
         "--disagreement-top-rank-k",
         type=int,
         default=5,
@@ -1166,10 +1175,12 @@ def main() -> int:
     pair_max_per_query = _safe_int(args.pair_max_per_query, default=80, minimum=1, maximum=1_000_000)
     pair_strong_threshold = _safe_float(args.pair_strong_threshold, default=0.8, minimum=0.0, maximum=1.0)
     pair_mid_threshold = _safe_float(args.pair_mid_threshold, default=0.4, minimum=0.0, maximum=1.0)
+    min_mid_high_coverage = _safe_float(args.min_mid_high_coverage, default=0.60, minimum=0.0, maximum=1.0)
     disagreement_top_rank_k = _safe_int(args.disagreement_top_rank_k, default=5, minimum=1, maximum=100_000)
     disagreement_low_score_threshold = _safe_float(args.disagreement_low_score_threshold, default=0.4, minimum=0.0, maximum=1.0)
     if pair_strong_threshold < pair_mid_threshold:
         pair_strong_threshold = pair_mid_threshold
+    coverage_gate_enabled = bool(use_prefilter and float(min_mid_high_coverage) > 0.0)
     listwise_top_k = _safe_int(args.listwise_top_k, default=0, minimum=0, maximum=10_000_000)
     use_tqdm = not bool(args.no_tqdm)
     use_vllm_tqdm = bool(args.vllm_tqdm)
@@ -1257,6 +1268,7 @@ def main() -> int:
     # Step 6) Initialize run counters + print run config
     # ===========================
     started = time.time()
+    total_scored_evaluated = 0
     total_scored = 0
     total_pairwise = 0
     total_json_ok = 0
@@ -1296,6 +1308,12 @@ def main() -> int:
     llm_band_shortage_high_spec_count = 0
     llm_band_shortage_mid_spec_count = 0
     llm_band_shortage_low_spec_count = 0
+    coverage_gate_kept_spec_count = 0
+    coverage_gate_dropped_spec_count = 0
+    coverage_gate_dropped_high_fail_spec_count = 0
+    coverage_gate_dropped_mid_fail_spec_count = 0
+    coverage_gate_dropped_both_fail_spec_count = 0
+    coverage_gate_dropped_scored_pairs = 0
 
     print(f"model_id={model_id}")
     print(f"spec_count={len(specs)}")
@@ -1323,6 +1341,11 @@ def main() -> int:
         f"strong>={pair_strong_threshold:.3f}, "
         f"boundary>={pair_mid_threshold:.3f}, "
         f"disagree(rank<{disagreement_top_rank_k},raw_score<{disagreement_low_score_threshold:.3f})"
+    )
+    print(
+        "coverage_gate="
+        f"enabled:{coverage_gate_enabled},"
+        f"min_mid_high_coverage:{float(min_mid_high_coverage):.3f}"
     )
     print(f"batch_size={batch_size}")
     print(f"raw_output={raw_output}")
@@ -1357,6 +1380,9 @@ def main() -> int:
             for spec_rank, spec_item in enumerate(specs, start=1):
                 ranked_indices: List[int] = []
                 prefilter_bucket_diag: Dict[str, int] = {}
+                req_h = 0
+                req_m = 0
+                req_l = 0
                 if use_prefilter:
                     if use_prefilter_score_cache:
                         ranked_indices = list(prefilter_score_cache.get(_spec_key(spec_item)) or [])
@@ -1455,10 +1481,6 @@ def main() -> int:
                 spec_boundary_count = int(sum(1 for c in candidates if _clean_text(c.get("band")) == "boundary"))
                 spec_weak_count = int(sum(1 for c in candidates if _clean_text(c.get("band")) == "weak"))
                 if use_prefilter:
-                    req_h = int(prefilter_bucket_diag.get("requested_high", 0))
-                    req_m = int(prefilter_bucket_diag.get("requested_mid", 0))
-                    req_l = int(prefilter_bucket_diag.get("requested_low", 0))
-
                     miss_h = max(0, int(req_h) - int(spec_strong_count))
                     miss_m = max(0, int(req_m) - int(spec_boundary_count))
                     miss_l = max(0, int(req_l) - int(spec_weak_count))
@@ -1483,9 +1505,33 @@ def main() -> int:
                     if miss_l > 0:
                         llm_band_shortage_low_spec_count += 1
 
-                total_scored += len(candidates)
+                total_scored_evaluated += len(candidates)
                 total_json_ok += int(json_ok)
                 total_fallback += int(fallback)
+
+                mid_cov = (float(spec_boundary_count) / float(max(1, req_m))) if req_m > 0 else 1.0
+                high_cov = (float(spec_strong_count) / float(max(1, req_h))) if req_h > 0 else 1.0
+                pass_coverage_gate = True
+                if coverage_gate_enabled:
+                    pass_coverage_gate = bool(
+                        (float(high_cov) >= float(min_mid_high_coverage))
+                        and (float(mid_cov) >= float(min_mid_high_coverage))
+                    )
+                if not pass_coverage_gate:
+                    coverage_gate_dropped_spec_count += 1
+                    coverage_gate_dropped_scored_pairs += int(len(candidates))
+                    high_fail = bool(float(high_cov) < float(min_mid_high_coverage))
+                    mid_fail = bool(float(mid_cov) < float(min_mid_high_coverage))
+                    if high_fail:
+                        coverage_gate_dropped_high_fail_spec_count += 1
+                    if mid_fail:
+                        coverage_gate_dropped_mid_fail_spec_count += 1
+                    if high_fail and mid_fail:
+                        coverage_gate_dropped_both_fail_spec_count += 1
+                    continue
+
+                coverage_gate_kept_spec_count += 1
+                total_scored += len(candidates)
                 sum_candidates_per_spec += len(candidates)
                 min_candidates_per_spec = min(min_candidates_per_spec, len(candidates))
                 max_candidates_per_spec = max(max_candidates_per_spec, len(candidates))
@@ -1582,19 +1628,21 @@ def main() -> int:
 
                 if spec_rank % 10 == 0 or spec_rank == len(specs):
                     elapsed = max(1e-6, time.time() - started)
-                    speed = total_scored / elapsed
-                    avg_cand = (sum_candidates_per_spec / float(max(1, spec_rank)))
+                    speed = total_scored_evaluated / elapsed
+                    avg_cand = (sum_candidates_per_spec / float(max(1, coverage_gate_kept_spec_count)))
                     if tqdm_bar is not None:
                         tqdm_bar.set_postfix(
                             {
                                 "spec": f"{spec_rank}/{len(specs)}",
+                                "kept": f"{coverage_gate_kept_spec_count}",
                                 "cand/spec": f"{avg_cand:.1f}",
                                 "pairs_per_s": f"{speed:.2f}",
                             }
                         )
                     print(
                         f"spec_progress={spec_rank}/{len(specs)} "
-                        f"scored_pairs={total_scored}/{total_pairs} "
+                        f"scored_pairs={total_scored_evaluated}/{total_pairs} "
+                        f"kept_specs={coverage_gate_kept_spec_count} "
                         f"avg_candidates_per_spec={avg_cand:.2f} "
                         f"pairwise_rows={total_pairwise} "
                         f"speed={speed:.2f} pairs/sec"
@@ -1607,7 +1655,7 @@ def main() -> int:
     # Step 9) Finalize manifest + summary logs
     # ===========================
     elapsed = max(1e-6, time.time() - started)
-    avg_candidates = float(sum_candidates_per_spec / float(max(1, len(specs))))
+    avg_candidates = float(sum_candidates_per_spec / float(max(1, coverage_gate_kept_spec_count)))
     if min_candidates_per_spec == 2_147_483_647:
         min_candidates_per_spec = 0
     manifest = {
@@ -1619,11 +1667,20 @@ def main() -> int:
         "pairwise_output": str(pairwise_output),
         "listwise_output": str(listwise_output),
         "spec_count": int(len(specs)),
+        "coverage_gate_kept_spec_count": int(coverage_gate_kept_spec_count),
+        "coverage_gate_dropped_spec_count": int(coverage_gate_dropped_spec_count),
+        "coverage_gate_dropped_high_fail_spec_count": int(coverage_gate_dropped_high_fail_spec_count),
+        "coverage_gate_dropped_mid_fail_spec_count": int(coverage_gate_dropped_mid_fail_spec_count),
+        "coverage_gate_dropped_both_fail_spec_count": int(coverage_gate_dropped_both_fail_spec_count),
         "fac_spec_count": int(len(fac_specs)),
         "full_total_pairs": int(full_total_pairs),
         "total_pairs": int(total_pairs),
+        "total_scored_pairs_evaluated": int(total_scored_evaluated),
         "total_scored_pairs": int(total_scored),
+        "total_scored_pairs_dropped_by_gate": int(coverage_gate_dropped_scored_pairs),
         "reduction_ratio_vs_full": float(total_scored / float(max(1, full_total_pairs))),
+        "coverage_gate_min_mid_high_coverage": float(min_mid_high_coverage),
+        "coverage_gate_enabled": bool(coverage_gate_enabled),
         "use_prefilter": bool(use_prefilter),
         "prefilter_top_k": int(prefilter_top_k),
         "prefilter_mid_k": int(prefilter_mid_k),
@@ -1701,12 +1758,27 @@ def main() -> int:
         "disagreement_score_mode": "raw",
         "listwise_top_k": int(listwise_top_k),
         "elapsed_seconds": float(elapsed),
-        "pairs_per_second": float(total_scored / elapsed),
+        "pairs_per_second": float(total_scored_evaluated / elapsed),
+        "kept_pairs_per_second": float(total_scored / elapsed),
     }
     manifest_output.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
 
     print("done=true")
+    print(f"total_scored_pairs_evaluated={total_scored_evaluated}")
     print(f"total_scored_pairs={total_scored}")
+    print(f"total_scored_pairs_dropped_by_gate={coverage_gate_dropped_scored_pairs}")
+    print(
+        "coverage_gate_specs="
+        f"kept:{coverage_gate_kept_spec_count},"
+        f"dropped:{coverage_gate_dropped_spec_count},"
+        f"threshold:{float(min_mid_high_coverage):.3f}"
+    )
+    print(
+        "coverage_gate_drop_reasons="
+        f"high_fail:{coverage_gate_dropped_high_fail_spec_count},"
+        f"mid_fail:{coverage_gate_dropped_mid_fail_spec_count},"
+        f"both_fail:{coverage_gate_dropped_both_fail_spec_count}"
+    )
     print(f"full_total_pairs={full_total_pairs}")
     print(f"reduction_ratio_vs_full={(total_scored / float(max(1, full_total_pairs))):.6f}")
     print(f"avg_candidates_per_spec={avg_candidates:.2f}")
@@ -1764,7 +1836,8 @@ def main() -> int:
     print(f"parsed_json_ok_count={total_json_ok}")
     print(f"parsed_fallback_count={total_fallback}")
     print(f"elapsed_seconds={elapsed:.2f}")
-    print(f"pairs_per_second={(total_scored / elapsed):.4f}")
+    print(f"pairs_per_second={(total_scored_evaluated / elapsed):.4f}")
+    print(f"kept_pairs_per_second={(total_scored / elapsed):.4f}")
     print(f"manifest_output={manifest_output}")
     return 0
 
