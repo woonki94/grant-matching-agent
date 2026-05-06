@@ -1187,65 +1187,112 @@ def main() -> int:
 
             kept_specs += 1
 
-            raw_obj = {
-                "grant_id": grant_id,
-                "spec_idx": int(spec_idx),
-                "spec_text": spec_text,
-                "candidates": [
+            sorted_candidates = sorted(
+                scored_candidates,
+                key=lambda x: float(
+                    x.get("llm_score_norm")
+                    if x.get("llm_score_norm") is not None
+                    else x.get("llm_score_raw") or 0.0
+                ),
+                reverse=True,
+            )
+
+            ranked_docs: List[Dict[str, Any]] = []
+            for rank_idx, c in enumerate(sorted_candidates, start=1):
+                ranked_docs.append(
                     {
+                        "rank": int(rank_idx),
+                        "text": _clean_text(c.get("fac_spec_text")),
+                        "teacher_score": float(
+                            c.get("llm_score_norm")
+                            if c.get("llm_score_norm") is not None
+                            else c.get("llm_score_raw") or 0.0
+                        ),
+                        "teacher_score_raw": float(c.get("llm_score_raw") or 0.0),
+                        "target_cluster": _clean_text(c.get("llm_target_cluster")) or "unused",
+                        "selected_for_target": bool(c.get("selected_for_target", False)),
                         "fac_id": int(c.get("fac_id") or 0),
                         "fac_spec_id": int(c.get("fac_spec_id") or 0),
                         "fac_spec_idx": int(c.get("fac_spec_idx") or 0),
                         "section": _clean_text(c.get("section")) or "unknown",
-                        "fac_spec_text": _clean_text(c.get("fac_spec_text")),
                         "sts_rank": int(c.get("sts_rank", -1)),
-                        "score_raw": float(c.get("llm_score_raw") or 0.0),
-                        "score": float(c.get("llm_score_norm") if c.get("llm_score_norm") is not None else c.get("llm_score_raw") or 0.0),
                         "band": _clean_text(c.get("band")) or "unknown",
                         "type": _clean_text(c.get("type")) or "unknown",
                         "is_disagreement": bool(c.get("is_disagreement", False)),
                         "is_augmented": bool(c.get("is_augmented", False)),
-                        "augment_target_cluster": _clean_text(c.get("llm_target_cluster")) if bool(c.get("is_augmented", False)) else "",
+                        "augment_target_cluster": (
+                            _clean_text(c.get("llm_target_cluster")) if bool(c.get("is_augmented", False)) else ""
+                        ),
                         "augment_validation_score": (
                             float(c.get("llm_score_raw") or 0.0) if bool(c.get("is_augmented", False)) else None
                         ),
                         "augment_validation_pass": bool(c.get("is_augmented", False)),
                     }
-                    for c in scored_candidates
-                ],
+                )
+
+            cluster_counts = {
+                "high": int(sum(1 for d in ranked_docs if _clean_text(d.get("target_cluster")) == "high")),
+                "mid": int(sum(1 for d in ranked_docs if _clean_text(d.get("target_cluster")) == "mid")),
+                "low": int(sum(1 for d in ranked_docs if _clean_text(d.get("target_cluster")) == "low")),
+            }
+
+            raw_obj = {
+                "grant_id": grant_id,
+                "spec_idx": int(spec_idx),
+                "query_text": spec_text,
+                "target_requested": {
+                    "high": int(target_high),
+                    "mid": int(target_mid),
+                    "low": int(target_low),
+                },
+                "target_selected": {
+                    "high": int(final_quota_info["selected_high"]),
+                    "mid": int(final_quota_info["selected_mid"]),
+                    "low": int(final_quota_info["selected_low"]),
+                    "total": int(final_quota_info["selected_total"]),
+                },
+                "target_missing": {
+                    "high": int(final_quota_info["missing_high"]),
+                    "mid": int(final_quota_info["missing_mid"]),
+                    "low": int(final_quota_info["missing_low"]),
+                    "total": int(final_quota_info["missing_total"]),
+                },
+                "llm_score_bands": {
+                    "high_min": float(HIGH_SCORE_MIN_DEFAULT),
+                    "mid_min": float(MID_SCORE_MIN_DEFAULT),
+                    "mid_max": float(MID_SCORE_MAX_DEFAULT),
+                },
+                "cluster_counts": cluster_counts,
+                "ranked_docs": ranked_docs,
             }
             raw_f.write(json.dumps(raw_obj, ensure_ascii=False) + "\n")
 
-            sorted_candidates = sorted(
-                scored_candidates,
-                key=lambda x: float(x.get("llm_score_norm") if x.get("llm_score_norm") is not None else x.get("llm_score_raw") or 0.0),
-                reverse=True,
-            )
             listwise_obj = {
                 "grant_id": grant_id,
                 "spec_idx": int(spec_idx),
                 "query_text": spec_text,
                 "docs": [
                     {
-                        "text": _clean_text(d.get("fac_spec_text")),
-                        "teacher_score": float(d.get("llm_score_norm") if d.get("llm_score_norm") is not None else d.get("llm_score_raw") or 0.0),
-                        "teacher_score_raw": float(d.get("llm_score_raw") or 0.0),
-                        "fac_id": int(d.get("fac_id") or 0),
-                        "fac_spec_id": int(d.get("fac_spec_id") or 0),
-                        "fac_spec_idx": int(d.get("fac_spec_idx") or 0),
-                        "section": _clean_text(d.get("section")) or "unknown",
-                        "sts_rank": int(d.get("sts_rank", -1)),
-                        "band": _clean_text(d.get("band")) or "unknown",
-                        "type": _clean_text(d.get("type")) or "unknown",
-                        "is_disagreement": bool(d.get("is_disagreement", False)),
-                        "is_augmented": bool(d.get("is_augmented", False)),
-                        "augment_target_cluster": _clean_text(d.get("llm_target_cluster")) if bool(d.get("is_augmented", False)) else "",
-                        "augment_validation_score": (
-                            float(d.get("llm_score_raw") or 0.0) if bool(d.get("is_augmented", False)) else None
-                        ),
-                        "augment_validation_pass": bool(d.get("is_augmented", False)),
+                        "rank": int(doc.get("rank") or 0),
+                        "text": _clean_text(doc.get("text")),
+                        "teacher_score": float(doc.get("teacher_score") or 0.0),
+                        "teacher_score_raw": float(doc.get("teacher_score_raw") or 0.0),
+                        "fac_id": int(doc.get("fac_id") or 0),
+                        "fac_spec_id": int(doc.get("fac_spec_id") or 0),
+                        "fac_spec_idx": int(doc.get("fac_spec_idx") or 0),
+                        "section": _clean_text(doc.get("section")) or "unknown",
+                        "sts_rank": int(doc.get("sts_rank", -1)),
+                        "band": _clean_text(doc.get("band")) or "unknown",
+                        "type": _clean_text(doc.get("type")) or "unknown",
+                        "is_disagreement": bool(doc.get("is_disagreement", False)),
+                        "is_augmented": bool(doc.get("is_augmented", False)),
+                        "target_cluster": _clean_text(doc.get("target_cluster")) or "unused",
+                        "selected_for_target": bool(doc.get("selected_for_target", False)),
+                        "augment_target_cluster": _clean_text(doc.get("augment_target_cluster")),
+                        "augment_validation_score": doc.get("augment_validation_score"),
+                        "augment_validation_pass": bool(doc.get("augment_validation_pass", False)),
                     }
-                    for d in sorted_candidates
+                    for doc in ranked_docs
                 ],
             }
             list_f.write(json.dumps(listwise_obj, ensure_ascii=False) + "\n")
