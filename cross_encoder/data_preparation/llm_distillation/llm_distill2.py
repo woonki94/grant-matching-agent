@@ -50,7 +50,7 @@ TEMPERATURE_DEFAULT = 0.0
 SEED_DEFAULT = 42
 
 # Pairwise control defaults (minimal complexity, aligned with requested recipe).
-PAIR_MAX_PER_SPEC_DEFAULT = 30
+PAIR_MAX_PER_SPEC_DEFAULT = 80
 PAIR_MAX_DISAGREE_PER_SPEC_DEFAULT = 6
 PAIR_MAX_BOUNDARY_PER_SPEC_DEFAULT = 6
 PAIR_WEAK_MIN_DEFAULT = 10
@@ -881,12 +881,19 @@ def main() -> int:
             "Example: target high=5 with multiplier=3.0 -> prefilter high=15."
         ),
     )
+    parser.add_argument(
+        "--max-specs",
+        type=int,
+        default=0,
+        help="Limit number of query specs to process (0 = all).",
+    )
     parser.add_argument("--target-high", type=int, default=5, help="Exact target high count per spec after LLM scoring.")
     parser.add_argument("--target-mid", type=int, default=10, help="Exact target mid count per spec after LLM scoring.")
     parser.add_argument("--target-low", type=int, default=5, help="Exact target low count per spec after LLM scoring.")
     args = parser.parse_args()
 
     prefilter_multiplier = _safe_float(args.prefilter_multiplier, default=2.0, minimum=0.0, maximum=100.0)
+    max_specs = _safe_int(args.max_specs, default=0, minimum=0, maximum=10_000_000)
     target_high = _safe_int(args.target_high, default=5, minimum=0, maximum=100_000)
     target_mid = _safe_int(args.target_mid, default=10, minimum=0, maximum=100_000)
     target_low = _safe_int(args.target_low, default=5, minimum=0, maximum=100_000)
@@ -918,6 +925,9 @@ def main() -> int:
     grant_payload = _load_json(grant_db)
     fac_payload = _load_json(fac_db)
     specs = _flatten_specs(grant_payload)
+    full_spec_count = int(len(specs))
+    if max_specs > 0:
+        specs = specs[: min(int(max_specs), len(specs))]
     fac_specs = _flatten_fac_specs(fac_payload)
     if not specs:
         raise RuntimeError("No specs found in grant DB.")
@@ -1270,6 +1280,7 @@ def main() -> int:
         "max_new_tokens": int(MAX_NEW_TOKENS_DEFAULT),
         "temperature": float(TEMPERATURE_DEFAULT),
         "prefilter_multiplier": float(prefilter_multiplier),
+        "max_specs": int(max_specs),
         "prefilter_requested": {
             "high": int(prefilter_high),
             "mid": int(prefilter_mid),
@@ -1280,6 +1291,7 @@ def main() -> int:
             "mid": int(target_mid),
             "low": int(target_low),
         },
+        "spec_count_input_total": int(full_spec_count),
         "spec_count_total": int(len(specs)),
         "spec_count": int(len(specs)),
         "spec_count_kept": int(kept_specs),
@@ -1341,6 +1353,8 @@ def main() -> int:
     }
     manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
 
+    print(f"spec_count_input_total={full_spec_count}")
+    print(f"max_specs={max_specs}")
     print(f"spec_count_total={len(specs)}")
     print(f"spec_count_kept={kept_specs}")
     print(f"spec_count_dropped_by_coverage_gate={dropped_by_coverage_gate_specs}")
