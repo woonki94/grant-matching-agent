@@ -357,45 +357,124 @@ def _load_prefilter_score_cache(
     return out, stats
 
 
-def _select_fac_spec_candidates_from_ranked_indices(
+def _select_candidate_indices_with_bucket_stats(
     *,
-    spec_item: Dict[str, Any],
-    fac_specs: Sequence[Dict[str, Any]],
+    total: int,
     ranked_indices: Sequence[int],
     top_k: int,
     mid_k: int,
     rand_k: int,
-    base_seed: int,
-) -> List[Dict[str, Any]]:
-    total = len(fac_specs)
+    rng: random.Random,
+) -> Tuple[List[int], Dict[str, int]]:
     if total <= 0:
-        return []
+        return [], {
+            "requested_high": 0,
+            "requested_mid": 0,
+            "requested_low": 0,
+            "requested_total": 0,
+            "selected_high": 0,
+            "selected_mid": 0,
+            "selected_low": 0,
+            "selected_total": 0,
+            "missing_high": 0,
+            "missing_mid": 0,
+            "missing_low": 0,
+            "missing_total": 0,
+            "has_shortage": 0,
+            "total_fac_specs": 0,
+            "ranked_count": 0,
+        }
+
     t = max(0, int(top_k))
     m = max(0, int(mid_k))
     r = max(0, int(rand_k))
     target = t + m + r
-    if target <= 0 or target >= total:
-        return list(fac_specs)
 
-    grant_id = _clean_text(spec_item.get("grant_id"))
-    spec_idx = int(spec_item.get("spec_idx") or 0)
-    rng = _rng_for_spec(base_seed=base_seed, grant_id=grant_id, spec_idx=spec_idx)
+    ranked: List[int] = []
+    ranked_seen = set()
+    for raw_idx in ranked_indices:
+        idx = int(raw_idx)
+        if idx < 0 or idx >= total:
+            continue
+        if idx in ranked_seen:
+            continue
+        ranked_seen.add(idx)
+        ranked.append(idx)
 
-    ranked = [int(i) for i in ranked_indices if 0 <= int(i) < total]
+    if target <= 0:
+        stats = {
+            "requested_high": int(t),
+            "requested_mid": int(m),
+            "requested_low": int(r),
+            "requested_total": int(target),
+            "selected_high": 0,
+            "selected_mid": 0,
+            "selected_low": 0,
+            "selected_total": int(total),
+            "missing_high": 0,
+            "missing_mid": 0,
+            "missing_low": 0,
+            "missing_total": 0,
+            "has_shortage": 0,
+            "total_fac_specs": int(total),
+            "ranked_count": int(len(ranked)),
+        }
+        return list(range(total)), stats
+
+    if target >= total:
+        # Keep previous pipeline behavior: when request >= corpus size, score all docs.
+        # For diagnostics, allocate selected buckets sequentially by requested priority.
+        rem = int(total)
+        selected_high = min(int(t), rem)
+        rem -= selected_high
+        selected_mid = min(int(m), rem)
+        rem -= selected_mid
+        selected_low = min(int(r), rem)
+        missing_high = max(0, int(t) - int(selected_high))
+        missing_mid = max(0, int(m) - int(selected_mid))
+        missing_low = max(0, int(r) - int(selected_low))
+        missing_total = int(missing_high + missing_mid + missing_low)
+        stats = {
+            "requested_high": int(t),
+            "requested_mid": int(m),
+            "requested_low": int(r),
+            "requested_total": int(target),
+            "selected_high": int(selected_high),
+            "selected_mid": int(selected_mid),
+            "selected_low": int(selected_low),
+            "selected_total": int(total),
+            "missing_high": int(missing_high),
+            "missing_mid": int(missing_mid),
+            "missing_low": int(missing_low),
+            "missing_total": int(missing_total),
+            "has_shortage": int(missing_total > 0),
+            "total_fac_specs": int(total),
+            "ranked_count": int(len(ranked)),
+        }
+        return list(range(total)), stats
+
     selected: List[int] = []
     selected_set = set()
 
-    def _add(idx: int) -> None:
+    selected_high = 0
+    selected_mid = 0
+    selected_low = 0
+
+    def _add(idx: int) -> bool:
         if idx in selected_set:
-            return
+            return False
         if idx < 0 or idx >= total:
-            return
+            return False
         selected.append(idx)
         selected_set.add(idx)
+        return True
 
+    # 1) High bucket: top sparse/BGE-ranked.
     for idx in ranked[: min(t, len(ranked))]:
-        _add(idx)
+        if _add(idx):
+            selected_high += 1
 
+    # 2) Mid bucket: middle band of non-top ranked.
     if m > 0:
         non_top = ranked[min(t, len(ranked)) :]
         if non_top:
@@ -405,39 +484,80 @@ def _select_fac_spec_candidates_from_ranked_indices(
             avail = [i for i in mid_pool if i not in selected_set]
             if avail:
                 pick = min(m, len(avail))
-                if pick == len(avail):
-                    for idx in avail:
-                        _add(idx)
-                else:
-                    for idx in rng.sample(avail, k=pick):
-                        _add(idx)
+                chosen = avail if pick == len(avail) else rng.sample(avail, k=pick)
+                for idx in chosen:
+                    if _add(idx):
+                        selected_mid += 1
 
+    # 3) Low bucket: random from remainder.
     if r > 0:
         remainder = [i for i in range(total) if i not in selected_set]
         if remainder:
             pick = min(r, len(remainder))
-            if pick == len(remainder):
-                for idx in remainder:
-                    _add(idx)
-            else:
-                for idx in rng.sample(remainder, k=pick):
-                    _add(idx)
+            chosen = remainder if pick == len(remainder) else rng.sample(remainder, k=pick)
+            for idx in chosen:
+                if _add(idx):
+                    selected_low += 1
 
-    if len(selected) < target:
-        for idx in ranked:
-            if len(selected) >= target:
-                break
-            _add(idx)
-    if len(selected) < target:
-        remainder = [i for i in range(total) if i not in selected_set]
-        if remainder:
-            rng.shuffle(remainder)
-            for idx in remainder:
-                if len(selected) >= target:
-                    break
-                _add(idx)
+    selected_indices = selected[:target] if target > 0 else list(range(total))
+    selected_total = len(selected_indices)
 
-    return [fac_specs[i] for i in selected[:target]]
+    missing_high = max(0, t - selected_high)
+    missing_mid = max(0, m - selected_mid)
+    missing_low = max(0, r - selected_low)
+    missing_total = int(missing_high + missing_mid + missing_low)
+
+    stats = {
+        "requested_high": int(t),
+        "requested_mid": int(m),
+        "requested_low": int(r),
+        "requested_total": int(target),
+        "selected_high": int(selected_high),
+        "selected_mid": int(selected_mid),
+        "selected_low": int(selected_low),
+        "selected_total": int(selected_total),
+        "missing_high": int(missing_high),
+        "missing_mid": int(missing_mid),
+        "missing_low": int(missing_low),
+        "missing_total": int(missing_total),
+        "has_shortage": int(missing_total > 0),
+        "total_fac_specs": int(total),
+        "ranked_count": int(len(ranked)),
+    }
+    return selected_indices, stats
+
+
+def _select_fac_spec_candidates_from_ranked_indices(
+    *,
+    spec_item: Dict[str, Any],
+    fac_specs: Sequence[Dict[str, Any]],
+    ranked_indices: Sequence[int],
+    top_k: int,
+    mid_k: int,
+    rand_k: int,
+    base_seed: int,
+    diagnostics_out: Optional[Dict[str, int]] = None,
+) -> List[Dict[str, Any]]:
+    total = len(fac_specs)
+    if total <= 0:
+        return []
+
+    grant_id = _clean_text(spec_item.get("grant_id"))
+    spec_idx = int(spec_item.get("spec_idx") or 0)
+    rng = _rng_for_spec(base_seed=base_seed, grant_id=grant_id, spec_idx=spec_idx)
+
+    selected_indices, stats = _select_candidate_indices_with_bucket_stats(
+        total=total,
+        ranked_indices=ranked_indices,
+        top_k=top_k,
+        mid_k=mid_k,
+        rand_k=rand_k,
+        rng=rng,
+    )
+    if diagnostics_out is not None:
+        diagnostics_out.clear()
+        diagnostics_out.update(stats)
+    return [fac_specs[i] for i in selected_indices]
 
 
 def _tokenize_for_sparse(text: str) -> List[str]:
@@ -679,16 +799,12 @@ def _select_fac_spec_candidates_for_spec(
     mid_k: int,
     rand_k: int,
     base_seed: int,
+    diagnostics_out: Optional[Dict[str, int]] = None,
 ) -> List[Dict[str, Any]]:
     total = len(fac_specs)
     if total <= 0:
         return []
-
-    t = max(0, int(top_k))
-    m = max(0, int(mid_k))
-    r = max(0, int(rand_k))
-    target = t + m + r
-    if target <= 0 or target >= total or sparse_index is None:
+    if sparse_index is None:
         return list(fac_specs)
 
     grant_id = _clean_text(spec_item.get("grant_id"))
@@ -696,57 +812,18 @@ def _select_fac_spec_candidates_for_spec(
     rng = _rng_for_spec(base_seed=base_seed, grant_id=grant_id, spec_idx=spec_idx)
 
     ranked = _rank_fac_spec_indices_for_spec(_clean_text(spec_item.get("spec_text")), sparse_index=sparse_index)
-    selected: List[int] = []
-    selected_set = set()
-
-    def _add(idx: int) -> None:
-        if idx in selected_set:
-            return
-        if idx < 0 or idx >= total:
-            return
-        selected.append(idx)
-        selected_set.add(idx)
-
-    # 1) Strong candidates from sparse rank top.
-    for idx in ranked[: min(t, len(ranked))]:
-        _add(idx)
-
-    # 2) Medium band candidates from middle of non-top ranked pool.
-    if m > 0:
-        non_top = ranked[min(t, len(ranked)) :]
-        if non_top:
-            start = len(non_top) // 3
-            end = (2 * len(non_top)) // 3
-            mid_pool = non_top[start:end] if end > start else non_top
-            if mid_pool:
-                pick = min(m, len(mid_pool))
-                for idx in rng.sample(mid_pool, k=pick):
-                    _add(idx)
-
-    # 3) Easy/diverse negatives from full remainder.
-    if r > 0:
-        remainder = [i for i in range(total) if i not in selected_set]
-        if remainder:
-            pick = min(r, len(remainder))
-            for idx in rng.sample(remainder, k=pick):
-                _add(idx)
-
-    # Backfill if collisions reduced count.
-    if len(selected) < target:
-        for idx in ranked:
-            if len(selected) >= target:
-                break
-            _add(idx)
-    if len(selected) < target:
-        remainder = [i for i in range(total) if i not in selected_set]
-        if remainder:
-            rng.shuffle(remainder)
-            for idx in remainder:
-                if len(selected) >= target:
-                    break
-                _add(idx)
-
-    return [fac_specs[i] for i in selected[:target]]
+    selected_indices, stats = _select_candidate_indices_with_bucket_stats(
+        total=total,
+        ranked_indices=ranked,
+        top_k=top_k,
+        mid_k=mid_k,
+        rand_k=rand_k,
+        rng=rng,
+    )
+    if diagnostics_out is not None:
+        diagnostics_out.clear()
+        diagnostics_out.update(stats)
+    return [fac_specs[i] for i in selected_indices]
 
 
 def _chunked(items: Sequence[Any], batch_size: int) -> List[Sequence[Any]]:
@@ -1040,6 +1117,9 @@ def _build_parser() -> argparse.ArgumentParser:
 
 
 def main() -> int:
+    # ===========================
+    # Step 1) Parse args + import runtime backend
+    # ===========================
     args = _build_parser().parse_args()
 
     try:
@@ -1050,6 +1130,9 @@ def main() -> int:
             "Install `vllm` in your runtime, then rerun."
         ) from e
 
+    # ===========================
+    # Step 2) Resolve paths + normalize config
+    # ===========================
     grant_db = _resolve_path(args.grant_db)
     fac_db = _resolve_path(args.fac_db)
     raw_output = _resolve_path(args.raw_output)
@@ -1091,6 +1174,9 @@ def main() -> int:
     use_tqdm = not bool(args.no_tqdm)
     use_vllm_tqdm = bool(args.vllm_tqdm)
 
+    # ===========================
+    # Step 3) Load input datasets
+    # ===========================
     if not grant_db.exists():
         raise RuntimeError(f"Grant DB not found: {grant_db}")
     if not fac_db.exists():
@@ -1114,6 +1200,9 @@ def main() -> int:
     if not specs:
         raise RuntimeError("No specs left after start-spec-index filtering.")
 
+    # ===========================
+    # Step 4) Build prefilter resources
+    # ===========================
     fac_global_index_map = _build_fac_spec_global_index_map(fac_specs)
     full_total_pairs = int(len(specs) * len(fac_specs))
     prefilter_score_cache: Dict[Tuple[str, int], List[int]] = {}
@@ -1147,6 +1236,9 @@ def main() -> int:
         total_pairs_per_spec += int(prefilter_global_rand_count)
     total_pairs = int(len(specs) * total_pairs_per_spec)
 
+    # ===========================
+    # Step 5) Prepare outputs + initialize LLM
+    # ===========================
     raw_output.parent.mkdir(parents=True, exist_ok=True)
     pairwise_output.parent.mkdir(parents=True, exist_ok=True)
     listwise_output.parent.mkdir(parents=True, exist_ok=True)
@@ -1161,6 +1253,9 @@ def main() -> int:
     tokenizer = llm.get_tokenizer()
     sampling_params = SamplingParams(max_tokens=max_new_tokens, temperature=temperature)
 
+    # ===========================
+    # Step 6) Initialize run counters + print run config
+    # ===========================
     started = time.time()
     total_scored = 0
     total_pairwise = 0
@@ -1174,6 +1269,19 @@ def main() -> int:
     sum_candidates_per_spec = 0
     min_candidates_per_spec = 2_147_483_647
     max_candidates_per_spec = 0
+    prefilter_requested_high_pairs = 0
+    prefilter_requested_mid_pairs = 0
+    prefilter_requested_low_pairs = 0
+    prefilter_selected_high_pairs = 0
+    prefilter_selected_mid_pairs = 0
+    prefilter_selected_low_pairs = 0
+    prefilter_missing_high_pairs = 0
+    prefilter_missing_mid_pairs = 0
+    prefilter_missing_low_pairs = 0
+    prefilter_shortage_spec_count = 0
+    prefilter_shortage_high_spec_count = 0
+    prefilter_shortage_mid_spec_count = 0
+    prefilter_shortage_low_spec_count = 0
 
     print(f"model_id={model_id}")
     print(f"spec_count={len(specs)}")
@@ -1207,6 +1315,9 @@ def main() -> int:
     print(f"pairwise_output={pairwise_output}")
     print(f"listwise_output={listwise_output}")
 
+    # ===========================
+    # Step 7) Progress bar setup
+    # ===========================
     tqdm_bar = None
     if use_tqdm:
         try:
@@ -1220,6 +1331,9 @@ def main() -> int:
         if tqdm_bar is not None:
             tqdm_bar.update(int(max(0, step)))
 
+    # ===========================
+    # Step 8) Main scoring + dataset writing loop
+    # ===========================
     try:
         with (
             raw_output.open("w", encoding="utf-8") as raw_f,
@@ -1228,6 +1342,7 @@ def main() -> int:
         ):
             for spec_rank, spec_item in enumerate(specs, start=1):
                 ranked_indices: List[int] = []
+                prefilter_bucket_diag: Dict[str, int] = {}
                 if use_prefilter:
                     if use_prefilter_score_cache:
                         ranked_indices = list(prefilter_score_cache.get(_spec_key(spec_item)) or [])
@@ -1239,6 +1354,7 @@ def main() -> int:
                             mid_k=prefilter_mid_k,
                             rand_k=prefilter_rand_k,
                             base_seed=prefilter_seed,
+                            diagnostics_out=prefilter_bucket_diag,
                         )
                     else:
                         ranked_indices = _rank_fac_spec_indices_for_spec(
@@ -1253,10 +1369,41 @@ def main() -> int:
                             mid_k=prefilter_mid_k,
                             rand_k=prefilter_rand_k,
                             base_seed=prefilter_seed,
+                            diagnostics_out=prefilter_bucket_diag,
                         )
                 else:
                     ranked_indices = []
                     selected_fac_specs = list(fac_specs)
+
+                if use_prefilter:
+                    req_h = int(prefilter_bucket_diag.get("requested_high", 0))
+                    req_m = int(prefilter_bucket_diag.get("requested_mid", 0))
+                    req_l = int(prefilter_bucket_diag.get("requested_low", 0))
+                    sel_h = int(prefilter_bucket_diag.get("selected_high", 0))
+                    sel_m = int(prefilter_bucket_diag.get("selected_mid", 0))
+                    sel_l = int(prefilter_bucket_diag.get("selected_low", 0))
+                    miss_h = int(prefilter_bucket_diag.get("missing_high", 0))
+                    miss_m = int(prefilter_bucket_diag.get("missing_mid", 0))
+                    miss_l = int(prefilter_bucket_diag.get("missing_low", 0))
+                    miss_total = int(prefilter_bucket_diag.get("missing_total", 0))
+
+                    prefilter_requested_high_pairs += req_h
+                    prefilter_requested_mid_pairs += req_m
+                    prefilter_requested_low_pairs += req_l
+                    prefilter_selected_high_pairs += sel_h
+                    prefilter_selected_mid_pairs += sel_m
+                    prefilter_selected_low_pairs += sel_l
+                    prefilter_missing_high_pairs += miss_h
+                    prefilter_missing_mid_pairs += miss_m
+                    prefilter_missing_low_pairs += miss_l
+                    if miss_total > 0:
+                        prefilter_shortage_spec_count += 1
+                    if miss_h > 0:
+                        prefilter_shortage_high_spec_count += 1
+                    if miss_m > 0:
+                        prefilter_shortage_mid_spec_count += 1
+                    if miss_l > 0:
+                        prefilter_shortage_low_spec_count += 1
 
                 selected_fac_specs = _inject_global_random_fac_specs(
                     spec_item=spec_item,
@@ -1414,6 +1561,9 @@ def main() -> int:
         if tqdm_bar is not None:
             tqdm_bar.close()
 
+    # ===========================
+    # Step 9) Finalize manifest + summary logs
+    # ===========================
     elapsed = max(1e-6, time.time() - started)
     avg_candidates = float(sum_candidates_per_spec / float(max(1, len(specs))))
     if min_candidates_per_spec == 2_147_483_647:
@@ -1445,6 +1595,22 @@ def main() -> int:
         "prefilter_score_cache_path": str(prefilter_score_cache_path) if prefilter_score_cache_path is not None else "",
         "prefilter_score_cache_spec_count": int(len(prefilter_score_cache)),
         "prefilter_score_cache_stats": prefilter_score_cache_stats,
+        "prefilter_requested_high_pairs": int(prefilter_requested_high_pairs),
+        "prefilter_requested_mid_pairs": int(prefilter_requested_mid_pairs),
+        "prefilter_requested_low_pairs": int(prefilter_requested_low_pairs),
+        "prefilter_selected_high_pairs": int(prefilter_selected_high_pairs),
+        "prefilter_selected_mid_pairs": int(prefilter_selected_mid_pairs),
+        "prefilter_selected_low_pairs": int(prefilter_selected_low_pairs),
+        "prefilter_missing_high_pairs": int(prefilter_missing_high_pairs),
+        "prefilter_missing_mid_pairs": int(prefilter_missing_mid_pairs),
+        "prefilter_missing_low_pairs": int(prefilter_missing_low_pairs),
+        "prefilter_missing_total_pairs": int(
+            prefilter_missing_high_pairs + prefilter_missing_mid_pairs + prefilter_missing_low_pairs
+        ),
+        "prefilter_shortage_spec_count": int(prefilter_shortage_spec_count),
+        "prefilter_shortage_high_spec_count": int(prefilter_shortage_high_spec_count),
+        "prefilter_shortage_mid_spec_count": int(prefilter_shortage_mid_spec_count),
+        "prefilter_shortage_low_spec_count": int(prefilter_shortage_low_spec_count),
         "avg_candidates_per_spec": float(avg_candidates),
         "min_candidates_per_spec": int(min_candidates_per_spec),
         "max_candidates_per_spec": int(max_candidates_per_spec),
@@ -1489,6 +1655,27 @@ def main() -> int:
     print(f"total_pair_llm_disagreement={total_pair_llm_disagreement}")
     print(f"total_pair_strong_vs_boundary={total_pair_strong_vs_boundary}")
     print(f"total_disagreement_candidates={total_disagreement_candidates}")
+    if use_prefilter:
+        print(
+            "prefilter_missing_pairs="
+            f"high:{prefilter_missing_high_pairs},"
+            f"mid:{prefilter_missing_mid_pairs},"
+            f"low:{prefilter_missing_low_pairs},"
+            f"total:{(prefilter_missing_high_pairs + prefilter_missing_mid_pairs + prefilter_missing_low_pairs)}"
+        )
+        print(
+            "prefilter_requested_vs_selected_pairs="
+            f"high:{prefilter_requested_high_pairs}/{prefilter_selected_high_pairs},"
+            f"mid:{prefilter_requested_mid_pairs}/{prefilter_selected_mid_pairs},"
+            f"low:{prefilter_requested_low_pairs}/{prefilter_selected_low_pairs}"
+        )
+        print(
+            "prefilter_shortage_specs="
+            f"any:{prefilter_shortage_spec_count}/{len(specs)},"
+            f"high:{prefilter_shortage_high_spec_count},"
+            f"mid:{prefilter_shortage_mid_spec_count},"
+            f"low:{prefilter_shortage_low_spec_count}"
+        )
     print(f"parsed_json_ok_count={total_json_ok}")
     print(f"parsed_fallback_count={total_fallback}")
     print(f"elapsed_seconds={elapsed:.2f}")
