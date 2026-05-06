@@ -30,14 +30,14 @@ if str(PROJECT_ROOT) not in sys.path:
 # Requested model family (closest available instruct model in this setup).
 MODEL_ID_DEFAULT = "Qwen/Qwen2.5-14B-Instruct"
 
-GRANT_DB_DEFAULT = "cross_encoder/dataset/grant_keywords_spec_keywords_db.json"
-FAC_DB_DEFAULT = "cross_encoder/dataset/fac_specs_db.json"
+GRANT_DB_DEFAULT = "cross_encoder/dataset/source/grant_keywords_spec_keywords_db.json"
+FAC_DB_DEFAULT = "cross_encoder/dataset/source/fac_specs_db.json"
 
-RAW_OUTPUT_DEFAULT = "cross_encoder/dataset/llm_distill_raw_scores.jsonl"
-PAIRWISE_OUTPUT_DEFAULT = "cross_encoder/dataset/llm_distill_pairwise.jsonl"
-LISTWISE_OUTPUT_DEFAULT = "cross_encoder/dataset/llm_distill_listwise.jsonl"
-MANIFEST_OUTPUT_DEFAULT = "cross_encoder/dataset/llm_distill_manifest.json"
-PREFILTER_SCORE_CACHE_DEFAULT = "cross_encoder/dataset/spec_facspec_sts_cache.jsonl"
+RAW_OUTPUT_DEFAULT = "cross_encoder/dataset/distill/llm_distill_raw_scores.jsonl"
+PAIRWISE_OUTPUT_DEFAULT = "cross_encoder/dataset/distill/llm_distill_pairwise.jsonl"
+LISTWISE_OUTPUT_DEFAULT = "cross_encoder/dataset/distill/llm_distill_listwise.jsonl"
+MANIFEST_OUTPUT_DEFAULT = "cross_encoder/dataset/distill/llm_distill_manifest.json"
+PREFILTER_SCORE_CACHE_DEFAULT = "cross_encoder/dataset/source/spec_facspec_sts_cache.jsonl"
 
 
 SYSTEM_PROMPT = """

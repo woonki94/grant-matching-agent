@@ -29,10 +29,10 @@ if str(PROJECT_ROOT) not in sys.path:
 from db.db_conn import SessionLocal
 
 
-GRANT_DB_DEFAULT = "cross_encoder/dataset/grant_keywords_spec_keywords_db.json"
-FAC_DB_DEFAULT = "cross_encoder/dataset/fac_specs_db.json"
-OUTPUT_DEFAULT = "cross_encoder/dataset/spec_facspec_sts_cache.jsonl"
-MANIFEST_DEFAULT = "cross_encoder/dataset/spec_facspec_sts_cache.manifest.json"
+GRANT_DB_DEFAULT = "cross_encoder/dataset/source/grant_keywords_spec_keywords_db.json"
+FAC_DB_DEFAULT = "cross_encoder/dataset/source/fac_specs_db.json"
+OUTPUT_DEFAULT = "cross_encoder/dataset/source/spec_facspec_sts_cache.jsonl"
+MANIFEST_DEFAULT = "cross_encoder/dataset/source/spec_facspec_sts_cache.manifest.json"
 PREFILTER_METHOD_DEFAULT = "sts"
 STS_MODEL_ID_DEFAULT = "dleemiller/ModernCE-base-sts"
 

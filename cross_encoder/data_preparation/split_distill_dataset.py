@@ -19,8 +19,8 @@ def _find_project_root() -> Path:
 
 PROJECT_ROOT = _find_project_root()
 
-RAW_INPUT_DEFAULT = "cross_encoder/dataset/llm_distill_raw_scores.jsonl"
-PAIRWISE_INPUT_DEFAULT = "cross_encoder/dataset/llm_distill_pairwise.jsonl"
+RAW_INPUT_DEFAULT = "cross_encoder/dataset/distill/llm_distill_raw_scores.jsonl"
+PAIRWISE_INPUT_DEFAULT = "cross_encoder/dataset/distill/llm_distill_pairwise.jsonl"
 DEFAULT_SPLIT_DIR = "cross_encoder/dataset/splits"
 
 RAW_TRAIN_BASENAME = "llm_distill_raw_train.jsonl"

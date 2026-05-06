@@ -24,8 +24,8 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from db.db_conn import SessionLocal
 
-GRANT_OUTPUT_DEFAULT = "cross_encoder/dataset/grant_keywords_spec_keywords_db.json"
-FAC_OUTPUT_DEFAULT = "cross_encoder/dataset/fac_specs_db.json"
+GRANT_OUTPUT_DEFAULT = "cross_encoder/dataset/source/grant_keywords_spec_keywords_db.json"
+FAC_OUTPUT_DEFAULT = "cross_encoder/dataset/source/fac_specs_db.json"
 
 
 def _clean_text(value: Any) -> str:
