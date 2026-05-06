@@ -672,6 +672,31 @@ def _resolve_opportunity_id(grant_link=None, grant_title=None):
         logger.info("_resolve_opportunity_id: link-as-title search result=%s", result)
         if result.get("found"):
             return result["opportunity_id"], result.get("opportunity_title")
+    
+    # 4. If the grant is not in DB, try fetching it from the grants.gov-backed API
+    try:
+        if grant_link:
+            fetch_result = agent.fetch_grant_from_source(
+                grant_identifier_type="link",
+                grant_link=grant_link,
+                grant_title=grant_title,
+            )
+            logger.info("_resolve_opportunity_id: fetch by link result=%s", fetch_result)
+            if fetch_result.get("fetched"):
+                return fetch_result["opportunity_id"], fetch_result.get("opportunity_title")
+
+        if grant_title:
+            fetch_result = agent.fetch_grant_from_source(
+                grant_identifier_type="title",
+                grant_link=grant_link,
+                grant_title=grant_title,
+            )
+            logger.info("_resolve_opportunity_id: fetch by title result=%s", fetch_result)
+            if fetch_result.get("fetched"):
+                return fetch_result["opportunity_id"], fetch_result.get("opportunity_title")
+    except Exception as e:
+        logger.warning("_resolve_opportunity_id: fetch failed for link=%r title=%r: %s", grant_link, grant_title, e)
+
 
     logger.warning("_resolve_opportunity_id: grant not found for link=%r title=%r", grant_link, grant_title)
     return None, None
