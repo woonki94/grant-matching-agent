@@ -697,8 +697,34 @@ def _load_llm(model_id: str, *, tensor_parallel_size: int, max_model_len: int, g
     }
 
 
-def _unload_llm(llm_bundle: Dict[str, Any]) -> None:
-    del llm_bundle
+def _unload_llm(llm_bundle: Optional[Dict[str, Any]]) -> None:
+    if not isinstance(llm_bundle, dict):
+        return
+
+    client = llm_bundle.get("client")
+    tokenizer = llm_bundle.get("tokenizer")
+
+    # Break strong references held by caller-visible bundle before GC.
+    llm_bundle["client"] = None
+    llm_bundle["tokenizer"] = None
+    llm_bundle["backend"] = ""
+    llm_bundle["model_id"] = ""
+
+    # Best-effort explicit shutdown hooks if backend exposes them.
+    if client is not None:
+        for method_name in ("shutdown", "close"):
+            fn = getattr(client, method_name, None)
+            if callable(fn):
+                try:
+                    fn()
+                except Exception:
+                    pass
+
+    # Drop local refs and clear container.
+    del client
+    del tokenizer
+    llm_bundle.clear()
+
     gc.collect()
     try:
         import torch
@@ -1128,6 +1154,7 @@ def _run_single_model(
         if verbose:
             print(f"[{model_id}] step=unload_model")
         _unload_llm(llm_bundle)
+        llm_bundle = None
 
 
 def _run_model_across_queries(
@@ -1185,6 +1212,7 @@ def _run_model_across_queries(
         if verbose:
             print(f"[{model_id}] step=unload_model")
         _unload_llm(llm_bundle)
+        llm_bundle = None
     return results
 
 
@@ -1451,6 +1479,7 @@ def main() -> int:
             if verbose:
                 print(f"[{model_key}] step=unload_model")
             _unload_llm(llm_bundle)
+            llm_bundle = None
 
     for query_item in query_reports:
         query = _clean_text(query_item.get("query"))
