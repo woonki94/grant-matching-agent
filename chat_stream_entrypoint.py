@@ -1311,6 +1311,23 @@ def create_faculty_profiles():
             "error": "At least one email is required.",
         }, 400
 
+
+    # Check if any faculty already exist
+    from db.db_conn import SessionLocal
+    with SessionLocal() as session:
+        from dao.faculty_dao import FacultyDAO
+        dao = FacultyDAO(session)
+        existing_faculty = []
+        for email in emails:
+            if dao.get_by_email(email):
+                existing_faculty.append(email)
+        
+        if existing_faculty:
+            return {
+                "ok": False,
+                "error": f"Faculty already exists in the database: {', '.join(existing_faculty)}",
+            }, 400
+
     # Build OSU URL map
     osu_url_map: dict = {}
     for em, url in zip(request.form.getlist("osu_url_email"), request.form.getlist("osu_url_value")):
