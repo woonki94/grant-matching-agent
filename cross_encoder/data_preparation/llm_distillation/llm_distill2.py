@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import gc
 import hashlib
 import json
 import math
@@ -43,9 +44,11 @@ PAIRWISE_OUTPUT_DEFAULT = "cross_encoder/dataset/distill/llm_distill2_pairwise.j
 LISTWISE_OUTPUT_DEFAULT = "cross_encoder/dataset/distill/llm_distill2_listwise.jsonl"
 MANIFEST_DEFAULT = "cross_encoder/dataset/distill/llm_distill2_manifest.json"
 
-MODEL_ID_DEFAULT = "Qwen/Qwen2.5-14B-Instruct"
+SCORE_MODEL_ID_DEFAULT = "Qwen/Qwen2.5-14B-Instruct"
+AUGMENT_MODEL_ID_DEFAULT = "Qwen/Qwen3-14B"
+MODEL_ID_DEFAULT = SCORE_MODEL_ID_DEFAULT
 BATCH_SIZE_DEFAULT = 64
-MAX_NEW_TOKENS_DEFAULT = 24
+MAX_NEW_TOKENS_DEFAULT = 512
 TEMPERATURE_DEFAULT = 0.0
 SEED_DEFAULT = 42
 
@@ -61,12 +64,12 @@ BOUNDARY_MIN_MARGIN_DEFAULT = 0.05
 ALLOW_EXTRA_DISAGREE_FROM_UNSELECTED_DEFAULT = True
 
 # Post-score quality controls (fixed, keep code simple).
-COVERAGE_GATE_MIN_MID_HIGH_DEFAULT = 0.40
+COVERAGE_GATE_MIN_MID_HIGH_DEFAULT = 0.20
 AUGMENT_ENABLE_DEFAULT = True
 AUGMENT_MAX_ATTEMPTS_DEFAULT = 3
-AUGMENT_MAX_TRIES_PER_MISSING_DEFAULT = 3
-AUGMENT_MAX_NEW_TOKENS_DEFAULT = 384
-AUGMENT_VALIDATION_MAX_NEW_TOKENS_DEFAULT = 160
+AUGMENT_MAX_TRIES_PER_MISSING_DEFAULT = 5
+AUGMENT_MAX_NEW_TOKENS_DEFAULT = 512
+AUGMENT_VALIDATION_MAX_NEW_TOKENS_DEFAULT = 512
 
 # LLM score banding for real-candidate target assignment.
 HIGH_SCORE_MIN_DEFAULT = 0.70
@@ -204,6 +207,57 @@ def _extract_score(raw_text: str) -> Tuple[float, bool]:
     if n:
         return _clamp_score(n.group(0)), False
     return 0.0, False
+
+
+def _load_vllm_bundle(
+    *,
+    model_id: str,
+    max_new_tokens: int,
+    temperature: float,
+) -> Tuple[Any, Any, Any]:
+    try:
+        from vllm import LLM, SamplingParams
+    except Exception as exc:
+        raise RuntimeError(
+            "vLLM is required but not installed in this environment. Install `vllm` and rerun."
+        ) from exc
+
+    llm = LLM(
+        _clean_text(model_id),
+        tensor_parallel_size=1,
+        max_model_len=4096,
+        gpu_memory_utilization=0.9,
+    )
+    tokenizer = llm.get_tokenizer()
+    sampling_params = SamplingParams(
+        max_tokens=int(max(1, max_new_tokens)),
+        temperature=float(max(0.0, temperature)),
+    )
+    return llm, tokenizer, sampling_params
+
+
+def _release_vllm_bundle(llm: Any) -> None:
+    if llm is None:
+        return
+    for method_name in ("shutdown", "close"):
+        fn = getattr(llm, method_name, None)
+        if callable(fn):
+            try:
+                fn()
+            except Exception:
+                pass
+    try:
+        del llm
+    except Exception:
+        pass
+    gc.collect()
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except Exception:
+        pass
 
 
 def _load_json(path: Path) -> Dict[str, Any]:
@@ -937,42 +991,18 @@ def main() -> int:
     prefilter_map = _load_prefilter_score_cache(cache_path=prefilter_cache, fac_specs=fac_specs)
 
     # ======================================================
-    # Step 4) Load LLM scorer
+    # Step 4) Score model pass (Qwen2.5), then unload
     # ======================================================
-    try:
-        from vllm import LLM, SamplingParams
-    except Exception as exc:
-        raise RuntimeError(
-            "vLLM is required but not installed in this environment. Install `vllm` and rerun."
-        ) from exc
-
-    llm = LLM(
-        MODEL_ID_DEFAULT,
-        tensor_parallel_size=1,
-        max_model_len=4096,
-        gpu_memory_utilization=0.9,
+    score_model_id = _clean_text(SCORE_MODEL_ID_DEFAULT) or _clean_text(MODEL_ID_DEFAULT)
+    augment_model_id = _clean_text(AUGMENT_MODEL_ID_DEFAULT) or score_model_id
+    llm, tokenizer, sampling_params = _load_vllm_bundle(
+        model_id=score_model_id,
+        max_new_tokens=MAX_NEW_TOKENS_DEFAULT,
+        temperature=TEMPERATURE_DEFAULT,
     )
-    tokenizer = llm.get_tokenizer()
-    sampling_params = SamplingParams(max_tokens=MAX_NEW_TOKENS_DEFAULT, temperature=TEMPERATURE_DEFAULT)
-
-    augmenter = None
-    if AUGMENT_ENABLE_DEFAULT:
-        if LLMDistillationAugmenter is None:
-            raise RuntimeError("Augmentation is enabled but LLMDistillationAugmenter could not be imported.")
-        augmenter = LLMDistillationAugmenter(
-            llm=llm,
-            tokenizer=tokenizer,
-            model_id=MODEL_ID_DEFAULT,
-            max_attempts=AUGMENT_MAX_ATTEMPTS_DEFAULT,
-            max_new_tokens=AUGMENT_MAX_NEW_TOKENS_DEFAULT,
-            temperature=0.2,
-            top_p=0.9,
-            enable_validation=True,
-            validation_max_new_tokens=AUGMENT_VALIDATION_MAX_NEW_TOKENS_DEFAULT,
-        )
 
     # ======================================================
-    # Step 5) Prefilter -> score real -> gate -> recover high/mid -> pairwise
+    # Step 5) Stage A: prefilter -> score real -> pre-coverage gate
     # ======================================================
     raw_output_path.parent.mkdir(parents=True, exist_ok=True)
     pairwise_output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1013,6 +1043,7 @@ def main() -> int:
     total_boundary_candidates = 0
     total_weak_candidates = 0
     synthetic_id_cursor = 1
+    scored_spec_rows: List[Dict[str, Any]] = []
 
     try:
         from tqdm import tqdm as _tqdm  # type: ignore
@@ -1022,88 +1053,155 @@ def main() -> int:
     base_iter = enumerate(specs, start=1)
     spec_iter = _tqdm(base_iter, total=len(specs), desc="Scoring specs") if _tqdm is not None else base_iter
 
+    for spec_rank, spec in spec_iter:
+        grant_id = _clean_text(spec.get("grant_id"))
+        spec_idx = _safe_int(spec.get("spec_idx"), default=0, minimum=0, maximum=50_000_000)
+        spec_text = _clean_text(spec.get("spec_text"))
+        ranked_indices = list(prefilter_map.get((grant_id, spec_idx)) or [])
+        rank_map = {int(idx): int(i) for i, idx in enumerate(ranked_indices)}
+
+        rng = _rng_for_spec(base_seed=SEED_DEFAULT, grant_id=grant_id, spec_idx=spec_idx)
+        high_indices, mid_indices, low_indices = _select_prefilter_buckets(
+            total=len(fac_specs),
+            ranked_indices=ranked_indices,
+            high_k=prefilter_high,
+            mid_k=prefilter_mid,
+            low_k=prefilter_low,
+            rng=rng,
+        )
+        high_index_set = set(high_indices)
+        mid_index_set = set(mid_indices)
+
+        prefilter_candidates: List[Dict[str, Any]] = []
+        for idx in list(high_indices) + list(mid_indices) + list(low_indices):
+            if idx < 0 or idx >= len(fac_specs):
+                continue
+            fac = fac_specs[idx]
+            bucket = "low"
+            if idx in high_index_set:
+                bucket = "high"
+            elif idx in mid_index_set:
+                bucket = "mid"
+            prefilter_candidates.append(
+                {
+                    "fac_id": int(fac["fac_id"]),
+                    "fac_spec_id": int(fac["fac_spec_id"]),
+                    "fac_spec_idx": int(fac["fac_spec_idx"]),
+                    "section": _clean_text(fac["section"]),
+                    "fac_spec_text": _clean_text(fac["fac_spec_text"]),
+                    "prefilter_bucket": bucket,
+                    "sts_rank": int(rank_map.get(int(idx), -1)),
+                }
+            )
+
+        total_prefilter_selected += int(len(prefilter_candidates))
+
+        scored_candidates, json_ok, fallback = _score_prefiltered_candidates(
+            llm=llm,
+            tokenizer=tokenizer,
+            sampling_params=sampling_params,
+            spec_text=spec_text,
+            candidates=prefilter_candidates,
+            batch_size=BATCH_SIZE_DEFAULT,
+        )
+        total_scored_candidates += int(len(scored_candidates))
+        total_json_ok += int(json_ok)
+        total_fallback += int(fallback)
+
+        scored_candidates = _normalize_llm_scores(scored_candidates)
+        scored_candidates, quota_info = _assign_target_clusters(
+            candidates=scored_candidates,
+            target_high=target_high,
+            target_mid=target_mid,
+            target_low=target_low,
+        )
+        missing_high_total_pre += int(quota_info["missing_high"])
+        missing_mid_total_pre += int(quota_info["missing_mid"])
+        missing_low_total_pre += int(quota_info["missing_low"])
+        if int(quota_info["missing_total"]) > 0:
+            shortage_specs_pre += 1
+
+        high_cov_pre = _coverage_ratio(int(quota_info["selected_high"]), int(target_high))
+        mid_cov_pre = _coverage_ratio(int(quota_info["selected_mid"]), int(target_mid))
+        passed_coverage_gate = bool(
+            high_cov_pre >= float(COVERAGE_GATE_MIN_MID_HIGH_DEFAULT)
+            and mid_cov_pre >= float(COVERAGE_GATE_MIN_MID_HIGH_DEFAULT)
+        )
+        if not passed_coverage_gate:
+            dropped_by_coverage_gate_specs += 1
+            continue
+
+        scored_spec_rows.append(
+            {
+                "grant_id": grant_id,
+                "spec_idx": int(spec_idx),
+                "spec_text": spec_text,
+                "scored_candidates": scored_candidates,
+                "quota_info": quota_info,
+            }
+        )
+
+        if (_tqdm is None) and (spec_rank % 10 == 0 or spec_rank == len(specs)):
+            elapsed = max(1e-6, time.time() - started)
+            speed = float(total_scored_candidates / elapsed)
+            print(
+                f"score_progress={spec_rank}/{len(specs)} "
+                f"scored_candidates={total_scored_candidates} "
+                f"gate_kept_specs={len(scored_spec_rows)} "
+                f"speed={speed:.2f} cand/sec"
+            )
+
+    _release_vllm_bundle(llm)
+    llm = None
+    tokenizer = None
+    sampling_params = None
+
+    # ======================================================
+    # Step 6) Stage B: load augmentation model (if needed), finalize + write outputs
+    # ======================================================
+    augmenter = None
+    augment_llm = None
+    augment_needed = bool(
+        AUGMENT_ENABLE_DEFAULT
+        and any(
+            int((row.get("quota_info") or {}).get("missing_high", 0)) > 0
+            or int((row.get("quota_info") or {}).get("missing_mid", 0)) > 0
+            for row in scored_spec_rows
+        )
+    )
+    if augment_needed:
+        if LLMDistillationAugmenter is None:
+            raise RuntimeError("Augmentation is enabled but LLMDistillationAugmenter could not be imported.")
+        augment_llm, augment_tokenizer, _augment_sampling = _load_vllm_bundle(
+            model_id=augment_model_id,
+            max_new_tokens=AUGMENT_MAX_NEW_TOKENS_DEFAULT,
+            temperature=0.2,
+        )
+        augmenter = LLMDistillationAugmenter(
+            llm=augment_llm,
+            tokenizer=augment_tokenizer,
+            model_id=augment_model_id,
+            max_attempts=AUGMENT_MAX_ATTEMPTS_DEFAULT,
+            max_new_tokens=AUGMENT_MAX_NEW_TOKENS_DEFAULT,
+            temperature=0.2,
+            top_p=0.9,
+            enable_validation=True,
+            validation_max_new_tokens=AUGMENT_VALIDATION_MAX_NEW_TOKENS_DEFAULT,
+        )
+
+    final_iter_base = enumerate(scored_spec_rows, start=1)
+    final_iter = _tqdm(final_iter_base, total=len(scored_spec_rows), desc="Finalize specs") if _tqdm is not None else final_iter_base
     with (
         raw_output_path.open("w", encoding="utf-8") as raw_f,
         pairwise_output_path.open("w", encoding="utf-8") as pair_f,
         listwise_output_path.open("w", encoding="utf-8") as list_f,
     ):
-        for spec_rank, spec in spec_iter:
-            grant_id = _clean_text(spec.get("grant_id"))
-            spec_idx = _safe_int(spec.get("spec_idx"), default=0, minimum=0, maximum=50_000_000)
-            spec_text = _clean_text(spec.get("spec_text"))
-            ranked_indices = list(prefilter_map.get((grant_id, spec_idx)) or [])
-            rank_map = {int(idx): int(i) for i, idx in enumerate(ranked_indices)}
-
-            rng = _rng_for_spec(base_seed=SEED_DEFAULT, grant_id=grant_id, spec_idx=spec_idx)
-            high_indices, mid_indices, low_indices = _select_prefilter_buckets(
-                total=len(fac_specs),
-                ranked_indices=ranked_indices,
-                high_k=prefilter_high,
-                mid_k=prefilter_mid,
-                low_k=prefilter_low,
-                rng=rng,
-            )
-            high_index_set = set(high_indices)
-            mid_index_set = set(mid_indices)
-
-            prefilter_candidates: List[Dict[str, Any]] = []
-            for idx in list(high_indices) + list(mid_indices) + list(low_indices):
-                if idx < 0 or idx >= len(fac_specs):
-                    continue
-                fac = fac_specs[idx]
-                bucket = "low"
-                if idx in high_index_set:
-                    bucket = "high"
-                elif idx in mid_index_set:
-                    bucket = "mid"
-                prefilter_candidates.append(
-                    {
-                        "fac_id": int(fac["fac_id"]),
-                        "fac_spec_id": int(fac["fac_spec_id"]),
-                        "fac_spec_idx": int(fac["fac_spec_idx"]),
-                        "section": _clean_text(fac["section"]),
-                        "fac_spec_text": _clean_text(fac["fac_spec_text"]),
-                        "prefilter_bucket": bucket,
-                        "sts_rank": int(rank_map.get(int(idx), -1)),
-                    }
-                )
-
-            total_prefilter_selected += int(len(prefilter_candidates))
-
-            scored_candidates, json_ok, fallback = _score_prefiltered_candidates(
-                llm=llm,
-                tokenizer=tokenizer,
-                sampling_params=sampling_params,
-                spec_text=spec_text,
-                candidates=prefilter_candidates,
-                batch_size=BATCH_SIZE_DEFAULT,
-            )
-            total_scored_candidates += int(len(scored_candidates))
-            total_json_ok += int(json_ok)
-            total_fallback += int(fallback)
-
-            scored_candidates = _normalize_llm_scores(scored_candidates)
-            scored_candidates, quota_info = _assign_target_clusters(
-                candidates=scored_candidates,
-                target_high=target_high,
-                target_mid=target_mid,
-                target_low=target_low,
-            )
-            missing_high_total_pre += int(quota_info["missing_high"])
-            missing_mid_total_pre += int(quota_info["missing_mid"])
-            missing_low_total_pre += int(quota_info["missing_low"])
-            if int(quota_info["missing_total"]) > 0:
-                shortage_specs_pre += 1
-
-            high_cov_pre = _coverage_ratio(int(quota_info["selected_high"]), int(target_high))
-            mid_cov_pre = _coverage_ratio(int(quota_info["selected_mid"]), int(target_mid))
-            passed_coverage_gate = bool(
-                high_cov_pre >= float(COVERAGE_GATE_MIN_MID_HIGH_DEFAULT)
-                and mid_cov_pre >= float(COVERAGE_GATE_MIN_MID_HIGH_DEFAULT)
-            )
-            if not passed_coverage_gate:
-                dropped_by_coverage_gate_specs += 1
-                continue
+        for final_rank, row in final_iter:
+            grant_id = _clean_text(row.get("grant_id"))
+            spec_idx = _safe_int(row.get("spec_idx"), default=0, minimum=0, maximum=50_000_000)
+            spec_text = _clean_text(row.get("spec_text"))
+            scored_candidates = list(row.get("scored_candidates") or [])
+            quota_info = dict(row.get("quota_info") or {})
 
             augment_info = {
                 "requested_high": 0,
@@ -1119,14 +1217,14 @@ def main() -> int:
             }
             if (
                 augmenter is not None
-                and (int(quota_info["missing_high"]) > 0 or int(quota_info["missing_mid"]) > 0)
+                and (int(quota_info.get("missing_high", 0)) > 0 or int(quota_info.get("missing_mid", 0)) > 0)
             ):
                 synthetic_rows, augment_info, synthetic_id_cursor = _augment_missing_high_mid_for_spec(
                     augmenter=augmenter,
                     spec_text=spec_text,
                     existing_candidates=scored_candidates,
-                    missing_high=int(quota_info["missing_high"]),
-                    missing_mid=int(quota_info["missing_mid"]),
+                    missing_high=int(quota_info.get("missing_high", 0)),
+                    missing_mid=int(quota_info.get("missing_mid", 0)),
                     next_synthetic_id=synthetic_id_cursor,
                 )
                 if synthetic_rows:
@@ -1159,7 +1257,6 @@ def main() -> int:
                 shortage_specs_final += 1
 
             scored_candidates = _attach_sts_rank_percentile(scored_candidates)
-
             for c in scored_candidates:
                 score_raw = float(c.get("llm_score_raw") or 0.0)
                 c["band"] = _band_from_raw_score(score_raw)
@@ -1297,18 +1394,21 @@ def main() -> int:
             }
             list_f.write(json.dumps(listwise_obj, ensure_ascii=False) + "\n")
 
-            if (_tqdm is None) and (spec_rank % 10 == 0 or spec_rank == len(specs)):
+            if (_tqdm is None) and (final_rank % 10 == 0 or final_rank == len(scored_spec_rows)):
                 elapsed = max(1e-6, time.time() - started)
                 speed = float(total_scored_candidates / elapsed)
                 print(
-                    f"spec_progress={spec_rank}/{len(specs)} "
+                    f"finalize_progress={final_rank}/{len(scored_spec_rows)} "
                     f"scored_candidates={total_scored_candidates} "
                     f"kept_specs={kept_specs} "
                     f"speed={speed:.2f} cand/sec"
                 )
 
+    _release_vllm_bundle(augment_llm)
+    augment_llm = None
+
     # ======================================================
-    # Step 6) Save manifest + print summary
+    # Step 7) Save manifest + print summary
     # ======================================================
     elapsed = max(1e-6, time.time() - started)
     manifest = {
@@ -1322,7 +1422,9 @@ def main() -> int:
         "listwise_output": str(listwise_output_path),
         "manifest_output": str(manifest_path),
         "output_path": str(raw_output_path),
-        "model_id": MODEL_ID_DEFAULT,
+        "model_id": score_model_id,
+        "score_model_id": score_model_id,
+        "augment_model_id": augment_model_id if bool(AUGMENT_ENABLE_DEFAULT) else "",
         "batch_size": int(BATCH_SIZE_DEFAULT),
         "max_new_tokens": int(MAX_NEW_TOKENS_DEFAULT),
         "temperature": float(TEMPERATURE_DEFAULT),
@@ -1367,6 +1469,7 @@ def main() -> int:
         "target_missing_low_total": int(missing_low_total_final),
         "target_shortage_specs": int(shortage_specs_final),
         "augmentation_enabled": bool(augmenter is not None),
+        "augmentation_needed": bool(augment_needed),
         "augmentation_requested_high_total": int(augment_requested_high_total),
         "augmentation_requested_mid_total": int(augment_requested_mid_total),
         "augmentation_created_high_total": int(augment_created_high_total),
@@ -1407,6 +1510,8 @@ def main() -> int:
     print(f"spec_count_dropped_by_coverage_gate={dropped_by_coverage_gate_specs}")
     print(f"spec_count_dropped_after_augmentation={dropped_after_augmentation_specs}")
     print(f"fac_spec_count={len(fac_specs)}")
+    print(f"score_model_id={score_model_id}")
+    print(f"augment_model_id={augment_model_id if AUGMENT_ENABLE_DEFAULT else ''}")
     print(f"prefilter_multiplier={prefilter_multiplier:.4f}")
     print(f"prefilter_requested=high:{prefilter_high},mid:{prefilter_mid},low:{prefilter_low}")
     print(f"target_requested=high:{target_high},mid:{target_mid},low:{target_low}")
