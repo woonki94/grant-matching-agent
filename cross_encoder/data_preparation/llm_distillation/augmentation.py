@@ -1,63 +1,55 @@
 from __future__ import annotations
 
+import inspect
 import json
 import re
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Sequence
 
 QWEN_AUGMENT_SYSTEM_PROMPT = """
-You are generating synthetic faculty-specialization text for requirement-matching distillation.
-Return exactly one JSON object and nothing else.
+You are generating augmented training dataset for requirement matching.
+Final output must be exactly one JSON object.
 
-Target cluster rules:
-- high: strong semantic fit to the requirement, but not a close paraphrase.
-- mid: partial fit with controlled overlap.
-  - Keep domain/topic relevance.
-  - Deliberately miss at least one CORE concept from the requirement.
-  - Do NOT include all key method + objective + context concepts together.
-  - Keep it plausible but incomplete.
-- low: weak/adjacent fit; related domain only, with clear concept gaps.
+Rules:
+- Keep semantic relevance to the query and target band.
+- Avoid close paraphrase and repeated n-grams from the query.
+- Preserve core meaning with alternate wording (concept-equivalent phrasing, not copy).
+- For target "mid", intentionally miss at least one core concept and add a related but non-identical angle.
 
-Anti-copy rules:
-- Do not copy long spans from the query.
-- Avoid repeating the same 2-3 word phrases from the query.
-- Use alternate wording and structure while preserving intended relevance for target cluster.
-
-MID guardrails (important):
-- Aim for partial semantic coverage (roughly 50-75% of major concepts).
-- Include exactly one deliberate concept gap for MID.
-- If output sounds fully complete, it is NOT MID.
+Required JSON schema:
+{
+  "augmented_text": "<D text only: concise capability phrase, 6-24 words>",
+  "target_band": "<high|mid|low>",
+  "intentionally_missing_core_concept": "<short phrase>",
+  "notes": "<short phrase>"
+}
 
 Style for augmented_text:
-- Concise capability phrase suitable for pair dataset.
-- Avoid biography style openings like "Specializes in", "Focuses on", "Expert in".
-- Prefer 6-28 words.
+- Dataset pair style (Q || D), compact and capability-focused.
+- Prefer verb-noun phrase style; avoid biography style.
+- Do NOT start with "Specializes in", "Focuses on", "Expert in", or similar.
+- Keep a small topical anchor from Q while rewording the rest.
 
-Return strict JSON only:
-{
-  "augmented_text": "<candidate specialization text>",
-  "target_cluster": "<high|mid|low>",
-  "intentionally_missing_core_concept": "<short phrase; required for mid, empty for high>",
-  "notes": "<very short note>"
-}
+Quality target pattern:
+- High: semantically very close but lexically rewritten.
+- Mid: partially aligned to one/few core aspects, with one clear conceptual gap.
+- Low: weak/adjacent relevance with clear concept gaps.
+
+No markdown fences or extra text outside the JSON object.
 """.strip()
 
 QWEN_AUGMENT_USER_PROMPT_TEMPLATE = """
 Requirement query:
 {query}
 
-Target cluster:
-{target_cluster}
+Target band:
+{target_band}
 
-Desired judge score range (aim):
+Desired judge score range:
 {target_min} to {target_max}
 
 Preferred center:
 {target_center}
-
-Cluster-specific instruction:
-- If target is MID, keep clear topical relevance but intentionally leave one core concept unmet.
-- If target is HIGH, cover all core concepts without copying phrasing.
 """.strip()
 
 
@@ -75,61 +67,41 @@ VALID_SCORE_RANGES: Dict[str, tuple[float, float]] = {
     "low": (0.00, 0.39),
 }
 
+# Lexical-diversity filters (same style as eval multi-model test).
+MAX_QUERY_TOKEN_COVERAGE = 0.60
+MAX_QUERY_BIGRAM_OVERLAP = 0.25
+MAX_QUERY_TRIGRAM_OVERLAP = 0.10
+MIN_NOVEL_TOKEN_RATIO = 0.50
+MIN_QUERY_TOKEN_COVERAGE_HIGH = 0.20
+MIN_QUERY_TOKEN_COVERAGE_MID = 0.10
+MIN_QUERY_TOKEN_COVERAGE_LOW = 0.05
+
 
 VALIDATION_SYSTEM_PROMPT = """
-You are evaluating whether a candidate specialization satisfies a requirement.
+You are a strict requirement-match judge.
+Final output must be exactly one JSON object.
 
-This is NOT general similarity — it is REQUIREMENT MATCHING.
+Required JSON schema:
+{
+  "score": <float in [0,1]>,
+  "reason": "<one short sentence>",
+  "band": "<high|mid|low>"
+}
 
+Band mapping guidance:
+- high: score >= 0.70
+- mid: 0.40 <= score < 0.70
+- low: score < 0.40
 
-Return ONLY strict JSON:
-{"score": <float between 0.0 and 1.0>}
-
-
-Evaluation steps (IMPORTANT — follow strictly):
-
-1. Extract the core required concepts from the requirement text.
-   - Keep them short (2–6 key phrases)
-   - Do NOT invent new concepts
-
-2. For each extracted concept:
-   - Classify it as:
-     - CORE (central to the requirement)
-     - SUPPORTING (secondary detail)
-
-3. For each concept:
-   - Check if the candidate expresses it
-   - Mark as: FULL, PARTIAL, or MISSING
-
-4. Evaluate coverage with priority:
-   - First consider CORE concepts
-   - Missing a CORE concept should significantly reduce the score
-   - SUPPORTING concepts influence the score only after CORE coverage is considered
-
-5. Score based on coverage:
-   - All CORE = FULL → 0.9–1.0
-   - CORE mostly FULL + minor gaps → 0.75–0.9
-   - Some CORE PARTIAL/MISSING → 0.5–0.75
-   - Most CORE MISSING but some SUPPORTING overlap → 0.1–0.5
-   - No meaningful overlap → 0.0–0.1
-
-IMPORTANT:
-- Only evaluate concepts present in the requirement
-- Do NOT penalize for unrelated missing topics
-- Avoid assigning identical scores when coverage differs
-- Prefer slightly different scores when candidates differ in which CORE concepts they satisfy
-- If a candidate covers the same broad domain but changes the main objective, method, or intended use, treat it as a partial match and cap the score at 0.65 unless most CORE concepts are still satisfied.
-- A candidate that lacks one CORE concept should not receive the same score as a candidate that covers all CORE concepts partially.
-
-Do not output explanation text.
+No markdown or extra text outside JSON.
 """.strip()
 
 VALIDATION_USER_PROMPT_TEMPLATE = """
-Grant specialization keyword:
-{spec_text}
+Requirement query:
+{query}
 
-Faculty specialization:
-{fac_spec_text}
+Candidate specialization:
+{candidate}
 """.strip()
 
 
@@ -158,6 +130,58 @@ def _clamp_score(value: Any) -> float:
     if score > 1.0:
         return 1.0
     return score
+
+
+def _normalize_band(value: Any) -> str:
+    token = _clean_text(value).lower()
+    if token in {"high", "mid", "low"}:
+        return token
+    return "low"
+
+
+def _tokenize_simple(text: str) -> List[str]:
+    return re.findall(r"[a-z0-9]+", _clean_text(text).lower())
+
+
+def _query_token_coverage(query: str, candidate: str) -> float:
+    q_tokens = set(_tokenize_simple(query))
+    c_tokens = set(_tokenize_simple(candidate))
+    if not q_tokens:
+        return 0.0
+    return float(len(q_tokens.intersection(c_tokens)) / float(max(1, len(q_tokens))))
+
+
+def _query_bigram_overlap(query: str, candidate: str) -> float:
+    q_toks = _tokenize_simple(query)
+    c_toks = _tokenize_simple(candidate)
+    if len(q_toks) < 2:
+        return 0.0
+    q_bi = set(zip(q_toks[:-1], q_toks[1:]))
+    c_bi = set(zip(c_toks[:-1], c_toks[1:])) if len(c_toks) >= 2 else set()
+    if not q_bi:
+        return 0.0
+    return float(len(q_bi.intersection(c_bi)) / float(len(q_bi)))
+
+
+def _query_trigram_overlap(query: str, candidate: str) -> float:
+    q_toks = _tokenize_simple(query)
+    c_toks = _tokenize_simple(candidate)
+    if len(q_toks) < 3:
+        return 0.0
+    q_tri = set(zip(q_toks[:-2], q_toks[1:-1], q_toks[2:]))
+    c_tri = set(zip(c_toks[:-2], c_toks[1:-1], c_toks[2:])) if len(c_toks) >= 3 else set()
+    if not q_tri:
+        return 0.0
+    return float(len(q_tri.intersection(c_tri)) / float(len(q_tri)))
+
+
+def _novel_token_ratio(query: str, candidate: str) -> float:
+    q_tokens = set(_tokenize_simple(query))
+    c_tokens = set(_tokenize_simple(candidate))
+    if not c_tokens:
+        return 0.0
+    novel = len([t for t in c_tokens if t not in q_tokens])
+    return float(novel / float(len(c_tokens)))
 
 
 def _extract_score(raw_text: str) -> tuple[float, bool]:
@@ -268,7 +292,7 @@ def _extract_json_object(text: str) -> Optional[Dict[str, Any]]:
 
 
 def _extract_augmented_text(parsed: Dict[str, Any]) -> str:
-    for key in ("augmented_text", "d_text", "candidate_text", "candidate", "text", "output"):
+    for key in ("augmented_text", "d_text", "domain_text", "candidate_text", "candidate", "text", "output"):
         text = _clean_text(parsed.get(key))
         if text:
             return text
@@ -306,6 +330,13 @@ def _normalize_augmented_text(text: str) -> str:
     if not s:
         return ""
     return s[0].upper() + s[1:] if len(s) > 1 else s.upper()
+
+
+def _model_generation_sampling(model_id: str) -> tuple[float, float]:
+    token = _clean_text(model_id).lower()
+    if "qwen3" in token or "ophiuchi-qwen3" in token or "deepseek-r1" in token:
+        return 0.6, 0.95
+    return 0.1, 0.9
 
 
 @dataclass
@@ -364,11 +395,31 @@ class LLMDistillationAugmenter:
             return llm.get_tokenizer()
         raise RuntimeError("Tokenizer was not provided and could not be inferred from llm.get_tokenizer().")
 
+    def _apply_chat_template(self, messages: Sequence[Dict[str, str]]) -> str:
+        kwargs: Dict[str, Any] = {
+            "tokenize": False,
+            "add_generation_prompt": True,
+        }
+        token = _clean_text(self.model_id).lower()
+        if "qwen3" in token or "ophiuchi-qwen3" in token:
+            try:
+                sig = inspect.signature(self.tokenizer.apply_chat_template)
+                if "enable_thinking" in sig.parameters:
+                    kwargs["enable_thinking"] = True
+            except Exception:
+                pass
+        try:
+            return self.tokenizer.apply_chat_template(list(messages), **kwargs)
+        except TypeError:
+            kwargs.pop("enable_thinking", None)
+            return self.tokenizer.apply_chat_template(list(messages), **kwargs)
+
     def _build_prompt(self, *, query: str, target_cluster: str) -> str:
         target_min, target_max = _range_for_cluster(target_cluster, AIM_SCORE_RANGES)
+        target_band = _normalize_target_cluster(target_cluster)
         user_prompt = QWEN_AUGMENT_USER_PROMPT_TEMPLATE.format(
             query=_clean_text(query),
-            target_cluster=_normalize_target_cluster(target_cluster),
+            target_band=target_band,
             target_min=f"{target_min:.2f}",
             target_max=f"{target_max:.2f}",
             target_center=f"{((target_min + target_max) / 2.0):.2f}",
@@ -377,11 +428,7 @@ class LLMDistillationAugmenter:
             {"role": "system", "content": QWEN_AUGMENT_SYSTEM_PROMPT},
             {"role": "user", "content": user_prompt},
         ]
-        return self.tokenizer.apply_chat_template(
-            messages,
-            tokenize=False,
-            add_generation_prompt=True,
-        )
+        return self._apply_chat_template(messages)
 
     def _generate_raw_batch(
         self,
@@ -415,18 +462,14 @@ class LLMDistillationAugmenter:
 
     def _build_validation_prompt(self, *, query: str, candidate_text: str) -> str:
         user_prompt = VALIDATION_USER_PROMPT_TEMPLATE.format(
-            spec_text=_clean_text(query),
-            fac_spec_text=_clean_text(candidate_text),
+            query=_clean_text(query),
+            candidate=_clean_text(candidate_text),
         )
         messages = [
             {"role": "system", "content": VALIDATION_SYSTEM_PROMPT},
             {"role": "user", "content": user_prompt},
         ]
-        return self.tokenizer.apply_chat_template(
-            messages,
-            tokenize=False,
-            add_generation_prompt=True,
-        )
+        return self._apply_chat_template(messages)
 
     def validate_pair(
         self,
@@ -462,7 +505,11 @@ class LLMDistillationAugmenter:
             temperature=0.0,
             top_p=1.0,
         )[0]
+        parsed_obj = _extract_json_object(raw)
         score, parsed_ok = _extract_score(raw)
+        if parsed_obj is not None and ("score" in parsed_obj):
+            score = _clamp_score(parsed_obj.get("score"))
+            parsed_ok = True
         pass_valid = bool(valid_min <= float(score) <= valid_max)
         return {
             "score": float(score),
@@ -482,15 +529,29 @@ class LLMDistillationAugmenter:
         if not query_text:
             raise ValueError("query must be non-empty.")
         cluster = _normalize_target_cluster(target_cluster)
+        target_min, target_max = _range_for_cluster(cluster, AIM_SCORE_RANGES)
+        target_center = float((target_min + target_max) / 2.0)
+        gen_temp, gen_top_p = _model_generation_sampling(self.model_id)
+        min_coverage = (
+            float(MIN_QUERY_TOKEN_COVERAGE_HIGH)
+            if cluster == "high"
+            else float(MIN_QUERY_TOKEN_COVERAGE_MID if cluster == "mid" else MIN_QUERY_TOKEN_COVERAGE_LOW)
+        )
 
         last_raw = ""
         last_parsed: Dict[str, Any] = {}
         best_candidate: Optional[AugmentationResult] = None
         best_distance = float("inf")
+        best_key = (float("inf"), float("inf"), float("inf"), float("inf"))
 
         for attempt in range(1, self.max_attempts + 1):
             prompt = self._build_prompt(query=query_text, target_cluster=cluster)
-            raw = self._generate_raw_batch([prompt])[0]
+            raw = self._generate_raw_batch(
+                [prompt],
+                max_new_tokens=int(self.max_new_tokens),
+                temperature=float(gen_temp),
+                top_p=float(gen_top_p),
+            )[0]
             last_raw = raw
 
             parsed_obj = _extract_json_object(raw)
@@ -502,8 +563,24 @@ class LLMDistillationAugmenter:
                 continue
             if _looks_like_reasoning_spill(candidate):
                 continue
+            coverage = _query_token_coverage(query=query_text, candidate=candidate)
+            if float(coverage) < float(min_coverage):
+                continue
+            if float(coverage) > float(MAX_QUERY_TOKEN_COVERAGE):
+                continue
+            bigram_overlap = _query_bigram_overlap(query=query_text, candidate=candidate)
+            if float(bigram_overlap) > float(MAX_QUERY_BIGRAM_OVERLAP):
+                continue
+            trigram_overlap = _query_trigram_overlap(query=query_text, candidate=candidate)
+            if float(trigram_overlap) > float(MAX_QUERY_TRIGRAM_OVERLAP):
+                continue
+            novel_ratio = _novel_token_ratio(query=query_text, candidate=candidate)
+            if float(novel_ratio) < float(MIN_NOVEL_TOKEN_RATIO):
+                continue
 
-            out_cluster = _normalize_target_cluster(parsed.get("target_cluster") or cluster)
+            out_cluster = _normalize_target_cluster(
+                parsed.get("target_cluster") or parsed.get("target_band") or cluster
+            )
             validation = (
                 self.validate_pair(query=query_text, candidate_text=candidate, target_cluster=cluster)
                 if self.enable_validation
@@ -527,8 +604,16 @@ class LLMDistillationAugmenter:
                 return result.__dict__
 
             dist = float(validation.get("distance_to_aim_range", 1.0))
-            if dist < best_distance:
+            score = _clamp_score(validation.get("score"))
+            rank_key = (
+                abs(float(score) - float(target_center)),
+                float(trigram_overlap),
+                float(bigram_overlap),
+                -float(novel_ratio),
+            )
+            if (dist < best_distance) or (dist == best_distance and rank_key < best_key):
                 best_distance = dist
+                best_key = rank_key
                 best_candidate = result
 
         if best_candidate is not None:

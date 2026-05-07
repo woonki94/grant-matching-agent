@@ -19,8 +19,8 @@ def _find_project_root() -> Path:
 
 PROJECT_ROOT = _find_project_root()
 
-RAW_INPUT_DEFAULT = "cross_encoder/dataset/distill/llm_distill_raw_scores.jsonl"
-PAIRWISE_INPUT_DEFAULT = "cross_encoder/dataset/distill/llm_distill_pairwise.jsonl"
+RAW_INPUT_DEFAULT = "cross_encoder/dataset/distill/llm_distill2_raw_scores.jsonl"
+PAIRWISE_INPUT_DEFAULT = "cross_encoder/dataset/distill/llm_distill2_pairwise.jsonl"
 DEFAULT_SPLIT_DIR = "cross_encoder/dataset/splits"
 
 RAW_TRAIN_BASENAME = "llm_distill_raw_train.jsonl"
@@ -128,17 +128,23 @@ def _extract_query_key(obj: Dict[str, Any]) -> str:
 
 def _score_from_raw_obj(obj: Dict[str, Any]) -> Optional[float]:
     best: Optional[float] = None
-    candidates = obj.get("candidates")
-    if isinstance(candidates, list):
-        for cand in candidates:
+    for key in ("candidates", "ranked_docs", "docs"):
+        rows = obj.get(key)
+        if not isinstance(rows, list):
+            continue
+        for cand in rows:
             if not isinstance(cand, dict):
                 continue
-            for key in ("score_raw", "score", "teacher_score_raw", "teacher_score"):
-                if key in cand:
-                    val = _clamp_01(_safe_float(cand.get(key), default=-1.0))
-                    if best is None or val > best:
-                        best = val
-                    break
+            for score_key in ("teacher_score", "teacher_score_raw", "score", "score_raw"):
+                if score_key not in cand:
+                    continue
+                try:
+                    val = _clamp_01(float(cand.get(score_key)))
+                except Exception:
+                    continue
+                if best is None or val > best:
+                    best = val
+                break
     if best is not None:
         return float(best)
 
