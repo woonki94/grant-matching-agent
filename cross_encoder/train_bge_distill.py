@@ -57,7 +57,7 @@ WANDB_PROJECT_DEFAULT = "cross_encoder_distill"
 TRAIN_BAND_HIGH_THRESHOLD_DEFAULT = 0.70
 TRAIN_BAND_MID_THRESHOLD_DEFAULT = 0.30
 LIST_AUGMENTED_DOC_WEIGHT_DEFAULT = 0.70
-PAIR_TYPE_MAX_SHARE_DEFAULT = 0.45
+PAIR_TYPE_MAX_SHARE_DEFAULT = 1.0
 PAIR_TYPE_WEIGHT_MAP_DEFAULT = (
     "default=1.0,"
     "llm_disagreement=1.15,"
@@ -795,11 +795,17 @@ def _sample_docs_for_query(
     random_ratio: float,
     seed: int,
 ) -> List[Dict[str, Any]]:
-    pool = list(group.candidates[: min(len(group.candidates), max(1, int(candidate_pool_size)))])
+    if int(candidate_pool_size) <= 0:
+        pool = list(group.candidates)
+    else:
+        pool = list(group.candidates[: min(len(group.candidates), max(1, int(candidate_pool_size)))])
     if not pool:
         return []
 
-    k = min(len(pool), max(2, int(mini_list_size)))
+    if int(mini_list_size) <= 0:
+        k = int(len(pool))
+    else:
+        k = min(len(pool), max(2, int(mini_list_size)))
     rng_seed = f"{seed}::{group.grant_id}::{group.spec_idx}::{len(pool)}"
     rng = random.Random(int(hashlib.sha1(rng_seed.encode("utf-8")).hexdigest()[:16], 16))
 
@@ -914,7 +920,10 @@ def _build_sampled_list_rows(
 ) -> List[Dict[str, Any]]:
     out: List[Dict[str, Any]] = []
     for g in groups:
-        pool = list(g.candidates[: min(len(g.candidates), max(2, int(candidate_pool_size)))])
+        if int(candidate_pool_size) <= 0:
+            pool = list(g.candidates)
+        else:
+            pool = list(g.candidates[: min(len(g.candidates), max(2, int(candidate_pool_size)))])
         scores = [float(c.score) for c in pool]
         mx, std = _compute_score_stats(scores)
 
@@ -2828,8 +2837,8 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--max-train-queries", type=int, default=0, help="Cap raw query groups loaded (0=all).")
     p.add_argument("--max-pairwise-rows", type=int, default=0, help="Cap pairwise rows loaded (0=all).")
 
-    p.add_argument("--candidate-pool-size", type=int, default=64, help="Candidate pool per query before mini-list sampling.")
-    p.add_argument("--mini-list-size", type=int, default=10, help="Mini-list docs per query for listwise loss.")
+    p.add_argument("--candidate-pool-size", type=int, default=0, help="Candidate pool per query before mini-list sampling (0=all docs).")
+    p.add_argument("--mini-list-size", type=int, default=0, help="Mini-list docs per query for listwise loss (0=all docs in pool).")
 
     p.add_argument("--boundary-center", type=float, default=0.6, help="Boundary score center for informative mids.")
     p.add_argument("--boundary-bandwidth", type=float, default=0.12, help="Boundary bandwidth around center.")
@@ -2839,7 +2848,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
     p.add_argument("--low-signal-max-score-threshold", type=float, default=0.3)
     p.add_argument("--low-signal-std-threshold", type=float, default=0.05)
-    p.add_argument("--low-signal-keep-prob", type=float, default=0.1)
+    p.add_argument("--low-signal-keep-prob", type=float, default=1.0)
 
     p.add_argument("--teacher-temperature", type=float, default=2.0)
 
@@ -2878,10 +2887,10 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--train-low-band-cap-ratio",
         type=float,
-        default=1.0,
+        default=0.0,
         help=(
             "Cap low-band train query groups to <= high_count * ratio. "
-            "Set 0 to disable. Default 1.0 caps low to high count."
+            "Set 0 to disable. Default 0.0 keeps all low-band groups."
         ),
     )
     p.add_argument(
@@ -3133,8 +3142,8 @@ def main() -> int:
     max_train_queries = _safe_int(args.max_train_queries, default=0, minimum=0, maximum=100_000_000)
     max_pairwise_rows = _safe_int(args.max_pairwise_rows, default=0, minimum=0, maximum=2_000_000_000)
 
-    candidate_pool_size = _safe_int(args.candidate_pool_size, default=64, minimum=2, maximum=10_000)
-    mini_list_size = _safe_int(args.mini_list_size, default=10, minimum=2, maximum=256)
+    candidate_pool_size = _safe_int(args.candidate_pool_size, default=0, minimum=0, maximum=100_000)
+    mini_list_size = _safe_int(args.mini_list_size, default=0, minimum=0, maximum=100_000)
 
     stage1_epochs = _safe_int(args.stage1_epochs, default=1, minimum=0, maximum=100)
     stage2_epochs = _safe_int(args.stage2_epochs, default=3, minimum=0, maximum=100)
@@ -3163,7 +3172,7 @@ def main() -> int:
         maximum=1.0,
     )
     low_signal_std_threshold = _safe_float(args.low_signal_std_threshold, default=0.05, minimum=0.0, maximum=1.0)
-    low_signal_keep_prob = _safe_float(args.low_signal_keep_prob, default=0.1, minimum=0.0, maximum=1.0)
+    low_signal_keep_prob = _safe_float(args.low_signal_keep_prob, default=1.0, minimum=0.0, maximum=1.0)
     train_band_high_threshold = _safe_float(
         args.train_band_high_threshold,
         default=TRAIN_BAND_HIGH_THRESHOLD_DEFAULT,
@@ -3178,7 +3187,7 @@ def main() -> int:
     )
     if train_band_mid_threshold > train_band_high_threshold:
         train_band_mid_threshold = train_band_high_threshold
-    train_low_band_cap_ratio = _safe_float(args.train_low_band_cap_ratio, default=1.0, minimum=0.0, maximum=100.0)
+    train_low_band_cap_ratio = _safe_float(args.train_low_band_cap_ratio, default=0.0, minimum=0.0, maximum=100.0)
     pair_type_max_share = _safe_float(
         args.pair_type_max_share,
         default=PAIR_TYPE_MAX_SHARE_DEFAULT,
