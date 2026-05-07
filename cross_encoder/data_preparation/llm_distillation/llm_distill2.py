@@ -68,6 +68,7 @@ COVERAGE_GATE_MIN_MID_HIGH_DEFAULT = 0.20
 AUGMENT_ENABLE_DEFAULT = True
 AUGMENT_MAX_ATTEMPTS_DEFAULT = 3
 AUGMENT_MAX_TRIES_PER_MISSING_DEFAULT = 5
+AUGMENT_BATCH_SIZE_DEFAULT = 32
 AUGMENT_MAX_NEW_TOKENS_DEFAULT = 128
 AUGMENT_VALIDATION_MAX_NEW_TOKENS_DEFAULT = 32
 
@@ -657,22 +658,30 @@ def _augment_missing_high_mid_for_spec(
     }
 
     for cluster, required in (("high", int(max(0, int(missing_high)))), ("mid", int(max(0, int(missing_mid))))):
-        for _ in range(required):
-            accepted = False
-            for _try in range(int(max(1, AUGMENT_MAX_TRIES_PER_MISSING_DEFAULT))):
-                stats["attempts_total"] += 1
-                out = augmenter.augment(query=spec_text, target_cluster=cluster)
-                augmented_text = _clean_text(out.get("augmented_text"))
+        remaining_slots = list(range(int(required)))
+        max_tries = int(max(1, AUGMENT_MAX_TRIES_PER_MISSING_DEFAULT))
+        for _try in range(max_tries):
+            if not remaining_slots:
+                break
+            jobs = [{"query": spec_text, "target_cluster": cluster} for _ in remaining_slots]
+            stats["attempts_total"] += int(len(jobs))
+            outputs = augmenter.augment_batch(jobs, batch_size=int(AUGMENT_BATCH_SIZE_DEFAULT))
+            next_remaining: List[int] = []
+            for slot_id, out in zip(remaining_slots, outputs):
+                augmented_text = _clean_text((out or {}).get("augmented_text"))
                 if not augmented_text:
                     stats["rejected_empty"] += 1
+                    next_remaining.append(slot_id)
                     continue
                 key = _dedup_text_key(augmented_text)
                 if not key or key in used_text:
                     stats["rejected_duplicate"] += 1
+                    next_remaining.append(slot_id)
                     continue
-                validation = dict(out.get("validation") or {})
+                validation = dict((out or {}).get("validation") or {})
                 if not bool(validation.get("pass_valid_range")):
                     stats["rejected_validation"] += 1
+                    next_remaining.append(slot_id)
                     continue
                 score = _clamp_score(validation.get("score"))
                 syn_id = int(cursor)
@@ -696,10 +705,9 @@ def _augment_missing_high_mid_for_spec(
                 )
                 used_text.add(key)
                 stats[f"created_{cluster}"] += 1
-                accepted = True
-                break
-            if not accepted:
-                stats[f"unfilled_{cluster}"] += 1
+            remaining_slots = next_remaining
+        if remaining_slots:
+            stats[f"unfilled_{cluster}"] += int(len(remaining_slots))
 
     return synthetic_rows, stats, cursor
 

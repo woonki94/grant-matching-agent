@@ -4,7 +4,7 @@ import inspect
 import json
 import re
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 QWEN_AUGMENT_SYSTEM_PROMPT = """
 You are generating augmented training dataset for requirement matching.
@@ -524,123 +524,275 @@ class LLMDistillationAugmenter:
             "distance_to_aim_range": float(_score_distance_to_range(float(score), float(aim_min), float(aim_max))),
         }
 
+    def _validate_batch(
+        self,
+        *,
+        items: Sequence[Tuple[str, str, str]],
+        batch_size: int,
+    ) -> List[Dict[str, Any]]:
+        out: List[Dict[str, Any]] = []
+        if not items:
+            return out
+
+        for start in range(0, len(items), max(1, int(batch_size))):
+            chunk = list(items[start : start + max(1, int(batch_size))])
+            prompts = [
+                self._build_validation_prompt(query=query_text, candidate_text=candidate_text)
+                for query_text, candidate_text, _cluster in chunk
+            ]
+            raws = self._generate_raw_batch(
+                prompts,
+                max_new_tokens=int(self.validation_max_new_tokens),
+                temperature=0.0,
+                top_p=1.0,
+            )
+            for (query_text, candidate_text, cluster), raw in zip(chunk, raws):
+                valid_min, valid_max = _range_for_cluster(cluster, VALID_SCORE_RANGES)
+                aim_min, aim_max = _range_for_cluster(cluster, AIM_SCORE_RANGES)
+                parsed_obj = _extract_json_object(raw)
+                score, parsed_ok = _extract_score(raw)
+                if parsed_obj is not None and ("score" in parsed_obj):
+                    score = _clamp_score(parsed_obj.get("score"))
+                    parsed_ok = True
+                pass_valid = bool(valid_min <= float(score) <= valid_max)
+                out.append(
+                    {
+                        "score": float(score),
+                        "parsed_ok": bool(parsed_ok),
+                        "raw_response": raw,
+                        "target_cluster": cluster,
+                        "valid_min": float(valid_min),
+                        "valid_max": float(valid_max),
+                        "aim_min": float(aim_min),
+                        "aim_max": float(aim_max),
+                        "pass_valid_range": bool(pass_valid),
+                        "distance_to_aim_range": float(
+                            _score_distance_to_range(float(score), float(aim_min), float(aim_max))
+                        ),
+                    }
+                )
+        return out
+
     def augment(self, *, query: str, target_cluster: str) -> Dict[str, Any]:
         query_text = _clean_text(query)
         if not query_text:
             raise ValueError("query must be non-empty.")
         cluster = _normalize_target_cluster(target_cluster)
-        target_min, target_max = _range_for_cluster(cluster, AIM_SCORE_RANGES)
-        target_center = float((target_min + target_max) / 2.0)
+        out = self.augment_batch(
+            [{"query": query_text, "target_cluster": cluster}],
+            batch_size=1,
+        )
+        if not out:
+            return {
+                "query": query_text,
+                "target_cluster": cluster,
+                "augmented_text": "",
+                "parsed_ok": False,
+                "attempt": int(self.max_attempts),
+                "raw_response": "",
+                "parsed": {},
+                "notes": "",
+                "validation": {},
+                "failure_reason": "No usable candidate produced.",
+            }
+        return out[0]
+
+    def augment_batch(self, items: Sequence[Dict[str, Any]], *, batch_size: int = 32) -> List[Dict[str, Any]]:
+        batch_n = max(1, int(batch_size))
+        results: List[Optional[Dict[str, Any]]] = [None] * len(items)
+        jobs: List[Dict[str, Any]] = []
         gen_temp, gen_top_p = _model_generation_sampling(self.model_id)
-        min_coverage = (
-            float(MIN_QUERY_TOKEN_COVERAGE_HIGH)
-            if cluster == "high"
-            else float(MIN_QUERY_TOKEN_COVERAGE_MID if cluster == "mid" else MIN_QUERY_TOKEN_COVERAGE_LOW)
-        )
 
-        last_raw = ""
-        last_parsed: Dict[str, Any] = {}
-        best_candidate: Optional[AugmentationResult] = None
-        best_distance = float("inf")
-        best_key = (float("inf"), float("inf"), float("inf"), float("inf"))
-
-        for attempt in range(1, self.max_attempts + 1):
-            prompt = self._build_prompt(query=query_text, target_cluster=cluster)
-            raw = self._generate_raw_batch(
-                [prompt],
-                max_new_tokens=int(self.max_new_tokens),
-                temperature=float(gen_temp),
-                top_p=float(gen_top_p),
-            )[0]
-            last_raw = raw
-
-            parsed_obj = _extract_json_object(raw)
-            parsed = dict(parsed_obj or {})
-            last_parsed = parsed
-
-            candidate = _normalize_augmented_text(_extract_augmented_text(parsed))
-            if not candidate:
-                continue
-            if _looks_like_reasoning_spill(candidate):
-                continue
-            coverage = _query_token_coverage(query=query_text, candidate=candidate)
-            if float(coverage) < float(min_coverage):
-                continue
-            if float(coverage) > float(MAX_QUERY_TOKEN_COVERAGE):
-                continue
-            bigram_overlap = _query_bigram_overlap(query=query_text, candidate=candidate)
-            if float(bigram_overlap) > float(MAX_QUERY_BIGRAM_OVERLAP):
-                continue
-            trigram_overlap = _query_trigram_overlap(query=query_text, candidate=candidate)
-            if float(trigram_overlap) > float(MAX_QUERY_TRIGRAM_OVERLAP):
-                continue
-            novel_ratio = _novel_token_ratio(query=query_text, candidate=candidate)
-            if float(novel_ratio) < float(MIN_NOVEL_TOKEN_RATIO):
-                continue
-
-            out_cluster = _normalize_target_cluster(
-                parsed.get("target_cluster") or parsed.get("target_band") or cluster
-            )
-            validation = (
-                self.validate_pair(query=query_text, candidate_text=candidate, target_cluster=cluster)
-                if self.enable_validation
-                else {}
-            )
-            result = AugmentationResult(
-                query=query_text,
-                target_cluster=out_cluster,
-                augmented_text=candidate,
-                parsed_ok=bool(parsed_obj is not None),
-                attempt=int(attempt),
-                raw_response=raw,
-                parsed=parsed,
-                notes=_clean_text(parsed.get("notes")),
-                validation=validation,
-                failure_reason="",
-            )
-            if not self.enable_validation:
-                return result.__dict__
-            if bool(validation.get("pass_valid_range")):
-                return result.__dict__
-
-            dist = float(validation.get("distance_to_aim_range", 1.0))
-            score = _clamp_score(validation.get("score"))
-            rank_key = (
-                abs(float(score) - float(target_center)),
-                float(trigram_overlap),
-                float(bigram_overlap),
-                -float(novel_ratio),
-            )
-            if (dist < best_distance) or (dist == best_distance and rank_key < best_key):
-                best_distance = dist
-                best_key = rank_key
-                best_candidate = result
-
-        if best_candidate is not None:
-            out = best_candidate.__dict__.copy()
-            out["failure_reason"] = "No candidate passed validation range; returning closest-to-aim candidate."
-            return out
-
-        failed = AugmentationResult(
-            query=query_text,
-            target_cluster=cluster,
-            augmented_text="",
-            parsed_ok=False,
-            attempt=int(self.max_attempts),
-            raw_response=last_raw,
-            parsed=last_parsed,
-            notes="",
-            validation={},
-            failure_reason="No usable candidate produced.",
-        )
-        return failed.__dict__
-
-    def augment_batch(self, items: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        results: List[Dict[str, Any]] = []
-        for row in items:
+        for idx, row in enumerate(items):
             query_text = _clean_text(row.get("query"))
-            target_cluster = _clean_text(row.get("target_cluster") or row.get("target_band") or "mid")
+            cluster = _normalize_target_cluster(row.get("target_cluster") or row.get("target_band") or "mid")
             if not query_text:
+                results[idx] = {
+                    "query": "",
+                    "target_cluster": cluster,
+                    "augmented_text": "",
+                    "parsed_ok": False,
+                    "attempt": 0,
+                    "raw_response": "",
+                    "parsed": {},
+                    "notes": "",
+                    "validation": {},
+                    "failure_reason": "query must be non-empty.",
+                }
                 continue
-            results.append(self.augment(query=query_text, target_cluster=target_cluster))
-        return results
+            target_min, target_max = _range_for_cluster(cluster, AIM_SCORE_RANGES)
+            target_center = float((target_min + target_max) / 2.0)
+            min_coverage = (
+                float(MIN_QUERY_TOKEN_COVERAGE_HIGH)
+                if cluster == "high"
+                else float(MIN_QUERY_TOKEN_COVERAGE_MID if cluster == "mid" else MIN_QUERY_TOKEN_COVERAGE_LOW)
+            )
+            jobs.append(
+                {
+                    "idx": int(idx),
+                    "query": query_text,
+                    "cluster": cluster,
+                    "target_center": target_center,
+                    "min_coverage": float(min_coverage),
+                    "attempt": 0,
+                    "done": False,
+                    "last_raw": "",
+                    "last_parsed": {},
+                    "best_candidate": None,
+                    "best_distance": float("inf"),
+                    "best_key": (float("inf"), float("inf"), float("inf"), float("inf")),
+                }
+            )
+
+        for _round in range(1, self.max_attempts + 1):
+            active = [j for j in jobs if (not bool(j["done"])) and int(j["attempt"]) < self.max_attempts]
+            if not active:
+                break
+
+            validate_queue: List[Dict[str, Any]] = []
+            for start in range(0, len(active), batch_n):
+                chunk = active[start : start + batch_n]
+                prompts = [self._build_prompt(query=j["query"], target_cluster=j["cluster"]) for j in chunk]
+                raws = self._generate_raw_batch(
+                    prompts,
+                    max_new_tokens=int(self.max_new_tokens),
+                    temperature=float(gen_temp),
+                    top_p=float(gen_top_p),
+                )
+                for j, raw in zip(chunk, raws):
+                    j["attempt"] = int(j["attempt"]) + 1
+                    j["last_raw"] = raw
+                    parsed_obj = _extract_json_object(raw)
+                    parsed = dict(parsed_obj or {})
+                    j["last_parsed"] = parsed
+
+                    candidate = _normalize_augmented_text(_extract_augmented_text(parsed))
+                    if not candidate:
+                        continue
+                    if _looks_like_reasoning_spill(candidate):
+                        continue
+                    coverage = _query_token_coverage(query=j["query"], candidate=candidate)
+                    if float(coverage) < float(j["min_coverage"]):
+                        continue
+                    if float(coverage) > float(MAX_QUERY_TOKEN_COVERAGE):
+                        continue
+                    bigram_overlap = _query_bigram_overlap(query=j["query"], candidate=candidate)
+                    if float(bigram_overlap) > float(MAX_QUERY_BIGRAM_OVERLAP):
+                        continue
+                    trigram_overlap = _query_trigram_overlap(query=j["query"], candidate=candidate)
+                    if float(trigram_overlap) > float(MAX_QUERY_TRIGRAM_OVERLAP):
+                        continue
+                    novel_ratio = _novel_token_ratio(query=j["query"], candidate=candidate)
+                    if float(novel_ratio) < float(MIN_NOVEL_TOKEN_RATIO):
+                        continue
+
+                    out_cluster = _normalize_target_cluster(
+                        parsed.get("target_cluster") or parsed.get("target_band") or j["cluster"]
+                    )
+                    if not self.enable_validation:
+                        result = AugmentationResult(
+                            query=j["query"],
+                            target_cluster=out_cluster,
+                            augmented_text=candidate,
+                            parsed_ok=bool(parsed_obj is not None),
+                            attempt=int(j["attempt"]),
+                            raw_response=raw,
+                            parsed=parsed,
+                            notes=_clean_text(parsed.get("notes")),
+                            validation={},
+                            failure_reason="",
+                        )
+                        results[int(j["idx"])] = result.__dict__
+                        j["done"] = True
+                        continue
+
+                    validate_queue.append(
+                        {
+                            "job": j,
+                            "candidate": candidate,
+                            "out_cluster": out_cluster,
+                            "parsed_ok": bool(parsed_obj is not None),
+                            "raw_response": raw,
+                            "parsed": parsed,
+                            "notes": _clean_text(parsed.get("notes")),
+                            "bigram_overlap": float(bigram_overlap),
+                            "trigram_overlap": float(trigram_overlap),
+                            "novel_ratio": float(novel_ratio),
+                        }
+                    )
+
+            if self.enable_validation and validate_queue:
+                validate_items = [
+                    (v["job"]["query"], v["candidate"], _normalize_target_cluster(v["job"]["cluster"]))
+                    for v in validate_queue
+                ]
+                validations = self._validate_batch(items=validate_items, batch_size=batch_n)
+                for item, validation in zip(validate_queue, validations):
+                    j = item["job"]
+                    result = AugmentationResult(
+                        query=j["query"],
+                        target_cluster=item["out_cluster"],
+                        augmented_text=item["candidate"],
+                        parsed_ok=bool(item["parsed_ok"]),
+                        attempt=int(j["attempt"]),
+                        raw_response=item["raw_response"],
+                        parsed=item["parsed"],
+                        notes=item["notes"],
+                        validation=validation,
+                        failure_reason="",
+                    )
+                    if bool(validation.get("pass_valid_range")):
+                        results[int(j["idx"])] = result.__dict__
+                        j["done"] = True
+                        continue
+
+                    dist = float(validation.get("distance_to_aim_range", 1.0))
+                    score = _clamp_score(validation.get("score"))
+                    rank_key = (
+                        abs(float(score) - float(j["target_center"])),
+                        float(item["trigram_overlap"]),
+                        float(item["bigram_overlap"]),
+                        -float(item["novel_ratio"]),
+                    )
+                    if (dist < float(j["best_distance"])) or (
+                        dist == float(j["best_distance"]) and rank_key < tuple(j["best_key"])
+                    ):
+                        j["best_distance"] = float(dist)
+                        j["best_key"] = rank_key
+                        j["best_candidate"] = result
+
+        for j in jobs:
+            idx = int(j["idx"])
+            if results[idx] is not None:
+                continue
+            best = j.get("best_candidate")
+            if isinstance(best, AugmentationResult):
+                out = best.__dict__.copy()
+                out["failure_reason"] = "No candidate passed validation range; returning closest-to-aim candidate."
+                results[idx] = out
+                continue
+            results[idx] = AugmentationResult(
+                query=j["query"],
+                target_cluster=j["cluster"],
+                augmented_text="",
+                parsed_ok=False,
+                attempt=int(j["attempt"]),
+                raw_response=_clean_text(j.get("last_raw")),
+                parsed=dict(j.get("last_parsed") or {}),
+                notes="",
+                validation={},
+                failure_reason="No usable candidate produced.",
+            ).__dict__
+
+        return [r if r is not None else {
+            "query": "",
+            "target_cluster": "mid",
+            "augmented_text": "",
+            "parsed_ok": False,
+            "attempt": 0,
+            "raw_response": "",
+            "parsed": {},
+            "notes": "",
+            "validation": {},
+            "failure_reason": "No usable candidate produced.",
+        } for r in results]
