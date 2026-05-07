@@ -11,13 +11,22 @@ Return exactly one JSON object and nothing else.
 
 Target cluster rules:
 - high: strong semantic fit to the requirement, but not a close paraphrase.
-- mid: partial fit; keep topical relevance but miss at least one core concept.
+- mid: partial fit with controlled overlap.
+  - Keep domain/topic relevance.
+  - Deliberately miss at least one CORE concept from the requirement.
+  - Do NOT include all key method + objective + context concepts together.
+  - Keep it plausible but incomplete.
 - low: weak/adjacent fit; related domain only, with clear concept gaps.
 
 Anti-copy rules:
 - Do not copy long spans from the query.
 - Avoid repeating the same 2-3 word phrases from the query.
 - Use alternate wording and structure while preserving intended relevance for target cluster.
+
+MID guardrails (important):
+- Aim for partial semantic coverage (roughly 50-75% of major concepts).
+- Include exactly one deliberate concept gap for MID.
+- If output sounds fully complete, it is NOT MID.
 
 Style for augmented_text:
 - Concise capability phrase suitable for pair dataset.
@@ -28,6 +37,7 @@ Return strict JSON only:
 {
   "augmented_text": "<candidate specialization text>",
   "target_cluster": "<high|mid|low>",
+  "intentionally_missing_core_concept": "<short phrase; required for mid, empty for high>",
   "notes": "<very short note>"
 }
 """.strip()
@@ -44,6 +54,10 @@ Desired judge score range (aim):
 
 Preferred center:
 {target_center}
+
+Cluster-specific instruction:
+- If target is MID, keep clear topical relevance but intentionally leave one core concept unmet.
+- If target is HIGH, cover all core concepts without copying phrasing.
 """.strip()
 
 
@@ -323,7 +337,7 @@ class LLMDistillationAugmenter:
         tokenizer: Optional[Any] = None,
         model_id: str = "Qwen/Qwen2.5-14B-Instruct",
         max_attempts: int = 3,
-        max_new_tokens: int = 384,
+        max_new_tokens: int = 512,
         temperature: float = 0.2,
         top_p: float = 0.9,
         enable_validation: bool = True,
