@@ -44,6 +44,7 @@ PAIRWISE_OUTPUT_DEFAULT = "cross_encoder/dataset/distill/llm_distill2_pairwise.j
 LISTWISE_OUTPUT_DEFAULT = "cross_encoder/dataset/distill/llm_distill2_listwise.jsonl"
 MANIFEST_DEFAULT = "cross_encoder/dataset/distill/llm_distill2_manifest.json"
 STATS_DEFAULT = "cross_encoder/dataset/distill/llm_distill2_stats.json"
+DISTILL_RAW_DEFAULT = "cross_encoder/dataset/distill/llm_distill2_distill_raw_scores.jsonl"
 
 SCORE_MODEL_ID_DEFAULT = "Qwen/Qwen2.5-14B-Instruct"
 AUGMENT_MODEL_ID_DEFAULT = "Qwen/Qwen3-14B"
@@ -270,6 +271,30 @@ def _load_json(path: Path) -> Dict[str, Any]:
     if not isinstance(obj, dict):
         raise RuntimeError(f"Expected top-level JSON object in {path}")
     return obj
+
+
+def _load_jsonl(path: Path) -> List[Dict[str, Any]]:
+    rows: List[Dict[str, Any]] = []
+    try:
+        with path.open("r", encoding="utf-8") as f:
+            for line_no, line in enumerate(f, start=1):
+                raw = _clean_text(line)
+                if not raw:
+                    continue
+                obj = json.loads(raw)
+                if not isinstance(obj, dict):
+                    raise RuntimeError(f"Expected object JSONL row at {path}:{line_no}")
+                rows.append(obj)
+    except Exception as exc:
+        raise RuntimeError(f"Failed to parse JSONL: {path} ({type(exc).__name__}: {exc})") from exc
+    return rows
+
+
+def _write_jsonl(path: Path, rows: Sequence[Dict[str, Any]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as f:
+        for row in rows:
+            f.write(json.dumps(row, ensure_ascii=False) + "\n")
 
 
 def _flatten_specs(grant_payload: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -1021,6 +1046,19 @@ def main() -> int:
         default=0,
         help="Limit number of query specs to process (0 = all).",
     )
+    parser.add_argument(
+        "--run-mode",
+        type=str,
+        default="full",
+        choices=["full", "distill-only", "augment-only"],
+        help="full: distill+augment, distill-only: save raw scored file, augment-only: consume saved raw scored file.",
+    )
+    parser.add_argument(
+        "--distill-raw-path",
+        type=str,
+        default=DISTILL_RAW_DEFAULT,
+        help="Stage-A raw scored spec file (written by distill-only/full, read by augment-only).",
+    )
     parser.add_argument("--target-high", type=int, default=1, help="Exact target high count per spec after LLM scoring.")
     parser.add_argument("--target-mid", type=int, default=2, help="Exact target mid count per spec after LLM scoring.")
     parser.add_argument("--target-low", type=int, default=1, help="Exact target low count per spec after LLM scoring.")
@@ -1028,6 +1066,7 @@ def main() -> int:
 
     prefilter_multiplier = _safe_float(args.prefilter_multiplier, default=2.0, minimum=0.0, maximum=100.0)
     max_specs = _safe_int(args.max_specs, default=0, minimum=0, maximum=10_000_000)
+    run_mode = _clean_text(args.run_mode).lower()
     target_high = _safe_int(args.target_high, default=1, minimum=0, maximum=100_000)
     target_mid = _safe_int(args.target_mid, default=2, minimum=0, maximum=100_000)
     target_low = _safe_int(args.target_low, default=1, minimum=0, maximum=100_000)
@@ -1046,50 +1085,46 @@ def main() -> int:
     listwise_output_path = _resolve_path(LISTWISE_OUTPUT_DEFAULT)
     manifest_path = _resolve_path(MANIFEST_DEFAULT)
     stats_output_path = _resolve_path(STATS_DEFAULT)
-
-    if not grant_db.exists():
-        raise RuntimeError(f"Grant DB not found: {grant_db}")
-    if not fac_db.exists():
-        raise RuntimeError(f"Faculty DB not found: {fac_db}")
-    if not prefilter_cache.exists():
-        raise RuntimeError(f"STS prefilter cache not found: {prefilter_cache}")
+    distill_raw_path = _resolve_path(args.distill_raw_path)
+    distill_meta_path = distill_raw_path.with_suffix(".meta.json")
 
     # ======================================================
-    # Step 3) Load datasets + STS cache
+    # Step 3) Load datasets + STS cache (not needed for augment-only)
     # ======================================================
-    grant_payload = _load_json(grant_db)
-    fac_payload = _load_json(fac_db)
-    specs = _flatten_specs(grant_payload)
-    full_spec_count = int(len(specs))
-    if max_specs > 0:
-        specs = specs[: min(int(max_specs), len(specs))]
-    fac_specs = _flatten_fac_specs(fac_payload)
-    if not specs:
-        raise RuntimeError("No specs found in grant DB.")
-    if not fac_specs:
-        raise RuntimeError("No faculty specs found in faculty DB.")
+    specs: List[Dict[str, Any]] = []
+    fac_specs: List[Dict[str, Any]] = []
+    prefilter_map: Dict[Tuple[str, int], List[int]] = {}
+    full_spec_count = 0
+    if run_mode != "augment-only":
+        if not grant_db.exists():
+            raise RuntimeError(f"Grant DB not found: {grant_db}")
+        if not fac_db.exists():
+            raise RuntimeError(f"Faculty DB not found: {fac_db}")
+        if not prefilter_cache.exists():
+            raise RuntimeError(f"STS prefilter cache not found: {prefilter_cache}")
 
-    prefilter_map = _load_prefilter_score_cache(cache_path=prefilter_cache, fac_specs=fac_specs)
+        grant_payload = _load_json(grant_db)
+        fac_payload = _load_json(fac_db)
+        specs = _flatten_specs(grant_payload)
+        full_spec_count = int(len(specs))
+        if max_specs > 0:
+            specs = specs[: min(int(max_specs), len(specs))]
+        fac_specs = _flatten_fac_specs(fac_payload)
+        if not specs:
+            raise RuntimeError("No specs found in grant DB.")
+        if not fac_specs:
+            raise RuntimeError("No faculty specs found in faculty DB.")
+        prefilter_map = _load_prefilter_score_cache(cache_path=prefilter_cache, fac_specs=fac_specs)
 
     # ======================================================
-    # Step 4) Score model pass (Qwen2.5), then unload
-    # ======================================================
-    score_model_id = _clean_text(SCORE_MODEL_ID_DEFAULT) or _clean_text(MODEL_ID_DEFAULT)
-    augment_model_id = _clean_text(AUGMENT_MODEL_ID_DEFAULT) or score_model_id
-    llm, tokenizer, sampling_params = _load_vllm_bundle(
-        model_id=score_model_id,
-        max_new_tokens=MAX_NEW_TOKENS_DEFAULT,
-        temperature=TEMPERATURE_DEFAULT,
-    )
-
-    # ======================================================
-    # Step 5) Stage A: prefilter -> score real -> pre-coverage gate
+    # Step 4) Setup counters and IO dirs
     # ======================================================
     raw_output_path.parent.mkdir(parents=True, exist_ok=True)
     pairwise_output_path.parent.mkdir(parents=True, exist_ok=True)
     listwise_output_path.parent.mkdir(parents=True, exist_ok=True)
     manifest_path.parent.mkdir(parents=True, exist_ok=True)
     stats_output_path.parent.mkdir(parents=True, exist_ok=True)
+    distill_raw_path.parent.mkdir(parents=True, exist_ok=True)
 
     started = time.time()
     total_prefilter_selected = 0
@@ -1132,119 +1167,199 @@ def main() -> int:
     total_weak_candidates = 0
     synthetic_id_cursor = 1
     scored_spec_rows: List[Dict[str, Any]] = []
+    score_model_id = _clean_text(SCORE_MODEL_ID_DEFAULT) or _clean_text(MODEL_ID_DEFAULT)
+    augment_model_id = _clean_text(AUGMENT_MODEL_ID_DEFAULT) or score_model_id
 
     try:
         from tqdm import tqdm as _tqdm  # type: ignore
     except Exception:
         _tqdm = None
 
-    base_iter = enumerate(specs, start=1)
-    spec_iter = _tqdm(base_iter, total=len(specs), desc="Scoring specs") if _tqdm is not None else base_iter
-
-    for spec_rank, spec in spec_iter:
-        grant_id = _clean_text(spec.get("grant_id"))
-        spec_idx = _safe_int(spec.get("spec_idx"), default=0, minimum=0, maximum=50_000_000)
-        spec_text = _clean_text(spec.get("spec_text"))
-        ranked_indices = list(prefilter_map.get((grant_id, spec_idx)) or [])
-        rank_map = {int(idx): int(i) for i, idx in enumerate(ranked_indices)}
-
-        rng = _rng_for_spec(base_seed=SEED_DEFAULT, grant_id=grant_id, spec_idx=spec_idx)
-        high_indices, mid_indices, low_indices = _select_prefilter_buckets(
-            total=len(fac_specs),
-            ranked_indices=ranked_indices,
-            high_k=prefilter_high,
-            mid_k=prefilter_mid,
-            low_k=prefilter_low,
-            rng=rng,
+    if run_mode != "augment-only":
+        # ======================================================
+        # Step 5) Stage A: prefilter -> score real -> pre-coverage gate
+        # ======================================================
+        llm, tokenizer, sampling_params = _load_vllm_bundle(
+            model_id=score_model_id,
+            max_new_tokens=MAX_NEW_TOKENS_DEFAULT,
+            temperature=TEMPERATURE_DEFAULT,
         )
-        high_index_set = set(high_indices)
-        mid_index_set = set(mid_indices)
 
-        prefilter_candidates: List[Dict[str, Any]] = []
-        for idx in list(high_indices) + list(mid_indices) + list(low_indices):
-            if idx < 0 or idx >= len(fac_specs):
+        base_iter = enumerate(specs, start=1)
+        spec_iter = _tqdm(base_iter, total=len(specs), desc="Scoring specs") if _tqdm is not None else base_iter
+
+        for spec_rank, spec in spec_iter:
+            grant_id = _clean_text(spec.get("grant_id"))
+            spec_idx = _safe_int(spec.get("spec_idx"), default=0, minimum=0, maximum=50_000_000)
+            spec_text = _clean_text(spec.get("spec_text"))
+            ranked_indices = list(prefilter_map.get((grant_id, spec_idx)) or [])
+            rank_map = {int(idx): int(i) for i, idx in enumerate(ranked_indices)}
+
+            rng = _rng_for_spec(base_seed=SEED_DEFAULT, grant_id=grant_id, spec_idx=spec_idx)
+            high_indices, mid_indices, low_indices = _select_prefilter_buckets(
+                total=len(fac_specs),
+                ranked_indices=ranked_indices,
+                high_k=prefilter_high,
+                mid_k=prefilter_mid,
+                low_k=prefilter_low,
+                rng=rng,
+            )
+            high_index_set = set(high_indices)
+            mid_index_set = set(mid_indices)
+
+            prefilter_candidates: List[Dict[str, Any]] = []
+            for idx in list(high_indices) + list(mid_indices) + list(low_indices):
+                if idx < 0 or idx >= len(fac_specs):
+                    continue
+                fac = fac_specs[idx]
+                bucket = "low"
+                if idx in high_index_set:
+                    bucket = "high"
+                elif idx in mid_index_set:
+                    bucket = "mid"
+                prefilter_candidates.append(
+                    {
+                        "fac_id": int(fac["fac_id"]),
+                        "fac_spec_id": int(fac["fac_spec_id"]),
+                        "fac_spec_idx": int(fac["fac_spec_idx"]),
+                        "section": _clean_text(fac["section"]),
+                        "fac_spec_text": _clean_text(fac["fac_spec_text"]),
+                        "prefilter_bucket": bucket,
+                        "sts_rank": int(rank_map.get(int(idx), -1)),
+                    }
+                )
+
+            total_prefilter_selected += int(len(prefilter_candidates))
+
+            scored_candidates, json_ok, fallback = _score_prefiltered_candidates(
+                llm=llm,
+                tokenizer=tokenizer,
+                sampling_params=sampling_params,
+                spec_text=spec_text,
+                candidates=prefilter_candidates,
+                batch_size=BATCH_SIZE_DEFAULT,
+            )
+            total_scored_candidates += int(len(scored_candidates))
+            total_json_ok += int(json_ok)
+            total_fallback += int(fallback)
+
+            scored_candidates = _normalize_llm_scores(scored_candidates)
+            adaptive = _decide_adaptive_targets_with_args(
+                candidates=scored_candidates,
+                requested_high=target_high,
+                requested_mid=target_mid,
+                requested_low=target_low,
+            )
+            scored_candidates, quota_info = _assign_target_clusters(
+                candidates=scored_candidates,
+                target_high=int(adaptive.get("target_high", 1)),
+                target_mid=int(adaptive.get("target_mid", 2)),
+                target_low=int(adaptive.get("target_low", 1)),
+            )
+            quota_info["policy_case"] = _clean_text(adaptive.get("policy_case"))
+            quota_info["drop_no_low"] = bool(adaptive.get("drop_no_low", False))
+            missing_high_total_pre += int(quota_info["missing_high"])
+            missing_mid_total_pre += int(quota_info["missing_mid"])
+            missing_low_total_pre += int(quota_info["missing_low"])
+            if int(quota_info["missing_total"]) > 0:
+                shortage_specs_pre += 1
+
+            if bool(quota_info.get("drop_no_low", False)):
+                dropped_by_coverage_gate_specs += 1
                 continue
-            fac = fac_specs[idx]
-            bucket = "low"
-            if idx in high_index_set:
-                bucket = "high"
-            elif idx in mid_index_set:
-                bucket = "mid"
-            prefilter_candidates.append(
+
+            scored_spec_rows.append(
                 {
-                    "fac_id": int(fac["fac_id"]),
-                    "fac_spec_id": int(fac["fac_spec_id"]),
-                    "fac_spec_idx": int(fac["fac_spec_idx"]),
-                    "section": _clean_text(fac["section"]),
-                    "fac_spec_text": _clean_text(fac["fac_spec_text"]),
-                    "prefilter_bucket": bucket,
-                    "sts_rank": int(rank_map.get(int(idx), -1)),
+                    "grant_id": grant_id,
+                    "spec_idx": int(spec_idx),
+                    "spec_text": spec_text,
+                    "scored_candidates": scored_candidates,
+                    "quota_info": quota_info,
                 }
             )
 
-        total_prefilter_selected += int(len(prefilter_candidates))
+            if (_tqdm is None) and (spec_rank % 10 == 0 or spec_rank == len(specs)):
+                elapsed = max(1e-6, time.time() - started)
+                speed = float(total_scored_candidates / elapsed)
+                print(
+                    f"score_progress={spec_rank}/{len(specs)} "
+                    f"scored_candidates={total_scored_candidates} "
+                    f"gate_kept_specs={len(scored_spec_rows)} "
+                    f"speed={speed:.2f} cand/sec"
+                )
 
-        scored_candidates, json_ok, fallback = _score_prefiltered_candidates(
-            llm=llm,
-            tokenizer=tokenizer,
-            sampling_params=sampling_params,
-            spec_text=spec_text,
-            candidates=prefilter_candidates,
-            batch_size=BATCH_SIZE_DEFAULT,
-        )
-        total_scored_candidates += int(len(scored_candidates))
-        total_json_ok += int(json_ok)
-        total_fallback += int(fallback)
+        _release_vllm_bundle(llm)
+        llm = None
+        tokenizer = None
+        sampling_params = None
 
-        scored_candidates = _normalize_llm_scores(scored_candidates)
-        adaptive = _decide_adaptive_targets_with_args(
-            candidates=scored_candidates,
-            requested_high=target_high,
-            requested_mid=target_mid,
-            requested_low=target_low,
-        )
-        scored_candidates, quota_info = _assign_target_clusters(
-            candidates=scored_candidates,
-            target_high=int(adaptive.get("target_high", 1)),
-            target_mid=int(adaptive.get("target_mid", 2)),
-            target_low=int(adaptive.get("target_low", 1)),
-        )
-        quota_info["policy_case"] = _clean_text(adaptive.get("policy_case"))
-        quota_info["drop_no_low"] = bool(adaptive.get("drop_no_low", False))
-        missing_high_total_pre += int(quota_info["missing_high"])
-        missing_mid_total_pre += int(quota_info["missing_mid"])
-        missing_low_total_pre += int(quota_info["missing_low"])
-        if int(quota_info["missing_total"]) > 0:
-            shortage_specs_pre += 1
+        _write_jsonl(distill_raw_path, scored_spec_rows)
+        distill_meta = {
+            "created_at_utc": datetime.now(timezone.utc).isoformat(),
+            "run_mode": str(run_mode),
+            "score_model_id": score_model_id,
+            "prefilter_multiplier": float(prefilter_multiplier),
+            "prefilter_requested": {"high": int(prefilter_high), "mid": int(prefilter_mid), "low": int(prefilter_low)},
+            "target_requested": {"high": int(target_high), "mid": int(target_mid), "low": int(target_low)},
+            "spec_count_input_total": int(full_spec_count),
+            "spec_count_total": int(len(specs)),
+            "spec_count_stagea_kept": int(len(scored_spec_rows)),
+            "spec_count_dropped_by_coverage_gate": int(dropped_by_coverage_gate_specs),
+            "total_prefilter_selected_candidates": int(total_prefilter_selected),
+            "total_scored_candidates": int(total_scored_candidates),
+            "parsed_json_ok_count": int(total_json_ok),
+            "parsed_fallback_count": int(total_fallback),
+            "missing_high_total_pre": int(missing_high_total_pre),
+            "missing_mid_total_pre": int(missing_mid_total_pre),
+            "missing_low_total_pre": int(missing_low_total_pre),
+            "shortage_specs_pre": int(shortage_specs_pre),
+            "distill_raw_path": str(distill_raw_path),
+        }
+        distill_meta_path.write_text(json.dumps(distill_meta, ensure_ascii=False, indent=2), encoding="utf-8")
 
-        if bool(quota_info.get("drop_no_low", False)):
-            dropped_by_coverage_gate_specs += 1
-            continue
-
-        scored_spec_rows.append(
-            {
-                "grant_id": grant_id,
-                "spec_idx": int(spec_idx),
-                "spec_text": spec_text,
-                "scored_candidates": scored_candidates,
-                "quota_info": quota_info,
-            }
-        )
-
-        if (_tqdm is None) and (spec_rank % 10 == 0 or spec_rank == len(specs)):
+        if run_mode == "distill-only":
             elapsed = max(1e-6, time.time() - started)
-            speed = float(total_scored_candidates / elapsed)
-            print(
-                f"score_progress={spec_rank}/{len(specs)} "
-                f"scored_candidates={total_scored_candidates} "
-                f"gate_kept_specs={len(scored_spec_rows)} "
-                f"speed={speed:.2f} cand/sec"
+            print("done=true")
+            print(f"run_mode={run_mode}")
+            print(f"spec_count_input_total={full_spec_count}")
+            print(f"spec_count_total={len(specs)}")
+            print(f"spec_count_stagea_kept={len(scored_spec_rows)}")
+            print(f"spec_count_dropped_by_coverage_gate={dropped_by_coverage_gate_specs}")
+            print(f"total_prefilter_selected_candidates={total_prefilter_selected}")
+            print(f"total_scored_candidates={total_scored_candidates}")
+            print(f"target_missing_pairs_pre_augmentation=high:{missing_high_total_pre},mid:{missing_mid_total_pre},low:{missing_low_total_pre}")
+            print(f"target_shortage_specs_pre_augmentation={shortage_specs_pre}/{len(specs)}")
+            print(f"parsed_json_ok_count={total_json_ok}")
+            print(f"parsed_fallback_count={total_fallback}")
+            print(f"elapsed_seconds={elapsed:.2f}")
+            print(f"candidates_per_second={(total_scored_candidates / elapsed):.4f}")
+            print(f"distill_raw_output={distill_raw_path}")
+            print(f"distill_meta_output={distill_meta_path}")
+            return 0
+    else:
+        if not distill_raw_path.exists():
+            raise RuntimeError(
+                f"augment-only requires existing distill raw file: {distill_raw_path}. "
+                "Run with --run-mode distill-only or full first."
             )
-
-    _release_vllm_bundle(llm)
-    llm = None
-    tokenizer = None
-    sampling_params = None
+        scored_spec_rows = _load_jsonl(distill_raw_path)
+        if not scored_spec_rows:
+            raise RuntimeError(f"No rows found in distill raw file: {distill_raw_path}")
+        if distill_meta_path.exists():
+            meta = _load_json(distill_meta_path)
+            full_spec_count = _safe_int(meta.get("spec_count_input_total"), default=full_spec_count, minimum=0, maximum=10_000_000)
+            total_prefilter_selected = _safe_int(meta.get("total_prefilter_selected_candidates"), default=0, minimum=0, maximum=2_000_000_000)
+            total_scored_candidates = _safe_int(meta.get("total_scored_candidates"), default=0, minimum=0, maximum=2_000_000_000)
+            total_json_ok = _safe_int(meta.get("parsed_json_ok_count"), default=0, minimum=0, maximum=2_000_000_000)
+            total_fallback = _safe_int(meta.get("parsed_fallback_count"), default=0, minimum=0, maximum=2_000_000_000)
+            dropped_by_coverage_gate_specs = _safe_int(meta.get("spec_count_dropped_by_coverage_gate"), default=0, minimum=0, maximum=10_000_000)
+            missing_high_total_pre = _safe_int(meta.get("missing_high_total_pre"), default=0, minimum=0, maximum=2_000_000_000)
+            missing_mid_total_pre = _safe_int(meta.get("missing_mid_total_pre"), default=0, minimum=0, maximum=2_000_000_000)
+            missing_low_total_pre = _safe_int(meta.get("missing_low_total_pre"), default=0, minimum=0, maximum=2_000_000_000)
+            shortage_specs_pre = _safe_int(meta.get("shortage_specs_pre"), default=0, minimum=0, maximum=10_000_000)
+        else:
+            total_scored_candidates = int(sum(len(list(r.get("scored_candidates") or [])) for r in scored_spec_rows))
+        specs = list(scored_spec_rows)
 
     # ======================================================
     # Step 6) Stage B: load augmentation model (if needed), finalize + write outputs
@@ -1527,9 +1642,12 @@ def main() -> int:
 
     manifest = {
         "created_at_utc": datetime.now(timezone.utc).isoformat(),
+        "run_mode": str(run_mode),
         "grant_db": str(grant_db),
         "fac_db": str(fac_db),
         "prefilter_cache": str(prefilter_cache),
+        "distill_raw_input": str(distill_raw_path),
+        "distill_meta_input": str(distill_meta_path),
         "raw_output": str(raw_output_path),
         "pairwise_output_path": str(pairwise_output_path),
         "pairwise_output": str(pairwise_output_path),
@@ -1636,6 +1754,8 @@ def main() -> int:
     stats = {
         "created_at_utc": manifest["created_at_utc"],
         "files": {
+            "distill_raw_input": str(distill_raw_path),
+            "distill_meta_input": str(distill_meta_path),
             "raw_output": str(raw_output_path),
             "pairwise_output": str(pairwise_output_path),
             "listwise_output": str(listwise_output_path),
@@ -1715,6 +1835,7 @@ def main() -> int:
     stats_output_path.write_text(json.dumps(stats, ensure_ascii=False, indent=2), encoding="utf-8")
 
     print(f"spec_count_input_total={full_spec_count}")
+    print(f"run_mode={run_mode}")
     print(f"max_specs={max_specs}")
     print(f"spec_count_total={len(specs)}")
     print(f"spec_count_kept={kept_specs}")
@@ -1783,6 +1904,8 @@ def main() -> int:
     print(f"raw_output={raw_output_path}")
     print(f"pairwise_output={pairwise_output_path}")
     print(f"listwise_output={listwise_output_path}")
+    print(f"distill_raw_input={distill_raw_path}")
+    print(f"distill_meta_input={distill_meta_path}")
     print(f"manifest={manifest_path}")
     print(f"stats_output={stats_output_path}")
     return 0
