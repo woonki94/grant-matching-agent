@@ -1543,6 +1543,10 @@ def main() -> int:
         augment_rejected_empty_total = int(global_aug_stats.get("rejected_empty", 0))
         augment_rejected_duplicate_total = int(global_aug_stats.get("rejected_duplicate", 0))
         augment_rejected_validation_total = int(global_aug_stats.get("rejected_validation", 0))
+        # Augmentation is complete; release model before finalize/write to free GPU memory early.
+        _release_vllm_bundle(augment_llm)
+        augment_llm = None
+        augmenter = None
 
     final_iter_base = enumerate(scored_spec_rows, start=1)
     final_iter = _tqdm(final_iter_base, total=len(scored_spec_rows), desc="Finalize specs") if _tqdm is not None else final_iter_base
