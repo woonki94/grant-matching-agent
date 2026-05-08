@@ -43,6 +43,7 @@ RAW_OUTPUT_DEFAULT = "cross_encoder/dataset/distill/llm_distill2_raw_scores.json
 PAIRWISE_OUTPUT_DEFAULT = "cross_encoder/dataset/distill/llm_distill2_pairwise.jsonl"
 LISTWISE_OUTPUT_DEFAULT = "cross_encoder/dataset/distill/llm_distill2_listwise.jsonl"
 MANIFEST_DEFAULT = "cross_encoder/dataset/distill/llm_distill2_manifest.json"
+STATS_DEFAULT = "cross_encoder/dataset/distill/llm_distill2_stats.json"
 
 SCORE_MODEL_ID_DEFAULT = "Qwen/Qwen2.5-14B-Instruct"
 AUGMENT_MODEL_ID_DEFAULT = "Qwen/Qwen3-14B"
@@ -586,6 +587,54 @@ def _assign_target_clusters(
     return out, info
 
 
+def _decide_adaptive_targets_121(*, candidates: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
+    high_avail = int(sum(1 for c in candidates if float(c.get("llm_score_raw") or 0.0) >= float(HIGH_SCORE_MIN_DEFAULT)))
+    mid_avail = int(
+        sum(
+            1
+            for c in candidates
+            if float(MID_SCORE_MIN_DEFAULT) <= float(c.get("llm_score_raw") or 0.0) <= float(MID_SCORE_MAX_DEFAULT)
+        )
+    )
+    low_avail = int(sum(1 for c in candidates if float(c.get("llm_score_raw") or 0.0) < float(MID_SCORE_MIN_DEFAULT)))
+
+    # Policy:
+    # - Prefer 1/2/1 when possible.
+    # - If mid is short but still >=1 and high exists, fallback to 1/1/1 (no augmentation).
+    # - If high==0 or mid==0, still target 1/1/1 and recover missing high/mid via augmentation.
+    # - Drop only when no low exists.
+    target_high = 1
+    target_mid = 2
+    target_low = 1
+    case_name = "A_1_2_1"
+    drop_no_low = bool(low_avail < 1)
+    if (not drop_no_low) and (high_avail >= 1) and (mid_avail == 1):
+        target_mid = 1
+        case_name = "B_1_1_1"
+    elif (not drop_no_low) and (high_avail == 0) and (mid_avail >= 1):
+        target_mid = 1
+        case_name = "C_need_high_aug"
+    elif (not drop_no_low) and (high_avail >= 1) and (mid_avail == 0):
+        target_mid = 1
+        case_name = "D_need_mid_aug"
+    elif (not drop_no_low) and (high_avail == 0) and (mid_avail == 0):
+        target_mid = 1
+        case_name = "E_need_high_mid_aug"
+    elif drop_no_low:
+        case_name = "F_drop_no_low"
+
+    return {
+        "target_high": int(target_high),
+        "target_mid": int(target_mid),
+        "target_low": int(target_low),
+        "available_high": int(high_avail),
+        "available_mid": int(mid_avail),
+        "available_low": int(low_avail),
+        "drop_no_low": bool(drop_no_low),
+        "policy_case": case_name,
+    }
+
+
 def _summarize_selected_clusters(
     *,
     candidates: Sequence[Dict[str, Any]],
@@ -949,16 +998,16 @@ def main() -> int:
         default=0,
         help="Limit number of query specs to process (0 = all).",
     )
-    parser.add_argument("--target-high", type=int, default=5, help="Exact target high count per spec after LLM scoring.")
-    parser.add_argument("--target-mid", type=int, default=10, help="Exact target mid count per spec after LLM scoring.")
-    parser.add_argument("--target-low", type=int, default=5, help="Exact target low count per spec after LLM scoring.")
+    parser.add_argument("--target-high", type=int, default=1, help="Exact target high count per spec after LLM scoring.")
+    parser.add_argument("--target-mid", type=int, default=2, help="Exact target mid count per spec after LLM scoring.")
+    parser.add_argument("--target-low", type=int, default=1, help="Exact target low count per spec after LLM scoring.")
     args = parser.parse_args()
 
     prefilter_multiplier = _safe_float(args.prefilter_multiplier, default=2.0, minimum=0.0, maximum=100.0)
     max_specs = _safe_int(args.max_specs, default=0, minimum=0, maximum=10_000_000)
-    target_high = _safe_int(args.target_high, default=5, minimum=0, maximum=100_000)
-    target_mid = _safe_int(args.target_mid, default=10, minimum=0, maximum=100_000)
-    target_low = _safe_int(args.target_low, default=5, minimum=0, maximum=100_000)
+    target_high = _safe_int(args.target_high, default=1, minimum=0, maximum=100_000)
+    target_mid = _safe_int(args.target_mid, default=2, minimum=0, maximum=100_000)
+    target_low = _safe_int(args.target_low, default=1, minimum=0, maximum=100_000)
     prefilter_high = int(max(target_high, math.ceil(float(target_high) * float(prefilter_multiplier)))) if target_high > 0 else 0
     prefilter_mid = int(max(target_mid, math.ceil(float(target_mid) * float(prefilter_multiplier)))) if target_mid > 0 else 0
     prefilter_low = int(max(target_low, math.ceil(float(target_low) * float(prefilter_multiplier)))) if target_low > 0 else 0
@@ -973,6 +1022,7 @@ def main() -> int:
     pairwise_output_path = _resolve_path(PAIRWISE_OUTPUT_DEFAULT)
     listwise_output_path = _resolve_path(LISTWISE_OUTPUT_DEFAULT)
     manifest_path = _resolve_path(MANIFEST_DEFAULT)
+    stats_output_path = _resolve_path(STATS_DEFAULT)
 
     if not grant_db.exists():
         raise RuntimeError(f"Grant DB not found: {grant_db}")
@@ -1016,6 +1066,7 @@ def main() -> int:
     pairwise_output_path.parent.mkdir(parents=True, exist_ok=True)
     listwise_output_path.parent.mkdir(parents=True, exist_ok=True)
     manifest_path.parent.mkdir(parents=True, exist_ok=True)
+    stats_output_path.parent.mkdir(parents=True, exist_ok=True)
 
     started = time.time()
     total_prefilter_selected = 0
@@ -1046,6 +1097,12 @@ def main() -> int:
     total_pair_strong_vs_boundary = 0
     total_pair_strong_vs_weak = 0
     total_pair_strong_vs_hard = 0
+    target_requested_high_total_kept = 0
+    target_requested_mid_total_kept = 0
+    target_requested_low_total_kept = 0
+    target_selected_high_total_kept = 0
+    target_selected_mid_total_kept = 0
+    target_selected_low_total_kept = 0
     total_disagreement_candidates = 0
     total_strong_candidates = 0
     total_boundary_candidates = 0
@@ -1117,25 +1174,22 @@ def main() -> int:
         total_fallback += int(fallback)
 
         scored_candidates = _normalize_llm_scores(scored_candidates)
+        adaptive = _decide_adaptive_targets_121(candidates=scored_candidates)
         scored_candidates, quota_info = _assign_target_clusters(
             candidates=scored_candidates,
-            target_high=target_high,
-            target_mid=target_mid,
-            target_low=target_low,
+            target_high=int(adaptive.get("target_high", 1)),
+            target_mid=int(adaptive.get("target_mid", 2)),
+            target_low=int(adaptive.get("target_low", 1)),
         )
+        quota_info["policy_case"] = _clean_text(adaptive.get("policy_case"))
+        quota_info["drop_no_low"] = bool(adaptive.get("drop_no_low", False))
         missing_high_total_pre += int(quota_info["missing_high"])
         missing_mid_total_pre += int(quota_info["missing_mid"])
         missing_low_total_pre += int(quota_info["missing_low"])
         if int(quota_info["missing_total"]) > 0:
             shortage_specs_pre += 1
 
-        high_cov_pre = _coverage_ratio(int(quota_info["selected_high"]), int(target_high))
-        mid_cov_pre = _coverage_ratio(int(quota_info["selected_mid"]), int(target_mid))
-        passed_coverage_gate = bool(
-            high_cov_pre >= float(COVERAGE_GATE_MIN_MID_HIGH_DEFAULT)
-            and mid_cov_pre >= float(COVERAGE_GATE_MIN_MID_HIGH_DEFAULT)
-        )
-        if not passed_coverage_gate:
+        if bool(quota_info.get("drop_no_low", False)):
             dropped_by_coverage_gate_specs += 1
             continue
 
@@ -1247,14 +1301,21 @@ def main() -> int:
             augment_rejected_duplicate_total += int(augment_info["rejected_duplicate"])
             augment_rejected_validation_total += int(augment_info["rejected_validation"])
 
+            target_high_eff = _safe_int(quota_info.get("target_high"), default=target_high, minimum=0, maximum=100_000)
+            target_mid_eff = _safe_int(quota_info.get("target_mid"), default=target_mid, minimum=0, maximum=100_000)
+            target_low_eff = _safe_int(quota_info.get("target_low"), default=target_low, minimum=0, maximum=100_000)
             final_quota_info = _summarize_selected_clusters(
                 candidates=scored_candidates,
-                target_high=target_high,
-                target_mid=target_mid,
-                target_low=target_low,
+                target_high=target_high_eff,
+                target_mid=target_mid_eff,
+                target_low=target_low_eff,
             )
 
-            if int(final_quota_info["missing_high"]) > 0 or int(final_quota_info["missing_mid"]) > 0:
+            if (
+                int(final_quota_info["missing_high"]) > 0
+                or int(final_quota_info["missing_mid"]) > 0
+                or int(final_quota_info["missing_low"]) > 0
+            ):
                 dropped_after_augmentation_specs += 1
                 continue
 
@@ -1289,6 +1350,12 @@ def main() -> int:
             total_pair_strong_vs_boundary += int(pair_info.get("pair_strong_vs_boundary", 0))
             total_pair_strong_vs_weak += int(pair_info.get("pair_strong_vs_weak", 0))
             total_pair_strong_vs_hard += int(pair_info.get("pair_strong_vs_hard", 0))
+            target_requested_high_total_kept += int(target_high_eff)
+            target_requested_mid_total_kept += int(target_mid_eff)
+            target_requested_low_total_kept += int(target_low_eff)
+            target_selected_high_total_kept += int(final_quota_info["selected_high"])
+            target_selected_mid_total_kept += int(final_quota_info["selected_mid"])
+            target_selected_low_total_kept += int(final_quota_info["selected_low"])
 
             kept_specs += 1
 
@@ -1346,9 +1413,9 @@ def main() -> int:
                 "spec_idx": int(spec_idx),
                 "query_text": spec_text,
                 "target_requested": {
-                    "high": int(target_high),
-                    "mid": int(target_mid),
-                    "low": int(target_low),
+                    "high": int(target_high_eff),
+                    "mid": int(target_mid_eff),
+                    "low": int(target_low_eff),
                 },
                 "target_selected": {
                     "high": int(final_quota_info["selected_high"]),
@@ -1419,6 +1486,17 @@ def main() -> int:
     # Step 7) Save manifest + print summary
     # ======================================================
     elapsed = max(1e-6, time.time() - started)
+    kept_candidate_band_total = int(total_strong_candidates + total_boundary_candidates + total_weak_candidates)
+    kept_target_selected_total = int(
+        target_selected_high_total_kept + target_selected_mid_total_kept + target_selected_low_total_kept
+    )
+
+    def _ratio(n: int, d: int) -> float:
+        den = int(d)
+        if den <= 0:
+            return 0.0
+        return float(max(0, int(n)) / float(den))
+
     manifest = {
         "created_at_utc": datetime.now(timezone.utc).isoformat(),
         "grant_db": str(grant_db),
@@ -1429,6 +1507,7 @@ def main() -> int:
         "pairwise_output": str(pairwise_output_path),
         "listwise_output": str(listwise_output_path),
         "manifest_output": str(manifest_path),
+        "stats_output": str(stats_output_path),
         "output_path": str(raw_output_path),
         "model_id": score_model_id,
         "score_model_id": score_model_id,
@@ -1504,12 +1583,108 @@ def main() -> int:
         "total_strong_candidates": int(total_strong_candidates),
         "total_boundary_candidates": int(total_boundary_candidates),
         "total_weak_candidates": int(total_weak_candidates),
+        "target_selected_high_total_kept": int(target_selected_high_total_kept),
+        "target_selected_mid_total_kept": int(target_selected_mid_total_kept),
+        "target_selected_low_total_kept": int(target_selected_low_total_kept),
+        "target_selected_total_kept": int(kept_target_selected_total),
+        "target_selected_portions_kept": {
+            "high": float(_ratio(target_selected_high_total_kept, kept_target_selected_total)),
+            "mid": float(_ratio(target_selected_mid_total_kept, kept_target_selected_total)),
+            "low": float(_ratio(target_selected_low_total_kept, kept_target_selected_total)),
+        },
+        "candidate_band_total_kept": int(kept_candidate_band_total),
+        "candidate_band_portions_kept": {
+            "high": float(_ratio(total_strong_candidates, kept_candidate_band_total)),
+            "mid": float(_ratio(total_boundary_candidates, kept_candidate_band_total)),
+            "low": float(_ratio(total_weak_candidates, kept_candidate_band_total)),
+        },
         "parsed_json_ok_count": int(total_json_ok),
         "parsed_fallback_count": int(total_fallback),
         "elapsed_seconds": float(elapsed),
         "candidates_per_second": float(total_scored_candidates / elapsed),
     }
     manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    stats = {
+        "created_at_utc": manifest["created_at_utc"],
+        "files": {
+            "raw_output": str(raw_output_path),
+            "pairwise_output": str(pairwise_output_path),
+            "listwise_output": str(listwise_output_path),
+            "manifest_output": str(manifest_path),
+            "stats_output": str(stats_output_path),
+        },
+        "specs": {
+            "input_total": int(full_spec_count),
+            "processed_total": int(len(specs)),
+            "kept_total": int(kept_specs),
+            "dropped_by_coverage_gate": int(dropped_by_coverage_gate_specs),
+            "dropped_after_augmentation": int(dropped_after_augmentation_specs),
+            "kept_ratio_vs_processed": float(_ratio(kept_specs, len(specs))),
+            "kept_ratio_vs_input": float(_ratio(kept_specs, full_spec_count)),
+        },
+        "target_selection_kept": {
+            "requested": {
+                "high": int(target_requested_high_total_kept),
+                "mid": int(target_requested_mid_total_kept),
+                "low": int(target_requested_low_total_kept),
+                "total": int(
+                    target_requested_high_total_kept + target_requested_mid_total_kept + target_requested_low_total_kept
+                ),
+            },
+            "selected": {
+                "high": int(target_selected_high_total_kept),
+                "mid": int(target_selected_mid_total_kept),
+                "low": int(target_selected_low_total_kept),
+                "total": int(kept_target_selected_total),
+            },
+            "selected_portions": {
+                "high": float(_ratio(target_selected_high_total_kept, kept_target_selected_total)),
+                "mid": float(_ratio(target_selected_mid_total_kept, kept_target_selected_total)),
+                "low": float(_ratio(target_selected_low_total_kept, kept_target_selected_total)),
+            },
+        },
+        "candidate_bands_kept": {
+            "high": int(total_strong_candidates),
+            "mid": int(total_boundary_candidates),
+            "low": int(total_weak_candidates),
+            "total": int(kept_candidate_band_total),
+            "portions": {
+                "high": float(_ratio(total_strong_candidates, kept_candidate_band_total)),
+                "mid": float(_ratio(total_boundary_candidates, kept_candidate_band_total)),
+                "low": float(_ratio(total_weak_candidates, kept_candidate_band_total)),
+            },
+        },
+        "pairwise_rows": {
+            "total": int(total_pairwise_rows),
+            "disagreement": int(total_pair_disagreement),
+            "strong_vs_boundary": int(total_pair_strong_vs_boundary),
+            "strong_vs_weak": int(total_pair_strong_vs_weak),
+            "strong_vs_hard": int(total_pair_strong_vs_hard),
+            "portions": {
+                "disagreement": float(_ratio(total_pair_disagreement, total_pairwise_rows)),
+                "strong_vs_boundary": float(_ratio(total_pair_strong_vs_boundary, total_pairwise_rows)),
+                "strong_vs_weak": float(_ratio(total_pair_strong_vs_weak, total_pairwise_rows)),
+                "strong_vs_hard": float(_ratio(total_pair_strong_vs_hard, total_pairwise_rows)),
+            },
+        },
+        "augmentation": {
+            "enabled": bool(augmenter is not None),
+            "requested_high": int(augment_requested_high_total),
+            "requested_mid": int(augment_requested_mid_total),
+            "created_high": int(augment_created_high_total),
+            "created_mid": int(augment_created_mid_total),
+            "attempts": int(augment_attempts_total),
+            "rejected_empty": int(augment_rejected_empty_total),
+            "rejected_duplicate": int(augment_rejected_duplicate_total),
+            "rejected_validation": int(augment_rejected_validation_total),
+        },
+        "timing": {
+            "elapsed_seconds": float(elapsed),
+            "candidates_per_second": float(total_scored_candidates / elapsed),
+        },
+    }
+    stats_output_path.write_text(json.dumps(stats, ensure_ascii=False, indent=2), encoding="utf-8")
 
     print(f"spec_count_input_total={full_spec_count}")
     print(f"max_specs={max_specs}")
@@ -1581,6 +1756,7 @@ def main() -> int:
     print(f"pairwise_output={pairwise_output_path}")
     print(f"listwise_output={listwise_output_path}")
     print(f"manifest={manifest_path}")
+    print(f"stats_output={stats_output_path}")
     return 0
 
 
