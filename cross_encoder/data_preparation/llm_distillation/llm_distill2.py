@@ -587,7 +587,13 @@ def _assign_target_clusters(
     return out, info
 
 
-def _decide_adaptive_targets_121(*, candidates: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
+def _decide_adaptive_targets_with_args(
+    *,
+    candidates: Sequence[Dict[str, Any]],
+    requested_high: int,
+    requested_mid: int,
+    requested_low: int,
+) -> Dict[str, Any]:
     high_avail = int(sum(1 for c in candidates if float(c.get("llm_score_raw") or 0.0) >= float(HIGH_SCORE_MIN_DEFAULT)))
     mid_avail = int(
         sum(
@@ -599,31 +605,48 @@ def _decide_adaptive_targets_121(*, candidates: Sequence[Dict[str, Any]]) -> Dic
     low_avail = int(sum(1 for c in candidates if float(c.get("llm_score_raw") or 0.0) < float(MID_SCORE_MIN_DEFAULT)))
 
     # Policy:
-    # - Prefer 1/2/1 when possible.
-    # - If mid is short but still >=1 and high exists, fallback to 1/1/1 (no augmentation).
-    # - If high==0 or mid==0, still target 1/1/1 and recover missing high/mid via augmentation.
+    # - Try requested targets, but cap each by available real candidates when possible.
+    # - Keep at least 1/2/1 as minimum floor:
+    #   high>=1, mid>=2, low>=1.
+    # - If below the floor for high/mid, keep floor targets so augmentation can fill.
     # - Drop only when no low exists.
-    target_high = 1
-    target_mid = 2
-    target_low = 1
-    case_name = "A_1_2_1"
+    req_high = max(1, int(requested_high))
+    req_mid = max(2, int(requested_mid))
+    req_low = max(1, int(requested_low))
+    target_high = int(req_high)
+    target_mid = int(req_mid)
+    target_low = int(req_low)
+    case_name = "A_requested_or_capped"
     drop_no_low = bool(low_avail < 1)
-    if (not drop_no_low) and (high_avail >= 1) and (mid_avail == 1):
-        target_mid = 1
-        case_name = "B_1_1_1"
-    elif (not drop_no_low) and (high_avail == 0) and (mid_avail >= 1):
-        target_mid = 1
-        case_name = "C_need_high_aug"
-    elif (not drop_no_low) and (high_avail >= 1) and (mid_avail == 0):
-        target_mid = 1
-        case_name = "D_need_mid_aug"
-    elif (not drop_no_low) and (high_avail == 0) and (mid_avail == 0):
-        target_mid = 1
-        case_name = "E_need_high_mid_aug"
-    elif drop_no_low:
-        case_name = "F_drop_no_low"
+    if drop_no_low:
+        case_name = "D_drop_no_low"
+    else:
+        # high: cap if >=1 exists, otherwise keep floor(1) and let augmentation fill.
+        if high_avail >= 1:
+            target_high = int(min(req_high, high_avail))
+        else:
+            target_high = 1
+
+        # mid: cap when >=2 exists; if below floor, keep floor(2) and augment gap.
+        if mid_avail >= 2:
+            target_mid = int(min(req_mid, mid_avail))
+        else:
+            target_mid = 2
+
+        # low: cap to what exists (>=1 guaranteed here).
+        target_low = int(min(req_low, low_avail))
+
+        if target_high == req_high and target_mid == req_mid and target_low == req_low:
+            case_name = "A_requested_or_capped"
+        elif high_avail < 1 or mid_avail < 2:
+            case_name = "C_need_augmentation_to_floor"
+        else:
+            case_name = "B_capped_by_real_pool"
 
     return {
+        "requested_high": int(req_high),
+        "requested_mid": int(req_mid),
+        "requested_low": int(req_low),
         "target_high": int(target_high),
         "target_mid": int(target_mid),
         "target_low": int(target_low),
@@ -1174,7 +1197,12 @@ def main() -> int:
         total_fallback += int(fallback)
 
         scored_candidates = _normalize_llm_scores(scored_candidates)
-        adaptive = _decide_adaptive_targets_121(candidates=scored_candidates)
+        adaptive = _decide_adaptive_targets_with_args(
+            candidates=scored_candidates,
+            requested_high=target_high,
+            requested_mid=target_mid,
+            requested_low=target_low,
+        )
         scored_candidates, quota_info = _assign_target_clusters(
             candidates=scored_candidates,
             target_high=int(adaptive.get("target_high", 1)),
