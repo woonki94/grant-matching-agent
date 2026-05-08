@@ -1568,10 +1568,11 @@ def main() -> int:
                 target_low=target_low_eff,
             )
 
+            # Lenient final drop: keep partially-complete specs.
+            # Drop only when both high and mid are completely absent.
             if (
-                int(final_quota_info["missing_high"]) > 0
-                or int(final_quota_info["missing_mid"]) > 0
-                or int(final_quota_info["missing_low"]) > 0
+                int(final_quota_info["selected_high"]) <= 0
+                and int(final_quota_info["selected_mid"]) <= 0
             ):
                 dropped_after_augmentation_specs += 1
                 continue
