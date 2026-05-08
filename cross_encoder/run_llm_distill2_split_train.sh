@@ -2,13 +2,14 @@
 set -euo pipefail
 
 # ==========================================================
-# llm_distill2 -> split -> train
+# llm_distill2(augment-only) -> split -> train
 # ==========================================================
 # Usage:
 #   bash cross_encoder/run_llm_distill2_split_train.sh
 #
 # Optional: override any config below via env vars, e.g.
-#   MAX_SPECS=200 TARGET_HIGH=5 TARGET_MID=10 TARGET_LOW=5 \
+#   DISTILL_RAW_PATH=cross_encoder/dataset/distill/llm_distill2_distill_raw_scores.jsonl \
+#   TARGET_HIGH=2 TARGET_MID=4 TARGET_LOW=2 \
 #   bash cross_encoder/run_llm_distill2_split_train.sh
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -20,12 +21,11 @@ cd "${PROJECT_ROOT}"
 # ===========================
 PYTHON_BIN="${PYTHON_BIN:-python}"
 
-# Stage 1) Distill
-PREFILTER_MULTIPLIER="${PREFILTER_MULTIPLIER:-20}"
-MAX_SPECS="${MAX_SPECS:-100}"
-TARGET_HIGH="${TARGET_HIGH:-4}"
+# Stage 1) Augment-only from existing distill raw file
+DISTILL_RAW_PATH="${DISTILL_RAW_PATH:-cross_encoder/dataset/distill/llm_distill2_distill_raw_scores.jsonl}"
+TARGET_HIGH="${TARGET_HIGH:-2}"
 TARGET_MID="${TARGET_MID:-4}"
-TARGET_LOW="${TARGET_LOW:-4}"
+TARGET_LOW="${TARGET_LOW:-2}"
 
 # Stage 2) Split
 SPLIT_DIR="${SPLIT_DIR:-cross_encoder/dataset/splits}"
@@ -35,15 +35,10 @@ SPLIT_SEED="${SPLIT_SEED:-42}"
 SPLIT_OVERWRITE="${SPLIT_OVERWRITE:-true}"   # true | false
 
 # Stage 3) Train
-MODEL_ID="${MODEL_ID:-dleemiller/ModernCE-base-sts}"
-OUTPUT_DIR="${OUTPUT_DIR:-cross_encoder/models/bge_reranker_distill_llm2}"
-STAGE1_EPOCHS="${STAGE1_EPOCHS:-1}"
+STAGE1_EPOCHS="${STAGE1_EPOCHS:-2}"
 STAGE2_EPOCHS="${STAGE2_EPOCHS:-3}"
-TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-8}"
-EVAL_BATCH_SIZE="${EVAL_BATCH_SIZE:-32}"
-GRAD_ACCUM_STEPS="${GRAD_ACCUM_STEPS:-8}"
-LEARNING_RATE="${LEARNING_RATE:-2e-5}"
-NO_WANDB="${NO_WANDB:-true}"                  # true | false
+NO_WANDB="${NO_WANDB:-false}"   # true | false
+
 
 RAW_INPUT="cross_encoder/dataset/distill/llm_distill2_raw_scores.jsonl"
 PAIRWISE_INPUT="cross_encoder/dataset/distill/llm_distill2_pairwise.jsonl"
@@ -61,10 +56,10 @@ if [[ "${NO_WANDB}" == "true" ]]; then
   WANDB_FLAG="--no-wandb"
 fi
 
-log "Stage 1/3: llm_distill2"
+log "Stage 1/3: llm_distill2 (augment-only)"
 "${PYTHON_BIN}" cross_encoder/data_preparation/llm_distillation/llm_distill2.py \
-  --prefilter-multiplier "${PREFILTER_MULTIPLIER}" \
-  --max-specs "${MAX_SPECS}" \
+  --run-mode augment-only \
+  --distill-raw-path "${DISTILL_RAW_PATH}" \
   --target-high "${TARGET_HIGH}" \
   --target-mid "${TARGET_MID}" \
   --target-low "${TARGET_LOW}"
@@ -81,18 +76,9 @@ log "Stage 2/3: split_distill_dataset"
 
 log "Stage 3/3: train_bge_distill"
 "${PYTHON_BIN}" cross_encoder/train_bge_distill.py \
-  --raw-input "${RAW_INPUT}" \
-  --pairwise-input "${PAIRWISE_INPUT}" \
-  --split-dir "${SPLIT_DIR}" \
-  --use-prepared-splits \
-  --model-id "${MODEL_ID}" \
-  --output-dir "${OUTPUT_DIR}" \
   --stage1-epochs "${STAGE1_EPOCHS}" \
   --stage2-epochs "${STAGE2_EPOCHS}" \
-  --train-batch-size "${TRAIN_BATCH_SIZE}" \
-  --eval-batch-size "${EVAL_BATCH_SIZE}" \
-  --grad-accum-steps "${GRAD_ACCUM_STEPS}" \
-  --learning-rate "${LEARNING_RATE}" \
   ${WANDB_FLAG}
 
-log "Done: distill + split + train completed."
+
+log "Done: augment-only + split + train completed."

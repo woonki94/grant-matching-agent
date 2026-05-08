@@ -809,6 +809,121 @@ def _augment_missing_high_mid_for_spec(
     return synthetic_rows, stats, cursor
 
 
+def _augment_missing_high_mid_global(
+    *,
+    augmenter: Any,
+    scored_spec_rows: Sequence[Dict[str, Any]],
+    next_synthetic_id: int,
+) -> Tuple[List[Dict[str, Any]], Dict[str, int], int]:
+    out_rows: List[Dict[str, Any]] = [dict(r) for r in scored_spec_rows]
+    cursor = int(max(1, next_synthetic_id))
+    per_spec_candidates: Dict[int, List[Dict[str, Any]]] = {}
+    used_text_per_spec: Dict[int, set[str]] = {}
+
+    stats = {
+        "requested_high": 0,
+        "requested_mid": 0,
+        "created_high": 0,
+        "created_mid": 0,
+        "attempts_total": 0,
+        "rejected_empty": 0,
+        "rejected_duplicate": 0,
+        "rejected_validation": 0,
+        "unfilled_high": 0,
+        "unfilled_mid": 0,
+    }
+
+    def _build_jobs(cluster: str) -> List[Dict[str, Any]]:
+        jobs: List[Dict[str, Any]] = []
+        for row_idx, row in enumerate(out_rows):
+            spec_text = _clean_text(row.get("spec_text"))
+            if not spec_text:
+                continue
+            candidates = list(row.get("scored_candidates") or [])
+            per_spec_candidates[row_idx] = candidates
+            if row_idx not in used_text_per_spec:
+                used = {_dedup_text_key(c.get("fac_spec_text")) for c in candidates if _clean_text(c.get("fac_spec_text"))}
+                used_text_per_spec[row_idx] = {k for k in used if k}
+            quota_info = dict(row.get("quota_info") or {})
+            missing_count = int(max(0, int(quota_info.get(f"missing_{cluster}", 0))))
+            if missing_count <= 0:
+                continue
+            for _ in range(missing_count):
+                jobs.append(
+                    {
+                        "row_idx": int(row_idx),
+                        "query": spec_text,
+                        "target_cluster": cluster,
+                    }
+                )
+        return jobs
+
+    max_tries = int(max(1, AUGMENT_MAX_TRIES_PER_MISSING_DEFAULT))
+    for cluster in ("high", "mid"):
+        pending = _build_jobs(cluster=cluster)
+        stats[f"requested_{cluster}"] = int(len(pending))
+        for _try in range(max_tries):
+            if not pending:
+                break
+            prompts = [{"query": p["query"], "target_cluster": cluster} for p in pending]
+            stats["attempts_total"] += int(len(prompts))
+            outputs = augmenter.augment_batch(prompts, batch_size=int(AUGMENT_BATCH_SIZE_DEFAULT))
+            next_pending: List[Dict[str, Any]] = []
+            for job, out in zip(pending, outputs):
+                row_idx = int(job["row_idx"])
+                candidates = per_spec_candidates.get(row_idx)
+                if candidates is None:
+                    candidates = list(out_rows[row_idx].get("scored_candidates") or [])
+                    per_spec_candidates[row_idx] = candidates
+                used_text = used_text_per_spec.setdefault(row_idx, set())
+
+                augmented_text = _clean_text((out or {}).get("augmented_text"))
+                if not augmented_text:
+                    stats["rejected_empty"] += 1
+                    next_pending.append(job)
+                    continue
+                key = _dedup_text_key(augmented_text)
+                if not key or key in used_text:
+                    stats["rejected_duplicate"] += 1
+                    next_pending.append(job)
+                    continue
+                validation = dict((out or {}).get("validation") or {})
+                if not bool(validation.get("pass_valid_range")):
+                    stats["rejected_validation"] += 1
+                    next_pending.append(job)
+                    continue
+                score = _clamp_score(validation.get("score"))
+                syn_id = int(cursor)
+                cursor += 1
+                candidates.append(
+                    {
+                        "fac_id": int(-syn_id),
+                        "fac_spec_id": int(-syn_id),
+                        "fac_spec_idx": int(-syn_id),
+                        "section": f"augmented_{cluster}",
+                        "fac_spec_text": augmented_text,
+                        "prefilter_bucket": f"augmented_{cluster}",
+                        "sts_rank": -1,
+                        "sts_rank_percentile": 1.0,
+                        "llm_score_raw": float(score),
+                        "llm_score_norm": float(score),
+                        "llm_target_cluster": cluster,
+                        "selected_for_target": True,
+                        "is_augmented": True,
+                    }
+                )
+                used_text.add(key)
+                stats[f"created_{cluster}"] += 1
+            pending = next_pending
+        if pending:
+            stats[f"unfilled_{cluster}"] += int(len(pending))
+
+    for row_idx, row in enumerate(out_rows):
+        if row_idx in per_spec_candidates:
+            row["scored_candidates"] = per_spec_candidates[row_idx]
+    return out_rows, stats, cursor
+
+
 def _candidate_id(c: Dict[str, Any]) -> Tuple[int, int, int]:
     return (
         _safe_int(c.get("fac_id"), default=0, minimum=-2_147_483_648, maximum=2_147_483_647),
@@ -1034,7 +1149,7 @@ def main() -> int:
     parser.add_argument(
         "--prefilter-multiplier",
         type=float,
-        default=3.0,
+        default=10.0,
         help=(
             "Multiplier applied to each target cluster count to derive prefilter sizes. "
             "Example: target high=5 with multiplier=3.0 -> prefilter high=15."
@@ -1393,6 +1508,19 @@ def main() -> int:
             enable_validation=True,
             validation_max_new_tokens=AUGMENT_VALIDATION_MAX_NEW_TOKENS_DEFAULT,
         )
+        scored_spec_rows, global_aug_stats, synthetic_id_cursor = _augment_missing_high_mid_global(
+            augmenter=augmenter,
+            scored_spec_rows=scored_spec_rows,
+            next_synthetic_id=synthetic_id_cursor,
+        )
+        augment_requested_high_total = int(global_aug_stats.get("requested_high", 0))
+        augment_requested_mid_total = int(global_aug_stats.get("requested_mid", 0))
+        augment_created_high_total = int(global_aug_stats.get("created_high", 0))
+        augment_created_mid_total = int(global_aug_stats.get("created_mid", 0))
+        augment_attempts_total = int(global_aug_stats.get("attempts_total", 0))
+        augment_rejected_empty_total = int(global_aug_stats.get("rejected_empty", 0))
+        augment_rejected_duplicate_total = int(global_aug_stats.get("rejected_duplicate", 0))
+        augment_rejected_validation_total = int(global_aug_stats.get("rejected_validation", 0))
 
     final_iter_base = enumerate(scored_spec_rows, start=1)
     final_iter = _tqdm(final_iter_base, total=len(scored_spec_rows), desc="Finalize specs") if _tqdm is not None else final_iter_base
@@ -1407,42 +1535,6 @@ def main() -> int:
             spec_text = _clean_text(row.get("spec_text"))
             scored_candidates = list(row.get("scored_candidates") or [])
             quota_info = dict(row.get("quota_info") or {})
-
-            augment_info = {
-                "requested_high": 0,
-                "requested_mid": 0,
-                "created_high": 0,
-                "created_mid": 0,
-                "attempts_total": 0,
-                "rejected_empty": 0,
-                "rejected_duplicate": 0,
-                "rejected_validation": 0,
-                "unfilled_high": 0,
-                "unfilled_mid": 0,
-            }
-            if (
-                augmenter is not None
-                and (int(quota_info.get("missing_high", 0)) > 0 or int(quota_info.get("missing_mid", 0)) > 0)
-            ):
-                synthetic_rows, augment_info, synthetic_id_cursor = _augment_missing_high_mid_for_spec(
-                    augmenter=augmenter,
-                    spec_text=spec_text,
-                    existing_candidates=scored_candidates,
-                    missing_high=int(quota_info.get("missing_high", 0)),
-                    missing_mid=int(quota_info.get("missing_mid", 0)),
-                    next_synthetic_id=synthetic_id_cursor,
-                )
-                if synthetic_rows:
-                    scored_candidates.extend(synthetic_rows)
-
-            augment_requested_high_total += int(augment_info["requested_high"])
-            augment_requested_mid_total += int(augment_info["requested_mid"])
-            augment_created_high_total += int(augment_info["created_high"])
-            augment_created_mid_total += int(augment_info["created_mid"])
-            augment_attempts_total += int(augment_info["attempts_total"])
-            augment_rejected_empty_total += int(augment_info["rejected_empty"])
-            augment_rejected_duplicate_total += int(augment_info["rejected_duplicate"])
-            augment_rejected_validation_total += int(augment_info["rejected_validation"])
 
             target_high_eff = _safe_int(quota_info.get("target_high"), default=target_high, minimum=0, maximum=100_000)
             target_mid_eff = _safe_int(quota_info.get("target_mid"), default=target_mid, minimum=0, maximum=100_000)
