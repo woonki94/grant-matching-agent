@@ -21,11 +21,15 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from cross_encoder.data_preparation.llm_distillation.augmentation import LLMDistillationAugmenter
 from cross_encoder.data_preparation.llm_distillation.llm_distill2 import (  # noqa: E402
+    AUGMENT_BATCH_SIZE_DEFAULT,
     AUGMENT_MAX_ATTEMPTS_DEFAULT,
     AUGMENT_MAX_NEW_TOKENS_DEFAULT,
+    AUGMENT_MAX_TRIES_PER_MISSING_DEFAULT,
     AUGMENT_VALIDATION_MAX_NEW_TOKENS_DEFAULT,
     GRANT_DB_DEFAULT,
     MODEL_ID_DEFAULT,
+    _load_vllm_bundle,
+    _release_vllm_bundle,
     _augment_missing_high_mid_for_spec,
 )
 
@@ -33,7 +37,7 @@ from cross_encoder.data_preparation.llm_distillation.llm_distill2 import (  # no
 # Eval constants (no CLI args)
 # ======================================================
 GRANT_DB_PATH = GRANT_DB_DEFAULT
-MODEL_ID = MODEL_ID_DEFAULT
+MODEL_ID = "Qwen/Qwen3-14B"
 RANDOM_SEED = 42
 NEED_HIGH = 2
 NEED_MID = 2
@@ -92,39 +96,45 @@ def main() -> int:
     print(f"picked_spec_idx={spec_idx}")
     print(f"query={query}")
     print(f"need_high={int(NEED_HIGH)} need_mid={int(NEED_MID)}")
+    print(
+        "augment_runtime="
+        f"batch_size:{int(AUGMENT_BATCH_SIZE_DEFAULT)},"
+        f"max_attempts:{int(AUGMENT_MAX_ATTEMPTS_DEFAULT)},"
+        f"max_tries_per_missing:{int(AUGMENT_MAX_TRIES_PER_MISSING_DEFAULT)},"
+        f"gen_tokens:{int(AUGMENT_MAX_NEW_TOKENS_DEFAULT)},"
+        f"val_tokens:{int(AUGMENT_VALIDATION_MAX_NEW_TOKENS_DEFAULT)}"
+    )
 
+    llm = None
+    tokenizer = None
     try:
-        from vllm import LLM
-    except Exception as exc:
-        raise RuntimeError("vLLM is required but not installed in this environment.") from exc
+        llm, tokenizer, _sampling = _load_vllm_bundle(
+            model_id=_clean_text(MODEL_ID) or MODEL_ID_DEFAULT,
+            max_new_tokens=AUGMENT_MAX_NEW_TOKENS_DEFAULT,
+            temperature=0.2,
+        )
+        augmenter = LLMDistillationAugmenter(
+            llm=llm,
+            tokenizer=tokenizer,
+            model_id=_clean_text(MODEL_ID) or MODEL_ID_DEFAULT,
+            max_attempts=AUGMENT_MAX_ATTEMPTS_DEFAULT,
+            max_new_tokens=AUGMENT_MAX_NEW_TOKENS_DEFAULT,
+            temperature=0.2,
+            top_p=0.9,
+            enable_validation=True,
+            validation_max_new_tokens=AUGMENT_VALIDATION_MAX_NEW_TOKENS_DEFAULT,
+        )
 
-    llm = LLM(
-        _clean_text(MODEL_ID) or MODEL_ID_DEFAULT,
-        tensor_parallel_size=1,
-        max_model_len=4096,
-        gpu_memory_utilization=0.9,
-    )
-    tokenizer = llm.get_tokenizer()
-    augmenter = LLMDistillationAugmenter(
-        llm=llm,
-        tokenizer=tokenizer,
-        model_id=_clean_text(MODEL_ID) or MODEL_ID_DEFAULT,
-        max_attempts=AUGMENT_MAX_ATTEMPTS_DEFAULT,
-        max_new_tokens=AUGMENT_MAX_NEW_TOKENS_DEFAULT,
-        temperature=0.2,
-        top_p=0.9,
-        enable_validation=True,
-        validation_max_new_tokens=AUGMENT_VALIDATION_MAX_NEW_TOKENS_DEFAULT,
-    )
-
-    synthetic_rows, stats, _ = _augment_missing_high_mid_for_spec(
-        augmenter=augmenter,
-        spec_text=query,
-        existing_candidates=[],
-        missing_high=max(0, int(NEED_HIGH)),
-        missing_mid=max(0, int(NEED_MID)),
-        next_synthetic_id=1,
-    )
+        synthetic_rows, stats, _ = _augment_missing_high_mid_for_spec(
+            augmenter=augmenter,
+            spec_text=query,
+            existing_candidates=[],
+            missing_high=max(0, int(NEED_HIGH)),
+            missing_mid=max(0, int(NEED_MID)),
+            next_synthetic_id=1,
+        )
+    finally:
+        _release_vllm_bundle(llm)
 
     high_rows = [r for r in synthetic_rows if _clean_text(r.get("llm_target_cluster")) == "high"]
     mid_rows = [r for r in synthetic_rows if _clean_text(r.get("llm_target_cluster")) == "mid"]
