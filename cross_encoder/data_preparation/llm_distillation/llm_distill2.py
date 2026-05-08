@@ -70,7 +70,7 @@ COVERAGE_GATE_MIN_MID_HIGH_DEFAULT = 0.20
 AUGMENT_ENABLE_DEFAULT = True
 AUGMENT_MAX_ATTEMPTS_DEFAULT = 1
 AUGMENT_MAX_TRIES_PER_MISSING_DEFAULT = 1
-AUGMENT_BATCH_SIZE_DEFAULT = 32
+AUGMENT_BATCH_SIZE_DEFAULT = 256
 AUGMENT_MAX_NEW_TOKENS_DEFAULT = 512
 AUGMENT_VALIDATION_MAX_NEW_TOKENS_DEFAULT = 512
 
@@ -1201,7 +1201,7 @@ def main() -> int:
     parser.add_argument("--target-low", type=int, default=1, help="Exact target low count per spec after LLM scoring.")
     args = parser.parse_args()
 
-    prefilter_multiplier = _safe_float(args.prefilter_multiplier, default=2.0, minimum=0.0, maximum=100.0)
+    prefilter_multiplier = _safe_float(args.prefilter_multiplier, default=10.0, minimum=0.0, maximum=100.0)
     max_specs = _safe_int(args.max_specs, default=0, minimum=0, maximum=10_000_000)
     run_mode = _clean_text(args.run_mode).lower()
     target_high = _safe_int(args.target_high, default=1, minimum=0, maximum=100_000)
