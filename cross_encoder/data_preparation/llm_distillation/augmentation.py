@@ -8,19 +8,18 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 QWEN_AUGMENT_SYSTEM_PROMPT = """
 You are generating augmented training dataset for requirement matching.
-Final output must be exactly one JSON object.
+Final output must be exactly one JSON object and nothing else.
 
 Rules:
 - Keep semantic relevance to the query and target band.
-- Avoid close paraphrase and repeated n-grams from the query.
+- Avoid direct copy from the query.
 - Preserve core meaning with alternate wording (concept-equivalent phrasing, not copy).
 - For target "mid", intentionally miss at least one core concept and add a related but non-identical angle.
 
 Required JSON schema:
 {
-  "augmented_text": "<D text only: concise capability phrase, 6-24 words>",
+  "augmented_text": "<D text only: concise capability phrase, 8-26 words>",
   "target_band": "<high|mid|low>",
-  "intentionally_missing_core_concept": "<short phrase>",
   "notes": "<short phrase>"
 }
 
@@ -35,7 +34,11 @@ Quality target pattern:
 - Mid: partially aligned to one/few core aspects, with one clear conceptual gap.
 - Low: weak/adjacent relevance with clear concept gaps.
 
-No markdown fences or extra text outside the JSON object.
+Output rules (strict):
+- Do not output reasoning, analysis, or explanations.
+- Do not output markdown fences.
+- Do not output <think> tags.
+- Output only valid JSON object with the keys above.
 """.strip()
 
 QWEN_AUGMENT_USER_PROMPT_TEMPLATE = """
@@ -69,8 +72,8 @@ VALID_SCORE_RANGES: Dict[str, tuple[float, float]] = {
 
 # Lexical-diversity filters (same style as eval multi-model test).
 MAX_QUERY_TOKEN_COVERAGE = 0.60
-MAX_QUERY_BIGRAM_OVERLAP = 0.25
-MAX_QUERY_TRIGRAM_OVERLAP = 0.10
+MAX_QUERY_BIGRAM_OVERLAP = 0.45
+MAX_QUERY_TRIGRAM_OVERLAP = 0.25
 MIN_NOVEL_TOKEN_RATIO = 0.50
 MIN_QUERY_TOKEN_COVERAGE_HIGH = 0.20
 MIN_QUERY_TOKEN_COVERAGE_MID = 0.10
@@ -405,7 +408,7 @@ class LLMDistillationAugmenter:
             try:
                 sig = inspect.signature(self.tokenizer.apply_chat_template)
                 if "enable_thinking" in sig.parameters:
-                    kwargs["enable_thinking"] = True
+                    kwargs["enable_thinking"] = False
             except Exception:
                 pass
         try:

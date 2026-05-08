@@ -40,8 +40,8 @@ from cross_encoder.data_preparation.llm_distillation.llm_distill2 import (  # no
 GRANT_DB_PATH = GRANT_DB_DEFAULT
 MODEL_ID = "Qwen/Qwen3-14B"
 RANDOM_SEED = 42
-NEED_HIGH = 2
-NEED_MID = 2
+NEED_HIGH = 100
+NEED_MID = 100
 ENABLE_VALIDATION = False
 
 
@@ -103,70 +103,60 @@ def _augment_specs_batch(
     used_text_by_idx: Dict[int, set] = {i: set() for i in range(len(picked_specs))}
     accepted_by_idx: Dict[int, List[Dict[str, Any]]] = {i: [] for i in range(len(picked_specs))}
 
-    unresolved: List[Dict[str, int]] = []
-    for i in range(len(picked_specs)):
-        for _ in range(int(max(0, int(need_high)))):
-            unresolved.append({"spec_i": int(i), "cluster_i": 0})
-        for _ in range(int(max(0, int(need_mid)))):
-            unresolved.append({"spec_i": int(i), "cluster_i": 1})
-
-    cluster_name = {0: "high", 1: "mid"}
     max_tries = int(max(1, AUGMENT_MAX_TRIES_PER_MISSING_DEFAULT))
-    for _try in range(max_tries):
-        if not unresolved:
-            break
-        jobs = [
-            {
-                "query": query_by_idx[int(slot["spec_i"])],
-                "target_cluster": cluster_name[int(slot["cluster_i"])],
-            }
-            for slot in unresolved
-        ]
-        stats["attempts_total"] += int(len(jobs))
-        outs = augmenter.augment_batch(jobs, batch_size=int(AUGMENT_BATCH_SIZE_DEFAULT))
-        next_unresolved: List[Dict[str, int]] = []
-        for slot, out in zip(unresolved, outs):
-            spec_i = int(slot["spec_i"])
-            cluster = cluster_name[int(slot["cluster_i"])]
-            augmented_text = _clean_text((out or {}).get("augmented_text"))
-            if not augmented_text:
-                stats["rejected_empty"] += 1
-                next_unresolved.append(slot)
-                continue
-            key = _dedup_text_key(augmented_text)
-            if not key or key in used_text_by_idx[spec_i]:
-                stats["rejected_duplicate"] += 1
-                next_unresolved.append(slot)
-                continue
-            validation = dict((out or {}).get("validation") or {})
-            if bool(getattr(augmenter, "enable_validation", True)):
-                if not bool(validation.get("pass_valid_range")):
-                    stats["rejected_validation"] += 1
-                    next_unresolved.append(slot)
-                    continue
-                score = float(validation.get("score") or 0.0)
-            else:
-                score = 0.0
-            accepted_by_idx[spec_i].append(
-                {
-                    "cluster": cluster,
-                    "text": augmented_text,
-                    "score": score,
-                }
-            )
-            used_text_by_idx[spec_i].add(key)
-            if cluster == "high":
-                stats["created_high"] += 1
-            elif cluster == "mid":
-                stats["created_mid"] += 1
-        unresolved = next_unresolved
+    for cluster, need in (("high", int(max(0, int(need_high)))), ("mid", int(max(0, int(need_mid))))):
+        unresolved: List[int] = []
+        for i in range(len(picked_specs)):
+            for _ in range(need):
+                unresolved.append(int(i))
 
-    for slot in unresolved:
-        cluster = cluster_name[int(slot["cluster_i"])]
-        if cluster == "high":
-            stats["unfilled_high"] += 1
-        elif cluster == "mid":
-            stats["unfilled_mid"] += 1
+        for _try in range(max_tries):
+            if not unresolved:
+                break
+            jobs = [{"query": query_by_idx[int(spec_i)], "target_cluster": cluster} for spec_i in unresolved]
+            stats["attempts_total"] += int(len(jobs))
+            outs = augmenter.augment_batch(jobs, batch_size=int(AUGMENT_BATCH_SIZE_DEFAULT))
+            next_unresolved: List[int] = []
+            for spec_i, out in zip(unresolved, outs):
+                spec_i = int(spec_i)
+                augmented_text = _clean_text((out or {}).get("augmented_text"))
+                if not augmented_text:
+                    stats["rejected_empty"] += 1
+                    next_unresolved.append(spec_i)
+                    continue
+                key = _dedup_text_key(augmented_text)
+                if not key or key in used_text_by_idx[spec_i]:
+                    stats["rejected_duplicate"] += 1
+                    next_unresolved.append(spec_i)
+                    continue
+                validation = dict((out or {}).get("validation") or {})
+                if bool(getattr(augmenter, "enable_validation", True)):
+                    if not bool(validation.get("pass_valid_range")):
+                        stats["rejected_validation"] += 1
+                        next_unresolved.append(spec_i)
+                        continue
+                    score = float(validation.get("score") or 0.0)
+                else:
+                    score = 0.0
+                accepted_by_idx[spec_i].append(
+                    {
+                        "cluster": cluster,
+                        "text": augmented_text,
+                        "score": score,
+                    }
+                )
+                used_text_by_idx[spec_i].add(key)
+                if cluster == "high":
+                    stats["created_high"] += 1
+                else:
+                    stats["created_mid"] += 1
+            unresolved = next_unresolved
+
+        if unresolved:
+            if cluster == "high":
+                stats["unfilled_high"] += int(len(unresolved))
+            else:
+                stats["unfilled_mid"] += int(len(unresolved))
 
     for i, spec in enumerate(picked_specs):
         results.append(
