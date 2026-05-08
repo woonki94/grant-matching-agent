@@ -859,9 +859,17 @@ def _augment_missing_high_mid_global(
         return jobs
 
     max_tries = int(max(1, AUGMENT_MAX_TRIES_PER_MISSING_DEFAULT))
+    try:
+        from tqdm import tqdm as _tqdm  # type: ignore
+    except Exception:
+        _tqdm = None
+
     for cluster in ("high", "mid"):
         pending = _build_jobs(cluster=cluster)
         stats[f"requested_{cluster}"] = int(len(pending))
+        total_slots = int(len(pending))
+        aug_bar = _tqdm(total=total_slots, desc=f"Augment {cluster}", leave=False) if (_tqdm is not None and total_slots > 0) else None
+        resolved_slots = 0
         for _try in range(max_tries):
             if not pending:
                 break
@@ -915,8 +923,22 @@ def _augment_missing_high_mid_global(
                 used_text.add(key)
                 stats[f"created_{cluster}"] += 1
             pending = next_pending
+            newly_resolved = int(total_slots - len(pending) - resolved_slots)
+            if newly_resolved > 0 and aug_bar is not None:
+                aug_bar.update(newly_resolved)
+            resolved_slots += max(0, newly_resolved)
+            if (_tqdm is None) and total_slots > 0:
+                print(
+                    f"augment_{cluster}_progress="
+                    f"{min(total_slots, resolved_slots)}/{total_slots} "
+                    f"try={_try + 1}/{max_tries}"
+                )
         if pending:
             stats[f"unfilled_{cluster}"] += int(len(pending))
+        if aug_bar is not None:
+            if resolved_slots < total_slots:
+                aug_bar.update(int(total_slots - resolved_slots))
+            aug_bar.close()
 
     for row_idx, row in enumerate(out_rows):
         if row_idx in per_spec_candidates:
