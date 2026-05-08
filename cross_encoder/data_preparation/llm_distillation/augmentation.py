@@ -53,7 +53,25 @@ Desired judge score range:
 
 Preferred center:
 {target_center}
+
+Band-specific generation rule:
+{band_rule}
 """.strip()
+
+
+BAND_RULES: Dict[str, str] = {
+    "high": (
+        "Keep strong semantic match to the requirement while using different wording. "
+        "Preserve most core concepts and objective."
+    ),
+    "mid": (
+        "Produce a partial match. Keep 1-2 core concepts, but intentionally leave out one central concept "
+        "(objective, method, or constraint). Do not fully satisfy all core concepts."
+    ),
+    "low": (
+        "Keep only weak/adjacent relevance and leave multiple core concepts uncovered."
+    ),
+}
 
 
 # Sharp generation target range.
@@ -420,12 +438,14 @@ class LLMDistillationAugmenter:
     def _build_prompt(self, *, query: str, target_cluster: str) -> str:
         target_min, target_max = _range_for_cluster(target_cluster, AIM_SCORE_RANGES)
         target_band = _normalize_target_cluster(target_cluster)
+        band_rule = _clean_text(BAND_RULES.get(target_band) or BAND_RULES["mid"])
         user_prompt = QWEN_AUGMENT_USER_PROMPT_TEMPLATE.format(
             query=_clean_text(query),
             target_band=target_band,
             target_min=f"{target_min:.2f}",
             target_max=f"{target_max:.2f}",
             target_center=f"{((target_min + target_max) / 2.0):.2f}",
+            band_rule=band_rule,
         )
         messages = [
             {"role": "system", "content": QWEN_AUGMENT_SYSTEM_PROMPT},
