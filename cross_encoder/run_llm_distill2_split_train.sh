@@ -23,9 +23,9 @@ PYTHON_BIN="${PYTHON_BIN:-python}"
 
 # Stage 1) Augment-only from existing distill raw file
 DISTILL_RAW_PATH="${DISTILL_RAW_PATH:-cross_encoder/dataset/distill/llm_distill2_distill_raw_scores.jsonl}"
-TARGET_HIGH="${TARGET_HIGH:-2}"
-TARGET_MID="${TARGET_MID:-4}"
-TARGET_LOW="${TARGET_LOW:-2}"
+TARGET_HIGH="${TARGET_HIGH:-4}"
+TARGET_MID="${TARGET_MID:-8}"
+TARGET_LOW="${TARGET_LOW:-4}"
 
 # Stage 2) Split
 SPLIT_DIR="${SPLIT_DIR:-cross_encoder/dataset/splits}"
@@ -38,6 +38,13 @@ SPLIT_OVERWRITE="${SPLIT_OVERWRITE:-true}"   # true | false
 STAGE1_EPOCHS="${STAGE1_EPOCHS:-2}"
 STAGE2_EPOCHS="${STAGE2_EPOCHS:-3}"
 NO_WANDB="${NO_WANDB:-false}"   # true | false
+TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-2}"
+EVAL_BATCH_SIZE="${EVAL_BATCH_SIZE:-16}"
+GRAD_ACCUM_STEPS="${GRAD_ACCUM_STEPS:-16}"
+MAX_LENGTH="${MAX_LENGTH:-256}"
+CANDIDATE_POOL_SIZE="${CANDIDATE_POOL_SIZE:-32}"
+MINI_LIST_SIZE="${MINI_LIST_SIZE:-8}"
+BF16="${BF16:-true}"   # true | false
 
 
 RAW_INPUT="cross_encoder/dataset/distill/llm_distill2_raw_scores.jsonl"
@@ -56,9 +63,14 @@ if [[ "${NO_WANDB}" == "true" ]]; then
   WANDB_FLAG="--no-wandb"
 fi
 
+BF16_FLAG=""
+if [[ "${BF16}" == "true" ]]; then
+  BF16_FLAG="--bf16"
+fi
+
 log "Stage 1/3: llm_distill2 (augment-only)"
 "${PYTHON_BIN}" cross_encoder/data_preparation/llm_distillation/llm_distill2.py \
-  --run-mode augment-only \
+  --run-mode full \
   --distill-raw-path "${DISTILL_RAW_PATH}" \
   --target-high "${TARGET_HIGH}" \
   --target-mid "${TARGET_MID}" \
@@ -78,6 +90,13 @@ log "Stage 3/3: train_bge_distill"
 "${PYTHON_BIN}" cross_encoder/train_bge_distill.py \
   --stage1-epochs "${STAGE1_EPOCHS}" \
   --stage2-epochs "${STAGE2_EPOCHS}" \
+  --train-batch-size "${TRAIN_BATCH_SIZE}" \
+  --eval-batch-size "${EVAL_BATCH_SIZE}" \
+  --grad-accum-steps "${GRAD_ACCUM_STEPS}" \
+  --max-length "${MAX_LENGTH}" \
+  --candidate-pool-size "${CANDIDATE_POOL_SIZE}" \
+  --mini-list-size "${MINI_LIST_SIZE}" \
+  ${BF16_FLAG} \
   ${WANDB_FLAG}
 
 

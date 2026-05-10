@@ -1171,7 +1171,7 @@ def main() -> int:
     parser.add_argument(
         "--prefilter-multiplier",
         type=float,
-        default=10.0,
+        default=30.0,
         help=(
             "Multiplier applied to each target cluster count to derive prefilter sizes. "
             "Example: target high=5 with multiplier=3.0 -> prefilter high=15."
