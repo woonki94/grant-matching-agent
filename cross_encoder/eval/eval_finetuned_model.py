@@ -34,8 +34,9 @@ if str(PROJECT_ROOT) not in sys.path:
 from db.db_conn import SessionLocal
 
 
-FINETUNED_MODEL_DEFAULT = "cross_encoder/models/bge_reranker_distill"
-FINETUNED_MODEL_LEGACY_DEFAULT = "cross_encoder/spec_to_spec/models/spec_to_spec_finetuned_ce"
+FINETUNED_MODEL_LEGACY_DEFAULT = "cross_encoder/models/bge_reranker_distill__sd42_s12_s23_bs2_ga16_cp32_ml8_lr2em05_t2_kl1_pw0p5_mse0p05/stage1_epoch_2"
+FINETUNED_MODEL_CURRENT_DEFAULT = "cross_encoder/models/bge_reranker_distill"
+FINETUNED_MODEL_DEFAULT = FINETUNED_MODEL_LEGACY_DEFAULT
 PURE_BGE_MODEL_ID = "dleemiller/ModernCE-base-sts"
 OUTPUT_DIR_DEFAULT = "cross_encoder/eval/results"
 DISTILL_INPUT_DEFAULT = "cross_encoder/dataset/distill/llm_distill2_raw_scores.jsonl"
@@ -129,7 +130,7 @@ def _is_hf_model_dir(path: Path) -> bool:
 
 
 def _resolve_default_finetuned_model_ref() -> str:
-    base = _resolve_path(FINETUNED_MODEL_DEFAULT)
+    base = _resolve_path(FINETUNED_MODEL_CURRENT_DEFAULT)
     legacy = _resolve_path(FINETUNED_MODEL_LEGACY_DEFAULT)
 
     candidates: List[Path] = []
@@ -1086,8 +1087,8 @@ def _run_distill_eval(args: argparse.Namespace) -> int:
     if ground_truth_mode not in {"normalized", "raw"}:
         ground_truth_mode = "normalized"
 
-    finetuned_arg = _clean_text(args.finetuned_model)
-    if (not finetuned_arg) or (finetuned_arg == FINETUNED_MODEL_DEFAULT):
+    finetuned_arg = _clean_text(args.finetuned_model) or FINETUNED_MODEL_DEFAULT
+    if bool(args.auto_resolve_finetuned):
         finetuned_ref = _resolve_default_finetuned_model_ref()
     else:
         finetuned_ref = _resolve_model_ref(finetuned_arg)
@@ -1367,6 +1368,15 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--embedding-model-id", type=str, default="", help="Optional model filter for specialization tables.")
 
     p.add_argument("--finetuned-model", type=str, default=FINETUNED_MODEL_DEFAULT)
+    p.add_argument(
+        "--auto-resolve-finetuned",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Auto-pick latest available finetuned checkpoint (best/stage* search across "
+            "current+legacy model dirs). Default false uses --finetuned-model path as-is."
+        ),
+    )
     p.add_argument("--base-model", type=str, default=PURE_BGE_MODEL_ID)
     p.add_argument("--batch-size", type=int, default=32)
     p.add_argument("--max-length", type=int, default=512)
@@ -1483,8 +1493,8 @@ def main() -> int:
     if cluster_mid_min > cluster_strong_min:
         cluster_mid_min = cluster_strong_min
 
-    finetuned_arg = _clean_text(args.finetuned_model)
-    if (not finetuned_arg) or (finetuned_arg == FINETUNED_MODEL_DEFAULT):
+    finetuned_arg = _clean_text(args.finetuned_model) or FINETUNED_MODEL_DEFAULT
+    if bool(args.auto_resolve_finetuned):
         finetuned_ref = _resolve_default_finetuned_model_ref()
     else:
         finetuned_ref = _resolve_model_ref(finetuned_arg)
