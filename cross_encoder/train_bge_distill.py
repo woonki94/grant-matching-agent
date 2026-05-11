@@ -2854,6 +2854,24 @@ def _build_parser() -> argparse.ArgumentParser:
 
     p.add_argument("--stage1-epochs", type=int, default=1)
     p.add_argument("--stage2-epochs", type=int, default=3)
+    p.add_argument(
+        "--stage1-early-stop",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Enable Stage1 early stopping using val_pair_loss (epoch-level patience).",
+    )
+    p.add_argument(
+        "--stage1-early-stop-patience",
+        type=int,
+        default=1,
+        help="Stage1 early-stop patience in epochs without val_pair_loss improvement.",
+    )
+    p.add_argument(
+        "--stage2-start-from-best-stage1",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Before Stage2, reload checkpoint from best_stage1_val_pair_loss if available.",
+    )
     p.add_argument("--train-batch-size", type=int, default=8)
     p.add_argument("--eval-batch-size", type=int, default=32)
     p.add_argument("--grad-accum-steps", type=int, default=8)
@@ -3147,6 +3165,9 @@ def main() -> int:
 
     stage1_epochs = _safe_int(args.stage1_epochs, default=1, minimum=0, maximum=100)
     stage2_epochs = _safe_int(args.stage2_epochs, default=3, minimum=0, maximum=100)
+    stage1_early_stop = bool(args.stage1_early_stop)
+    stage1_early_stop_patience = _safe_int(args.stage1_early_stop_patience, default=1, minimum=0, maximum=1000)
+    stage2_start_from_best_stage1 = bool(args.stage2_start_from_best_stage1)
     train_batch_size = _safe_int(args.train_batch_size, default=8, minimum=1, maximum=4096)
     eval_batch_size = _safe_int(args.eval_batch_size, default=32, minimum=1, maximum=4096)
     grad_accum_steps = _safe_int(args.grad_accum_steps, default=8, minimum=1, maximum=1024)
@@ -3374,6 +3395,12 @@ def main() -> int:
     print(f"output_dir={output_dir}")
     print(f"use_tqdm={use_tqdm}")
     print(f"use_prepared_splits={use_prepared_splits}")
+    print(
+        "stage1_control="
+        f"early_stop:{stage1_early_stop},"
+        f"patience:{stage1_early_stop_patience},"
+        f"stage2_start_from_best_stage1:{stage2_start_from_best_stage1}"
+    )
     print(f"train_band_thresholds=high:{train_band_high_threshold:.2f},mid:{train_band_mid_threshold:.2f}")
     print(
         "pair_type_weighting="
@@ -3772,6 +3799,19 @@ def main() -> int:
         )
 
     best_ndcg = -1.0
+    best_stage1_val_pair_loss = float("inf")
+    best_stage1_val_pair_loss_step = -1
+    best_stage1_val_pair_loss_epoch = -1
+    best_stage1_val_pair_loss_source = ""
+    best_val_total_loss = float("inf")
+    best_val_total_loss_step = -1
+    best_val_total_loss_epoch = -1
+    best_val_total_loss_source = ""
+    best_val_total_loss_components: Dict[str, float] = {
+        "val_kl_loss": 0.0,
+        "val_pair_loss": 0.0,
+        "val_mse_loss": 0.0,
+    }
     history: List[Dict[str, Any]] = []
     global_step = 0
     start_time = time.time()
@@ -3837,6 +3877,112 @@ def main() -> int:
             "val_list_batches": float(len(kl_vals)),
         }
 
+    def maybe_save_best_val_total_loss(
+        *,
+        epoch: int,
+        global_step_now: int,
+        val_total_loss: float,
+        val_kl_loss: float,
+        val_pair_loss: float,
+        val_mse_loss: float,
+        source: str,
+    ) -> None:
+        nonlocal best_val_total_loss
+        nonlocal best_val_total_loss_step
+        nonlocal best_val_total_loss_epoch
+        nonlocal best_val_total_loss_source
+        nonlocal best_val_total_loss_components
+
+        current = float(val_total_loss)
+        if not math.isfinite(current):
+            return
+        if current >= float(best_val_total_loss):
+            return
+
+        best_val_total_loss = float(current)
+        best_val_total_loss_step = int(global_step_now)
+        best_val_total_loss_epoch = int(epoch)
+        best_val_total_loss_source = _clean_text(source) or "unknown"
+        best_val_total_loss_components = {
+            "val_kl_loss": float(val_kl_loss),
+            "val_pair_loss": float(val_pair_loss),
+            "val_mse_loss": float(val_mse_loss),
+        }
+
+        best_loss_dir = output_dir / "best_val_loss"
+        best_loss_dir.mkdir(parents=True, exist_ok=True)
+        model.save_pretrained(best_loss_dir)
+        tokenizer.save_pretrained(best_loss_dir)
+        (best_loss_dir / "best_val_loss_meta.json").write_text(
+            json.dumps(
+                {
+                    "best_val_total_loss": float(best_val_total_loss),
+                    "epoch": int(best_val_total_loss_epoch),
+                    "global_step": int(best_val_total_loss_step),
+                    "source": str(best_val_total_loss_source),
+                    "components": dict(best_val_total_loss_components),
+                },
+                ensure_ascii=False,
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+        print(
+            "best_val_total_loss_update="
+            f"{best_val_total_loss:.6f} "
+            f"epoch={best_val_total_loss_epoch} "
+            f"step={best_val_total_loss_step} "
+            f"source={best_val_total_loss_source}"
+        )
+
+    def maybe_save_best_stage1_val_pair_loss(
+        *,
+        epoch: int,
+        global_step_now: int,
+        val_pair_loss: float,
+        source: str,
+    ) -> None:
+        nonlocal best_stage1_val_pair_loss
+        nonlocal best_stage1_val_pair_loss_step
+        nonlocal best_stage1_val_pair_loss_epoch
+        nonlocal best_stage1_val_pair_loss_source
+
+        current = float(val_pair_loss)
+        if not math.isfinite(current):
+            return
+        if current >= float(best_stage1_val_pair_loss):
+            return
+
+        best_stage1_val_pair_loss = float(current)
+        best_stage1_val_pair_loss_step = int(global_step_now)
+        best_stage1_val_pair_loss_epoch = int(epoch)
+        best_stage1_val_pair_loss_source = _clean_text(source) or "unknown"
+
+        best_stage1_dir = output_dir / "best_stage1_val_pair_loss"
+        best_stage1_dir.mkdir(parents=True, exist_ok=True)
+        model.save_pretrained(best_stage1_dir)
+        tokenizer.save_pretrained(best_stage1_dir)
+        (best_stage1_dir / "best_stage1_val_pair_loss_meta.json").write_text(
+            json.dumps(
+                {
+                    "best_stage1_val_pair_loss": float(best_stage1_val_pair_loss),
+                    "epoch": int(best_stage1_val_pair_loss_epoch),
+                    "global_step": int(best_stage1_val_pair_loss_step),
+                    "source": str(best_stage1_val_pair_loss_source),
+                },
+                ensure_ascii=False,
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+        print(
+            "best_stage1_val_pair_loss_update="
+            f"{best_stage1_val_pair_loss:.6f} "
+            f"epoch={best_stage1_val_pair_loss_epoch} "
+            f"step={best_stage1_val_pair_loss_step} "
+            f"source={best_stage1_val_pair_loss_source}"
+        )
+
     def run_step_validation(*, stage: int, epoch: int, global_step_now: int) -> None:
         if int(eval_every_steps) <= 0:
             return
@@ -3858,6 +4004,12 @@ def main() -> int:
                     "eval/loss_pair_step": float(val_pair_loss),
                 },
                 step=int(global_step_now),
+            )
+            maybe_save_best_stage1_val_pair_loss(
+                epoch=int(epoch),
+                global_step_now=int(global_step_now),
+                val_pair_loss=float(val_pair_loss),
+                source="step_eval",
             )
             return
 
@@ -3885,10 +4037,21 @@ def main() -> int:
             },
             step=int(global_step_now),
         )
+        maybe_save_best_val_total_loss(
+            epoch=int(epoch),
+            global_step_now=int(global_step_now),
+            val_total_loss=float(val_total_loss),
+            val_kl_loss=float(val_kl_loss),
+            val_pair_loss=float(val_pair_loss),
+            val_mse_loss=float(val_mse_loss),
+            source="step_eval",
+        )
 
     # Stage 1: pairwise warm start.
     if stage1_epochs > 0:
         print(f"stage1_start=true epochs={stage1_epochs}")
+        stage1_no_improve_epochs = 0
+        stage1_best_epoch_val_pair_loss = float("inf")
         for epoch in range(1, stage1_epochs + 1):
             model.train()
             epoch_losses: List[float] = []
@@ -3993,14 +4156,48 @@ def main() -> int:
                 },
                 step=global_step if global_step > 0 else None,
             )
+            maybe_save_best_stage1_val_pair_loss(
+                epoch=int(epoch),
+                global_step_now=int(global_step),
+                val_pair_loss=float(val_pair_loss),
+                source="epoch_eval",
+            )
 
             stage1_dir = output_dir / f"stage1_epoch_{epoch}"
             stage1_dir.mkdir(parents=True, exist_ok=True)
             model.save_pretrained(stage1_dir)
             tokenizer.save_pretrained(stage1_dir)
 
+            improved_epoch = float(val_pair_loss) < float(stage1_best_epoch_val_pair_loss)
+            if improved_epoch:
+                stage1_best_epoch_val_pair_loss = float(val_pair_loss)
+                stage1_no_improve_epochs = 0
+            else:
+                stage1_no_improve_epochs += 1
+
+            if bool(stage1_early_stop) and int(stage1_no_improve_epochs) >= int(stage1_early_stop_patience):
+                print(
+                    "stage1_early_stop=true "
+                    f"epoch={epoch} "
+                    f"no_improve_epochs={stage1_no_improve_epochs} "
+                    f"patience={stage1_early_stop_patience} "
+                    f"best_epoch_val_pair_loss={stage1_best_epoch_val_pair_loss:.6f}"
+                )
+                break
+
     # Stage 2: listwise KD + pairwise + MSE.
     if stage2_epochs > 0:
+        if bool(stage2_start_from_best_stage1) and int(stage1_epochs) > 0:
+            best_stage1_dir = output_dir / "best_stage1_val_pair_loss"
+            if best_stage1_dir.exists():
+                print(f"stage2_init_from_best_stage1=true ckpt={best_stage1_dir}")
+                model = AutoModelForSequenceClassification.from_pretrained(str(best_stage1_dir), num_labels=1).to(device)
+                optimizer = AdamW(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
+            else:
+                print(
+                    "stage2_init_from_best_stage1=false "
+                    f"reason=missing_checkpoint path={best_stage1_dir}"
+                )
         print(f"stage2_start=true epochs={stage2_epochs}")
 
         pair_cycle = _make_pair_iterator(pair_train_loader)
@@ -4222,6 +4419,15 @@ def main() -> int:
                 },
                 step=global_step if global_step > 0 else None,
             )
+            maybe_save_best_val_total_loss(
+                epoch=int(epoch),
+                global_step_now=int(global_step),
+                val_total_loss=float(val_total_loss),
+                val_kl_loss=float(val_kl_loss),
+                val_pair_loss=float(val_pair_loss),
+                val_mse_loss=float(val_mse_loss),
+                source="epoch_eval",
+            )
 
             epoch_dir = output_dir / f"stage2_epoch_{epoch}"
             epoch_dir.mkdir(parents=True, exist_ok=True)
@@ -4353,6 +4559,9 @@ def main() -> int:
         "margin_clip": {"min": float(margin_min), "max": float(margin_max)},
         "stage1_epochs": int(stage1_epochs),
         "stage2_epochs": int(stage2_epochs),
+        "stage1_early_stop": bool(stage1_early_stop),
+        "stage1_early_stop_patience": int(stage1_early_stop_patience),
+        "stage2_start_from_best_stage1": bool(stage2_start_from_best_stage1),
         "train_batch_size": int(train_batch_size),
         "eval_batch_size": int(eval_batch_size),
         "eval_every_steps": int(eval_every_steps),
@@ -4365,6 +4574,19 @@ def main() -> int:
         "use_amp": bool(use_amp),
         "amp_dtype": str(amp_dtype) if use_amp else "",
         "best_ndcg@10": float(best_ndcg),
+        "best_stage1_val_pair_loss": (
+            float(best_stage1_val_pair_loss) if math.isfinite(best_stage1_val_pair_loss) else -1.0
+        ),
+        "best_stage1_val_pair_loss_step": int(best_stage1_val_pair_loss_step),
+        "best_stage1_val_pair_loss_epoch": int(best_stage1_val_pair_loss_epoch),
+        "best_stage1_val_pair_loss_source": str(best_stage1_val_pair_loss_source),
+        "best_stage1_val_pair_loss_checkpoint": str((output_dir / "best_stage1_val_pair_loss").resolve()),
+        "best_val_total_loss": float(best_val_total_loss) if math.isfinite(best_val_total_loss) else -1.0,
+        "best_val_total_loss_step": int(best_val_total_loss_step),
+        "best_val_total_loss_epoch": int(best_val_total_loss_epoch),
+        "best_val_total_loss_source": str(best_val_total_loss_source),
+        "best_val_total_loss_components": dict(best_val_total_loss_components),
+        "best_val_total_loss_checkpoint": str((output_dir / "best_val_loss").resolve()),
         "test_metrics": test_metrics,
         "elapsed_seconds": float(elapsed),
         "history": history,
@@ -4384,6 +4606,10 @@ def main() -> int:
         wandb_run,
         {
             "run/best_ndcg@10": float(best_ndcg),
+            "run/best_stage1_val_pair_loss": (
+                float(best_stage1_val_pair_loss) if math.isfinite(best_stage1_val_pair_loss) else -1.0
+            ),
+            "run/best_val_total_loss": float(best_val_total_loss) if math.isfinite(best_val_total_loss) else -1.0,
             "run/elapsed_seconds": float(elapsed),
         },
         step=global_step if global_step > 0 else None,
@@ -4396,6 +4622,16 @@ def main() -> int:
 
     print("done=true")
     print(f"best_ndcg@10={best_ndcg:.6f}")
+    if math.isfinite(best_stage1_val_pair_loss):
+        print(f"best_stage1_val_pair_loss={best_stage1_val_pair_loss:.6f}")
+        print(f"best_stage1_val_pair_loss_step={best_stage1_val_pair_loss_step}")
+        print(f"best_stage1_val_pair_loss_epoch={best_stage1_val_pair_loss_epoch}")
+        print(f"best_stage1_val_pair_loss_ckpt={output_dir / 'best_stage1_val_pair_loss'}")
+    if math.isfinite(best_val_total_loss):
+        print(f"best_val_total_loss={best_val_total_loss:.6f}")
+        print(f"best_val_total_loss_step={best_val_total_loss_step}")
+        print(f"best_val_total_loss_epoch={best_val_total_loss_epoch}")
+        print(f"best_val_total_loss_ckpt={output_dir / 'best_val_loss'}")
     print(f"elapsed_seconds={elapsed:.2f}")
     print(f"manifest={manifest_path}")
     return 0

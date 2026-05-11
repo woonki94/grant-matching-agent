@@ -29,8 +29,11 @@ MODEL_ID="${MODEL_ID:-dleemiller/ModernCE-base-sts}"
 
 # Train schedule
 SEED="${SEED:-42}"
-STAGE1_EPOCHS="${STAGE1_EPOCHS:-2}"
-STAGE2_EPOCHS="${STAGE2_EPOCHS:-1}"
+STAGE1_EPOCHS="${STAGE1_EPOCHS:-3}"
+STAGE2_EPOCHS="${STAGE2_EPOCHS:-2}"
+STAGE1_EARLY_STOP="${STAGE1_EARLY_STOP:-true}"                 # true | false
+STAGE1_EARLY_STOP_PATIENCE="${STAGE1_EARLY_STOP_PATIENCE:-1}"  # epochs
+STAGE2_START_FROM_BEST_STAGE1="${STAGE2_START_FROM_BEST_STAGE1:-true}"  # true | false
 
 # Memory-safe knobs
 TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-2}"
@@ -48,7 +51,7 @@ LOSS_MSE_WEIGHT="${LOSS_MSE_WEIGHT:-0.40}"
 TEACHER_TEMPERATURE="${TEACHER_TEMPERATURE:-1.0}"
 
 # Misc
-LEARNING_RATE="${LEARNING_RATE:-1e-5}"
+LEARNING_RATE="${LEARNING_RATE:-1e-7}"
 WEIGHT_DECAY="${WEIGHT_DECAY:-0.01}"
 MAX_GRAD_NORM="${MAX_GRAD_NORM:-1.0}"
 LOG_EVERY_STEPS="${LOG_EVERY_STEPS:-50}"
@@ -76,6 +79,7 @@ log "split_dir=${SPLIT_DIR}"
 log "output_dir=${OUTPUT_DIR}"
 log "model_id=${MODEL_ID}"
 log "stage1_epochs=${STAGE1_EPOCHS} stage2_epochs=${STAGE2_EPOCHS}"
+log "stage1_early_stop=${STAGE1_EARLY_STOP} patience=${STAGE1_EARLY_STOP_PATIENCE} stage2_start_from_best_stage1=${STAGE2_START_FROM_BEST_STAGE1}"
 log "train_batch_size=${TRAIN_BATCH_SIZE} eval_batch_size=${EVAL_BATCH_SIZE} grad_accum_steps=${GRAD_ACCUM_STEPS}"
 log "max_length=${MAX_LENGTH} candidate_pool_size=${CANDIDATE_POOL_SIZE} mini_list_size=${MINI_LIST_SIZE}"
 log "loss_kl=${LOSS_KL_WEIGHT} loss_pair=${LOSS_PAIR_WEIGHT} loss_mse=${LOSS_MSE_WEIGHT} teacher_temperature=${TEACHER_TEMPERATURE}"
@@ -90,6 +94,7 @@ CMD=(
   --seed "${SEED}"
   --stage1-epochs "${STAGE1_EPOCHS}"
   --stage2-epochs "${STAGE2_EPOCHS}"
+  --stage1-early-stop-patience "${STAGE1_EARLY_STOP_PATIENCE}"
   --train-batch-size "${TRAIN_BATCH_SIZE}"
   --eval-batch-size "${EVAL_BATCH_SIZE}"
   --grad-accum-steps "${GRAD_ACCUM_STEPS}"
@@ -112,6 +117,18 @@ if BOOL_TRUE "${USE_PREPARED_SPLITS}"; then
   CMD+=(--use-prepared-splits)
 else
   CMD+=(--no-use-prepared-splits)
+fi
+
+if BOOL_TRUE "${STAGE1_EARLY_STOP}"; then
+  CMD+=(--stage1-early-stop)
+else
+  CMD+=(--no-stage1-early-stop)
+fi
+
+if BOOL_TRUE "${STAGE2_START_FROM_BEST_STAGE1}"; then
+  CMD+=(--stage2-start-from-best-stage1)
+else
+  CMD+=(--no-stage2-start-from-best-stage1)
 fi
 
 if BOOL_TRUE "${REGENERATE_SPLITS}"; then

@@ -1594,10 +1594,16 @@ def main() -> int:
                 c["is_disagreement"] = bool(_is_disagreement_candidate(c))
                 c["type"] = "hard_negative" if bool(c["is_disagreement"]) else _clean_text(c["band"])
 
-            total_disagreement_candidates += int(sum(1 for c in scored_candidates if bool(c.get("is_disagreement"))))
-            total_strong_candidates += int(sum(1 for c in scored_candidates if _clean_text(c.get("band")) == "strong"))
-            total_boundary_candidates += int(sum(1 for c in scored_candidates if _clean_text(c.get("band")) == "boundary"))
-            total_weak_candidates += int(sum(1 for c in scored_candidates if _clean_text(c.get("band")) == "weak"))
+            # Keep output docs focused on target-selected subset only.
+            # This avoids flooding listwise/raw with unselected low tails.
+            output_candidates = [c for c in scored_candidates if bool(c.get("selected_for_target"))]
+            if not output_candidates:
+                output_candidates = list(scored_candidates)
+
+            total_disagreement_candidates += int(sum(1 for c in output_candidates if bool(c.get("is_disagreement"))))
+            total_strong_candidates += int(sum(1 for c in output_candidates if _clean_text(c.get("band")) == "strong"))
+            total_boundary_candidates += int(sum(1 for c in output_candidates if _clean_text(c.get("band")) == "boundary"))
+            total_weak_candidates += int(sum(1 for c in output_candidates if _clean_text(c.get("band")) == "weak"))
 
             pair_rows, pair_info = _build_controlled_pairwise_records(
                 grant_id=grant_id,
@@ -1622,7 +1628,7 @@ def main() -> int:
             kept_specs += 1
 
             sorted_candidates = sorted(
-                scored_candidates,
+                output_candidates,
                 key=lambda x: float(
                     x.get("llm_score_norm")
                     if x.get("llm_score_norm") is not None
