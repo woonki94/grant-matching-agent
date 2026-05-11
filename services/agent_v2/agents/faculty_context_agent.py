@@ -6,10 +6,11 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
-from config import settings
+from config import get_embedding_client, settings
 from dao.faculty_dao import FacultyDAO
 from db.db_conn import SessionLocal
 from mappers.page_to_faculty import map_faculty_profile_to_dto
+from services.faculty.author_publication_fetcher import AuthorPublicationFetcher
 from services.faculty.enrich_profile import enrich_faculty_publications_from_cv, enrich_new_faculty
 from services.faculty.profile_parser import parse_profile
 
@@ -36,6 +37,19 @@ def _resolve_single_faculty_keyword_batch_workers() -> int:
         default,
         minimum=1,
         maximum=64,
+    )
+
+
+def _resolve_ingest_publication_years_back() -> int:
+    """
+    Year window for runtime faculty ingestion publication prefetch.
+    Matches the default behavior used by services/faculty/import_faculty.py.
+    """
+    return _safe_env_int(
+        "FACULTY_INGEST_PUBLICATION_YEARS_BACK",
+        5,
+        minimum=0,
+        maximum=50,
     )
 
 
@@ -141,8 +155,11 @@ class FacultyContextAgent:
     def _scrape_and_upsert_one(self, email: str, osu_url: str) -> int:
         """
         Scrape the OSU engineering profile for `email` using the supplied URL,
-        upsert the record into the DB, and enrich from personal/lab website links.
-        Publication ingestion from a CV PDF is handled separately.
+        upsert the record into the DB, prefetch publications from OpenAlex,
+        and enrich from personal/lab website links.
+
+        Publication ingestion from a CV PDF is still supported separately and
+        can add more entries (title-dedup keeps re-runs safe).
 
         osu_url: the exact OSU engineering profile URL provided by the caller.
                  No URL is derived automatically — callers must always pass it.
@@ -159,6 +176,33 @@ class FacultyContextAgent:
 
         dto = map_faculty_profile_to_dto(profile)
 
+        # Keep runtime ingestion aligned with bulk import behavior:
+        # fetch publications from OpenAlex by faculty name + OSU org hint.
+        publications = []
+        full_name = str(dto.name or "").strip()
+        if full_name:
+            years_back = _resolve_ingest_publication_years_back()
+            current_year = int(datetime.now(timezone.utc).year)
+            year_from = (
+                int(current_year) - (int(years_back) - 1)
+                if int(years_back) > 0
+                else 1900
+            )
+            try:
+                fetcher = AuthorPublicationFetcher()
+                publications = fetcher.fetch_publications_for_name_year_range(
+                    faculty_name=full_name,
+                    year_from=year_from,
+                    year_to=int(current_year),
+                    org_hint=settings.university_name,
+                )
+            except Exception:
+                logger.exception(
+                    "FacultyContextAgent: publication prefetch failed for email=%s name=%s",
+                    email,
+                    full_name,
+                )
+
         with self.session_factory() as sess:
             dao = FacultyDAO(sess)
             fac = dao.upsert_faculty(dto)
@@ -167,6 +211,23 @@ class FacultyContextAgent:
 
             if dto.additional_info:
                 dao.upsert_additional_info(faculty_id, dto.additional_info)
+
+            if publications:
+                embedding_client = None
+                try:
+                    embedding_client = get_embedding_client().build()
+                except Exception:
+                    logger.exception(
+                        "FacultyContextAgent: failed to build embedding client for publication upsert "
+                        "email=%s faculty_id=%s",
+                        email,
+                        faculty_id,
+                    )
+                dao.upsert_publications(
+                    faculty_id,
+                    publications,
+                    embedding_client=embedding_client,
+                )
 
             fac.profile_last_refreshed_at = datetime.now(timezone.utc)
             sess.commit()
@@ -213,7 +274,8 @@ class FacultyContextAgent:
 
         Steps:
           1. Classify each email as known / stale / unknown.
-          2. Scrape + upsert stale and unknown emails in parallel
+          2. Scrape + upsert stale and unknown emails in parallel,
+             including OpenAlex publication prefetch by faculty name
              (up to _MAX_SCRAPE_WORKERS threads, each with its own DB session).
           3. Run keyword generation sequentially for every newly ingested
              faculty (serialised to avoid Bedrock rate limits).
