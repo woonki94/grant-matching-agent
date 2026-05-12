@@ -65,6 +65,14 @@ CALIB_DATA_LOW_SLACK="${CALIB_DATA_LOW_SLACK:-0.10}"
 TEACHER_TEMPERATURE="${TEACHER_TEMPERATURE:-1.2}"
 MARGIN_MIN="${MARGIN_MIN:-0.25}"
 MARGIN_MAX="${MARGIN_MAX:-1.0}"
+PAIR_ADD_MID_LOWER_MID="${PAIR_ADD_MID_LOWER_MID:-true}"   # true | false
+PAIR_MID_ADD_EASY_CONTRAST="${PAIR_MID_ADD_EASY_CONTRAST:-false}"  # true | false
+PAIR_MID_POS_SCORE_MIN="${PAIR_MID_POS_SCORE_MIN:-0.4}"
+PAIR_MID_POS_SCORE_MAX="${PAIR_MID_POS_SCORE_MAX:-0.7}"
+PAIR_MID_NEG_SCORE_MIN="${PAIR_MID_NEG_SCORE_MIN:-0.2}"
+PAIR_MID_NEG_SCORE_MAX="${PAIR_MID_NEG_SCORE_MAX:-0.5}"
+PAIR_MID_MARGIN_MIN="${PAIR_MID_MARGIN_MIN:-0.05}"
+PAIR_MID_MARGIN_MAX="${PAIR_MID_MARGIN_MAX:-0.4}"
 PAIR_MID_MIN_CANDIDATES="${PAIR_MID_MIN_CANDIDATES:-6}"
 PAIR_MID_START_RATIO="${PAIR_MID_START_RATIO:-0.30}"
 PAIR_MID_END_RATIO="${PAIR_MID_END_RATIO:-0.55}"
@@ -109,6 +117,8 @@ log "loss_cluster_margin=${LOSS_CLUSTER_MARGIN_WEIGHT} loss_calibration_band=${L
 log "cluster_margin_targets hm/ml/hl=${CLUSTER_MARGIN_HM}/${CLUSTER_MARGIN_ML}/${CLUSTER_MARGIN_HL}"
 log "calibration mode=${CALIB_BAND_MODE} anchor_stat=${CALIB_ANCHOR_STAT} fixed=${CALIB_HIGH_FLOOR}/${CALIB_MID_CENTER}+/-${CALIB_MID_BANDWIDTH}/${CALIB_LOW_CEIL} data_slack=${CALIB_DATA_HIGH_SLACK}/${CALIB_DATA_LOW_SLACK}"
 log "margin_min=${MARGIN_MIN} margin_max=${MARGIN_MAX}"
+log "pair_add_mid_lower_mid=${PAIR_ADD_MID_LOWER_MID} pair_mid_add_easy_contrast=${PAIR_MID_ADD_EASY_CONTRAST}"
+log "pair_mid_score_range pos=[${PAIR_MID_POS_SCORE_MIN},${PAIR_MID_POS_SCORE_MAX}] neg=[${PAIR_MID_NEG_SCORE_MIN},${PAIR_MID_NEG_SCORE_MAX}] pair_mid_margin=[${PAIR_MID_MARGIN_MIN},${PAIR_MID_MARGIN_MAX}]"
 log "pair_mid_min_candidates=${PAIR_MID_MIN_CANDIDATES} mid_ratio=[${PAIR_MID_START_RATIO},${PAIR_MID_END_RATIO}] lower_mid_ratio=[${PAIR_LOWER_MID_START_RATIO},${PAIR_LOWER_MID_END_RATIO}]"
 
 CMD=(
@@ -152,6 +162,12 @@ CMD=(
   --calib-data-high-slack "${CALIB_DATA_HIGH_SLACK}"
   --calib-data-low-slack "${CALIB_DATA_LOW_SLACK}"
   --teacher-temperature "${TEACHER_TEMPERATURE}"
+  --pair-mid-pos-score-min "${PAIR_MID_POS_SCORE_MIN}"
+  --pair-mid-pos-score-max "${PAIR_MID_POS_SCORE_MAX}"
+  --pair-mid-neg-score-min "${PAIR_MID_NEG_SCORE_MIN}"
+  --pair-mid-neg-score-max "${PAIR_MID_NEG_SCORE_MAX}"
+  --pair-mid-margin-min "${PAIR_MID_MARGIN_MIN}"
+  --pair-mid-margin-max "${PAIR_MID_MARGIN_MAX}"
   --pair-mid-min-candidates "${PAIR_MID_MIN_CANDIDATES}"
   --pair-mid-start-ratio "${PAIR_MID_START_RATIO}"
   --pair-mid-end-ratio "${PAIR_MID_END_RATIO}"
@@ -183,6 +199,14 @@ if BOOL_TRUE "${REGENERATE_SPLITS}"; then
   CMD+=(--regenerate-splits)
 else
   CMD+=(--no-regenerate-splits)
+fi
+
+if BOOL_TRUE "${PAIR_ADD_MID_LOWER_MID}"; then
+  CMD+=(--pair-add-mid-lower-mid)
+fi
+
+if BOOL_TRUE "${PAIR_MID_ADD_EASY_CONTRAST}"; then
+  CMD+=(--pair-mid-add-easy-contrast)
 fi
 
 if BOOL_TRUE "${APPEND_ARGS_TO_OUTPUT_DIR}"; then
