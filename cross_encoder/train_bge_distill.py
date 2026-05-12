@@ -58,6 +58,11 @@ TRAIN_BAND_HIGH_THRESHOLD_DEFAULT = 0.70
 TRAIN_BAND_MID_THRESHOLD_DEFAULT = 0.30
 LIST_AUGMENTED_DOC_WEIGHT_DEFAULT = 0.70
 PAIR_TYPE_MAX_SHARE_DEFAULT = 1.0
+PAIR_MID_MIN_CANDIDATES_DEFAULT = 6
+PAIR_MID_START_RATIO_DEFAULT = 0.30
+PAIR_MID_END_RATIO_DEFAULT = 0.55
+PAIR_LOWER_MID_START_RATIO_DEFAULT = 0.55
+PAIR_LOWER_MID_END_RATIO_DEFAULT = 0.80
 PAIR_TYPE_WEIGHT_MAP_DEFAULT = (
     "default=1.0,"
     "llm_disagreement=1.15,"
@@ -677,6 +682,11 @@ def _derive_mid_lower_mid_pairs_from_groups(
     groups: Sequence[QueryGroup],
     *,
     per_query_cap: int,
+    mid_min_candidates: int,
+    mid_start_ratio: float,
+    mid_end_ratio: float,
+    lower_mid_start_ratio: float,
+    lower_mid_end_ratio: float,
     pos_score_min: float,
     pos_score_max: float,
     neg_score_min: float,
@@ -691,18 +701,19 @@ def _derive_mid_lower_mid_pairs_from_groups(
     """
     out: List[PairExample] = []
     cap = max(1, int(per_query_cap))
+    min_candidates = max(2, int(mid_min_candidates))
 
     for g in groups:
         cands = list(g.candidates or [])
         n = len(cands)
-        if n < 6:
+        if n < min_candidates:
             continue
 
         # Candidate list is already sorted high->low by teacher score.
-        mid_start = max(1, int(0.30 * n))
-        mid_end = min(n, max(mid_start + 1, int(0.55 * n)))
-        lower_start = min(n, max(mid_end, int(0.55 * n)))
-        lower_end = min(n, max(lower_start + 1, int(0.80 * n)))
+        mid_start = max(1, int(float(mid_start_ratio) * n))
+        mid_end = min(n, max(mid_start + 1, int(float(mid_end_ratio) * n)))
+        lower_start = min(n, max(mid_end, int(float(lower_mid_start_ratio) * n)))
+        lower_end = min(n, max(lower_start + 1, int(float(lower_mid_end_ratio) * n)))
 
         mid_group = cands[mid_start:mid_end]
         lower_mid_group = cands[lower_start:lower_end]
@@ -1214,6 +1225,11 @@ def _build_mismatch_distill_files(
     pair_mid_margin_min: float,
     pair_mid_margin_max: float,
     pair_mid_add_easy_contrast: bool,
+    pair_mid_min_candidates: int,
+    pair_mid_start_ratio: float,
+    pair_mid_end_ratio: float,
+    pair_lower_mid_start_ratio: float,
+    pair_lower_mid_end_ratio: float,
 ) -> Dict[str, Any]:
     grouped: Dict[Tuple[str, int, str], QueryGroup] = {}
     seen_docs: Dict[Tuple[str, int, str], Set[str]] = {}
@@ -1321,6 +1337,11 @@ def _build_mismatch_distill_files(
         pair_rows = list(pair_rows) + _derive_mid_lower_mid_pairs_from_groups(
             usable_groups,
             per_query_cap=int(pair_derive_cap),
+            mid_min_candidates=int(pair_mid_min_candidates),
+            mid_start_ratio=float(pair_mid_start_ratio),
+            mid_end_ratio=float(pair_mid_end_ratio),
+            lower_mid_start_ratio=float(pair_lower_mid_start_ratio),
+            lower_mid_end_ratio=float(pair_lower_mid_end_ratio),
             pos_score_min=float(pair_mid_pos_score_min),
             pos_score_max=float(pair_mid_pos_score_max),
             neg_score_min=float(pair_mid_neg_score_min),
@@ -1678,6 +1699,11 @@ def _derive_pairs_for_groups(
     pair_mid_margin_min: float,
     pair_mid_margin_max: float,
     pair_mid_add_easy_contrast: bool,
+    pair_mid_min_candidates: int,
+    pair_mid_start_ratio: float,
+    pair_mid_end_ratio: float,
+    pair_lower_mid_start_ratio: float,
+    pair_lower_mid_end_ratio: float,
 ) -> List[PairExample]:
     base_pairs = _derive_pairwise_from_groups(
         groups,
@@ -1691,6 +1717,11 @@ def _derive_pairs_for_groups(
     mid_pairs = _derive_mid_lower_mid_pairs_from_groups(
         groups,
         per_query_cap=int(pair_derive_cap),
+        mid_min_candidates=int(pair_mid_min_candidates),
+        mid_start_ratio=float(pair_mid_start_ratio),
+        mid_end_ratio=float(pair_mid_end_ratio),
+        lower_mid_start_ratio=float(pair_lower_mid_start_ratio),
+        lower_mid_end_ratio=float(pair_lower_mid_end_ratio),
         pos_score_min=float(pair_mid_pos_score_min),
         pos_score_max=float(pair_mid_pos_score_max),
         neg_score_min=float(pair_mid_neg_score_min),
@@ -2042,6 +2073,46 @@ def _run_iterative_orchestration(args: argparse.Namespace, *, raw_argv: Sequence
     pair_mid_margin_min = _safe_float(args.pair_mid_margin_min, default=0.05, minimum=0.0, maximum=1.0)
     pair_mid_margin_max = _safe_float(args.pair_mid_margin_max, default=0.4, minimum=0.0, maximum=1.0)
     pair_mid_add_easy_contrast = bool(args.pair_mid_add_easy_contrast)
+    pair_mid_min_candidates = _safe_int(
+        args.pair_mid_min_candidates,
+        default=PAIR_MID_MIN_CANDIDATES_DEFAULT,
+        minimum=2,
+        maximum=100_000,
+    )
+    pair_mid_start_ratio = _safe_float(
+        args.pair_mid_start_ratio,
+        default=PAIR_MID_START_RATIO_DEFAULT,
+        minimum=0.0,
+        maximum=1.0,
+    )
+    pair_mid_end_ratio = _safe_float(
+        args.pair_mid_end_ratio,
+        default=PAIR_MID_END_RATIO_DEFAULT,
+        minimum=0.0,
+        maximum=1.0,
+    )
+    pair_lower_mid_start_ratio = _safe_float(
+        args.pair_lower_mid_start_ratio,
+        default=PAIR_LOWER_MID_START_RATIO_DEFAULT,
+        minimum=0.0,
+        maximum=1.0,
+    )
+    pair_lower_mid_end_ratio = _safe_float(
+        args.pair_lower_mid_end_ratio,
+        default=PAIR_LOWER_MID_END_RATIO_DEFAULT,
+        minimum=0.0,
+        maximum=1.0,
+    )
+    if pair_mid_pos_score_max < pair_mid_pos_score_min:
+        pair_mid_pos_score_max = pair_mid_pos_score_min
+    if pair_mid_neg_score_max < pair_mid_neg_score_min:
+        pair_mid_neg_score_max = pair_mid_neg_score_min
+    if pair_mid_margin_max < pair_mid_margin_min:
+        pair_mid_margin_max = pair_mid_margin_min
+    if pair_mid_end_ratio < pair_mid_start_ratio:
+        pair_mid_end_ratio = pair_mid_start_ratio
+    if pair_lower_mid_end_ratio < pair_lower_mid_start_ratio:
+        pair_lower_mid_end_ratio = pair_lower_mid_start_ratio
 
     replay_multiplier = _safe_float(args.iterative_replay_multiplier, default=0.25, minimum=0.0, maximum=10.0)
     replay_min_groups = _safe_int(args.iterative_replay_min_groups, default=0, minimum=0, maximum=10_000_000)
@@ -2126,6 +2197,11 @@ def _run_iterative_orchestration(args: argparse.Namespace, *, raw_argv: Sequence
             pair_mid_margin_min=pair_mid_margin_min,
             pair_mid_margin_max=pair_mid_margin_max,
             pair_mid_add_easy_contrast=pair_mid_add_easy_contrast,
+            pair_mid_min_candidates=pair_mid_min_candidates,
+            pair_mid_start_ratio=pair_mid_start_ratio,
+            pair_mid_end_ratio=pair_mid_end_ratio,
+            pair_lower_mid_start_ratio=pair_lower_mid_start_ratio,
+            pair_lower_mid_end_ratio=pair_lower_mid_end_ratio,
         )
         original_val_pairs = _derive_pairs_for_groups(
             original_val_groups,
@@ -2141,6 +2217,11 @@ def _run_iterative_orchestration(args: argparse.Namespace, *, raw_argv: Sequence
             pair_mid_margin_min=pair_mid_margin_min,
             pair_mid_margin_max=pair_mid_margin_max,
             pair_mid_add_easy_contrast=pair_mid_add_easy_contrast,
+            pair_mid_min_candidates=pair_mid_min_candidates,
+            pair_mid_start_ratio=pair_mid_start_ratio,
+            pair_mid_end_ratio=pair_mid_end_ratio,
+            pair_lower_mid_start_ratio=pair_lower_mid_start_ratio,
+            pair_lower_mid_end_ratio=pair_lower_mid_end_ratio,
         )
 
     original_train_pairs_before_low_cap_filter = int(len(original_train_pairs))
@@ -2164,6 +2245,11 @@ def _run_iterative_orchestration(args: argparse.Namespace, *, raw_argv: Sequence
             pair_mid_margin_min=pair_mid_margin_min,
             pair_mid_margin_max=pair_mid_margin_max,
             pair_mid_add_easy_contrast=pair_mid_add_easy_contrast,
+            pair_mid_min_candidates=pair_mid_min_candidates,
+            pair_mid_start_ratio=pair_mid_start_ratio,
+            pair_mid_end_ratio=pair_mid_end_ratio,
+            pair_lower_mid_start_ratio=pair_lower_mid_start_ratio,
+            pair_lower_mid_end_ratio=pair_lower_mid_end_ratio,
         )
 
     fixed_mining_dev_pairs = _derive_pairs_for_groups(
@@ -2180,6 +2266,11 @@ def _run_iterative_orchestration(args: argparse.Namespace, *, raw_argv: Sequence
         pair_mid_margin_min=pair_mid_margin_min,
         pair_mid_margin_max=pair_mid_margin_max,
         pair_mid_add_easy_contrast=pair_mid_add_easy_contrast,
+        pair_mid_min_candidates=pair_mid_min_candidates,
+        pair_mid_start_ratio=pair_mid_start_ratio,
+        pair_mid_end_ratio=pair_mid_end_ratio,
+        pair_lower_mid_start_ratio=pair_lower_mid_start_ratio,
+        pair_lower_mid_end_ratio=pair_lower_mid_end_ratio,
     )
 
     current_train_groups = list(original_train_groups)
@@ -2437,6 +2528,11 @@ def _run_iterative_orchestration(args: argparse.Namespace, *, raw_argv: Sequence
             pair_mid_margin_min=pair_mid_margin_min,
             pair_mid_margin_max=pair_mid_margin_max,
             pair_mid_add_easy_contrast=pair_mid_add_easy_contrast,
+            pair_mid_min_candidates=pair_mid_min_candidates,
+            pair_mid_start_ratio=pair_mid_start_ratio,
+            pair_mid_end_ratio=pair_mid_end_ratio,
+            pair_lower_mid_start_ratio=pair_lower_mid_start_ratio,
+            pair_lower_mid_end_ratio=pair_lower_mid_end_ratio,
         )
         round_summary["mismatch_build_stats"] = build_stats
         print(json.dumps({"iterative_mismatch_build": build_stats}, ensure_ascii=False))
@@ -2486,6 +2582,11 @@ def _run_iterative_orchestration(args: argparse.Namespace, *, raw_argv: Sequence
                 pair_mid_margin_min=pair_mid_margin_min,
                 pair_mid_margin_max=pair_mid_margin_max,
                 pair_mid_add_easy_contrast=pair_mid_add_easy_contrast,
+                pair_mid_min_candidates=pair_mid_min_candidates,
+                pair_mid_start_ratio=pair_mid_start_ratio,
+                pair_mid_end_ratio=pair_mid_end_ratio,
+                pair_lower_mid_start_ratio=pair_lower_mid_start_ratio,
+                pair_lower_mid_end_ratio=pair_lower_mid_end_ratio,
             )
             mined_val_pairs = _derive_pairs_for_groups(
                 mined_val_groups,
@@ -2501,6 +2602,11 @@ def _run_iterative_orchestration(args: argparse.Namespace, *, raw_argv: Sequence
                 pair_mid_margin_min=pair_mid_margin_min,
                 pair_mid_margin_max=pair_mid_margin_max,
                 pair_mid_add_easy_contrast=pair_mid_add_easy_contrast,
+                pair_mid_min_candidates=pair_mid_min_candidates,
+                pair_mid_start_ratio=pair_mid_start_ratio,
+                pair_mid_end_ratio=pair_mid_end_ratio,
+                pair_lower_mid_start_ratio=pair_lower_mid_start_ratio,
+                pair_lower_mid_end_ratio=pair_lower_mid_end_ratio,
             )
 
         mined_case_count = int(len(mined_train_groups))
@@ -2535,6 +2641,11 @@ def _run_iterative_orchestration(args: argparse.Namespace, *, raw_argv: Sequence
             pair_mid_margin_min=pair_mid_margin_min,
             pair_mid_margin_max=pair_mid_margin_max,
             pair_mid_add_easy_contrast=pair_mid_add_easy_contrast,
+            pair_mid_min_candidates=pair_mid_min_candidates,
+            pair_mid_start_ratio=pair_mid_start_ratio,
+            pair_mid_end_ratio=pair_mid_end_ratio,
+            pair_lower_mid_start_ratio=pair_lower_mid_start_ratio,
+            pair_lower_mid_end_ratio=pair_lower_mid_end_ratio,
         )
 
         next_train_groups = _merge_groups_unique(mined_train_groups, replay_groups)
@@ -2602,6 +2713,11 @@ def _run_iterative_orchestration(args: argparse.Namespace, *, raw_argv: Sequence
                 pair_mid_margin_min=pair_mid_margin_min,
                 pair_mid_margin_max=pair_mid_margin_max,
                 pair_mid_add_easy_contrast=pair_mid_add_easy_contrast,
+                pair_mid_min_candidates=pair_mid_min_candidates,
+                pair_mid_start_ratio=pair_mid_start_ratio,
+                pair_mid_end_ratio=pair_mid_end_ratio,
+                pair_lower_mid_start_ratio=pair_lower_mid_start_ratio,
+                pair_lower_mid_end_ratio=pair_lower_mid_end_ratio,
             )
         if not next_train_pairs:
             round_summary["stop_reason"] = "next_train_pairs_empty_after_mining_replay"
@@ -2623,6 +2739,11 @@ def _run_iterative_orchestration(args: argparse.Namespace, *, raw_argv: Sequence
                 pair_mid_margin_min=pair_mid_margin_min,
                 pair_mid_margin_max=pair_mid_margin_max,
                 pair_mid_add_easy_contrast=pair_mid_add_easy_contrast,
+                pair_mid_min_candidates=pair_mid_min_candidates,
+                pair_mid_start_ratio=pair_mid_start_ratio,
+                pair_mid_end_ratio=pair_mid_end_ratio,
+                pair_lower_mid_start_ratio=pair_lower_mid_start_ratio,
+                pair_lower_mid_end_ratio=pair_lower_mid_end_ratio,
             )
         if not next_test_pairs:
             next_test_pairs = _derive_pairs_for_groups(
@@ -2639,6 +2760,11 @@ def _run_iterative_orchestration(args: argparse.Namespace, *, raw_argv: Sequence
                 pair_mid_margin_min=pair_mid_margin_min,
                 pair_mid_margin_max=pair_mid_margin_max,
                 pair_mid_add_easy_contrast=pair_mid_add_easy_contrast,
+                pair_mid_min_candidates=pair_mid_min_candidates,
+                pair_mid_start_ratio=pair_mid_start_ratio,
+                pair_mid_end_ratio=pair_mid_end_ratio,
+                pair_lower_mid_start_ratio=pair_lower_mid_start_ratio,
+                pair_lower_mid_end_ratio=pair_lower_mid_end_ratio,
             )
 
         current_train_groups = next_train_groups
@@ -2961,6 +3087,36 @@ def _build_parser() -> argparse.ArgumentParser:
         help="For each mid item, also add one larger-margin lower-mid pair (if available).",
     )
     p.add_argument(
+        "--pair-mid-min-candidates",
+        type=int,
+        default=PAIR_MID_MIN_CANDIDATES_DEFAULT,
+        help="Minimum candidates required in a query list before mid>lower-mid augmentation is attempted.",
+    )
+    p.add_argument(
+        "--pair-mid-start-ratio",
+        type=float,
+        default=PAIR_MID_START_RATIO_DEFAULT,
+        help="Start ratio for mid slice (index ~= ratio * n).",
+    )
+    p.add_argument(
+        "--pair-mid-end-ratio",
+        type=float,
+        default=PAIR_MID_END_RATIO_DEFAULT,
+        help="End ratio for mid slice (exclusive index ~= ratio * n).",
+    )
+    p.add_argument(
+        "--pair-lower-mid-start-ratio",
+        type=float,
+        default=PAIR_LOWER_MID_START_RATIO_DEFAULT,
+        help="Start ratio for lower-mid slice (index ~= ratio * n).",
+    )
+    p.add_argument(
+        "--pair-lower-mid-end-ratio",
+        type=float,
+        default=PAIR_LOWER_MID_END_RATIO_DEFAULT,
+        help="End ratio for lower-mid slice (exclusive index ~= ratio * n).",
+    )
+    p.add_argument(
         "--pair-type-max-share",
         type=float,
         default=PAIR_TYPE_MAX_SHARE_DEFAULT,
@@ -3229,6 +3385,36 @@ def main() -> int:
     pair_mid_margin_min = _safe_float(args.pair_mid_margin_min, default=0.05, minimum=0.0, maximum=1.0)
     pair_mid_margin_max = _safe_float(args.pair_mid_margin_max, default=0.4, minimum=0.0, maximum=1.0)
     pair_mid_add_easy_contrast = bool(args.pair_mid_add_easy_contrast)
+    pair_mid_min_candidates = _safe_int(
+        args.pair_mid_min_candidates,
+        default=PAIR_MID_MIN_CANDIDATES_DEFAULT,
+        minimum=2,
+        maximum=100_000,
+    )
+    pair_mid_start_ratio = _safe_float(
+        args.pair_mid_start_ratio,
+        default=PAIR_MID_START_RATIO_DEFAULT,
+        minimum=0.0,
+        maximum=1.0,
+    )
+    pair_mid_end_ratio = _safe_float(
+        args.pair_mid_end_ratio,
+        default=PAIR_MID_END_RATIO_DEFAULT,
+        minimum=0.0,
+        maximum=1.0,
+    )
+    pair_lower_mid_start_ratio = _safe_float(
+        args.pair_lower_mid_start_ratio,
+        default=PAIR_LOWER_MID_START_RATIO_DEFAULT,
+        minimum=0.0,
+        maximum=1.0,
+    )
+    pair_lower_mid_end_ratio = _safe_float(
+        args.pair_lower_mid_end_ratio,
+        default=PAIR_LOWER_MID_END_RATIO_DEFAULT,
+        minimum=0.0,
+        maximum=1.0,
+    )
 
     if pair_mid_pos_score_max < pair_mid_pos_score_min:
         pair_mid_pos_score_max = pair_mid_pos_score_min
@@ -3236,6 +3422,10 @@ def main() -> int:
         pair_mid_neg_score_max = pair_mid_neg_score_min
     if pair_mid_margin_max < pair_mid_margin_min:
         pair_mid_margin_max = pair_mid_margin_min
+    if pair_mid_end_ratio < pair_mid_start_ratio:
+        pair_mid_end_ratio = pair_mid_start_ratio
+    if pair_lower_mid_end_ratio < pair_lower_mid_start_ratio:
+        pair_lower_mid_end_ratio = pair_lower_mid_start_ratio
 
     max_length = _safe_int(args.max_length, default=512, minimum=16, maximum=8192)
     val_ratio = _safe_float(args.val_ratio, default=0.1, minimum=0.0, maximum=0.5)
@@ -3554,6 +3744,11 @@ def main() -> int:
         train_mid_rows = _derive_mid_lower_mid_pairs_from_groups(
             train_groups,
             per_query_cap=_safe_int(args.pair_derive_cap, default=64, minimum=1, maximum=100_000),
+            mid_min_candidates=pair_mid_min_candidates,
+            mid_start_ratio=pair_mid_start_ratio,
+            mid_end_ratio=pair_mid_end_ratio,
+            lower_mid_start_ratio=pair_lower_mid_start_ratio,
+            lower_mid_end_ratio=pair_lower_mid_end_ratio,
             pos_score_min=pair_mid_pos_score_min,
             pos_score_max=pair_mid_pos_score_max,
             neg_score_min=pair_mid_neg_score_min,
@@ -3565,6 +3760,11 @@ def main() -> int:
         val_mid_rows = _derive_mid_lower_mid_pairs_from_groups(
             val_groups,
             per_query_cap=_safe_int(args.pair_derive_cap, default=64, minimum=1, maximum=100_000),
+            mid_min_candidates=pair_mid_min_candidates,
+            mid_start_ratio=pair_mid_start_ratio,
+            mid_end_ratio=pair_mid_end_ratio,
+            lower_mid_start_ratio=pair_lower_mid_start_ratio,
+            lower_mid_end_ratio=pair_lower_mid_end_ratio,
             pos_score_min=pair_mid_pos_score_min,
             pos_score_max=pair_mid_pos_score_max,
             neg_score_min=pair_mid_neg_score_min,
@@ -3576,6 +3776,11 @@ def main() -> int:
         test_mid_rows = _derive_mid_lower_mid_pairs_from_groups(
             test_groups,
             per_query_cap=_safe_int(args.pair_derive_cap, default=64, minimum=1, maximum=100_000),
+            mid_min_candidates=pair_mid_min_candidates,
+            mid_start_ratio=pair_mid_start_ratio,
+            mid_end_ratio=pair_mid_end_ratio,
+            lower_mid_start_ratio=pair_lower_mid_start_ratio,
+            lower_mid_end_ratio=pair_lower_mid_end_ratio,
             pos_score_min=pair_mid_pos_score_min,
             pos_score_max=pair_mid_pos_score_max,
             neg_score_min=pair_mid_neg_score_min,
@@ -3597,6 +3802,9 @@ def main() -> int:
             f"pos:[{pair_mid_pos_score_min:.3f},{pair_mid_pos_score_max:.3f}] "
             f"neg:[{pair_mid_neg_score_min:.3f},{pair_mid_neg_score_max:.3f}] "
             f"margin:[{pair_mid_margin_min:.3f},{pair_mid_margin_max:.3f}] "
+            f"min_candidates={pair_mid_min_candidates} "
+            f"mid_ratio:[{pair_mid_start_ratio:.3f},{pair_mid_end_ratio:.3f}] "
+            f"lower_mid_ratio:[{pair_lower_mid_start_ratio:.3f},{pair_lower_mid_end_ratio:.3f}] "
             f"easy_contrast={pair_mid_add_easy_contrast}"
         )
     else:
@@ -3700,6 +3908,11 @@ def main() -> int:
             "dataset/pair_mid_margin_min": float(pair_mid_margin_min),
             "dataset/pair_mid_margin_max": float(pair_mid_margin_max),
             "dataset/pair_mid_add_easy_contrast": int(1 if pair_mid_add_easy_contrast else 0),
+            "dataset/pair_mid_min_candidates": int(pair_mid_min_candidates),
+            "dataset/pair_mid_start_ratio": float(pair_mid_start_ratio),
+            "dataset/pair_mid_end_ratio": float(pair_mid_end_ratio),
+            "dataset/pair_lower_mid_start_ratio": float(pair_lower_mid_start_ratio),
+            "dataset/pair_lower_mid_end_ratio": float(pair_lower_mid_end_ratio),
             "dataset/pair_type_max_share": float(pair_type_max_share),
             "dataset/pair_type_cap_applied": int(1 if bool((pair_type_cap_stats or {}).get("applied")) else 0),
             "dataset/pair_type_cap_dropped": int((pair_type_cap_stats or {}).get("dropped", 0)),
@@ -4534,6 +4747,11 @@ def main() -> int:
         "pair_mid_margin_min": float(pair_mid_margin_min),
         "pair_mid_margin_max": float(pair_mid_margin_max),
         "pair_mid_add_easy_contrast": bool(pair_mid_add_easy_contrast),
+        "pair_mid_min_candidates": int(pair_mid_min_candidates),
+        "pair_mid_start_ratio": float(pair_mid_start_ratio),
+        "pair_mid_end_ratio": float(pair_mid_end_ratio),
+        "pair_lower_mid_start_ratio": float(pair_lower_mid_start_ratio),
+        "pair_lower_mid_end_ratio": float(pair_lower_mid_end_ratio),
         "pair_type_max_share": float(pair_type_max_share),
         "pair_type_weight_default": float(pair_default_weight),
         "pair_type_weights": dict(pair_type_weights),
