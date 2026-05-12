@@ -53,6 +53,9 @@ PAIRWISE_VAL_INPUT_DEFAULT = f"{SPLIT_DIR_DEFAULT}/llm_distill_pairwise_val.json
 PAIRWISE_TEST_INPUT_DEFAULT = f"{SPLIT_DIR_DEFAULT}/llm_distill_pairwise_test.jsonl"
 OUTPUT_DIR_DEFAULT = "cross_encoder/models/bge_reranker_distill"
 WANDB_PROJECT_DEFAULT = "cross_encoder_distill"
+LISTWISE_SCORE_MODE_DEFAULT = "normalized"
+CALIB_BAND_MODE_DEFAULT = "data_driven"
+CALIB_ANCHOR_STAT_DEFAULT = "mean"
 
 TRAIN_BAND_HIGH_THRESHOLD_DEFAULT = 0.70
 TRAIN_BAND_MID_THRESHOLD_DEFAULT = 0.30
@@ -76,6 +79,8 @@ PAIR_TYPE_WEIGHT_MAP_DEFAULT = (
 class Candidate:
     text: str
     score: float
+    score_raw: float
+    score_norm: float
     fac_id: int
     chunk_id: int
     chunk_index: int
@@ -198,7 +203,14 @@ class PairCollator:
 
 
 class ListCollator:
-    def __init__(self, tokenizer: Any, max_length: int, *, augmented_doc_weight: float) -> None:
+    def __init__(
+        self,
+        tokenizer: Any,
+        max_length: int,
+        *,
+        augmented_doc_weight: float,
+        listwise_score_mode: str,
+    ) -> None:
         self.tokenizer = tokenizer
         self.max_length = int(max_length)
         self.augmented_doc_weight = _safe_float(
@@ -207,12 +219,14 @@ class ListCollator:
             minimum=0.0,
             maximum=1.0,
         )
+        self.listwise_score_mode = _clean_listwise_score_mode(listwise_score_mode)
 
     def __call__(self, batch: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
         queries_flat: List[str] = []
         docs_flat: List[str] = []
         teacher_scores: List[float] = []
         doc_weights: List[float] = []
+        cluster_ids: List[int] = []
         list_sizes: List[int] = []
 
         for item in batch:
@@ -224,15 +238,22 @@ class ListCollator:
             for d in docs:
                 queries_flat.append(query)
                 docs_flat.append(str(d.get("text") or "").strip())
-                teacher_scores.append(_clamp_01(d.get("teacher_score")))
+                if self.listwise_score_mode == "raw":
+                    teacher_scores.append(_clamp_01(d.get("teacher_score_raw", d.get("teacher_score"))))
+                else:
+                    teacher_scores.append(
+                        _clamp_01(d.get("teacher_score_norm", d.get("teacher_score")))
+                    )
                 is_augmented = bool(d.get("is_augmented", False))
                 doc_weights.append(float(self.augmented_doc_weight) if is_augmented else 1.0)
+                cluster_ids.append(int(_cluster_id_from_text(d.get("target_cluster"))))
 
         if not list_sizes:
             return {
                 "enc": None,
                 "teacher_scores": None,
                 "doc_weights": None,
+                "cluster_ids": None,
                 "list_sizes": [],
             }
 
@@ -249,12 +270,39 @@ class ListCollator:
             "enc": enc,
             "teacher_scores": torch.tensor(teacher_scores, dtype=torch.float32),
             "doc_weights": torch.tensor(doc_weights, dtype=torch.float32),
+            "cluster_ids": torch.tensor(cluster_ids, dtype=torch.int64),
             "list_sizes": list_sizes,
         }
 
 
 def _clean_text(value: Any) -> str:
     return str(value or "").strip()
+
+
+def _clean_listwise_score_mode(value: Any) -> str:
+    mode = _clean_text(value).lower()
+    return "raw" if mode == "raw" else "normalized"
+
+
+def _clean_calib_band_mode(value: Any) -> str:
+    mode = _clean_text(value).lower()
+    return "fixed" if mode == "fixed" else CALIB_BAND_MODE_DEFAULT
+
+
+def _clean_calib_anchor_stat(value: Any) -> str:
+    stat = _clean_text(value).lower()
+    return "median" if stat == "median" else CALIB_ANCHOR_STAT_DEFAULT
+
+
+def _cluster_id_from_text(value: Any) -> int:
+    v = _clean_text(value).lower()
+    if v == "high":
+        return 2
+    if v == "mid":
+        return 1
+    if v == "low":
+        return 0
+    return -1
 
 
 def _resolve_path(value: Any) -> Path:
@@ -334,11 +382,25 @@ def _extract_raw_candidate_rows(obj: Dict[str, Any]) -> List[Dict[str, Any]]:
     return []
 
 
-def _extract_candidate_score(row: Dict[str, Any]) -> float:
-    for key in ("score", "teacher_score", "score_raw", "teacher_score_raw"):
+def _extract_candidate_score_raw(row: Dict[str, Any]) -> float:
+    for key in ("teacher_score_raw", "score_raw", "teacher_score", "score"):
         if key in row:
             return _clamp_01(row.get(key))
     return 0.0
+
+
+def _extract_candidate_score_norm(row: Dict[str, Any]) -> float:
+    for key in ("teacher_score_norm", "score_norm", "teacher_score", "score", "teacher_score_raw", "score_raw"):
+        if key in row:
+            return _clamp_01(row.get(key))
+    return 0.0
+
+
+def _candidate_score_for_mode(candidate: Candidate, *, score_mode: str) -> float:
+    mode = _clean_listwise_score_mode(score_mode)
+    if mode == "raw":
+        return float(candidate.score_raw)
+    return float(candidate.score_norm)
 
 
 def _parse_csv_items(value: Any) -> List[str]:
@@ -389,6 +451,8 @@ def _build_output_suffix(
     loss_kl_weight: float,
     loss_pair_weight: float,
     loss_mse_weight: float,
+    loss_cluster_margin_weight: float,
+    loss_calibration_band_weight: float,
 ) -> str:
     parts = [
         f"sd{int(seed)}",
@@ -403,6 +467,8 @@ def _build_output_suffix(
         f"kl{_float_token(float(loss_kl_weight))}",
         f"pw{_float_token(float(loss_pair_weight))}",
         f"mse{_float_token(float(loss_mse_weight))}",
+        f"cm{_float_token(float(loss_cluster_margin_weight))}",
+        f"cb{_float_token(float(loss_calibration_band_weight))}",
     ]
     return "_".join(parts)
 
@@ -527,7 +593,9 @@ def _load_raw_groups(path: Path, *, max_queries: int = 0) -> List[QueryGroup]:
                 cands.append(
                     Candidate(
                         text=doc_text,
-                        score=_extract_candidate_score(c),
+                        score=_extract_candidate_score_norm(c),
+                        score_raw=_extract_candidate_score_raw(c),
+                        score_norm=_extract_candidate_score_norm(c),
                         fac_id=_safe_int(c.get("fac_id"), default=0, minimum=0, maximum=2_147_483_647),
                         chunk_id=doc_id,
                         chunk_index=doc_index,
@@ -804,6 +872,7 @@ def _sample_docs_for_query(
     top_ratio: float,
     boundary_ratio: float,
     random_ratio: float,
+    listwise_score_mode: str,
     seed: int,
 ) -> List[Dict[str, Any]]:
     if int(candidate_pool_size) <= 0:
@@ -862,7 +931,7 @@ def _sample_docs_for_query(
         for i, c in enumerate(pool):
             if i in used:
                 continue
-            d = abs(float(c.score) - center)
+            d = abs(float(_candidate_score_for_mode(c, score_mode=listwise_score_mode)) - center)
             in_band_penalty = 0.0 if d <= width else (d - width)
             boundary_scored.append((in_band_penalty, d, i))
         boundary_scored.sort(key=lambda x: (x[0], x[1]))
@@ -896,11 +965,13 @@ def _sample_docs_for_query(
             add_idx(i)
 
     docs = [pool[i] for i in selected[:k]]
-    docs.sort(key=lambda x: float(x.score), reverse=True)
+    docs.sort(key=lambda x: float(_candidate_score_for_mode(x, score_mode=listwise_score_mode)), reverse=True)
     return [
         {
             "text": d.text,
-            "teacher_score": float(d.score),
+            "teacher_score": float(_candidate_score_for_mode(d, score_mode=listwise_score_mode)),
+            "teacher_score_raw": float(d.score_raw),
+            "teacher_score_norm": float(d.score_norm),
             "fac_id": int(d.fac_id),
             "chunk_id": int(d.chunk_id),
             "chunk_index": int(d.chunk_index),
@@ -927,6 +998,7 @@ def _build_sampled_list_rows(
     low_signal_max_score_threshold: float,
     low_signal_std_threshold: float,
     low_signal_keep_prob: float,
+    listwise_score_mode: str,
     seed: int,
 ) -> List[Dict[str, Any]]:
     out: List[Dict[str, Any]] = []
@@ -935,7 +1007,7 @@ def _build_sampled_list_rows(
             pool = list(g.candidates)
         else:
             pool = list(g.candidates[: min(len(g.candidates), max(2, int(candidate_pool_size)))])
-        scores = [float(c.score) for c in pool]
+        scores = [float(_candidate_score_for_mode(c, score_mode=listwise_score_mode)) for c in pool]
         mx, std = _compute_score_stats(scores)
 
         # Drop low-signal lists except a small retained slice for calibration.
@@ -954,6 +1026,7 @@ def _build_sampled_list_rows(
             top_ratio=top_ratio,
             boundary_ratio=boundary_ratio,
             random_ratio=random_ratio,
+            listwise_score_mode=listwise_score_mode,
             seed=seed,
         )
         if len(docs) < 2:
@@ -1043,6 +1116,177 @@ def _compute_listwise_kl_and_mse(
     kl_loss = torch.stack(kl_parts).mean()
     mse_loss = torch.stack(mse_parts).mean()
     return kl_loss, mse_loss
+
+
+def _weighted_mean(values: torch.Tensor, weights: Optional[torch.Tensor]) -> torch.Tensor:
+    if values.numel() <= 0:
+        return torch.zeros((), device=values.device, dtype=values.dtype)
+    if weights is None:
+        return values.mean()
+    w = weights.clamp(min=0.0)
+    denom = torch.clamp(w.sum(), min=1e-6)
+    return (values * w).sum() / denom
+
+
+def _masked_weighted_mean(
+    values: torch.Tensor,
+    mask: torch.Tensor,
+    weights: Optional[torch.Tensor],
+) -> Tuple[torch.Tensor, bool]:
+    if bool(mask.numel() <= 0) or (not bool(mask.any().item())):
+        return torch.zeros((), device=values.device, dtype=values.dtype), False
+    v = values[mask]
+    if weights is None:
+        w = None
+    else:
+        w = weights[mask]
+    return _weighted_mean(v, w), True
+
+
+def _cluster_anchor(values: torch.Tensor, *, stat_mode: str) -> torch.Tensor:
+    if values.numel() <= 0:
+        return torch.zeros((), device=values.device, dtype=values.dtype)
+    mode = _clean_calib_anchor_stat(stat_mode)
+    if mode == "median":
+        return torch.quantile(values, q=0.5)
+    return values.mean()
+
+
+def _compute_cluster_margin_loss(
+    *,
+    logits_flat: torch.Tensor,
+    cluster_ids_flat: torch.Tensor,
+    doc_weights_flat: Optional[torch.Tensor],
+    list_sizes: Sequence[int],
+    margin_hm: float,
+    margin_ml: float,
+    margin_hl: float,
+) -> torch.Tensor:
+    probs = torch.sigmoid(logits_flat)
+    parts: List[torch.Tensor] = []
+    cursor = 0
+    hm = max(0.0, float(margin_hm))
+    ml = max(0.0, float(margin_ml))
+    hl = max(0.0, float(margin_hl))
+
+    for sz in list_sizes:
+        n = int(sz)
+        if n <= 1:
+            cursor += max(0, n)
+            continue
+        s = probs[cursor : cursor + n]
+        c = cluster_ids_flat[cursor : cursor + n]
+        if doc_weights_flat is None:
+            w = None
+        else:
+            w = doc_weights_flat[cursor : cursor + n]
+        cursor += n
+
+        high_mask = c == 2
+        mid_mask = c == 1
+        low_mask = c == 0
+
+        high_mean, has_high = _masked_weighted_mean(s, high_mask, w)
+        mid_mean, has_mid = _masked_weighted_mean(s, mid_mask, w)
+        low_mean, has_low = _masked_weighted_mean(s, low_mask, w)
+
+        if has_high and has_mid:
+            parts.append(F.relu(torch.tensor(hm, device=s.device, dtype=s.dtype) - (high_mean - mid_mean)))
+        if has_mid and has_low:
+            parts.append(F.relu(torch.tensor(ml, device=s.device, dtype=s.dtype) - (mid_mean - low_mean)))
+        if has_high and has_low:
+            parts.append(F.relu(torch.tensor(hl, device=s.device, dtype=s.dtype) - (high_mean - low_mean)))
+
+    if not parts:
+        return torch.zeros((), device=logits_flat.device, dtype=logits_flat.dtype)
+    return torch.stack(parts).mean()
+
+
+def _compute_calibration_band_loss(
+    *,
+    logits_flat: torch.Tensor,
+    teacher_scores_flat: torch.Tensor,
+    cluster_ids_flat: torch.Tensor,
+    doc_weights_flat: Optional[torch.Tensor],
+    list_sizes: Sequence[int],
+    band_mode: str,
+    anchor_stat: str,
+    high_floor: float,
+    mid_center: float,
+    mid_bandwidth: float,
+    low_ceil: float,
+    data_high_slack: float,
+    data_low_slack: float,
+) -> torch.Tensor:
+    mode = _clean_calib_band_mode(band_mode)
+    stat_mode = _clean_calib_anchor_stat(anchor_stat)
+    probs = torch.sigmoid(logits_flat)
+    teacher = teacher_scores_flat.clamp(0.0, 1.0)
+    mid_bw = max(0.0, float(mid_bandwidth))
+    high_floor = float(_clamp_01(high_floor))
+    mid_center = float(_clamp_01(mid_center))
+    low_ceil = float(_clamp_01(low_ceil))
+    high_slack = max(0.0, float(data_high_slack))
+    low_slack = max(0.0, float(data_low_slack))
+
+    parts: List[torch.Tensor] = []
+    cursor = 0
+
+    for sz in list_sizes:
+        n = int(sz)
+        if n <= 0:
+            cursor += max(0, n)
+            continue
+        s = probs[cursor : cursor + n]
+        y = teacher[cursor : cursor + n]
+        c = cluster_ids_flat[cursor : cursor + n]
+        if doc_weights_flat is None:
+            w = None
+        else:
+            w = doc_weights_flat[cursor : cursor + n]
+        cursor += n
+
+        high_mask = c == 2
+        mid_mask = c == 1
+        low_mask = c == 0
+
+        if bool(high_mask.any().item()):
+            s_high = s[high_mask]
+            w_high = None if w is None else w[high_mask]
+            if mode == "fixed":
+                floor = torch.tensor(high_floor, device=s.device, dtype=s.dtype)
+            else:
+                anchor = _cluster_anchor(y[high_mask], stat_mode=stat_mode)
+                floor = torch.clamp(anchor - high_slack, min=0.0, max=1.0)
+            parts.append(_weighted_mean(F.relu(floor - s_high), w_high))
+
+        if bool(mid_mask.any().item()):
+            s_mid = s[mid_mask]
+            w_mid = None if w is None else w[mid_mask]
+            if mode == "fixed":
+                center = torch.tensor(mid_center, device=s.device, dtype=s.dtype)
+            else:
+                center = _cluster_anchor(y[mid_mask], stat_mode=stat_mode)
+            parts.append(
+                _weighted_mean(
+                    F.relu(torch.abs(s_mid - center) - mid_bw),
+                    w_mid,
+                )
+            )
+
+        if bool(low_mask.any().item()):
+            s_low = s[low_mask]
+            w_low = None if w is None else w[low_mask]
+            if mode == "fixed":
+                ceil = torch.tensor(low_ceil, device=s.device, dtype=s.dtype)
+            else:
+                anchor = _cluster_anchor(y[low_mask], stat_mode=stat_mode)
+                ceil = torch.clamp(anchor + low_slack, min=0.0, max=1.0)
+            parts.append(_weighted_mean(F.relu(s_low - ceil), w_low))
+
+    if not parts:
+        return torch.zeros((), device=logits_flat.device, dtype=logits_flat.dtype)
+    return torch.stack(parts).mean()
 
 
 def _dcg(scores: Sequence[float], k: int) -> float:
@@ -1273,6 +1517,8 @@ def _build_mismatch_distill_files(
             Candidate(
                 text=doc_text,
                 score=float(teacher_score),
+                score_raw=float(teacher_score),
+                score_norm=float(teacher_score),
                 fac_id=int(fac_id),
                 chunk_id=int(chunk_id),
                 chunk_index=int(chunk_index),
@@ -1307,10 +1553,12 @@ def _build_mismatch_distill_files(
                         "fac_spec_text": c.text,
                         "chunk_text": c.text,
                         "text": c.text,
-                        "score": float(c.score),
-                        "score_raw": float(c.score),
-                        "teacher_score": float(c.score),
-                        "teacher_score_raw": float(c.score),
+                        "score": float(c.score_norm),
+                        "score_raw": float(c.score_raw),
+                        "score_norm": float(c.score_norm),
+                        "teacher_score": float(c.score_norm),
+                        "teacher_score_raw": float(c.score_raw),
+                        "teacher_score_norm": float(c.score_norm),
                         "target_cluster": _clean_text(c.target_cluster) or "unknown",
                         "selected_for_target": bool(c.selected_for_target),
                         "is_augmented": bool(c.is_augmented),
@@ -1640,10 +1888,12 @@ def _query_group_to_raw_obj(group: QueryGroup) -> Dict[str, Any]:
                 "fac_spec_text": _clean_text(c.text),
                 "chunk_text": _clean_text(c.text),
                 "text": _clean_text(c.text),
-                "score": float(c.score),
-                "score_raw": float(c.score),
-                "teacher_score": float(c.score),
-                "teacher_score_raw": float(c.score),
+                "score": float(c.score_norm),
+                "score_raw": float(c.score_raw),
+                "score_norm": float(c.score_norm),
+                "teacher_score": float(c.score_norm),
+                "teacher_score_raw": float(c.score_raw),
+                "teacher_score_norm": float(c.score_norm),
                 "target_cluster": _clean_text(c.target_cluster) or "unknown",
                 "selected_for_target": bool(c.selected_for_target),
                 "is_augmented": bool(c.is_augmented),
@@ -2975,6 +3225,43 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--low-signal-max-score-threshold", type=float, default=0.3)
     p.add_argument("--low-signal-std-threshold", type=float, default=0.05)
     p.add_argument("--low-signal-keep-prob", type=float, default=1.0)
+    p.add_argument(
+        "--listwise-score-mode",
+        type=str,
+        choices=["normalized", "raw"],
+        default=LISTWISE_SCORE_MODE_DEFAULT,
+        help="Stage2 listwise/MSE teacher score mode: normalized or raw.",
+    )
+    p.add_argument(
+        "--calib-band-mode",
+        type=str,
+        choices=["fixed", "data_driven"],
+        default=CALIB_BAND_MODE_DEFAULT,
+        help="Calibration band mode for additional Stage2 calibration loss.",
+    )
+    p.add_argument(
+        "--calib-anchor-stat",
+        type=str,
+        choices=["mean", "median"],
+        default=CALIB_ANCHOR_STAT_DEFAULT,
+        help="Statistic for per-query cluster anchors in data-driven calibration mode.",
+    )
+    p.add_argument("--calib-high-floor", type=float, default=0.75, help="Fixed-mode lower floor for high cluster.")
+    p.add_argument("--calib-mid-center", type=float, default=0.50, help="Fixed-mode center for mid cluster.")
+    p.add_argument("--calib-mid-bandwidth", type=float, default=0.15, help="Allowed band around mid center.")
+    p.add_argument("--calib-low-ceil", type=float, default=0.25, help="Fixed-mode upper ceiling for low cluster.")
+    p.add_argument(
+        "--calib-data-high-slack",
+        type=float,
+        default=0.10,
+        help="Data-driven mode: high floor = teacher_high_anchor - slack.",
+    )
+    p.add_argument(
+        "--calib-data-low-slack",
+        type=float,
+        default=0.10,
+        help="Data-driven mode: low ceiling = teacher_low_anchor + slack.",
+    )
 
     p.add_argument("--teacher-temperature", type=float, default=2.0)
 
@@ -3008,9 +3295,24 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--loss-kl-weight", type=float, default=1.0)
     p.add_argument("--loss-pair-weight", type=float, default=0.5)
     p.add_argument("--loss-mse-weight", type=float, default=0.05)
+    p.add_argument(
+        "--loss-cluster-margin-weight",
+        type=float,
+        default=0.0,
+        help="Additional Stage2 loss weight for cluster-level margin constraints.",
+    )
+    p.add_argument(
+        "--loss-calibration-band-weight",
+        type=float,
+        default=0.0,
+        help="Additional Stage2 loss weight for calibration band constraints.",
+    )
 
     p.add_argument("--margin-min", type=float, default=0.1)
     p.add_argument("--margin-max", type=float, default=0.7)
+    p.add_argument("--cluster-margin-hm", type=float, default=0.20, help="Target minimum sigmoid gap: high - mid.")
+    p.add_argument("--cluster-margin-ml", type=float, default=0.20, help="Target minimum sigmoid gap: mid - low.")
+    p.add_argument("--cluster-margin-hl", type=float, default=0.45, help="Target minimum sigmoid gap: high - low.")
 
     p.add_argument("--pair-derive-pos-k", type=int, default=4)
     p.add_argument("--pair-derive-hard-k", type=int, default=4)
@@ -3339,8 +3641,33 @@ def main() -> int:
     loss_kl_weight = _safe_float(args.loss_kl_weight, default=1.0, minimum=0.0, maximum=100.0)
     loss_pair_weight = _safe_float(args.loss_pair_weight, default=0.5, minimum=0.0, maximum=100.0)
     loss_mse_weight = _safe_float(args.loss_mse_weight, default=0.05, minimum=0.0, maximum=100.0)
+    loss_cluster_margin_weight = _safe_float(
+        args.loss_cluster_margin_weight,
+        default=0.0,
+        minimum=0.0,
+        maximum=100.0,
+    )
+    loss_calibration_band_weight = _safe_float(
+        args.loss_calibration_band_weight,
+        default=0.0,
+        minimum=0.0,
+        maximum=100.0,
+    )
+
+    cluster_margin_hm = _safe_float(args.cluster_margin_hm, default=0.20, minimum=0.0, maximum=1.0)
+    cluster_margin_ml = _safe_float(args.cluster_margin_ml, default=0.20, minimum=0.0, maximum=1.0)
+    cluster_margin_hl = _safe_float(args.cluster_margin_hl, default=0.45, minimum=0.0, maximum=1.0)
+    calib_band_mode = _clean_calib_band_mode(args.calib_band_mode)
+    calib_anchor_stat = _clean_calib_anchor_stat(args.calib_anchor_stat)
+    calib_high_floor = _safe_float(args.calib_high_floor, default=0.75, minimum=0.0, maximum=1.0)
+    calib_mid_center = _safe_float(args.calib_mid_center, default=0.50, minimum=0.0, maximum=1.0)
+    calib_mid_bandwidth = _safe_float(args.calib_mid_bandwidth, default=0.15, minimum=0.0, maximum=1.0)
+    calib_low_ceil = _safe_float(args.calib_low_ceil, default=0.25, minimum=0.0, maximum=1.0)
+    calib_data_high_slack = _safe_float(args.calib_data_high_slack, default=0.10, minimum=0.0, maximum=1.0)
+    calib_data_low_slack = _safe_float(args.calib_data_low_slack, default=0.10, minimum=0.0, maximum=1.0)
 
     teacher_temperature = _safe_float(args.teacher_temperature, default=2.0, minimum=1e-6, maximum=100.0)
+    listwise_score_mode = _clean_listwise_score_mode(args.listwise_score_mode)
 
     low_signal_max_score_threshold = _safe_float(
         args.low_signal_max_score_threshold,
@@ -3455,6 +3782,8 @@ def main() -> int:
             loss_kl_weight=loss_kl_weight,
             loss_pair_weight=loss_pair_weight,
             loss_mse_weight=loss_mse_weight,
+            loss_cluster_margin_weight=loss_cluster_margin_weight,
+            loss_calibration_band_weight=loss_calibration_band_weight,
         )
         output_dir = (output_dir_base.parent / f"{output_dir_base.name}__{output_suffix}").resolve()
     else:
@@ -3598,6 +3927,20 @@ def main() -> int:
         f"map:{json.dumps(pair_type_weights, ensure_ascii=False)}"
     )
     print(f"list_augmented_doc_weight={list_augmented_doc_weight:.4f}")
+    print(f"listwise_score_mode={listwise_score_mode}")
+    print(
+        "stage2_extra_losses="
+        f"cluster_margin_weight:{loss_cluster_margin_weight:.4f},"
+        f"calibration_band_weight:{loss_calibration_band_weight:.4f},"
+        f"cluster_margins(hm/ml/hl):{cluster_margin_hm:.3f}/{cluster_margin_ml:.3f}/{cluster_margin_hl:.3f}"
+    )
+    print(
+        "calibration_band_config="
+        f"mode:{calib_band_mode},"
+        f"anchor_stat:{calib_anchor_stat},"
+        f"fixed(high/mid/low):{calib_high_floor:.3f}/{calib_mid_center:.3f}+/-{calib_mid_bandwidth:.3f}/{calib_low_ceil:.3f},"
+        f"data_slack(high/low):{calib_data_high_slack:.3f}/{calib_data_low_slack:.3f}"
+    )
     print(f"split_policy={split_policy}")
     print(f"split_dir={split_dir}")
     if use_prepared_splits:
@@ -3851,6 +4194,7 @@ def main() -> int:
         low_signal_max_score_threshold=low_signal_max_score_threshold,
         low_signal_std_threshold=low_signal_std_threshold,
         low_signal_keep_prob=low_signal_keep_prob,
+        listwise_score_mode=listwise_score_mode,
         seed=seed,
     )
     val_list_rows = _build_sampled_list_rows(
@@ -3865,6 +4209,7 @@ def main() -> int:
         low_signal_max_score_threshold=low_signal_max_score_threshold,
         low_signal_std_threshold=low_signal_std_threshold,
         low_signal_keep_prob=1.0,  # keep all val rows for stable eval.
+        listwise_score_mode=listwise_score_mode,
         seed=seed + 1,
     )
     test_list_rows = _build_sampled_list_rows(
@@ -3879,6 +4224,7 @@ def main() -> int:
         low_signal_max_score_threshold=low_signal_max_score_threshold,
         low_signal_std_threshold=low_signal_std_threshold,
         low_signal_keep_prob=1.0,  # keep all test rows for stable final eval.
+        listwise_score_mode=listwise_score_mode,
         seed=seed + 2,
     )
 
@@ -3934,6 +4280,9 @@ def main() -> int:
             "dataset/listwise_train": int(len(train_list_rows)),
             "dataset/listwise_val": int(len(val_list_rows)),
             "dataset/listwise_test": int(len(test_list_rows)),
+            "dataset/listwise_score_mode": str(listwise_score_mode),
+            "dataset/calib_band_mode": str(calib_band_mode),
+            "dataset/calib_anchor_stat": str(calib_anchor_stat),
         },
         step=0,
     )
@@ -3964,6 +4313,7 @@ def main() -> int:
         tokenizer,
         max_length=max_length,
         augmented_doc_weight=float(list_augmented_doc_weight),
+        listwise_score_mode=str(listwise_score_mode),
     )
 
     pair_train_loader = DataLoader(
@@ -4024,6 +4374,8 @@ def main() -> int:
         "val_kl_loss": 0.0,
         "val_pair_loss": 0.0,
         "val_mse_loss": 0.0,
+        "val_cluster_margin_loss": 0.0,
+        "val_calibration_band_loss": 0.0,
     }
     history: List[Dict[str, Any]] = []
     global_step = 0
@@ -4055,17 +4407,26 @@ def main() -> int:
 
     def eval_listwise_losses(loader: Optional[DataLoader]) -> Dict[str, float]:
         if loader is None:
-            return {"val_kl_loss": 0.0, "val_mse_loss": 0.0, "val_list_batches": 0.0}
+            return {
+                "val_kl_loss": 0.0,
+                "val_mse_loss": 0.0,
+                "val_cluster_margin_loss": 0.0,
+                "val_calibration_band_loss": 0.0,
+                "val_list_batches": 0.0,
+            }
         was_training = bool(model.training)
         model.eval()
         kl_vals: List[float] = []
         mse_vals: List[float] = []
+        cluster_margin_vals: List[float] = []
+        calib_vals: List[float] = []
         with torch.no_grad():
             for batch in loader:
                 if batch.get("enc") is None:
                     continue
                 enc = _to_device(batch["enc"], device)
                 teacher_scores = batch["teacher_scores"].to(device)
+                cluster_ids = batch["cluster_ids"].to(device)
                 doc_weights = batch.get("doc_weights")
                 if isinstance(doc_weights, torch.Tensor):
                     doc_weights = doc_weights.to(device)
@@ -4080,13 +4441,41 @@ def main() -> int:
                     list_sizes=list_sizes,
                     temperature=teacher_temperature,
                 )
+                cluster_margin_loss = _compute_cluster_margin_loss(
+                    logits_flat=logits_flat,
+                    cluster_ids_flat=cluster_ids,
+                    doc_weights_flat=doc_weights,
+                    list_sizes=list_sizes,
+                    margin_hm=cluster_margin_hm,
+                    margin_ml=cluster_margin_ml,
+                    margin_hl=cluster_margin_hl,
+                )
+                calibration_band_loss = _compute_calibration_band_loss(
+                    logits_flat=logits_flat,
+                    teacher_scores_flat=teacher_scores,
+                    cluster_ids_flat=cluster_ids,
+                    doc_weights_flat=doc_weights,
+                    list_sizes=list_sizes,
+                    band_mode=calib_band_mode,
+                    anchor_stat=calib_anchor_stat,
+                    high_floor=calib_high_floor,
+                    mid_center=calib_mid_center,
+                    mid_bandwidth=calib_mid_bandwidth,
+                    low_ceil=calib_low_ceil,
+                    data_high_slack=calib_data_high_slack,
+                    data_low_slack=calib_data_low_slack,
+                )
                 kl_vals.append(float(kl_loss.detach().cpu().item()))
                 mse_vals.append(float(mse_loss.detach().cpu().item()))
+                cluster_margin_vals.append(float(cluster_margin_loss.detach().cpu().item()))
+                calib_vals.append(float(calibration_band_loss.detach().cpu().item()))
         if was_training:
             model.train()
         return {
             "val_kl_loss": float(sum(kl_vals) / max(1, len(kl_vals))),
             "val_mse_loss": float(sum(mse_vals) / max(1, len(mse_vals))),
+            "val_cluster_margin_loss": float(sum(cluster_margin_vals) / max(1, len(cluster_margin_vals))),
+            "val_calibration_band_loss": float(sum(calib_vals) / max(1, len(calib_vals))),
             "val_list_batches": float(len(kl_vals)),
         }
 
@@ -4098,6 +4487,8 @@ def main() -> int:
         val_kl_loss: float,
         val_pair_loss: float,
         val_mse_loss: float,
+        val_cluster_margin_loss: float,
+        val_calibration_band_loss: float,
         source: str,
     ) -> None:
         nonlocal best_val_total_loss
@@ -4120,6 +4511,8 @@ def main() -> int:
             "val_kl_loss": float(val_kl_loss),
             "val_pair_loss": float(val_pair_loss),
             "val_mse_loss": float(val_mse_loss),
+            "val_cluster_margin_loss": float(val_cluster_margin_loss),
+            "val_calibration_band_loss": float(val_calibration_band_loss),
         }
 
         best_loss_dir = output_dir / "best_val_loss"
@@ -4229,15 +4622,21 @@ def main() -> int:
         val_list_loss = eval_listwise_losses(val_list_loader)
         val_kl_loss = float(val_list_loss.get("val_kl_loss", 0.0))
         val_mse_loss = float(val_list_loss.get("val_mse_loss", 0.0))
+        val_cluster_margin_loss = float(val_list_loss.get("val_cluster_margin_loss", 0.0))
+        val_calibration_band_loss = float(val_list_loss.get("val_calibration_band_loss", 0.0))
         val_total_loss = (
             float(loss_kl_weight) * float(val_kl_loss)
             + float(loss_pair_weight) * float(val_pair_loss)
             + float(loss_mse_weight) * float(val_mse_loss)
+            + float(loss_cluster_margin_weight) * float(val_cluster_margin_loss)
+            + float(loss_calibration_band_weight) * float(val_calibration_band_loss)
         )
         print(
             f"stage=2 epoch={epoch}/{stage2_epochs} step={global_step_now} "
             f"val_total_loss={val_total_loss:.6f} val_kl_loss={val_kl_loss:.6f} "
-            f"val_pair_loss={val_pair_loss:.6f} val_mse_loss={val_mse_loss:.6f}"
+            f"val_pair_loss={val_pair_loss:.6f} val_mse_loss={val_mse_loss:.6f} "
+            f"val_cluster_margin_loss={val_cluster_margin_loss:.6f} "
+            f"val_calibration_band_loss={val_calibration_band_loss:.6f}"
         )
         _wandb_log(
             wandb_run,
@@ -4247,6 +4646,8 @@ def main() -> int:
                 "eval/loss_kl_step": float(val_kl_loss),
                 "eval/loss_pair_step": float(val_pair_loss),
                 "eval/loss_mse_step": float(val_mse_loss),
+                "eval/loss_cluster_margin_step": float(val_cluster_margin_loss),
+                "eval/loss_calibration_band_step": float(val_calibration_band_loss),
             },
             step=int(global_step_now),
         )
@@ -4257,6 +4658,8 @@ def main() -> int:
             val_kl_loss=float(val_kl_loss),
             val_pair_loss=float(val_pair_loss),
             val_mse_loss=float(val_mse_loss),
+            val_cluster_margin_loss=float(val_cluster_margin_loss),
+            val_calibration_band_loss=float(val_calibration_band_loss),
             source="step_eval",
         )
 
@@ -4431,6 +4834,7 @@ def main() -> int:
                 low_signal_max_score_threshold=low_signal_max_score_threshold,
                 low_signal_std_threshold=low_signal_std_threshold,
                 low_signal_keep_prob=low_signal_keep_prob,
+                listwise_score_mode=listwise_score_mode,
                 seed=seed + epoch,
             )
             if not epoch_list_rows:
@@ -4449,7 +4853,14 @@ def main() -> int:
             optimizer.zero_grad(set_to_none=True)
             accum_counter = 0
 
-            loss_hist: Dict[str, List[float]] = {"total": [], "kl": [], "pair": [], "mse": []}
+            loss_hist: Dict[str, List[float]] = {
+                "total": [],
+                "kl": [],
+                "pair": [],
+                "mse": [],
+                "cluster_margin": [],
+                "calibration_band": [],
+            }
 
             stage2_iter: Any = epoch_loader
             stage2_bar: Any = None
@@ -4469,6 +4880,7 @@ def main() -> int:
 
                 list_enc = _to_device(list_batch["enc"], device)
                 teacher_scores = list_batch["teacher_scores"].to(device)
+                cluster_ids = list_batch["cluster_ids"].to(device)
                 doc_weights = list_batch.get("doc_weights")
                 if isinstance(doc_weights, torch.Tensor):
                     doc_weights = doc_weights.to(device)
@@ -4496,6 +4908,30 @@ def main() -> int:
                         list_sizes=list_sizes,
                         temperature=teacher_temperature,
                     )
+                    cluster_margin_loss = _compute_cluster_margin_loss(
+                        logits_flat=list_logits_flat,
+                        cluster_ids_flat=cluster_ids,
+                        doc_weights_flat=doc_weights,
+                        list_sizes=list_sizes,
+                        margin_hm=cluster_margin_hm,
+                        margin_ml=cluster_margin_ml,
+                        margin_hl=cluster_margin_hl,
+                    )
+                    calibration_band_loss = _compute_calibration_band_loss(
+                        logits_flat=list_logits_flat,
+                        teacher_scores_flat=teacher_scores,
+                        cluster_ids_flat=cluster_ids,
+                        doc_weights_flat=doc_weights,
+                        list_sizes=list_sizes,
+                        band_mode=calib_band_mode,
+                        anchor_stat=calib_anchor_stat,
+                        high_floor=calib_high_floor,
+                        mid_center=calib_mid_center,
+                        mid_bandwidth=calib_mid_bandwidth,
+                        low_ceil=calib_low_ceil,
+                        data_high_slack=calib_data_high_slack,
+                        data_low_slack=calib_data_low_slack,
+                    )
 
                     pos_logits = model(**pos).logits.squeeze(-1)
                     neg_logits = model(**neg).logits.squeeze(-1)
@@ -4505,6 +4941,8 @@ def main() -> int:
                         float(loss_kl_weight) * kl_loss
                         + float(loss_pair_weight) * pair_loss
                         + float(loss_mse_weight) * mse_loss
+                        + float(loss_cluster_margin_weight) * cluster_margin_loss
+                        + float(loss_calibration_band_weight) * calibration_band_loss
                     )
                     total_loss = total_loss / float(grad_accum_steps)
 
@@ -4514,6 +4952,8 @@ def main() -> int:
                 loss_hist["kl"].append(float(kl_loss.detach().cpu().item()))
                 loss_hist["pair"].append(float(pair_loss.detach().cpu().item()))
                 loss_hist["mse"].append(float(mse_loss.detach().cpu().item()))
+                loss_hist["cluster_margin"].append(float(cluster_margin_loss.detach().cpu().item()))
+                loss_hist["calibration_band"].append(float(calibration_band_loss.detach().cpu().item()))
                 accum_counter += 1
 
                 if accum_counter >= grad_accum_steps:
@@ -4529,12 +4969,16 @@ def main() -> int:
                         recent_kl = sum(loss_hist["kl"][-10:]) / max(1, min(10, len(loss_hist["kl"])))
                         recent_pair = sum(loss_hist["pair"][-10:]) / max(1, min(10, len(loss_hist["pair"])))
                         recent_mse = sum(loss_hist["mse"][-10:]) / max(1, min(10, len(loss_hist["mse"])))
+                        recent_cluster_margin = sum(loss_hist["cluster_margin"][-10:]) / max(1, min(10, len(loss_hist["cluster_margin"])))
+                        recent_calibration_band = sum(loss_hist["calibration_band"][-10:]) / max(1, min(10, len(loss_hist["calibration_band"])))
                         print(
                             f"stage=2 epoch={epoch}/{stage2_epochs} step={global_step} "
                             f"loss_total={recent_total:.6f} "
                             f"loss_kl={recent_kl:.6f} "
                             f"loss_pair={recent_pair:.6f} "
-                            f"loss_mse={recent_mse:.6f}"
+                            f"loss_mse={recent_mse:.6f} "
+                            f"loss_cluster_margin={recent_cluster_margin:.6f} "
+                            f"loss_calibration_band={recent_calibration_band:.6f}"
                         )
                         _wandb_log(
                             wandb_run,
@@ -4544,6 +4988,8 @@ def main() -> int:
                                 "train/loss_kl_step": float(recent_kl),
                                 "train/loss_pair_step": float(recent_pair),
                                 "train/loss_mse_step": float(recent_mse),
+                                "train/loss_cluster_margin_step": float(recent_cluster_margin),
+                                "train/loss_calibration_band_step": float(recent_calibration_band),
                             },
                             step=global_step,
                         )
@@ -4553,12 +4999,16 @@ def main() -> int:
                     recent_kl = sum(loss_hist["kl"][-10:]) / max(1, min(10, len(loss_hist["kl"])))
                     recent_pair = sum(loss_hist["pair"][-10:]) / max(1, min(10, len(loss_hist["pair"])))
                     recent_mse = sum(loss_hist["mse"][-10:]) / max(1, min(10, len(loss_hist["mse"])))
+                    recent_cluster_margin = sum(loss_hist["cluster_margin"][-10:]) / max(1, min(10, len(loss_hist["cluster_margin"])))
+                    recent_calibration_band = sum(loss_hist["calibration_band"][-10:]) / max(1, min(10, len(loss_hist["calibration_band"])))
                     stage2_bar.set_postfix(
                         {
                             "loss": f"{recent_total:.4f}",
                             "kl": f"{recent_kl:.4f}",
                             "pair": f"{recent_pair:.4f}",
                             "mse": f"{recent_mse:.4f}",
+                            "cm": f"{recent_cluster_margin:.4f}",
+                            "cb": f"{recent_calibration_band:.4f}",
                             "gs": int(global_step),
                         }
                     )
@@ -4577,10 +5027,14 @@ def main() -> int:
             val_list_loss = eval_listwise_losses(val_list_loader)
             val_kl_loss = float(val_list_loss.get("val_kl_loss", 0.0))
             val_mse_loss = float(val_list_loss.get("val_mse_loss", 0.0))
+            val_cluster_margin_loss = float(val_list_loss.get("val_cluster_margin_loss", 0.0))
+            val_calibration_band_loss = float(val_list_loss.get("val_calibration_band_loss", 0.0))
             val_total_loss = (
                 float(loss_kl_weight) * float(val_kl_loss)
                 + float(loss_pair_weight) * float(val_pair_loss)
                 + float(loss_mse_weight) * float(val_mse_loss)
+                + float(loss_cluster_margin_weight) * float(val_cluster_margin_loss)
+                + float(loss_calibration_band_weight) * float(val_calibration_band_loss)
             )
 
             eval_metrics = _evaluate(
@@ -4602,10 +5056,14 @@ def main() -> int:
                 "train_kl_loss": float(sum(loss_hist["kl"]) / max(1, len(loss_hist["kl"]))),
                 "train_pair_loss": float(sum(loss_hist["pair"]) / max(1, len(loss_hist["pair"]))),
                 "train_mse_loss": float(sum(loss_hist["mse"]) / max(1, len(loss_hist["mse"]))),
+                "train_cluster_margin_loss": float(sum(loss_hist["cluster_margin"]) / max(1, len(loss_hist["cluster_margin"]))),
+                "train_calibration_band_loss": float(sum(loss_hist["calibration_band"]) / max(1, len(loss_hist["calibration_band"]))),
                 "val_total_loss": float(val_total_loss),
                 "val_kl_loss": float(val_kl_loss),
                 "val_pair_loss": float(val_pair_loss),
                 "val_mse_loss": float(val_mse_loss),
+                "val_cluster_margin_loss": float(val_cluster_margin_loss),
+                "val_calibration_band_loss": float(val_calibration_band_loss),
                 "val_list_batches": int(val_list_loss.get("val_list_batches", 0.0)),
                 "global_step": global_step,
             }
@@ -4621,10 +5079,14 @@ def main() -> int:
                     "train/loss_kl_epoch": float(metrics["train_kl_loss"]),
                     "train/loss_pair_epoch": float(metrics["train_pair_loss"]),
                     "train/loss_mse_epoch": float(metrics["train_mse_loss"]),
+                    "train/loss_cluster_margin_epoch": float(metrics["train_cluster_margin_loss"]),
+                    "train/loss_calibration_band_epoch": float(metrics["train_calibration_band_loss"]),
                     "eval/loss_total_epoch": float(metrics["val_total_loss"]),
                     "eval/loss_kl_epoch": float(metrics["val_kl_loss"]),
                     "eval/loss_pair_epoch": float(metrics["val_pair_loss"]),
                     "eval/loss_mse_epoch": float(metrics["val_mse_loss"]),
+                    "eval/loss_cluster_margin_epoch": float(metrics["val_cluster_margin_loss"]),
+                    "eval/loss_calibration_band_epoch": float(metrics["val_calibration_band_loss"]),
                     "eval/ndcg@10": float(metrics.get("ndcg@10", 0.0)),
                     "eval/mrr@10": float(metrics.get("mrr@10", 0.0)),
                     "eval/recall@50": float(metrics.get("recall@50", 0.0)),
@@ -4639,6 +5101,8 @@ def main() -> int:
                 val_kl_loss=float(val_kl_loss),
                 val_pair_loss=float(val_pair_loss),
                 val_mse_loss=float(val_mse_loss),
+                val_cluster_margin_loss=float(val_cluster_margin_loss),
+                val_calibration_band_loss=float(val_calibration_band_loss),
                 source="epoch_eval",
             )
 
@@ -4658,10 +5122,14 @@ def main() -> int:
     test_list_loss = eval_listwise_losses(test_list_loader)
     test_kl_loss = float(test_list_loss.get("val_kl_loss", 0.0))
     test_mse_loss = float(test_list_loss.get("val_mse_loss", 0.0))
+    test_cluster_margin_loss = float(test_list_loss.get("val_cluster_margin_loss", 0.0))
+    test_calibration_band_loss = float(test_list_loss.get("val_calibration_band_loss", 0.0))
     test_total_loss = (
         float(loss_kl_weight) * float(test_kl_loss)
         + float(loss_pair_weight) * float(test_pair_loss)
         + float(loss_mse_weight) * float(test_mse_loss)
+        + float(loss_cluster_margin_weight) * float(test_cluster_margin_loss)
+        + float(loss_calibration_band_weight) * float(test_calibration_band_loss)
     )
     test_eval_metrics = _evaluate(
         model=model,
@@ -4680,6 +5148,8 @@ def main() -> int:
         "test_kl_loss": float(test_kl_loss),
         "test_pair_loss": float(test_pair_loss),
         "test_mse_loss": float(test_mse_loss),
+        "test_cluster_margin_loss": float(test_cluster_margin_loss),
+        "test_calibration_band_loss": float(test_calibration_band_loss),
         "test_list_batches": int(test_list_loss.get("val_list_batches", 0.0)),
         "global_step": global_step,
     }
@@ -4693,6 +5163,8 @@ def main() -> int:
             "test/loss_kl": float(test_metrics["test_kl_loss"]),
             "test/loss_pair": float(test_metrics["test_pair_loss"]),
             "test/loss_mse": float(test_metrics["test_mse_loss"]),
+            "test/loss_cluster_margin": float(test_metrics["test_cluster_margin_loss"]),
+            "test/loss_calibration_band": float(test_metrics["test_calibration_band_loss"]),
             "test/ndcg@10": float(test_metrics.get("ndcg@10", 0.0)),
             "test/mrr@10": float(test_metrics.get("mrr@10", 0.0)),
             "test/recall@50": float(test_metrics.get("recall@50", 0.0)),
@@ -4757,6 +5229,24 @@ def main() -> int:
         "pair_type_weights": dict(pair_type_weights),
         "pair_type_cap_stats": pair_type_cap_stats,
         "list_augmented_doc_weight": float(list_augmented_doc_weight),
+        "listwise_score_mode": str(listwise_score_mode),
+        "calibration_band_mode": str(calib_band_mode),
+        "calibration_anchor_stat": str(calib_anchor_stat),
+        "calibration_fixed": {
+            "high_floor": float(calib_high_floor),
+            "mid_center": float(calib_mid_center),
+            "mid_bandwidth": float(calib_mid_bandwidth),
+            "low_ceil": float(calib_low_ceil),
+        },
+        "calibration_data_slack": {
+            "high": float(calib_data_high_slack),
+            "low": float(calib_data_low_slack),
+        },
+        "cluster_margin_targets": {
+            "high_minus_mid": float(cluster_margin_hm),
+            "mid_minus_low": float(cluster_margin_ml),
+            "high_minus_low": float(cluster_margin_hl),
+        },
         "train_low_cap": {
             "train_band_high_threshold": float(train_band_high_threshold),
             "train_band_mid_threshold": float(train_band_mid_threshold),
@@ -4773,6 +5263,8 @@ def main() -> int:
             "kl": float(loss_kl_weight),
             "pair": float(loss_pair_weight),
             "mse": float(loss_mse_weight),
+            "cluster_margin": float(loss_cluster_margin_weight),
+            "calibration_band": float(loss_calibration_band_weight),
         },
         "margin_clip": {"min": float(margin_min), "max": float(margin_max)},
         "stage1_epochs": int(stage1_epochs),
