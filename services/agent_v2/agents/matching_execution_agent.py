@@ -549,7 +549,7 @@ class MatchingExecutionAgent:
                 self.faculty_matcher.run_for_faculty(
                     faculty_id=int(faculty_id),
                     k=max(prefilter_k, 20),
-                    min_domain=0.0,
+                    min_domain=0.3,
                     rerank_chunk_workers=int(self._resolve_single_faculty_rerank_chunk_workers()),
                 )
 
