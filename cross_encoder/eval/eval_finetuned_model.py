@@ -918,8 +918,15 @@ def _compute_raw_score_sanity(
     avg_low = _avg(by_band["low"])
     monotonic = bool(avg_high >= avg_mid >= avg_low)
 
+    mid_vals = by_band["mid"]
     low_vals = by_band["low"]
     high_vals = by_band["high"]
+    low_out_count = int(sum(1 for x in low_vals if x >= float(mid_threshold)))
+    mid_out_count = int(sum(1 for x in mid_vals if (x < float(mid_threshold) or x >= float(high_threshold))))
+    high_out_count = int(sum(1 for x in high_vals if x < float(high_threshold)))
+    low_out_rate = float(low_out_count / float(max(1, len(low_vals))))
+    mid_out_rate = float(mid_out_count / float(max(1, len(mid_vals))))
+    high_out_rate = float(high_out_count / float(max(1, len(high_vals))))
     weak_leak = float(sum(1 for x in low_vals if x >= float(high_threshold)) / float(max(1, len(low_vals))))
     strong_collapse = float(sum(1 for x in high_vals if x < float(mid_threshold)) / float(max(1, len(high_vals))))
 
@@ -928,6 +935,12 @@ def _compute_raw_score_sanity(
         "avg_pred_mid": float(avg_mid),
         "avg_pred_low": float(avg_low),
         "monotonic_high_mid_low": bool(monotonic),
+        "low_out_count": int(low_out_count),
+        "mid_out_count": int(mid_out_count),
+        "high_out_count": int(high_out_count),
+        "low_out_rate": float(low_out_rate),
+        "mid_out_rate": float(mid_out_rate),
+        "high_out_rate": float(high_out_rate),
         "weak_leak_rate": float(weak_leak),
         "strong_collapse_rate": float(strong_collapse),
         "count_high": int(len(by_band["high"])),
@@ -1029,6 +1042,41 @@ def _format_raw_sanity_table(
     return "\n".join(lines)
 
 
+def _format_out_of_band_table(
+    *,
+    ground_truth: Dict[str, Any],
+    finetuned: Dict[str, Any],
+    base: Dict[str, Any],
+    high_threshold: float,
+    mid_threshold: float,
+) -> str:
+    lines: List[str] = []
+    lines.append("")
+    lines.append("=== Out-Of-Band Summary ===")
+    lines.append(f"thresholds: high>={float(high_threshold):.2f}, mid>={float(mid_threshold):.2f}")
+    lines.append(
+        f"{'MODEL':<12} {'LOW_OUT':>21} {'MID_OUT':>21} {'HIGH_OUT':>21}"
+    )
+    lines.append("-" * 78)
+
+    def _cell(obj: Dict[str, Any], *, out_key: str, count_key: str, rate_key: str) -> str:
+        out_n = int(obj.get(out_key) or 0)
+        total_n = int(obj.get(count_key) or 0)
+        rate = float(obj.get(rate_key) or 0.0) * 100.0
+        return f"{out_n}/{total_n} ({rate:.2f}%)"
+
+    def _row(label: str, obj: Dict[str, Any]) -> str:
+        low_cell = _cell(obj, out_key="low_out_count", count_key="count_low", rate_key="low_out_rate")
+        mid_cell = _cell(obj, out_key="mid_out_count", count_key="count_mid", rate_key="mid_out_rate")
+        high_cell = _cell(obj, out_key="high_out_count", count_key="count_high", rate_key="high_out_rate")
+        return f"{label:<12} {low_cell:>21} {mid_cell:>21} {high_cell:>21}"
+
+    lines.append(_row("ground_truth", ground_truth))
+    lines.append(_row("finetuned", finetuned))
+    lines.append(_row("base", base))
+    return "\n".join(lines)
+
+
 def _format_distill_pairs_table(
     *,
     rows: Sequence[Dict[str, Any]],
@@ -1067,8 +1115,8 @@ def _run_distill_eval(args: argparse.Namespace) -> int:
     sample_high = _safe_int(args.distill_sample_high, default=0, minimum=0, maximum=1_000_000)
     sample_mid = _safe_int(args.distill_sample_mid, default=0, minimum=0, maximum=1_000_000)
     sample_low = _safe_int(args.distill_sample_low, default=0, minimum=0, maximum=1_000_000)
-    high_threshold = _safe_float(args.distill_high_threshold, default=0.67, minimum=0.0, maximum=1.0)
-    mid_threshold = _safe_float(args.distill_mid_threshold, default=0.34, minimum=0.0, maximum=1.0)
+    high_threshold = _safe_float(args.distill_high_threshold, default=0.70, minimum=0.0, maximum=1.0)
+    mid_threshold = _safe_float(args.distill_mid_threshold, default=0.30, minimum=0.0, maximum=1.0)
     if mid_threshold > high_threshold:
         mid_threshold = high_threshold
     max_pairs_scan = _safe_int(args.distill_max_pairs_scan, default=0, minimum=0, maximum=50_000_000)
@@ -1233,6 +1281,13 @@ def _run_distill_eval(args: argparse.Namespace) -> int:
             finetuned=raw_sanity_finetuned,
             base=raw_sanity_base,
         ),
+        _format_out_of_band_table(
+            ground_truth=raw_sanity_ground_truth,
+            finetuned=raw_sanity_finetuned,
+            base=raw_sanity_base,
+            high_threshold=high_threshold,
+            mid_threshold=mid_threshold,
+        ),
     ]
     blocks_save: List[str] = [
         meta_header,
@@ -1242,6 +1297,13 @@ def _run_distill_eval(args: argparse.Namespace) -> int:
             ground_truth=raw_sanity_ground_truth,
             finetuned=raw_sanity_finetuned,
             base=raw_sanity_base,
+        ),
+        _format_out_of_band_table(
+            ground_truth=raw_sanity_ground_truth,
+            finetuned=raw_sanity_finetuned,
+            base=raw_sanity_base,
+            high_threshold=high_threshold,
+            mid_threshold=mid_threshold,
         ),
     ]
 
@@ -1383,8 +1445,8 @@ def _build_parser() -> argparse.ArgumentParser:
 
     p.add_argument("--max-fac-specs", type=int, default=0, help="Optional cap faculty specs (0 = all).")
     p.add_argument("--max-grant-specs", type=int, default=0, help="Optional cap grant specs total (0 = all).")
-    p.add_argument("--cluster-strong-min", type=float, default=0.67, help="Finetuned score threshold for strong cluster.")
-    p.add_argument("--cluster-mid-min", type=float, default=0.34, help="Finetuned score threshold for mid cluster.")
+    p.add_argument("--cluster-strong-min", type=float, default=0.70, help="Finetuned score threshold for strong cluster.")
+    p.add_argument("--cluster-mid-min", type=float, default=0.30, help="Finetuned score threshold for mid cluster.")
     p.add_argument("--margin-top-k", type=int, default=10, help="Top-k rows by absolute |finetuned-base| margin.")
     p.add_argument("--distill-test-input", type=str, default=DISTILL_TEST_INPUT_DEFAULT, help="Preferred test JSONL for distill evaluation.")
     p.add_argument("--distill-input", type=str, default=DISTILL_INPUT_DEFAULT, help="Fallback distilled JSONL input (raw or listwise).")
@@ -1395,8 +1457,8 @@ def _build_parser() -> argparse.ArgumentParser:
         choices=["normalized", "raw"],
         help="Teacher score field used for margin computation.",
     )
-    p.add_argument("--distill-high-threshold", type=float, default=0.67, help="High band threshold for teacher score.")
-    p.add_argument("--distill-mid-threshold", type=float, default=0.34, help="Mid band lower threshold for teacher score.")
+    p.add_argument("--distill-high-threshold", type=float, default=0.70, help="High band threshold for teacher score.")
+    p.add_argument("--distill-mid-threshold", type=float, default=0.30, help="Mid band lower threshold for teacher score.")
     p.add_argument(
         "--distill-sample-high",
         type=int,
@@ -1487,8 +1549,8 @@ def main() -> int:
     max_grant_specs = _safe_int(args.max_grant_specs, default=0, minimum=0, maximum=5_000_000)
     batch_size = _safe_int(args.batch_size, default=32, minimum=1, maximum=4096)
     max_length = _safe_int(args.max_length, default=512, minimum=64, maximum=4096)
-    cluster_strong_min = _safe_float(args.cluster_strong_min, default=0.67, minimum=0.0, maximum=1.0)
-    cluster_mid_min = _safe_float(args.cluster_mid_min, default=0.34, minimum=0.0, maximum=1.0)
+    cluster_strong_min = _safe_float(args.cluster_strong_min, default=0.70, minimum=0.0, maximum=1.0)
+    cluster_mid_min = _safe_float(args.cluster_mid_min, default=0.30, minimum=0.0, maximum=1.0)
     margin_top_k = _safe_int(args.margin_top_k, default=10, minimum=1, maximum=100_000)
     if cluster_mid_min > cluster_strong_min:
         cluster_mid_min = cluster_strong_min
