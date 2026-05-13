@@ -6,6 +6,7 @@ from pathlib import Path
 import re
 import time
 from typing import Dict, Iterable, List, Optional
+from urllib.parse import quote
 
 import requests
 
@@ -30,6 +31,10 @@ class AuthorPublicationFetcher:
         self._semantic_scholar_paper_search_api = _clean_text(
             settings.semantic_scholar_paper_search_api
         ).rstrip("/")
+        self._semantic_scholar_paper_api = self._semantic_scholar_paper_search_api.replace(
+            "/search",
+            "",
+        )
         self._default_required_org = _clean_text(settings.university_name)
         self._session = requests.Session()
         self._session.headers.update({"User-Agent": _USER_AGENT})
@@ -37,6 +42,15 @@ class AuthorPublicationFetcher:
         self._s2_last_request_at: float = 0.0
         self._s2_rate_limited_until: float = 0.0
         self._s2_consecutive_429: int = 0
+
+    @staticmethod
+    def normalize_doi(raw: str) -> str:
+        txt = _clean_text(raw)
+        if not txt:
+            return ""
+        txt = re.sub(r"^doi:\s*", "", txt, flags=re.IGNORECASE).strip()
+        txt = re.sub(r"^https?://(dx\.)?doi\.org/", "", txt, flags=re.IGNORECASE).strip()
+        return txt
 
     def _extract_openalex_id(self, raw: str) -> Optional[str]:
         txt = _clean_text(raw)
@@ -315,6 +329,59 @@ class AuthorPublicationFetcher:
 
         self._s2_abstract_cache[key] = None
         return None
+
+    def fetch_semantic_scholar_paper_by_doi(self, *, doi: str) -> Optional[dict]:
+        """
+        Fetch one paper from Semantic Scholar using DOI.
+
+        Returns a dict with optional keys: title, abstract, year.
+        """
+        normalized_doi = self.normalize_doi(doi or "")
+        if not normalized_doi:
+            return None
+
+        headers = {"User-Agent": _USER_AGENT}
+        api_key = self._get_s2_api_key()
+        if api_key:
+            headers["x-api-key"] = api_key
+
+        paper_id = quote(f"DOI:{normalized_doi}", safe="")
+        url = f"{self._semantic_scholar_paper_api}/{paper_id}"
+        resp = self._request_with_backoff(
+            url=url,
+            params={"fields": "title,abstract,year,tldr"},
+            headers=headers,
+            max_retries=2,
+            label="Semantic Scholar",
+        )
+        if resp is None:
+            return None
+
+        try:
+            payload = resp.json() or {}
+        except Exception:
+            return None
+        if not isinstance(payload, dict):
+            return None
+
+        title = _clean_text(payload.get("title") or "")
+        abstract = _clean_text(payload.get("abstract") or "")
+        if not abstract:
+            tldr = payload.get("tldr") or {}
+            if isinstance(tldr, dict):
+                abstract = _clean_text(tldr.get("text") or "")
+
+        year_raw = payload.get("year")
+        try:
+            year = int(year_raw) if year_raw is not None else None
+        except Exception:
+            year = None
+
+        return {
+            "title": title or None,
+            "abstract": abstract or None,
+            "year": year,
+        }
 
     def resolve_author_id(
         self,

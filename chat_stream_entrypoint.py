@@ -1363,17 +1363,22 @@ def create_faculty_profiles():
             osu_url_map=osu_url_map,
             cv_pdf_map=cv_pdf_map,
             keyword_generator=keyword_generator,
+            run_matching_for_new=True,
         )
         logger.info(f"Result: {result}")
         # Count created faculty (those with faculty_id)
         created_count = len(result.get("newly_added", []))
         return {
             "ok": True,
+            "pipeline_status": "done",
             "message": f"Created {created_count} faculty profile(s).",
             "created": created_count,
             "resolved": result.get("resolved", []),
             "newly_added": result.get("newly_added", []),
             "failed": result.get("failed", []),
+            "match_rows_upserted": int(result.get("match_rows_upserted") or 0),
+            "matching_failed": result.get("matching_failed_emails", []),
+            "matching_ran": bool(result.get("matching_ran")),
         }, 200
     except Exception as e:
         logger.exception("POST /api/faculty/create failed")
