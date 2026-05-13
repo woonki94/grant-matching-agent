@@ -55,9 +55,18 @@ LOSS_MSE_WEIGHT="${LOSS_MSE_WEIGHT:-0.15}"
 LISTWISE_SCORE_MODE="${LISTWISE_SCORE_MODE:-raw}"        # raw | normalized
 LOSS_CLUSTER_MARGIN_WEIGHT="${LOSS_CLUSTER_MARGIN_WEIGHT:-1.80}"
 LOSS_CALIBRATION_BAND_WEIGHT="${LOSS_CALIBRATION_BAND_WEIGHT:-1.80}"
+LOSS_CLUSTER_MARGIN_HM_WEIGHT="${LOSS_CLUSTER_MARGIN_HM_WEIGHT:-1.0}"
+LOSS_CLUSTER_MARGIN_ML_WEIGHT="${LOSS_CLUSTER_MARGIN_ML_WEIGHT:-1.0}"
+LOSS_CLUSTER_MARGIN_HL_WEIGHT="${LOSS_CLUSTER_MARGIN_HL_WEIGHT:-1.0}"
+LOSS_CALIBRATION_HIGH_WEIGHT="${LOSS_CALIBRATION_HIGH_WEIGHT:-1.0}"
+LOSS_CALIBRATION_MID_WEIGHT="${LOSS_CALIBRATION_MID_WEIGHT:-1.0}"
+LOSS_CALIBRATION_LOW_WEIGHT="${LOSS_CALIBRATION_LOW_WEIGHT:-1.0}"
 CLUSTER_MARGIN_HM="${CLUSTER_MARGIN_HM:-0.38}"
 CLUSTER_MARGIN_ML="${CLUSTER_MARGIN_ML:-0.36}"
 CLUSTER_MARGIN_HL="${CLUSTER_MARGIN_HL:-0.75}"
+STAGE2_CLUSTER_SOURCE="${STAGE2_CLUSTER_SOURCE:-teacher_raw}"  # teacher_raw | teacher_normalized | target_cluster
+STAGE2_CLUSTER_HIGH_THRESHOLD="${STAGE2_CLUSTER_HIGH_THRESHOLD:-0.70}"
+STAGE2_CLUSTER_MID_THRESHOLD="${STAGE2_CLUSTER_MID_THRESHOLD:-0.30}"
 CALIB_BAND_MODE="${CALIB_BAND_MODE:-fixed}"        # fixed | data_driven
 CALIB_ANCHOR_STAT="${CALIB_ANCHOR_STAT:-mean}"           # mean | median
 CALIB_HIGH_FLOOR="${CALIB_HIGH_FLOOR:-0.92}"
@@ -89,6 +98,20 @@ WEIGHT_DECAY="${WEIGHT_DECAY:-0.01}"
 MAX_GRAD_NORM="${MAX_GRAD_NORM:-1.0}"
 LOG_EVERY_STEPS="${LOG_EVERY_STEPS:-50}"
 EVAL_EVERY_STEPS="${EVAL_EVERY_STEPS:-50}"
+STAGE2_OOB_SELECTION_SPLIT="${STAGE2_OOB_SELECTION_SPLIT:-val}"   # val | test
+STAGE2_OOB_HIGH_WEIGHT="${STAGE2_OOB_HIGH_WEIGHT:-2.0}"
+STAGE2_OOB_MID_WEIGHT="${STAGE2_OOB_MID_WEIGHT:-1.0}"
+STAGE2_OOB_LOW_WEIGHT="${STAGE2_OOB_LOW_WEIGHT:-1.0}"
+STAGE2_EARLY_STOP="${STAGE2_EARLY_STOP:-true}"                     # true | false
+STAGE2_EARLY_STOP_PATIENCE="${STAGE2_EARLY_STOP_PATIENCE:-2}"      # epochs
+STAGE2_POSTHOC_CALIBRATION="${STAGE2_POSTHOC_CALIBRATION:-true}"   # true | false
+STAGE2_POSTHOC_CALIBRATION_FIT_SPLIT="${STAGE2_POSTHOC_CALIBRATION_FIT_SPLIT:-val}"  # val | test
+STAGE2_POSTHOC_A_MIN="${STAGE2_POSTHOC_A_MIN:-0.5}"
+STAGE2_POSTHOC_A_MAX="${STAGE2_POSTHOC_A_MAX:-3.0}"
+STAGE2_POSTHOC_A_STEPS="${STAGE2_POSTHOC_A_STEPS:-15}"
+STAGE2_POSTHOC_B_MIN="${STAGE2_POSTHOC_B_MIN:--2.0}"
+STAGE2_POSTHOC_B_MAX="${STAGE2_POSTHOC_B_MAX:-2.0}"
+STAGE2_POSTHOC_B_STEPS="${STAGE2_POSTHOC_B_STEPS:-25}"
 
 USE_PREPARED_SPLITS="${USE_PREPARED_SPLITS:-true}"       # true | false
 REGENERATE_SPLITS="${REGENERATE_SPLITS:-false}"          # true | false
@@ -123,8 +146,13 @@ log "max_length=${MAX_LENGTH} candidate_pool_size=${CANDIDATE_POOL_SIZE} mini_li
 log "loss_kl=${LOSS_KL_WEIGHT} loss_pair=${LOSS_PAIR_WEIGHT} loss_mse=${LOSS_MSE_WEIGHT} teacher_temperature=${TEACHER_TEMPERATURE}"
 log "listwise_score_mode=${LISTWISE_SCORE_MODE}"
 log "loss_cluster_margin=${LOSS_CLUSTER_MARGIN_WEIGHT} loss_calibration_band=${LOSS_CALIBRATION_BAND_WEIGHT}"
+log "loss_cluster_margin_rel_weights hm/ml/hl=${LOSS_CLUSTER_MARGIN_HM_WEIGHT}/${LOSS_CLUSTER_MARGIN_ML_WEIGHT}/${LOSS_CLUSTER_MARGIN_HL_WEIGHT}"
+log "loss_calibration_band_weights high/mid/low=${LOSS_CALIBRATION_HIGH_WEIGHT}/${LOSS_CALIBRATION_MID_WEIGHT}/${LOSS_CALIBRATION_LOW_WEIGHT}"
 log "cluster_margin_targets hm/ml/hl=${CLUSTER_MARGIN_HM}/${CLUSTER_MARGIN_ML}/${CLUSTER_MARGIN_HL}"
+log "stage2_cluster_source=${STAGE2_CLUSTER_SOURCE} thresholds high/mid=${STAGE2_CLUSTER_HIGH_THRESHOLD}/${STAGE2_CLUSTER_MID_THRESHOLD}"
 log "calibration mode=${CALIB_BAND_MODE} anchor_stat=${CALIB_ANCHOR_STAT} fixed=${CALIB_HIGH_FLOOR}/${CALIB_MID_CENTER}+/-${CALIB_MID_BANDWIDTH}/${CALIB_LOW_CEIL} data_slack=${CALIB_DATA_HIGH_SLACK}/${CALIB_DATA_LOW_SLACK}"
+log "stage2_oob selection_split=${STAGE2_OOB_SELECTION_SPLIT} weights high/mid/low=${STAGE2_OOB_HIGH_WEIGHT}/${STAGE2_OOB_MID_WEIGHT}/${STAGE2_OOB_LOW_WEIGHT} early_stop=${STAGE2_EARLY_STOP} patience=${STAGE2_EARLY_STOP_PATIENCE}"
+log "stage2_posthoc calibration=${STAGE2_POSTHOC_CALIBRATION} fit_split=${STAGE2_POSTHOC_CALIBRATION_FIT_SPLIT} grid_a=[${STAGE2_POSTHOC_A_MIN},${STAGE2_POSTHOC_A_MAX}]x${STAGE2_POSTHOC_A_STEPS} grid_b=[${STAGE2_POSTHOC_B_MIN},${STAGE2_POSTHOC_B_MAX}]x${STAGE2_POSTHOC_B_STEPS}"
 log "margin_min=${MARGIN_MIN} margin_max=${MARGIN_MAX}"
 log "pair_add_mid_lower_mid=${PAIR_ADD_MID_LOWER_MID} pair_mid_add_easy_contrast=${PAIR_MID_ADD_EASY_CONTRAST}"
 log "pair_mid_score_range pos=[${PAIR_MID_POS_SCORE_MIN},${PAIR_MID_POS_SCORE_MAX}] neg=[${PAIR_MID_NEG_SCORE_MIN},${PAIR_MID_NEG_SCORE_MAX}] pair_mid_margin=[${PAIR_MID_MARGIN_MIN},${PAIR_MID_MARGIN_MAX}]"
@@ -158,9 +186,18 @@ CMD=(
   --loss-mse-weight "${LOSS_MSE_WEIGHT}"
   --loss-cluster-margin-weight "${LOSS_CLUSTER_MARGIN_WEIGHT}"
   --loss-calibration-band-weight "${LOSS_CALIBRATION_BAND_WEIGHT}"
+  --loss-cluster-margin-hm-weight "${LOSS_CLUSTER_MARGIN_HM_WEIGHT}"
+  --loss-cluster-margin-ml-weight "${LOSS_CLUSTER_MARGIN_ML_WEIGHT}"
+  --loss-cluster-margin-hl-weight "${LOSS_CLUSTER_MARGIN_HL_WEIGHT}"
+  --loss-calibration-high-weight "${LOSS_CALIBRATION_HIGH_WEIGHT}"
+  --loss-calibration-mid-weight "${LOSS_CALIBRATION_MID_WEIGHT}"
+  --loss-calibration-low-weight "${LOSS_CALIBRATION_LOW_WEIGHT}"
   --cluster-margin-hm "${CLUSTER_MARGIN_HM}"
   --cluster-margin-ml "${CLUSTER_MARGIN_ML}"
   --cluster-margin-hl "${CLUSTER_MARGIN_HL}"
+  --stage2-cluster-source "${STAGE2_CLUSTER_SOURCE}"
+  --stage2-cluster-high-threshold "${STAGE2_CLUSTER_HIGH_THRESHOLD}"
+  --stage2-cluster-mid-threshold "${STAGE2_CLUSTER_MID_THRESHOLD}"
   --listwise-score-mode "${LISTWISE_SCORE_MODE}"
   --calib-band-mode "${CALIB_BAND_MODE}"
   --calib-anchor-stat "${CALIB_ANCHOR_STAT}"
@@ -171,6 +208,18 @@ CMD=(
   --calib-data-high-slack "${CALIB_DATA_HIGH_SLACK}"
   --calib-data-low-slack "${CALIB_DATA_LOW_SLACK}"
   --teacher-temperature "${TEACHER_TEMPERATURE}"
+  --stage2-oob-selection-split "${STAGE2_OOB_SELECTION_SPLIT}"
+  --stage2-oob-high-weight "${STAGE2_OOB_HIGH_WEIGHT}"
+  --stage2-oob-mid-weight "${STAGE2_OOB_MID_WEIGHT}"
+  --stage2-oob-low-weight "${STAGE2_OOB_LOW_WEIGHT}"
+  --stage2-early-stop-patience "${STAGE2_EARLY_STOP_PATIENCE}"
+  --stage2-posthoc-calibration-fit-split "${STAGE2_POSTHOC_CALIBRATION_FIT_SPLIT}"
+  --stage2-posthoc-a-min "${STAGE2_POSTHOC_A_MIN}"
+  --stage2-posthoc-a-max "${STAGE2_POSTHOC_A_MAX}"
+  --stage2-posthoc-a-steps "${STAGE2_POSTHOC_A_STEPS}"
+  --stage2-posthoc-b-min "${STAGE2_POSTHOC_B_MIN}"
+  --stage2-posthoc-b-max "${STAGE2_POSTHOC_B_MAX}"
+  --stage2-posthoc-b-steps "${STAGE2_POSTHOC_B_STEPS}"
   --pair-mid-pos-score-min "${PAIR_MID_POS_SCORE_MIN}"
   --pair-mid-pos-score-max "${PAIR_MID_POS_SCORE_MAX}"
   --pair-mid-neg-score-min "${PAIR_MID_NEG_SCORE_MIN}"
@@ -202,6 +251,18 @@ if BOOL_TRUE "${STAGE2_START_FROM_BEST_STAGE1}"; then
   CMD+=(--stage2-start-from-best-stage1)
 else
   CMD+=(--no-stage2-start-from-best-stage1)
+fi
+
+if BOOL_TRUE "${STAGE2_EARLY_STOP}"; then
+  CMD+=(--stage2-early-stop)
+else
+  CMD+=(--no-stage2-early-stop)
+fi
+
+if BOOL_TRUE "${STAGE2_POSTHOC_CALIBRATION}"; then
+  CMD+=(--stage2-posthoc-calibration)
+else
+  CMD+=(--no-stage2-posthoc-calibration)
 fi
 
 if BOOL_TRUE "${REGENERATE_SPLITS}"; then

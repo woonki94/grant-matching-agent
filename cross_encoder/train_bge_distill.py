@@ -56,6 +56,9 @@ WANDB_PROJECT_DEFAULT = "cross_encoder_distill"
 LISTWISE_SCORE_MODE_DEFAULT = "normalized"
 CALIB_BAND_MODE_DEFAULT = "data_driven"
 CALIB_ANCHOR_STAT_DEFAULT = "mean"
+STAGE2_CLUSTER_SOURCE_DEFAULT = "teacher_raw"
+STAGE2_OOB_SELECTION_SPLIT_DEFAULT = "val"
+STAGE2_POSTHOC_CALIBRATION_FIT_SPLIT_DEFAULT = "val"
 
 TRAIN_BAND_HIGH_THRESHOLD_DEFAULT = 0.70
 TRAIN_BAND_MID_THRESHOLD_DEFAULT = 0.30
@@ -210,6 +213,9 @@ class ListCollator:
         *,
         augmented_doc_weight: float,
         listwise_score_mode: str,
+        stage2_cluster_source: str,
+        stage2_cluster_high_threshold: float,
+        stage2_cluster_mid_threshold: float,
     ) -> None:
         self.tokenizer = tokenizer
         self.max_length = int(max_length)
@@ -220,11 +226,27 @@ class ListCollator:
             maximum=1.0,
         )
         self.listwise_score_mode = _clean_listwise_score_mode(listwise_score_mode)
+        self.stage2_cluster_source = _clean_stage2_cluster_source(stage2_cluster_source)
+        self.stage2_cluster_high_threshold = _safe_float(
+            stage2_cluster_high_threshold,
+            default=TRAIN_BAND_HIGH_THRESHOLD_DEFAULT,
+            minimum=0.0,
+            maximum=1.0,
+        )
+        self.stage2_cluster_mid_threshold = _safe_float(
+            stage2_cluster_mid_threshold,
+            default=TRAIN_BAND_MID_THRESHOLD_DEFAULT,
+            minimum=0.0,
+            maximum=1.0,
+        )
+        if self.stage2_cluster_mid_threshold > self.stage2_cluster_high_threshold:
+            self.stage2_cluster_mid_threshold = self.stage2_cluster_high_threshold
 
     def __call__(self, batch: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
         queries_flat: List[str] = []
         docs_flat: List[str] = []
         teacher_scores: List[float] = []
+        teacher_scores_raw: List[float] = []
         doc_weights: List[float] = []
         cluster_ids: List[int] = []
         list_sizes: List[int] = []
@@ -238,20 +260,50 @@ class ListCollator:
             for d in docs:
                 queries_flat.append(query)
                 docs_flat.append(str(d.get("text") or "").strip())
+                teacher_raw = _clamp_01(d.get("teacher_score_raw", d.get("teacher_score")))
+                teacher_norm = _clamp_01(d.get("teacher_score_norm", d.get("teacher_score")))
                 if self.listwise_score_mode == "raw":
-                    teacher_scores.append(_clamp_01(d.get("teacher_score_raw", d.get("teacher_score"))))
+                    teacher_scores.append(teacher_raw)
                 else:
-                    teacher_scores.append(
-                        _clamp_01(d.get("teacher_score_norm", d.get("teacher_score")))
-                    )
+                    teacher_scores.append(teacher_norm)
+                teacher_scores_raw.append(teacher_raw)
                 is_augmented = bool(d.get("is_augmented", False))
                 doc_weights.append(float(self.augmented_doc_weight) if is_augmented else 1.0)
-                cluster_ids.append(int(_cluster_id_from_text(d.get("target_cluster"))))
+                target_cluster_id = int(_cluster_id_from_text(d.get("target_cluster")))
+                cluster_id = -1
+                if self.stage2_cluster_source == "teacher_raw":
+                    cluster_id = int(
+                        _cluster_id_from_score(
+                            teacher_raw,
+                            high_threshold=self.stage2_cluster_high_threshold,
+                            mid_threshold=self.stage2_cluster_mid_threshold,
+                        )
+                    )
+                elif self.stage2_cluster_source == "teacher_normalized":
+                    cluster_id = int(
+                        _cluster_id_from_score(
+                            teacher_norm,
+                            high_threshold=self.stage2_cluster_high_threshold,
+                            mid_threshold=self.stage2_cluster_mid_threshold,
+                        )
+                    )
+                elif target_cluster_id >= 0:
+                    cluster_id = int(target_cluster_id)
+                if cluster_id < 0:
+                    cluster_id = int(
+                        _cluster_id_from_score(
+                            teacher_raw,
+                            high_threshold=self.stage2_cluster_high_threshold,
+                            mid_threshold=self.stage2_cluster_mid_threshold,
+                        )
+                    )
+                cluster_ids.append(cluster_id)
 
         if not list_sizes:
             return {
                 "enc": None,
                 "teacher_scores": None,
+                "teacher_scores_raw": None,
                 "doc_weights": None,
                 "cluster_ids": None,
                 "list_sizes": [],
@@ -269,6 +321,7 @@ class ListCollator:
         return {
             "enc": enc,
             "teacher_scores": torch.tensor(teacher_scores, dtype=torch.float32),
+            "teacher_scores_raw": torch.tensor(teacher_scores_raw, dtype=torch.float32),
             "doc_weights": torch.tensor(doc_weights, dtype=torch.float32),
             "cluster_ids": torch.tensor(cluster_ids, dtype=torch.int64),
             "list_sizes": list_sizes,
@@ -294,6 +347,27 @@ def _clean_calib_anchor_stat(value: Any) -> str:
     return "median" if stat == "median" else CALIB_ANCHOR_STAT_DEFAULT
 
 
+def _clean_stage2_cluster_source(value: Any) -> str:
+    source = _clean_text(value).lower()
+    if source in {"teacher_raw", "teacher_normalized", "target_cluster"}:
+        return source
+    return STAGE2_CLUSTER_SOURCE_DEFAULT
+
+
+def _clean_stage2_oob_selection_split(value: Any) -> str:
+    split = _clean_text(value).lower()
+    if split in {"val", "test"}:
+        return split
+    return STAGE2_OOB_SELECTION_SPLIT_DEFAULT
+
+
+def _clean_stage2_posthoc_calibration_fit_split(value: Any) -> str:
+    split = _clean_text(value).lower()
+    if split in {"val", "test"}:
+        return split
+    return STAGE2_POSTHOC_CALIBRATION_FIT_SPLIT_DEFAULT
+
+
 def _cluster_id_from_text(value: Any) -> int:
     v = _clean_text(value).lower()
     if v == "high":
@@ -303,6 +377,73 @@ def _cluster_id_from_text(value: Any) -> int:
     if v == "low":
         return 0
     return -1
+
+
+def _cluster_id_from_score(score: Any, *, high_threshold: float, mid_threshold: float) -> int:
+    s = _safe_float(score, default=0.0, minimum=0.0, maximum=1.0)
+    high = _safe_float(high_threshold, default=0.7, minimum=0.0, maximum=1.0)
+    mid = _safe_float(mid_threshold, default=0.3, minimum=0.0, maximum=1.0)
+    if mid > high:
+        mid = high
+    if s >= high:
+        return 2
+    if s >= mid:
+        return 1
+    return 0
+
+
+def _summarize_target_cluster_alignment(
+    sampled_lists: Sequence[Dict[str, Any]],
+    *,
+    high_threshold: float,
+    mid_threshold: float,
+) -> Dict[str, int]:
+    total_docs = 0
+    with_target_cluster = 0
+    mismatch = 0
+    target_high = 0
+    target_mid = 0
+    target_low = 0
+    raw_high = 0
+    raw_mid = 0
+    raw_low = 0
+    for row in sampled_lists:
+        docs = list((row or {}).get("docs") or [])
+        for d in docs:
+            total_docs += 1
+            target_id = _cluster_id_from_text(d.get("target_cluster"))
+            raw_id = _cluster_id_from_score(
+                d.get("teacher_score_raw", d.get("teacher_score")),
+                high_threshold=high_threshold,
+                mid_threshold=mid_threshold,
+            )
+            if raw_id == 2:
+                raw_high += 1
+            elif raw_id == 1:
+                raw_mid += 1
+            else:
+                raw_low += 1
+            if target_id >= 0:
+                with_target_cluster += 1
+                if target_id == 2:
+                    target_high += 1
+                elif target_id == 1:
+                    target_mid += 1
+                else:
+                    target_low += 1
+                if int(target_id) != int(raw_id):
+                    mismatch += 1
+    return {
+        "total_docs": int(total_docs),
+        "with_target_cluster": int(with_target_cluster),
+        "mismatch": int(mismatch),
+        "target_high": int(target_high),
+        "target_mid": int(target_mid),
+        "target_low": int(target_low),
+        "raw_high": int(raw_high),
+        "raw_mid": int(raw_mid),
+        "raw_low": int(raw_low),
+    }
 
 
 def _resolve_path(value: Any) -> Path:
@@ -1161,13 +1302,20 @@ def _compute_cluster_margin_loss(
     margin_hm: float,
     margin_ml: float,
     margin_hl: float,
+    weight_hm: float,
+    weight_ml: float,
+    weight_hl: float,
 ) -> torch.Tensor:
     probs = torch.sigmoid(logits_flat)
-    parts: List[torch.Tensor] = []
+    weighted_parts: List[torch.Tensor] = []
+    part_weights: List[torch.Tensor] = []
     cursor = 0
     hm = max(0.0, float(margin_hm))
     ml = max(0.0, float(margin_ml))
     hl = max(0.0, float(margin_hl))
+    w_hm = max(0.0, float(weight_hm))
+    w_ml = max(0.0, float(weight_ml))
+    w_hl = max(0.0, float(weight_hl))
 
     for sz in list_sizes:
         n = int(sz)
@@ -1190,16 +1338,24 @@ def _compute_cluster_margin_loss(
         mid_mean, has_mid = _masked_weighted_mean(s, mid_mask, w)
         low_mean, has_low = _masked_weighted_mean(s, low_mask, w)
 
-        if has_high and has_mid:
-            parts.append(F.relu(torch.tensor(hm, device=s.device, dtype=s.dtype) - (high_mean - mid_mean)))
-        if has_mid and has_low:
-            parts.append(F.relu(torch.tensor(ml, device=s.device, dtype=s.dtype) - (mid_mean - low_mean)))
-        if has_high and has_low:
-            parts.append(F.relu(torch.tensor(hl, device=s.device, dtype=s.dtype) - (high_mean - low_mean)))
+        if has_high and has_mid and w_hm > 0.0:
+            relation_loss = F.relu(torch.tensor(hm, device=s.device, dtype=s.dtype) - (high_mean - mid_mean))
+            weighted_parts.append(relation_loss * float(w_hm))
+            part_weights.append(torch.tensor(float(w_hm), device=s.device, dtype=s.dtype))
+        if has_mid and has_low and w_ml > 0.0:
+            relation_loss = F.relu(torch.tensor(ml, device=s.device, dtype=s.dtype) - (mid_mean - low_mean))
+            weighted_parts.append(relation_loss * float(w_ml))
+            part_weights.append(torch.tensor(float(w_ml), device=s.device, dtype=s.dtype))
+        if has_high and has_low and w_hl > 0.0:
+            relation_loss = F.relu(torch.tensor(hl, device=s.device, dtype=s.dtype) - (high_mean - low_mean))
+            weighted_parts.append(relation_loss * float(w_hl))
+            part_weights.append(torch.tensor(float(w_hl), device=s.device, dtype=s.dtype))
 
-    if not parts:
+    if not weighted_parts:
         return torch.zeros((), device=logits_flat.device, dtype=logits_flat.dtype)
-    return torch.stack(parts).mean()
+    num = torch.stack(weighted_parts).sum()
+    den = torch.clamp(torch.stack(part_weights).sum(), min=1e-6)
+    return num / den
 
 
 def _compute_calibration_band_loss(
@@ -1217,6 +1373,9 @@ def _compute_calibration_band_loss(
     low_ceil: float,
     data_high_slack: float,
     data_low_slack: float,
+    weight_high: float,
+    weight_mid: float,
+    weight_low: float,
 ) -> torch.Tensor:
     mode = _clean_calib_band_mode(band_mode)
     stat_mode = _clean_calib_anchor_stat(anchor_stat)
@@ -1229,8 +1388,12 @@ def _compute_calibration_band_loss(
     high_slack = max(0.0, float(data_high_slack))
     low_slack = max(0.0, float(data_low_slack))
 
-    parts: List[torch.Tensor] = []
+    weighted_parts: List[torch.Tensor] = []
+    part_weights: List[torch.Tensor] = []
     cursor = 0
+    weight_high_val = max(0.0, float(weight_high))
+    weight_mid_val = max(0.0, float(weight_mid))
+    weight_low_val = max(0.0, float(weight_low))
 
     for sz in list_sizes:
         n = int(sz)
@@ -1250,43 +1413,213 @@ def _compute_calibration_band_loss(
         mid_mask = c == 1
         low_mask = c == 0
 
-        if bool(high_mask.any().item()):
+        if bool(high_mask.any().item()) and weight_high_val > 0.0:
             s_high = s[high_mask]
-            w_high = None if w is None else w[high_mask]
+            w_high_tensor = None if w is None else w[high_mask]
             if mode == "fixed":
                 floor = torch.tensor(high_floor, device=s.device, dtype=s.dtype)
             else:
                 anchor = _cluster_anchor(y[high_mask], stat_mode=stat_mode)
                 floor = torch.clamp(anchor - high_slack, min=0.0, max=1.0)
-            parts.append(_weighted_mean(F.relu(floor - s_high), w_high))
+            band_loss = _weighted_mean(F.relu(floor - s_high), w_high_tensor)
+            weighted_parts.append(band_loss * float(weight_high_val))
+            part_weights.append(torch.tensor(float(weight_high_val), device=s.device, dtype=s.dtype))
 
-        if bool(mid_mask.any().item()):
+        if bool(mid_mask.any().item()) and weight_mid_val > 0.0:
             s_mid = s[mid_mask]
-            w_mid = None if w is None else w[mid_mask]
+            w_mid_tensor = None if w is None else w[mid_mask]
             if mode == "fixed":
                 center = torch.tensor(mid_center, device=s.device, dtype=s.dtype)
             else:
                 center = _cluster_anchor(y[mid_mask], stat_mode=stat_mode)
-            parts.append(
-                _weighted_mean(
-                    F.relu(torch.abs(s_mid - center) - mid_bw),
-                    w_mid,
-                )
+            band_loss = _weighted_mean(
+                F.relu(torch.abs(s_mid - center) - mid_bw),
+                w_mid_tensor,
             )
+            weighted_parts.append(band_loss * float(weight_mid_val))
+            part_weights.append(torch.tensor(float(weight_mid_val), device=s.device, dtype=s.dtype))
 
-        if bool(low_mask.any().item()):
+        if bool(low_mask.any().item()) and weight_low_val > 0.0:
             s_low = s[low_mask]
-            w_low = None if w is None else w[low_mask]
+            w_low_tensor = None if w is None else w[low_mask]
             if mode == "fixed":
                 ceil = torch.tensor(low_ceil, device=s.device, dtype=s.dtype)
             else:
                 anchor = _cluster_anchor(y[low_mask], stat_mode=stat_mode)
                 ceil = torch.clamp(anchor + low_slack, min=0.0, max=1.0)
-            parts.append(_weighted_mean(F.relu(s_low - ceil), w_low))
+            band_loss = _weighted_mean(F.relu(s_low - ceil), w_low_tensor)
+            weighted_parts.append(band_loss * float(weight_low_val))
+            part_weights.append(torch.tensor(float(weight_low_val), device=s.device, dtype=s.dtype))
 
-    if not parts:
+    if not weighted_parts:
         return torch.zeros((), device=logits_flat.device, dtype=logits_flat.dtype)
-    return torch.stack(parts).mean()
+    num = torch.stack(weighted_parts).sum()
+    den = torch.clamp(torch.stack(part_weights).sum(), min=1e-6)
+    return num / den
+
+
+def _compute_oob_summary_from_probs(
+    *,
+    probs_flat: torch.Tensor,
+    cluster_ids_flat: torch.Tensor,
+    high_threshold: float,
+    mid_threshold: float,
+) -> Dict[str, float]:
+    p = probs_flat.detach()
+    c = cluster_ids_flat.detach().to(dtype=torch.int64)
+    high = _safe_float(high_threshold, default=0.7, minimum=0.0, maximum=1.0)
+    mid = _safe_float(mid_threshold, default=0.3, minimum=0.0, maximum=1.0)
+    if mid > high:
+        mid = high
+
+    low_mask = c == 0
+    mid_mask = c == 1
+    high_mask = c == 2
+
+    low_total = int(low_mask.sum().item())
+    mid_total = int(mid_mask.sum().item())
+    high_total = int(high_mask.sum().item())
+
+    low_out = int(((p >= float(mid)) & low_mask).sum().item())
+    mid_out = int((((p < float(mid)) | (p >= float(high))) & mid_mask).sum().item())
+    high_out = int(((p < float(high)) & high_mask).sum().item())
+
+    low_rate = float(low_out / float(max(1, low_total)))
+    mid_rate = float(mid_out / float(max(1, mid_total)))
+    high_rate = float(high_out / float(max(1, high_total)))
+
+    return {
+        "oob_low_out": float(low_out),
+        "oob_mid_out": float(mid_out),
+        "oob_high_out": float(high_out),
+        "oob_low_total": float(low_total),
+        "oob_mid_total": float(mid_total),
+        "oob_high_total": float(high_total),
+        "oob_low_rate": float(low_rate),
+        "oob_mid_rate": float(mid_rate),
+        "oob_high_rate": float(high_rate),
+    }
+
+
+def _compute_weighted_oob_objective(
+    *,
+    oob_summary: Dict[str, float],
+    weight_high: float,
+    weight_mid: float,
+    weight_low: float,
+) -> float:
+    w_high = max(0.0, float(weight_high))
+    w_mid = max(0.0, float(weight_mid))
+    w_low = max(0.0, float(weight_low))
+    denom = max(1e-6, w_high + w_mid + w_low)
+    return float(
+        (
+            w_high * float(oob_summary.get("oob_high_rate", 0.0))
+            + w_mid * float(oob_summary.get("oob_mid_rate", 0.0))
+            + w_low * float(oob_summary.get("oob_low_rate", 0.0))
+        )
+        / denom
+    )
+
+
+def _fit_affine_oob_calibration(
+    *,
+    logits_flat: torch.Tensor,
+    cluster_ids_flat: torch.Tensor,
+    teacher_scores_raw_flat: Optional[torch.Tensor],
+    high_threshold: float,
+    mid_threshold: float,
+    oob_high_weight: float,
+    oob_mid_weight: float,
+    oob_low_weight: float,
+    a_min: float,
+    a_max: float,
+    a_steps: int,
+    b_min: float,
+    b_max: float,
+    b_steps: int,
+) -> Dict[str, Any]:
+    logits_cpu = logits_flat.detach().to("cpu", dtype=torch.float32)
+    cluster_cpu = cluster_ids_flat.detach().to("cpu", dtype=torch.int64)
+    teacher_cpu: Optional[torch.Tensor] = None
+    if isinstance(teacher_scores_raw_flat, torch.Tensor):
+        teacher_cpu = teacher_scores_raw_flat.detach().to("cpu", dtype=torch.float32).clamp(0.0, 1.0)
+
+    a_lo = _safe_float(a_min, default=0.5, minimum=1e-5, maximum=100.0)
+    a_hi = _safe_float(a_max, default=3.0, minimum=1e-5, maximum=100.0)
+    if a_hi < a_lo:
+        a_hi = a_lo
+    b_lo = _safe_float(b_min, default=-2.0, minimum=-100.0, maximum=100.0)
+    b_hi = _safe_float(b_max, default=2.0, minimum=-100.0, maximum=100.0)
+    if b_hi < b_lo:
+        b_hi = b_lo
+    a_n = _safe_int(a_steps, default=15, minimum=1, maximum=1000)
+    b_n = _safe_int(b_steps, default=25, minimum=1, maximum=1000)
+
+    a_grid = torch.linspace(float(a_lo), float(a_hi), steps=int(a_n), dtype=torch.float32)
+    b_grid = torch.linspace(float(b_lo), float(b_hi), steps=int(b_n), dtype=torch.float32)
+
+    best: Dict[str, Any] = {}
+    best_obj = float("inf")
+    best_mae = float("inf")
+
+    for a in a_grid.tolist():
+        for b in b_grid.tolist():
+            probs = torch.sigmoid(logits_cpu * float(a) + float(b))
+            oob_summary = _compute_oob_summary_from_probs(
+                probs_flat=probs,
+                cluster_ids_flat=cluster_cpu,
+                high_threshold=high_threshold,
+                mid_threshold=mid_threshold,
+            )
+            objective = _compute_weighted_oob_objective(
+                oob_summary=oob_summary,
+                weight_high=oob_high_weight,
+                weight_mid=oob_mid_weight,
+                weight_low=oob_low_weight,
+            )
+            mae = float("inf")
+            if teacher_cpu is not None and teacher_cpu.numel() == probs.numel():
+                mae = float(torch.mean(torch.abs(probs - teacher_cpu)).item())
+            better = False
+            if objective + 1e-12 < best_obj:
+                better = True
+            elif abs(objective - best_obj) <= 1e-12 and mae < best_mae:
+                better = True
+            if better:
+                best_obj = float(objective)
+                best_mae = float(mae)
+                best = {
+                    "scale": float(a),
+                    "bias": float(b),
+                    "objective": float(objective),
+                    "teacher_raw_mae": float(mae if math.isfinite(mae) else -1.0),
+                    "oob_summary": oob_summary,
+                }
+
+    if not best:
+        base_probs = torch.sigmoid(logits_cpu)
+        oob_summary = _compute_oob_summary_from_probs(
+            probs_flat=base_probs,
+            cluster_ids_flat=cluster_cpu,
+            high_threshold=high_threshold,
+            mid_threshold=mid_threshold,
+        )
+        best = {
+            "scale": 1.0,
+            "bias": 0.0,
+            "objective": float(
+                _compute_weighted_oob_objective(
+                    oob_summary=oob_summary,
+                    weight_high=oob_high_weight,
+                    weight_mid=oob_mid_weight,
+                    weight_low=oob_low_weight,
+                )
+            ),
+            "teacher_raw_mae": -1.0,
+            "oob_summary": oob_summary,
+        }
+    return best
 
 
 def _dcg(scores: Sequence[float], k: int) -> float:
@@ -3246,6 +3579,25 @@ def _build_parser() -> argparse.ArgumentParser:
         default=CALIB_ANCHOR_STAT_DEFAULT,
         help="Statistic for per-query cluster anchors in data-driven calibration mode.",
     )
+    p.add_argument(
+        "--stage2-cluster-source",
+        type=str,
+        choices=["teacher_raw", "teacher_normalized", "target_cluster"],
+        default=STAGE2_CLUSTER_SOURCE_DEFAULT,
+        help="How Stage2 cluster ids are assigned for cluster/calibration losses.",
+    )
+    p.add_argument(
+        "--stage2-cluster-high-threshold",
+        type=float,
+        default=TRAIN_BAND_HIGH_THRESHOLD_DEFAULT,
+        help="High threshold for Stage2 cluster assignment when source is score-based.",
+    )
+    p.add_argument(
+        "--stage2-cluster-mid-threshold",
+        type=float,
+        default=TRAIN_BAND_MID_THRESHOLD_DEFAULT,
+        help="Mid threshold for Stage2 cluster assignment when source is score-based.",
+    )
     p.add_argument("--calib-high-floor", type=float, default=0.75, help="Fixed-mode lower floor for high cluster.")
     p.add_argument("--calib-mid-center", type=float, default=0.50, help="Fixed-mode center for mid cluster.")
     p.add_argument("--calib-mid-bandwidth", type=float, default=0.15, help="Allowed band around mid center.")
@@ -3307,6 +3659,53 @@ def _build_parser() -> argparse.ArgumentParser:
         default=0.0,
         help="Additional Stage2 loss weight for calibration band constraints.",
     )
+    p.add_argument("--loss-cluster-margin-hm-weight", type=float, default=1.0, help="Relative weight for high-mid cluster margin loss.")
+    p.add_argument("--loss-cluster-margin-ml-weight", type=float, default=1.0, help="Relative weight for mid-low cluster margin loss.")
+    p.add_argument("--loss-cluster-margin-hl-weight", type=float, default=1.0, help="Relative weight for high-low cluster margin loss.")
+    p.add_argument("--loss-calibration-high-weight", type=float, default=1.0, help="Relative weight for high-band calibration loss.")
+    p.add_argument("--loss-calibration-mid-weight", type=float, default=1.0, help="Relative weight for mid-band calibration loss.")
+    p.add_argument("--loss-calibration-low-weight", type=float, default=1.0, help="Relative weight for low-band calibration loss.")
+    p.add_argument(
+        "--stage2-oob-selection-split",
+        type=str,
+        choices=["val", "test"],
+        default=STAGE2_OOB_SELECTION_SPLIT_DEFAULT,
+        help="Split used for Stage2 out-of-band model selection / early stop.",
+    )
+    p.add_argument("--stage2-oob-high-weight", type=float, default=2.0, help="Weight for high-band out-of-band rate in Stage2 selection objective.")
+    p.add_argument("--stage2-oob-mid-weight", type=float, default=1.0, help="Weight for mid-band out-of-band rate in Stage2 selection objective.")
+    p.add_argument("--stage2-oob-low-weight", type=float, default=1.0, help="Weight for low-band out-of-band rate in Stage2 selection objective.")
+    p.add_argument(
+        "--stage2-early-stop",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Enable Stage2 early stopping on weighted out-of-band objective.",
+    )
+    p.add_argument(
+        "--stage2-early-stop-patience",
+        type=int,
+        default=2,
+        help="Stage2 early-stop patience in epochs without weighted out-of-band improvement.",
+    )
+    p.add_argument(
+        "--stage2-posthoc-calibration",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Fit/save monotonic affine post-hoc calibration (sigmoid(a*logit+b), a>0) after Stage2 eval.",
+    )
+    p.add_argument(
+        "--stage2-posthoc-calibration-fit-split",
+        type=str,
+        choices=["val", "test"],
+        default=STAGE2_POSTHOC_CALIBRATION_FIT_SPLIT_DEFAULT,
+        help="Split used to fit Stage2 post-hoc calibration.",
+    )
+    p.add_argument("--stage2-posthoc-a-min", type=float, default=0.5, help="Grid-search minimum scale (a) for post-hoc affine calibration.")
+    p.add_argument("--stage2-posthoc-a-max", type=float, default=3.0, help="Grid-search maximum scale (a) for post-hoc affine calibration.")
+    p.add_argument("--stage2-posthoc-a-steps", type=int, default=15, help="Grid-search steps for scale (a) in post-hoc affine calibration.")
+    p.add_argument("--stage2-posthoc-b-min", type=float, default=-2.0, help="Grid-search minimum bias (b) for post-hoc affine calibration.")
+    p.add_argument("--stage2-posthoc-b-max", type=float, default=2.0, help="Grid-search maximum bias (b) for post-hoc affine calibration.")
+    p.add_argument("--stage2-posthoc-b-steps", type=int, default=25, help="Grid-search steps for bias (b) in post-hoc affine calibration.")
 
     p.add_argument("--margin-min", type=float, default=0.1)
     p.add_argument("--margin-max", type=float, default=0.7)
@@ -3653,18 +4052,57 @@ def main() -> int:
         minimum=0.0,
         maximum=100.0,
     )
+    loss_cluster_margin_hm_weight = _safe_float(args.loss_cluster_margin_hm_weight, default=1.0, minimum=0.0, maximum=100.0)
+    loss_cluster_margin_ml_weight = _safe_float(args.loss_cluster_margin_ml_weight, default=1.0, minimum=0.0, maximum=100.0)
+    loss_cluster_margin_hl_weight = _safe_float(args.loss_cluster_margin_hl_weight, default=1.0, minimum=0.0, maximum=100.0)
+    loss_calibration_high_weight = _safe_float(args.loss_calibration_high_weight, default=1.0, minimum=0.0, maximum=100.0)
+    loss_calibration_mid_weight = _safe_float(args.loss_calibration_mid_weight, default=1.0, minimum=0.0, maximum=100.0)
+    loss_calibration_low_weight = _safe_float(args.loss_calibration_low_weight, default=1.0, minimum=0.0, maximum=100.0)
 
     cluster_margin_hm = _safe_float(args.cluster_margin_hm, default=0.20, minimum=0.0, maximum=1.0)
     cluster_margin_ml = _safe_float(args.cluster_margin_ml, default=0.20, minimum=0.0, maximum=1.0)
     cluster_margin_hl = _safe_float(args.cluster_margin_hl, default=0.45, minimum=0.0, maximum=1.0)
     calib_band_mode = _clean_calib_band_mode(args.calib_band_mode)
     calib_anchor_stat = _clean_calib_anchor_stat(args.calib_anchor_stat)
+    stage2_cluster_source = _clean_stage2_cluster_source(args.stage2_cluster_source)
+    stage2_cluster_high_threshold = _safe_float(
+        args.stage2_cluster_high_threshold,
+        default=TRAIN_BAND_HIGH_THRESHOLD_DEFAULT,
+        minimum=0.0,
+        maximum=1.0,
+    )
+    stage2_cluster_mid_threshold = _safe_float(
+        args.stage2_cluster_mid_threshold,
+        default=TRAIN_BAND_MID_THRESHOLD_DEFAULT,
+        minimum=0.0,
+        maximum=1.0,
+    )
+    if stage2_cluster_mid_threshold > stage2_cluster_high_threshold:
+        stage2_cluster_mid_threshold = stage2_cluster_high_threshold
     calib_high_floor = _safe_float(args.calib_high_floor, default=0.75, minimum=0.0, maximum=1.0)
     calib_mid_center = _safe_float(args.calib_mid_center, default=0.50, minimum=0.0, maximum=1.0)
     calib_mid_bandwidth = _safe_float(args.calib_mid_bandwidth, default=0.15, minimum=0.0, maximum=1.0)
     calib_low_ceil = _safe_float(args.calib_low_ceil, default=0.25, minimum=0.0, maximum=1.0)
     calib_data_high_slack = _safe_float(args.calib_data_high_slack, default=0.10, minimum=0.0, maximum=1.0)
     calib_data_low_slack = _safe_float(args.calib_data_low_slack, default=0.10, minimum=0.0, maximum=1.0)
+    stage2_oob_selection_split = _clean_stage2_oob_selection_split(args.stage2_oob_selection_split)
+    stage2_oob_high_weight = _safe_float(args.stage2_oob_high_weight, default=2.0, minimum=0.0, maximum=100.0)
+    stage2_oob_mid_weight = _safe_float(args.stage2_oob_mid_weight, default=1.0, minimum=0.0, maximum=100.0)
+    stage2_oob_low_weight = _safe_float(args.stage2_oob_low_weight, default=1.0, minimum=0.0, maximum=100.0)
+    stage2_early_stop = bool(args.stage2_early_stop)
+    stage2_early_stop_patience = _safe_int(args.stage2_early_stop_patience, default=2, minimum=0, maximum=1000)
+    stage2_posthoc_calibration = bool(args.stage2_posthoc_calibration)
+    stage2_posthoc_calibration_fit_split = _clean_stage2_posthoc_calibration_fit_split(args.stage2_posthoc_calibration_fit_split)
+    stage2_posthoc_a_min = _safe_float(args.stage2_posthoc_a_min, default=0.5, minimum=1e-6, maximum=100.0)
+    stage2_posthoc_a_max = _safe_float(args.stage2_posthoc_a_max, default=3.0, minimum=1e-6, maximum=100.0)
+    if stage2_posthoc_a_max < stage2_posthoc_a_min:
+        stage2_posthoc_a_max = stage2_posthoc_a_min
+    stage2_posthoc_a_steps = _safe_int(args.stage2_posthoc_a_steps, default=15, minimum=1, maximum=1000)
+    stage2_posthoc_b_min = _safe_float(args.stage2_posthoc_b_min, default=-2.0, minimum=-100.0, maximum=100.0)
+    stage2_posthoc_b_max = _safe_float(args.stage2_posthoc_b_max, default=2.0, minimum=-100.0, maximum=100.0)
+    if stage2_posthoc_b_max < stage2_posthoc_b_min:
+        stage2_posthoc_b_max = stage2_posthoc_b_min
+    stage2_posthoc_b_steps = _safe_int(args.stage2_posthoc_b_steps, default=25, minimum=1, maximum=1000)
 
     teacher_temperature = _safe_float(args.teacher_temperature, default=2.0, minimum=1e-6, maximum=100.0)
     listwise_score_mode = _clean_listwise_score_mode(args.listwise_score_mode)
@@ -3920,7 +4358,19 @@ def main() -> int:
         f"patience:{stage1_early_stop_patience},"
         f"stage2_start_from_best_stage1:{stage2_start_from_best_stage1}"
     )
+    print(
+        "stage2_control="
+        f"early_stop:{stage2_early_stop},"
+        f"patience:{stage2_early_stop_patience},"
+        f"oob_selection_split:{stage2_oob_selection_split},"
+        f"oob_weights(h/m/l):{stage2_oob_high_weight:.3f}/{stage2_oob_mid_weight:.3f}/{stage2_oob_low_weight:.3f}"
+    )
     print(f"train_band_thresholds=high:{train_band_high_threshold:.2f},mid:{train_band_mid_threshold:.2f}")
+    print(
+        "stage2_cluster_source="
+        f"{stage2_cluster_source} "
+        f"thresholds(high/mid)={stage2_cluster_high_threshold:.2f}/{stage2_cluster_mid_threshold:.2f}"
+    )
     print(
         "pair_type_weighting="
         f"default:{pair_default_weight:.4f} "
@@ -3932,14 +4382,20 @@ def main() -> int:
         "stage2_extra_losses="
         f"cluster_margin_weight:{loss_cluster_margin_weight:.4f},"
         f"calibration_band_weight:{loss_calibration_band_weight:.4f},"
-        f"cluster_margins(hm/ml/hl):{cluster_margin_hm:.3f}/{cluster_margin_ml:.3f}/{cluster_margin_hl:.3f}"
+        f"cluster_margins(hm/ml/hl):{cluster_margin_hm:.3f}/{cluster_margin_ml:.3f}/{cluster_margin_hl:.3f},"
+        f"cluster_margin_loss_weights(hm/ml/hl):{loss_cluster_margin_hm_weight:.3f}/{loss_cluster_margin_ml_weight:.3f}/{loss_cluster_margin_hl_weight:.3f},"
+        f"calibration_loss_weights(high/mid/low):{loss_calibration_high_weight:.3f}/{loss_calibration_mid_weight:.3f}/{loss_calibration_low_weight:.3f}"
     )
     print(
         "calibration_band_config="
         f"mode:{calib_band_mode},"
         f"anchor_stat:{calib_anchor_stat},"
         f"fixed(high/mid/low):{calib_high_floor:.3f}/{calib_mid_center:.3f}+/-{calib_mid_bandwidth:.3f}/{calib_low_ceil:.3f},"
-        f"data_slack(high/low):{calib_data_high_slack:.3f}/{calib_data_low_slack:.3f}"
+        f"data_slack(high/low):{calib_data_high_slack:.3f}/{calib_data_low_slack:.3f},"
+        f"posthoc_calibration:{stage2_posthoc_calibration},"
+        f"posthoc_fit_split:{stage2_posthoc_calibration_fit_split},"
+        f"posthoc_grid_a:[{stage2_posthoc_a_min:.3f},{stage2_posthoc_a_max:.3f}]x{stage2_posthoc_a_steps},"
+        f"posthoc_grid_b:[{stage2_posthoc_b_min:.3f},{stage2_posthoc_b_max:.3f}]x{stage2_posthoc_b_steps}"
     )
     print(f"split_policy={split_policy}")
     print(f"split_dir={split_dir}")
@@ -4234,6 +4690,35 @@ def main() -> int:
     print(f"listwise_train={len(train_list_rows)}")
     print(f"listwise_val={len(val_list_rows)}")
     print(f"listwise_test={len(test_list_rows)}")
+    train_cluster_alignment = _summarize_target_cluster_alignment(
+        train_list_rows,
+        high_threshold=stage2_cluster_high_threshold,
+        mid_threshold=stage2_cluster_mid_threshold,
+    )
+    val_cluster_alignment = _summarize_target_cluster_alignment(
+        val_list_rows,
+        high_threshold=stage2_cluster_high_threshold,
+        mid_threshold=stage2_cluster_mid_threshold,
+    )
+    test_cluster_alignment = _summarize_target_cluster_alignment(
+        test_list_rows,
+        high_threshold=stage2_cluster_high_threshold,
+        mid_threshold=stage2_cluster_mid_threshold,
+    )
+    def _alignment_line(name: str, stats: Dict[str, int]) -> str:
+        denom = max(1, int(stats.get("with_target_cluster", 0)))
+        mis = int(stats.get("mismatch", 0))
+        return (
+            f"{name}: mismatch={mis}/{denom} ({(100.0 * float(mis) / float(denom)):.2f}%) "
+            f"target(h/m/l)={int(stats.get('target_high', 0))}/"
+            f"{int(stats.get('target_mid', 0))}/{int(stats.get('target_low', 0))} "
+            f"raw(h/m/l)={int(stats.get('raw_high', 0))}/"
+            f"{int(stats.get('raw_mid', 0))}/{int(stats.get('raw_low', 0))}"
+        )
+    print("stage2_cluster_alignment:")
+    print(f"  {_alignment_line('train', train_cluster_alignment)}")
+    print(f"  {_alignment_line('val', val_cluster_alignment)}")
+    print(f"  {_alignment_line('test', test_cluster_alignment)}")
     _wandb_log(
         wandb_run,
         {
@@ -4283,6 +4768,12 @@ def main() -> int:
             "dataset/listwise_score_mode": str(listwise_score_mode),
             "dataset/calib_band_mode": str(calib_band_mode),
             "dataset/calib_anchor_stat": str(calib_anchor_stat),
+            "dataset/stage2_cluster_alignment_train_mismatch": int(train_cluster_alignment.get("mismatch", 0)),
+            "dataset/stage2_cluster_alignment_train_total_labeled": int(train_cluster_alignment.get("with_target_cluster", 0)),
+            "dataset/stage2_cluster_alignment_val_mismatch": int(val_cluster_alignment.get("mismatch", 0)),
+            "dataset/stage2_cluster_alignment_val_total_labeled": int(val_cluster_alignment.get("with_target_cluster", 0)),
+            "dataset/stage2_cluster_alignment_test_mismatch": int(test_cluster_alignment.get("mismatch", 0)),
+            "dataset/stage2_cluster_alignment_test_total_labeled": int(test_cluster_alignment.get("with_target_cluster", 0)),
         },
         step=0,
     )
@@ -4314,6 +4805,9 @@ def main() -> int:
         max_length=max_length,
         augmented_doc_weight=float(list_augmented_doc_weight),
         listwise_score_mode=str(listwise_score_mode),
+        stage2_cluster_source=str(stage2_cluster_source),
+        stage2_cluster_high_threshold=float(stage2_cluster_high_threshold),
+        stage2_cluster_mid_threshold=float(stage2_cluster_mid_threshold),
     )
 
     pair_train_loader = DataLoader(
@@ -4377,6 +4871,22 @@ def main() -> int:
         "val_cluster_margin_loss": 0.0,
         "val_calibration_band_loss": 0.0,
     }
+    best_val_oob_objective = float("inf")
+    best_val_oob_step = -1
+    best_val_oob_epoch = -1
+    best_val_oob_source = ""
+    best_val_oob_components: Dict[str, float] = {
+        "oob_objective": 0.0,
+        "oob_high_rate": 0.0,
+        "oob_mid_rate": 0.0,
+        "oob_low_rate": 0.0,
+        "oob_high_out": 0.0,
+        "oob_mid_out": 0.0,
+        "oob_low_out": 0.0,
+        "oob_high_total": 0.0,
+        "oob_mid_total": 0.0,
+        "oob_low_total": 0.0,
+    }
     history: List[Dict[str, Any]] = []
     global_step = 0
     start_time = time.time()
@@ -4413,6 +4923,16 @@ def main() -> int:
                 "val_cluster_margin_loss": 0.0,
                 "val_calibration_band_loss": 0.0,
                 "val_list_batches": 0.0,
+                "oob_objective": 0.0,
+                "oob_high_rate": 0.0,
+                "oob_mid_rate": 0.0,
+                "oob_low_rate": 0.0,
+                "oob_high_out": 0.0,
+                "oob_mid_out": 0.0,
+                "oob_low_out": 0.0,
+                "oob_high_total": 0.0,
+                "oob_mid_total": 0.0,
+                "oob_low_total": 0.0,
             }
         was_training = bool(model.training)
         model.eval()
@@ -4420,6 +4940,12 @@ def main() -> int:
         mse_vals: List[float] = []
         cluster_margin_vals: List[float] = []
         calib_vals: List[float] = []
+        oob_low_out_total = 0.0
+        oob_mid_out_total = 0.0
+        oob_high_out_total = 0.0
+        oob_low_total = 0.0
+        oob_mid_total = 0.0
+        oob_high_total = 0.0
         with torch.no_grad():
             for batch in loader:
                 if batch.get("enc") is None:
@@ -4449,6 +4975,9 @@ def main() -> int:
                     margin_hm=cluster_margin_hm,
                     margin_ml=cluster_margin_ml,
                     margin_hl=cluster_margin_hl,
+                    weight_hm=loss_cluster_margin_hm_weight,
+                    weight_ml=loss_cluster_margin_ml_weight,
+                    weight_hl=loss_cluster_margin_hl_weight,
                 )
                 calibration_band_loss = _compute_calibration_band_loss(
                     logits_flat=logits_flat,
@@ -4464,20 +4993,86 @@ def main() -> int:
                     low_ceil=calib_low_ceil,
                     data_high_slack=calib_data_high_slack,
                     data_low_slack=calib_data_low_slack,
+                    weight_high=loss_calibration_high_weight,
+                    weight_mid=loss_calibration_mid_weight,
+                    weight_low=loss_calibration_low_weight,
+                )
+                oob_summary_batch = _compute_oob_summary_from_probs(
+                    probs_flat=torch.sigmoid(logits_flat),
+                    cluster_ids_flat=cluster_ids,
+                    high_threshold=stage2_cluster_high_threshold,
+                    mid_threshold=stage2_cluster_mid_threshold,
                 )
                 kl_vals.append(float(kl_loss.detach().cpu().item()))
                 mse_vals.append(float(mse_loss.detach().cpu().item()))
                 cluster_margin_vals.append(float(cluster_margin_loss.detach().cpu().item()))
                 calib_vals.append(float(calibration_band_loss.detach().cpu().item()))
+                oob_low_out_total += float(oob_summary_batch.get("oob_low_out", 0.0))
+                oob_mid_out_total += float(oob_summary_batch.get("oob_mid_out", 0.0))
+                oob_high_out_total += float(oob_summary_batch.get("oob_high_out", 0.0))
+                oob_low_total += float(oob_summary_batch.get("oob_low_total", 0.0))
+                oob_mid_total += float(oob_summary_batch.get("oob_mid_total", 0.0))
+                oob_high_total += float(oob_summary_batch.get("oob_high_total", 0.0))
         if was_training:
             model.train()
+        oob_low_rate = float(oob_low_out_total / max(1.0, oob_low_total))
+        oob_mid_rate = float(oob_mid_out_total / max(1.0, oob_mid_total))
+        oob_high_rate = float(oob_high_out_total / max(1.0, oob_high_total))
+        oob_objective = _compute_weighted_oob_objective(
+            oob_summary={
+                "oob_low_rate": float(oob_low_rate),
+                "oob_mid_rate": float(oob_mid_rate),
+                "oob_high_rate": float(oob_high_rate),
+            },
+            weight_high=stage2_oob_high_weight,
+            weight_mid=stage2_oob_mid_weight,
+            weight_low=stage2_oob_low_weight,
+        )
         return {
             "val_kl_loss": float(sum(kl_vals) / max(1, len(kl_vals))),
             "val_mse_loss": float(sum(mse_vals) / max(1, len(mse_vals))),
             "val_cluster_margin_loss": float(sum(cluster_margin_vals) / max(1, len(cluster_margin_vals))),
             "val_calibration_band_loss": float(sum(calib_vals) / max(1, len(calib_vals))),
             "val_list_batches": float(len(kl_vals)),
+            "oob_objective": float(oob_objective),
+            "oob_high_rate": float(oob_high_rate),
+            "oob_mid_rate": float(oob_mid_rate),
+            "oob_low_rate": float(oob_low_rate),
+            "oob_high_out": float(oob_high_out_total),
+            "oob_mid_out": float(oob_mid_out_total),
+            "oob_low_out": float(oob_low_out_total),
+            "oob_high_total": float(oob_high_total),
+            "oob_mid_total": float(oob_mid_total),
+            "oob_low_total": float(oob_low_total),
         }
+
+    def collect_listwise_eval_tensors(loader: Optional[DataLoader]) -> Dict[str, Optional[torch.Tensor]]:
+        if loader is None:
+            return {"logits": None, "cluster_ids": None, "teacher_scores_raw": None}
+        was_training = bool(model.training)
+        model.eval()
+        logits_parts: List[torch.Tensor] = []
+        cluster_parts: List[torch.Tensor] = []
+        teacher_raw_parts: List[torch.Tensor] = []
+        with torch.no_grad():
+            for batch in loader:
+                if batch.get("enc") is None:
+                    continue
+                enc = _to_device(batch["enc"], device)
+                logits_flat = model(**enc).logits.squeeze(-1).detach().to("cpu", dtype=torch.float32)
+                logits_parts.append(logits_flat)
+                cluster_ids = batch.get("cluster_ids")
+                if isinstance(cluster_ids, torch.Tensor):
+                    cluster_parts.append(cluster_ids.detach().to("cpu", dtype=torch.int64))
+                teacher_scores_raw = batch.get("teacher_scores_raw")
+                if isinstance(teacher_scores_raw, torch.Tensor):
+                    teacher_raw_parts.append(teacher_scores_raw.detach().to("cpu", dtype=torch.float32))
+        if was_training:
+            model.train()
+        logits_all = torch.cat(logits_parts, dim=0) if logits_parts else None
+        cluster_all = torch.cat(cluster_parts, dim=0) if cluster_parts else None
+        teacher_raw_all = torch.cat(teacher_raw_parts, dim=0) if teacher_raw_parts else None
+        return {"logits": logits_all, "cluster_ids": cluster_all, "teacher_scores_raw": teacher_raw_all}
 
     def maybe_save_best_val_total_loss(
         *,
@@ -4589,6 +5184,77 @@ def main() -> int:
             f"source={best_stage1_val_pair_loss_source}"
         )
 
+    def maybe_save_best_val_oob(
+        *,
+        epoch: int,
+        global_step_now: int,
+        oob_objective: float,
+        oob_high_rate: float,
+        oob_mid_rate: float,
+        oob_low_rate: float,
+        oob_high_out: float,
+        oob_mid_out: float,
+        oob_low_out: float,
+        oob_high_total: float,
+        oob_mid_total: float,
+        oob_low_total: float,
+        source: str,
+    ) -> None:
+        nonlocal best_val_oob_objective
+        nonlocal best_val_oob_step
+        nonlocal best_val_oob_epoch
+        nonlocal best_val_oob_source
+        nonlocal best_val_oob_components
+
+        current = float(oob_objective)
+        if not math.isfinite(current):
+            return
+        if current >= float(best_val_oob_objective):
+            return
+
+        best_val_oob_objective = float(current)
+        best_val_oob_step = int(global_step_now)
+        best_val_oob_epoch = int(epoch)
+        best_val_oob_source = _clean_text(source) or "unknown"
+        best_val_oob_components = {
+            "oob_objective": float(oob_objective),
+            "oob_high_rate": float(oob_high_rate),
+            "oob_mid_rate": float(oob_mid_rate),
+            "oob_low_rate": float(oob_low_rate),
+            "oob_high_out": float(oob_high_out),
+            "oob_mid_out": float(oob_mid_out),
+            "oob_low_out": float(oob_low_out),
+            "oob_high_total": float(oob_high_total),
+            "oob_mid_total": float(oob_mid_total),
+            "oob_low_total": float(oob_low_total),
+        }
+
+        best_oob_dir = output_dir / "best_val_oob"
+        best_oob_dir.mkdir(parents=True, exist_ok=True)
+        model.save_pretrained(best_oob_dir)
+        tokenizer.save_pretrained(best_oob_dir)
+        (best_oob_dir / "best_val_oob_meta.json").write_text(
+            json.dumps(
+                {
+                    "best_val_oob_objective": float(best_val_oob_objective),
+                    "epoch": int(best_val_oob_epoch),
+                    "global_step": int(best_val_oob_step),
+                    "source": str(best_val_oob_source),
+                    "components": dict(best_val_oob_components),
+                },
+                ensure_ascii=False,
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+        print(
+            "best_val_oob_update="
+            f"{best_val_oob_objective:.6f} "
+            f"epoch={best_val_oob_epoch} "
+            f"step={best_val_oob_step} "
+            f"source={best_val_oob_source}"
+        )
+
     def run_step_validation(*, stage: int, epoch: int, global_step_now: int) -> None:
         if int(eval_every_steps) <= 0:
             return
@@ -4624,6 +5290,16 @@ def main() -> int:
         val_mse_loss = float(val_list_loss.get("val_mse_loss", 0.0))
         val_cluster_margin_loss = float(val_list_loss.get("val_cluster_margin_loss", 0.0))
         val_calibration_band_loss = float(val_list_loss.get("val_calibration_band_loss", 0.0))
+        val_oob_objective = float(val_list_loss.get("oob_objective", 0.0))
+        val_oob_high_rate = float(val_list_loss.get("oob_high_rate", 0.0))
+        val_oob_mid_rate = float(val_list_loss.get("oob_mid_rate", 0.0))
+        val_oob_low_rate = float(val_list_loss.get("oob_low_rate", 0.0))
+        val_oob_high_out = float(val_list_loss.get("oob_high_out", 0.0))
+        val_oob_mid_out = float(val_list_loss.get("oob_mid_out", 0.0))
+        val_oob_low_out = float(val_list_loss.get("oob_low_out", 0.0))
+        val_oob_high_total = float(val_list_loss.get("oob_high_total", 0.0))
+        val_oob_mid_total = float(val_list_loss.get("oob_mid_total", 0.0))
+        val_oob_low_total = float(val_list_loss.get("oob_low_total", 0.0))
         val_total_loss = (
             float(loss_kl_weight) * float(val_kl_loss)
             + float(loss_pair_weight) * float(val_pair_loss)
@@ -4636,7 +5312,9 @@ def main() -> int:
             f"val_total_loss={val_total_loss:.6f} val_kl_loss={val_kl_loss:.6f} "
             f"val_pair_loss={val_pair_loss:.6f} val_mse_loss={val_mse_loss:.6f} "
             f"val_cluster_margin_loss={val_cluster_margin_loss:.6f} "
-            f"val_calibration_band_loss={val_calibration_band_loss:.6f}"
+            f"val_calibration_band_loss={val_calibration_band_loss:.6f} "
+            f"val_oob_objective={val_oob_objective:.6f} "
+            f"val_oob_rates(h/m/l)={val_oob_high_rate:.4f}/{val_oob_mid_rate:.4f}/{val_oob_low_rate:.4f}"
         )
         _wandb_log(
             wandb_run,
@@ -4648,6 +5326,10 @@ def main() -> int:
                 "eval/loss_mse_step": float(val_mse_loss),
                 "eval/loss_cluster_margin_step": float(val_cluster_margin_loss),
                 "eval/loss_calibration_band_step": float(val_calibration_band_loss),
+                "eval/oob_objective_step": float(val_oob_objective),
+                "eval/oob_high_rate_step": float(val_oob_high_rate),
+                "eval/oob_mid_rate_step": float(val_oob_mid_rate),
+                "eval/oob_low_rate_step": float(val_oob_low_rate),
             },
             step=int(global_step_now),
         )
@@ -4662,6 +5344,22 @@ def main() -> int:
             val_calibration_band_loss=float(val_calibration_band_loss),
             source="step_eval",
         )
+        if str(stage2_oob_selection_split) == "val":
+            maybe_save_best_val_oob(
+                epoch=int(epoch),
+                global_step_now=int(global_step_now),
+                oob_objective=float(val_oob_objective),
+                oob_high_rate=float(val_oob_high_rate),
+                oob_mid_rate=float(val_oob_mid_rate),
+                oob_low_rate=float(val_oob_low_rate),
+                oob_high_out=float(val_oob_high_out),
+                oob_mid_out=float(val_oob_mid_out),
+                oob_low_out=float(val_oob_low_out),
+                oob_high_total=float(val_oob_high_total),
+                oob_mid_total=float(val_oob_mid_total),
+                oob_low_total=float(val_oob_low_total),
+                source="step_eval",
+            )
 
     # Stage 1: pairwise warm start.
     if stage1_epochs > 0:
@@ -4820,6 +5518,8 @@ def main() -> int:
         if pair_cycle is None:
             raise RuntimeError("Unable to initialize pairwise iterator for stage 2.")
 
+        stage2_no_improve_epochs = 0
+        stage2_best_epoch_oob = float("inf")
         for epoch in range(1, stage2_epochs + 1):
             # Re-sample list rows each epoch for more variety.
             epoch_list_rows = _build_sampled_list_rows(
@@ -4916,6 +5616,9 @@ def main() -> int:
                         margin_hm=cluster_margin_hm,
                         margin_ml=cluster_margin_ml,
                         margin_hl=cluster_margin_hl,
+                        weight_hm=loss_cluster_margin_hm_weight,
+                        weight_ml=loss_cluster_margin_ml_weight,
+                        weight_hl=loss_cluster_margin_hl_weight,
                     )
                     calibration_band_loss = _compute_calibration_band_loss(
                         logits_flat=list_logits_flat,
@@ -4931,6 +5634,9 @@ def main() -> int:
                         low_ceil=calib_low_ceil,
                         data_high_slack=calib_data_high_slack,
                         data_low_slack=calib_data_low_slack,
+                        weight_high=loss_calibration_high_weight,
+                        weight_mid=loss_calibration_mid_weight,
+                        weight_low=loss_calibration_low_weight,
                     )
 
                     pos_logits = model(**pos).logits.squeeze(-1)
@@ -5029,6 +5735,16 @@ def main() -> int:
             val_mse_loss = float(val_list_loss.get("val_mse_loss", 0.0))
             val_cluster_margin_loss = float(val_list_loss.get("val_cluster_margin_loss", 0.0))
             val_calibration_band_loss = float(val_list_loss.get("val_calibration_band_loss", 0.0))
+            val_oob_objective = float(val_list_loss.get("oob_objective", 0.0))
+            val_oob_high_rate = float(val_list_loss.get("oob_high_rate", 0.0))
+            val_oob_mid_rate = float(val_list_loss.get("oob_mid_rate", 0.0))
+            val_oob_low_rate = float(val_list_loss.get("oob_low_rate", 0.0))
+            val_oob_high_out = float(val_list_loss.get("oob_high_out", 0.0))
+            val_oob_mid_out = float(val_list_loss.get("oob_mid_out", 0.0))
+            val_oob_low_out = float(val_list_loss.get("oob_low_out", 0.0))
+            val_oob_high_total = float(val_list_loss.get("oob_high_total", 0.0))
+            val_oob_mid_total = float(val_list_loss.get("oob_mid_total", 0.0))
+            val_oob_low_total = float(val_list_loss.get("oob_low_total", 0.0))
             val_total_loss = (
                 float(loss_kl_weight) * float(val_kl_loss)
                 + float(loss_pair_weight) * float(val_pair_loss)
@@ -5036,6 +5752,24 @@ def main() -> int:
                 + float(loss_cluster_margin_weight) * float(val_cluster_margin_loss)
                 + float(loss_calibration_band_weight) * float(val_calibration_band_loss)
             )
+
+            selection_split = str(stage2_oob_selection_split)
+            selection_list_loss = val_list_loss
+            if selection_split == "test":
+                selection_list_loss = eval_listwise_losses(test_list_loader)
+                if int(selection_list_loss.get("val_list_batches", 0.0)) <= 0:
+                    selection_split = "val"
+                    selection_list_loss = val_list_loss
+            selection_oob_objective = float(selection_list_loss.get("oob_objective", val_oob_objective))
+            selection_oob_high_rate = float(selection_list_loss.get("oob_high_rate", val_oob_high_rate))
+            selection_oob_mid_rate = float(selection_list_loss.get("oob_mid_rate", val_oob_mid_rate))
+            selection_oob_low_rate = float(selection_list_loss.get("oob_low_rate", val_oob_low_rate))
+            selection_oob_high_out = float(selection_list_loss.get("oob_high_out", val_oob_high_out))
+            selection_oob_mid_out = float(selection_list_loss.get("oob_mid_out", val_oob_mid_out))
+            selection_oob_low_out = float(selection_list_loss.get("oob_low_out", val_oob_low_out))
+            selection_oob_high_total = float(selection_list_loss.get("oob_high_total", val_oob_high_total))
+            selection_oob_mid_total = float(selection_list_loss.get("oob_mid_total", val_oob_mid_total))
+            selection_oob_low_total = float(selection_list_loss.get("oob_low_total", val_oob_low_total))
 
             eval_metrics = _evaluate(
                 model=model,
@@ -5064,6 +5798,21 @@ def main() -> int:
                 "val_mse_loss": float(val_mse_loss),
                 "val_cluster_margin_loss": float(val_cluster_margin_loss),
                 "val_calibration_band_loss": float(val_calibration_band_loss),
+                "val_oob_objective": float(val_oob_objective),
+                "val_oob_high_rate": float(val_oob_high_rate),
+                "val_oob_mid_rate": float(val_oob_mid_rate),
+                "val_oob_low_rate": float(val_oob_low_rate),
+                "val_oob_high_out": float(val_oob_high_out),
+                "val_oob_mid_out": float(val_oob_mid_out),
+                "val_oob_low_out": float(val_oob_low_out),
+                "val_oob_high_total": float(val_oob_high_total),
+                "val_oob_mid_total": float(val_oob_mid_total),
+                "val_oob_low_total": float(val_oob_low_total),
+                "oob_selection_split": str(selection_split),
+                "oob_selection_objective": float(selection_oob_objective),
+                "oob_selection_high_rate": float(selection_oob_high_rate),
+                "oob_selection_mid_rate": float(selection_oob_mid_rate),
+                "oob_selection_low_rate": float(selection_oob_low_rate),
                 "val_list_batches": int(val_list_loss.get("val_list_batches", 0.0)),
                 "global_step": global_step,
             }
@@ -5087,6 +5836,11 @@ def main() -> int:
                     "eval/loss_mse_epoch": float(metrics["val_mse_loss"]),
                     "eval/loss_cluster_margin_epoch": float(metrics["val_cluster_margin_loss"]),
                     "eval/loss_calibration_band_epoch": float(metrics["val_calibration_band_loss"]),
+                    "eval/oob_objective_epoch": float(metrics["val_oob_objective"]),
+                    "eval/oob_high_rate_epoch": float(metrics["val_oob_high_rate"]),
+                    "eval/oob_mid_rate_epoch": float(metrics["val_oob_mid_rate"]),
+                    "eval/oob_low_rate_epoch": float(metrics["val_oob_low_rate"]),
+                    "eval/oob_selection_objective_epoch": float(metrics["oob_selection_objective"]),
                     "eval/ndcg@10": float(metrics.get("ndcg@10", 0.0)),
                     "eval/mrr@10": float(metrics.get("mrr@10", 0.0)),
                     "eval/recall@50": float(metrics.get("recall@50", 0.0)),
@@ -5105,11 +5859,85 @@ def main() -> int:
                 val_calibration_band_loss=float(val_calibration_band_loss),
                 source="epoch_eval",
             )
+            maybe_save_best_val_oob(
+                epoch=int(epoch),
+                global_step_now=int(global_step),
+                oob_objective=float(selection_oob_objective),
+                oob_high_rate=float(selection_oob_high_rate),
+                oob_mid_rate=float(selection_oob_mid_rate),
+                oob_low_rate=float(selection_oob_low_rate),
+                oob_high_out=float(selection_oob_high_out),
+                oob_mid_out=float(selection_oob_mid_out),
+                oob_low_out=float(selection_oob_low_out),
+                oob_high_total=float(selection_oob_high_total),
+                oob_mid_total=float(selection_oob_mid_total),
+                oob_low_total=float(selection_oob_low_total),
+                source=f"epoch_eval/{selection_split}",
+            )
 
             epoch_dir = output_dir / f"stage2_epoch_{epoch}"
             epoch_dir.mkdir(parents=True, exist_ok=True)
             model.save_pretrained(epoch_dir)
             tokenizer.save_pretrained(epoch_dir)
+
+            posthoc_payload: Optional[Dict[str, Any]] = None
+            if bool(stage2_posthoc_calibration):
+                fit_split = str(stage2_posthoc_calibration_fit_split)
+                fit_loader = val_list_loader if fit_split == "val" else test_list_loader
+                if fit_loader is None:
+                    fit_split = "val"
+                    fit_loader = val_list_loader
+                fit_tensors = collect_listwise_eval_tensors(fit_loader)
+                fit_logits = fit_tensors.get("logits")
+                fit_cluster = fit_tensors.get("cluster_ids")
+                fit_teacher_raw = fit_tensors.get("teacher_scores_raw")
+                if isinstance(fit_logits, torch.Tensor) and isinstance(fit_cluster, torch.Tensor) and fit_logits.numel() == fit_cluster.numel() and fit_logits.numel() > 0:
+                    posthoc_fit = _fit_affine_oob_calibration(
+                        logits_flat=fit_logits,
+                        cluster_ids_flat=fit_cluster,
+                        teacher_scores_raw_flat=fit_teacher_raw if isinstance(fit_teacher_raw, torch.Tensor) else None,
+                        high_threshold=stage2_cluster_high_threshold,
+                        mid_threshold=stage2_cluster_mid_threshold,
+                        oob_high_weight=stage2_oob_high_weight,
+                        oob_mid_weight=stage2_oob_mid_weight,
+                        oob_low_weight=stage2_oob_low_weight,
+                        a_min=stage2_posthoc_a_min,
+                        a_max=stage2_posthoc_a_max,
+                        a_steps=stage2_posthoc_a_steps,
+                        b_min=stage2_posthoc_b_min,
+                        b_max=stage2_posthoc_b_max,
+                        b_steps=stage2_posthoc_b_steps,
+                    )
+                    posthoc_payload = {
+                        "type": "affine_sigmoid",
+                        "scale": float(posthoc_fit.get("scale", 1.0)),
+                        "bias": float(posthoc_fit.get("bias", 0.0)),
+                        "fit_split": str(fit_split),
+                        "high_threshold": float(stage2_cluster_high_threshold),
+                        "mid_threshold": float(stage2_cluster_mid_threshold),
+                        "oob_weights": {
+                            "high": float(stage2_oob_high_weight),
+                            "mid": float(stage2_oob_mid_weight),
+                            "low": float(stage2_oob_low_weight),
+                        },
+                        "fit_metrics": posthoc_fit,
+                    }
+                    posthoc_path = epoch_dir / "posthoc_calibration_affine.json"
+                    posthoc_path.write_text(json.dumps(posthoc_payload, ensure_ascii=False, indent=2), encoding="utf-8")
+                    _wandb_log(
+                        wandb_run,
+                        {
+                            "stage": 2,
+                            "eval/posthoc_scale_epoch": float(posthoc_payload.get("scale", 1.0)),
+                            "eval/posthoc_bias_epoch": float(posthoc_payload.get("bias", 0.0)),
+                            "eval/posthoc_oob_objective_epoch": float((posthoc_payload.get("fit_metrics") or {}).get("objective", 0.0)),
+                        },
+                        step=global_step if global_step > 0 else None,
+                    )
+
+            if (best_val_oob_epoch == int(epoch)) and posthoc_payload is not None:
+                best_oob_calib_path = output_dir / "best_val_oob" / "posthoc_calibration_affine.json"
+                best_oob_calib_path.write_text(json.dumps(posthoc_payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
             if float(eval_metrics.get("ndcg@10", 0.0)) > best_ndcg:
                 best_ndcg = float(eval_metrics.get("ndcg@10", 0.0))
@@ -5117,6 +5945,27 @@ def main() -> int:
                 best_dir.mkdir(parents=True, exist_ok=True)
                 model.save_pretrained(best_dir)
                 tokenizer.save_pretrained(best_dir)
+                if posthoc_payload is not None:
+                    (best_dir / "posthoc_calibration_affine.json").write_text(
+                        json.dumps(posthoc_payload, ensure_ascii=False, indent=2),
+                        encoding="utf-8",
+                    )
+
+            improved_epoch_oob = float(selection_oob_objective) < float(stage2_best_epoch_oob)
+            if improved_epoch_oob:
+                stage2_best_epoch_oob = float(selection_oob_objective)
+                stage2_no_improve_epochs = 0
+            else:
+                stage2_no_improve_epochs += 1
+            if bool(stage2_early_stop) and int(stage2_no_improve_epochs) >= int(stage2_early_stop_patience):
+                print(
+                    "stage2_early_stop=true "
+                    f"epoch={epoch} "
+                    f"no_improve_epochs={stage2_no_improve_epochs} "
+                    f"patience={stage2_early_stop_patience} "
+                    f"best_oob_objective={stage2_best_epoch_oob:.6f}"
+                )
+                break
 
     test_pair_loss = eval_pairwise_margin(pair_test_loader) if test_pairs else 0.0
     test_list_loss = eval_listwise_losses(test_list_loader)
@@ -5124,6 +5973,16 @@ def main() -> int:
     test_mse_loss = float(test_list_loss.get("val_mse_loss", 0.0))
     test_cluster_margin_loss = float(test_list_loss.get("val_cluster_margin_loss", 0.0))
     test_calibration_band_loss = float(test_list_loss.get("val_calibration_band_loss", 0.0))
+    test_oob_objective = float(test_list_loss.get("oob_objective", 0.0))
+    test_oob_high_rate = float(test_list_loss.get("oob_high_rate", 0.0))
+    test_oob_mid_rate = float(test_list_loss.get("oob_mid_rate", 0.0))
+    test_oob_low_rate = float(test_list_loss.get("oob_low_rate", 0.0))
+    test_oob_high_out = float(test_list_loss.get("oob_high_out", 0.0))
+    test_oob_mid_out = float(test_list_loss.get("oob_mid_out", 0.0))
+    test_oob_low_out = float(test_list_loss.get("oob_low_out", 0.0))
+    test_oob_high_total = float(test_list_loss.get("oob_high_total", 0.0))
+    test_oob_mid_total = float(test_list_loss.get("oob_mid_total", 0.0))
+    test_oob_low_total = float(test_list_loss.get("oob_low_total", 0.0))
     test_total_loss = (
         float(loss_kl_weight) * float(test_kl_loss)
         + float(loss_pair_weight) * float(test_pair_loss)
@@ -5150,6 +6009,16 @@ def main() -> int:
         "test_mse_loss": float(test_mse_loss),
         "test_cluster_margin_loss": float(test_cluster_margin_loss),
         "test_calibration_band_loss": float(test_calibration_band_loss),
+        "test_oob_objective": float(test_oob_objective),
+        "test_oob_high_rate": float(test_oob_high_rate),
+        "test_oob_mid_rate": float(test_oob_mid_rate),
+        "test_oob_low_rate": float(test_oob_low_rate),
+        "test_oob_high_out": float(test_oob_high_out),
+        "test_oob_mid_out": float(test_oob_mid_out),
+        "test_oob_low_out": float(test_oob_low_out),
+        "test_oob_high_total": float(test_oob_high_total),
+        "test_oob_mid_total": float(test_oob_mid_total),
+        "test_oob_low_total": float(test_oob_low_total),
         "test_list_batches": int(test_list_loss.get("val_list_batches", 0.0)),
         "global_step": global_step,
     }
@@ -5165,6 +6034,10 @@ def main() -> int:
             "test/loss_mse": float(test_metrics["test_mse_loss"]),
             "test/loss_cluster_margin": float(test_metrics["test_cluster_margin_loss"]),
             "test/loss_calibration_band": float(test_metrics["test_calibration_band_loss"]),
+            "test/oob_objective": float(test_metrics["test_oob_objective"]),
+            "test/oob_high_rate": float(test_metrics["test_oob_high_rate"]),
+            "test/oob_mid_rate": float(test_metrics["test_oob_mid_rate"]),
+            "test/oob_low_rate": float(test_metrics["test_oob_low_rate"]),
             "test/ndcg@10": float(test_metrics.get("ndcg@10", 0.0)),
             "test/mrr@10": float(test_metrics.get("mrr@10", 0.0)),
             "test/recall@50": float(test_metrics.get("recall@50", 0.0)),
@@ -5210,6 +6083,9 @@ def main() -> int:
         "train_list_rows": int(len(train_list_rows)),
         "val_list_rows": int(len(val_list_rows)),
         "test_list_rows": int(len(test_list_rows)),
+        "stage2_cluster_alignment_train": dict(train_cluster_alignment),
+        "stage2_cluster_alignment_val": dict(val_cluster_alignment),
+        "stage2_cluster_alignment_test": dict(test_cluster_alignment),
         "pair_mid_lower_enabled": bool(pair_mid_lower_enabled),
         "pair_mid_lower_added": int(pair_mid_lower_added),
         "pair_mid_pos_score_min": float(pair_mid_pos_score_min),
@@ -5230,6 +6106,9 @@ def main() -> int:
         "pair_type_cap_stats": pair_type_cap_stats,
         "list_augmented_doc_weight": float(list_augmented_doc_weight),
         "listwise_score_mode": str(listwise_score_mode),
+        "stage2_cluster_source": str(stage2_cluster_source),
+        "stage2_cluster_high_threshold": float(stage2_cluster_high_threshold),
+        "stage2_cluster_mid_threshold": float(stage2_cluster_mid_threshold),
         "calibration_band_mode": str(calib_band_mode),
         "calibration_anchor_stat": str(calib_anchor_stat),
         "calibration_fixed": {
@@ -5265,12 +6144,36 @@ def main() -> int:
             "mse": float(loss_mse_weight),
             "cluster_margin": float(loss_cluster_margin_weight),
             "calibration_band": float(loss_calibration_band_weight),
+            "cluster_margin_hm": float(loss_cluster_margin_hm_weight),
+            "cluster_margin_ml": float(loss_cluster_margin_ml_weight),
+            "cluster_margin_hl": float(loss_cluster_margin_hl_weight),
+            "calibration_high": float(loss_calibration_high_weight),
+            "calibration_mid": float(loss_calibration_mid_weight),
+            "calibration_low": float(loss_calibration_low_weight),
         },
         "margin_clip": {"min": float(margin_min), "max": float(margin_max)},
         "stage1_epochs": int(stage1_epochs),
         "stage2_epochs": int(stage2_epochs),
         "stage1_early_stop": bool(stage1_early_stop),
         "stage1_early_stop_patience": int(stage1_early_stop_patience),
+        "stage2_early_stop": bool(stage2_early_stop),
+        "stage2_early_stop_patience": int(stage2_early_stop_patience),
+        "stage2_oob_selection_split": str(stage2_oob_selection_split),
+        "stage2_oob_weights": {
+            "high": float(stage2_oob_high_weight),
+            "mid": float(stage2_oob_mid_weight),
+            "low": float(stage2_oob_low_weight),
+        },
+        "stage2_posthoc_calibration": bool(stage2_posthoc_calibration),
+        "stage2_posthoc_calibration_fit_split": str(stage2_posthoc_calibration_fit_split),
+        "stage2_posthoc_grid": {
+            "a_min": float(stage2_posthoc_a_min),
+            "a_max": float(stage2_posthoc_a_max),
+            "a_steps": int(stage2_posthoc_a_steps),
+            "b_min": float(stage2_posthoc_b_min),
+            "b_max": float(stage2_posthoc_b_max),
+            "b_steps": int(stage2_posthoc_b_steps),
+        },
         "stage2_start_from_best_stage1": bool(stage2_start_from_best_stage1),
         "train_batch_size": int(train_batch_size),
         "eval_batch_size": int(eval_batch_size),
@@ -5297,6 +6200,12 @@ def main() -> int:
         "best_val_total_loss_source": str(best_val_total_loss_source),
         "best_val_total_loss_components": dict(best_val_total_loss_components),
         "best_val_total_loss_checkpoint": str((output_dir / "best_val_loss").resolve()),
+        "best_val_oob_objective": float(best_val_oob_objective) if math.isfinite(best_val_oob_objective) else -1.0,
+        "best_val_oob_step": int(best_val_oob_step),
+        "best_val_oob_epoch": int(best_val_oob_epoch),
+        "best_val_oob_source": str(best_val_oob_source),
+        "best_val_oob_components": dict(best_val_oob_components),
+        "best_val_oob_checkpoint": str((output_dir / "best_val_oob").resolve()),
         "test_metrics": test_metrics,
         "elapsed_seconds": float(elapsed),
         "history": history,
@@ -5320,6 +6229,9 @@ def main() -> int:
                 float(best_stage1_val_pair_loss) if math.isfinite(best_stage1_val_pair_loss) else -1.0
             ),
             "run/best_val_total_loss": float(best_val_total_loss) if math.isfinite(best_val_total_loss) else -1.0,
+            "run/best_val_oob_objective": (
+                float(best_val_oob_objective) if math.isfinite(best_val_oob_objective) else -1.0
+            ),
             "run/elapsed_seconds": float(elapsed),
         },
         step=global_step if global_step > 0 else None,
@@ -5342,6 +6254,11 @@ def main() -> int:
         print(f"best_val_total_loss_step={best_val_total_loss_step}")
         print(f"best_val_total_loss_epoch={best_val_total_loss_epoch}")
         print(f"best_val_total_loss_ckpt={output_dir / 'best_val_loss'}")
+    if math.isfinite(best_val_oob_objective):
+        print(f"best_val_oob_objective={best_val_oob_objective:.6f}")
+        print(f"best_val_oob_step={best_val_oob_step}")
+        print(f"best_val_oob_epoch={best_val_oob_epoch}")
+        print(f"best_val_oob_ckpt={output_dir / 'best_val_oob'}")
     print(f"elapsed_seconds={elapsed:.2f}")
     print(f"manifest={manifest_path}")
     return 0

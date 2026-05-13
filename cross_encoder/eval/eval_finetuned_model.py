@@ -8,7 +8,7 @@ import sys
 from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import torch
 from sqlalchemy import bindparam, text
@@ -180,6 +180,31 @@ def _resolve_distill_input_path(preferred_paths: Sequence[str]) -> Path:
     raise RuntimeError(f"Distill input file not found. Checked: {rendered}")
 
 
+def _resolve_score_calibration_json_path(value: Any) -> Optional[Path]:
+    raw = _clean_text(value)
+    if not raw:
+        return None
+    p = _resolve_path(raw)
+    if p.is_dir():
+        p = p / "posthoc_calibration_affine.json"
+    if not p.exists():
+        raise RuntimeError(f"score_calibration_json not found: {p}")
+    return p
+
+
+def _load_score_calibration(value: Any) -> Optional[Dict[str, float]]:
+    p = _resolve_score_calibration_json_path(value)
+    if p is None:
+        return None
+    try:
+        obj = json.loads(p.read_text(encoding="utf-8"))
+    except Exception as exc:
+        raise RuntimeError(f"Failed to read score calibration json: {p} ({type(exc).__name__}: {exc})") from exc
+    scale = _safe_float((obj or {}).get("scale"), default=1.0, minimum=1e-6, maximum=1000.0)
+    bias = _safe_float((obj or {}).get("bias"), default=0.0, minimum=-1000.0, maximum=1000.0)
+    return {"scale": float(scale), "bias": float(bias)}
+
+
 def _shorten(value: Any, max_chars: int) -> str:
     text = _normalize_ws(value)
     if len(text) <= max_chars:
@@ -204,6 +229,7 @@ def _score_docs_for_query(
     device: torch.device,
     batch_size: int,
     max_length: int,
+    score_calibration: Optional[Dict[str, float]] = None,
 ) -> List[float]:
     # sentence-transformers CrossEncoder path
     if tokenizer is None and hasattr(model, "predict"):
@@ -223,6 +249,11 @@ def _score_docs_for_query(
     # transformers AutoModelForSequenceClassification path
     out: List[float] = []
     step = max(1, int(batch_size))
+    calib_scale = 1.0
+    calib_bias = 0.0
+    if isinstance(score_calibration, dict):
+        calib_scale = _safe_float(score_calibration.get("scale"), default=1.0, minimum=1e-6, maximum=1000.0)
+        calib_bias = _safe_float(score_calibration.get("bias"), default=0.0, minimum=-1000.0, maximum=1000.0)
     with torch.no_grad():
         for i in range(0, len(doc_texts), step):
             docs = list(doc_texts[i : i + step])
@@ -237,6 +268,8 @@ def _score_docs_for_query(
             )
             enc = _to_device(enc, device)
             logits = model(**enc).logits.squeeze(-1)
+            if isinstance(score_calibration, dict):
+                logits = logits * float(calib_scale) + float(calib_bias)
             probs = torch.sigmoid(logits)
             out.extend(float(x) for x in probs.detach().cpu().tolist())
     return out
@@ -678,6 +711,7 @@ def _score_query_doc_rows(
     device: torch.device,
     batch_size: int,
     max_length: int,
+    score_calibration: Optional[Dict[str, float]] = None,
 ) -> List[float]:
     if not rows:
         return []
@@ -697,6 +731,7 @@ def _score_query_doc_rows(
             device=device,
             batch_size=batch_size,
             max_length=max_length,
+            score_calibration=score_calibration,
         )
         for row_idx, score in zip(idxs, scores):
             out[row_idx] = float(score)
@@ -1140,6 +1175,7 @@ def _run_distill_eval(args: argparse.Namespace) -> int:
         finetuned_ref = _resolve_default_finetuned_model_ref()
     else:
         finetuned_ref = _resolve_model_ref(finetuned_arg)
+    score_calibration = _load_score_calibration(args.score_calibration_json)
     base_ref = _resolve_model_ref(_clean_text(args.base_model) or PURE_BGE_MODEL_ID)
     distill_input = _resolve_distill_input_path(
         [
@@ -1177,6 +1213,7 @@ def _run_distill_eval(args: argparse.Namespace) -> int:
         device=device,
         batch_size=batch_size,
         max_length=max_length,
+        score_calibration=score_calibration,
     )
     base_scores = _score_query_doc_rows(
         model=model_base,
@@ -1185,6 +1222,7 @@ def _run_distill_eval(args: argparse.Namespace) -> int:
         device=device,
         batch_size=batch_size,
         max_length=max_length,
+        score_calibration=None,
     )
 
     rows: List[Dict[str, Any]] = []
@@ -1268,6 +1306,7 @@ def _run_distill_eval(args: argparse.Namespace) -> int:
         f"available_low={int(sample_meta.get('available_by_band', {}).get('low', 0))}\n"
         f"order_top_k={order_top_k} pair_eps={pair_eps} hard_gap_max={hard_gap_max} medium_gap_max={medium_gap_max}\n"
         f"finetuned_model={finetuned_ref}\n"
+        f"score_calibration_json={_clean_text(args.score_calibration_json)}\n"
         f"base_model={base_ref}\n"
         f"device={device}\n"
     )
@@ -1431,6 +1470,12 @@ def _build_parser() -> argparse.ArgumentParser:
 
     p.add_argument("--finetuned-model", type=str, default=FINETUNED_MODEL_DEFAULT)
     p.add_argument(
+        "--score-calibration-json",
+        type=str,
+        default="",
+        help="Optional path to posthoc_calibration_affine.json (or model dir containing it) applied to finetuned logits.",
+    )
+    p.add_argument(
         "--auto-resolve-finetuned",
         action=argparse.BooleanOptionalAction,
         default=False,
@@ -1560,6 +1605,7 @@ def main() -> int:
         finetuned_ref = _resolve_default_finetuned_model_ref()
     else:
         finetuned_ref = _resolve_model_ref(finetuned_arg)
+    score_calibration = _load_score_calibration(args.score_calibration_json)
     base_ref = _resolve_model_ref(_clean_text(args.base_model) or PURE_BGE_MODEL_ID)
     embedding_model_id = _clean_text(args.embedding_model_id)
 
@@ -1607,6 +1653,7 @@ def main() -> int:
         f"grant_spec_count={len(grant_specs)}\n"
         f"faculty_spec_count={len(faculty_specs)}\n"
         f"finetuned_model={finetuned_ref}\n"
+        f"score_calibration_json={_clean_text(args.score_calibration_json)}\n"
         f"base_model={base_ref}\n"
         f"device={device}\n"
         f"cluster_strong_min={cluster_strong_min}\n"
@@ -1635,6 +1682,7 @@ def main() -> int:
             device=device,
             batch_size=batch_size,
             max_length=max_length,
+            score_calibration=score_calibration,
         )
         base_scores = _score_docs_for_query(
             model=model_base,
