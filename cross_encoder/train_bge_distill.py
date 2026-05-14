@@ -588,6 +588,8 @@ def _build_output_suffix(
     candidate_pool_size: int,
     mini_list_size: int,
     learning_rate: float,
+    stage1_learning_rate: float,
+    stage2_learning_rate: float,
     teacher_temperature: float,
     loss_kl_weight: float,
     loss_pair_weight: float,
@@ -604,6 +606,8 @@ def _build_output_suffix(
         f"cp{int(candidate_pool_size)}",
         f"ml{int(mini_list_size)}",
         f"lr{_float_token(float(learning_rate))}",
+        f"lr1{_float_token(float(stage1_learning_rate))}",
+        f"lr2{_float_token(float(stage2_learning_rate))}",
         f"t{_float_token(float(teacher_temperature))}",
         f"kl{_float_token(float(loss_kl_weight))}",
         f"pw{_float_token(float(loss_pair_weight))}",
@@ -3641,6 +3645,18 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--eval-batch-size", type=int, default=32)
     p.add_argument("--grad-accum-steps", type=int, default=8)
     p.add_argument("--learning-rate", type=float, default=2e-5)
+    p.add_argument(
+        "--stage1-learning-rate",
+        type=float,
+        default=0.0,
+        help="Stage1 optimizer LR (<=0 uses --learning-rate).",
+    )
+    p.add_argument(
+        "--stage2-learning-rate",
+        type=float,
+        default=0.0,
+        help="Stage2 optimizer LR (<=0 uses --learning-rate).",
+    )
     p.add_argument("--weight-decay", type=float, default=0.01)
     p.add_argument("--max-grad-norm", type=float, default=1.0)
 
@@ -4029,6 +4045,10 @@ def main() -> int:
     eval_batch_size = _safe_int(args.eval_batch_size, default=32, minimum=1, maximum=4096)
     grad_accum_steps = _safe_int(args.grad_accum_steps, default=8, minimum=1, maximum=1024)
     learning_rate = _safe_float(args.learning_rate, default=2e-5, minimum=1e-8, maximum=1.0)
+    stage1_learning_rate_raw = _safe_float(args.stage1_learning_rate, default=0.0, minimum=0.0, maximum=1.0)
+    stage2_learning_rate_raw = _safe_float(args.stage2_learning_rate, default=0.0, minimum=0.0, maximum=1.0)
+    stage1_learning_rate = float(learning_rate if stage1_learning_rate_raw <= 0.0 else stage1_learning_rate_raw)
+    stage2_learning_rate = float(learning_rate if stage2_learning_rate_raw <= 0.0 else stage2_learning_rate_raw)
     weight_decay = _safe_float(args.weight_decay, default=0.01, minimum=0.0, maximum=10.0)
     max_grad_norm = _safe_float(args.max_grad_norm, default=1.0, minimum=0.0, maximum=100.0)
 
@@ -4216,6 +4236,8 @@ def main() -> int:
             candidate_pool_size=candidate_pool_size,
             mini_list_size=mini_list_size,
             learning_rate=learning_rate,
+            stage1_learning_rate=stage1_learning_rate,
+            stage2_learning_rate=stage2_learning_rate,
             teacher_temperature=teacher_temperature,
             loss_kl_weight=loss_kl_weight,
             loss_pair_weight=loss_pair_weight,
@@ -4357,6 +4379,12 @@ def main() -> int:
         f"early_stop:{stage1_early_stop},"
         f"patience:{stage1_early_stop_patience},"
         f"stage2_start_from_best_stage1:{stage2_start_from_best_stage1}"
+    )
+    print(
+        "learning_rates="
+        f"base:{learning_rate:.10f},"
+        f"stage1:{stage1_learning_rate:.10f},"
+        f"stage2:{stage2_learning_rate:.10f}"
     )
     print(
         "stage2_control="
@@ -4793,7 +4821,8 @@ def main() -> int:
     model = AutoModelForSequenceClassification.from_pretrained(_clean_text(args.model_id) or MODEL_ID_DEFAULT, num_labels=1)
     model.to(device)
 
-    optimizer = AdamW(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
+    initial_learning_rate = float(stage1_learning_rate if int(stage1_epochs) > 0 else stage2_learning_rate)
+    optimizer = AdamW(model.parameters(), lr=initial_learning_rate, weight_decay=weight_decay)
     pair_collator = PairCollator(
         tokenizer,
         max_length=max_length,
@@ -5506,12 +5535,13 @@ def main() -> int:
             if best_stage1_dir.exists():
                 print(f"stage2_init_from_best_stage1=true ckpt={best_stage1_dir}")
                 model = AutoModelForSequenceClassification.from_pretrained(str(best_stage1_dir), num_labels=1).to(device)
-                optimizer = AdamW(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
             else:
                 print(
                     "stage2_init_from_best_stage1=false "
                     f"reason=missing_checkpoint path={best_stage1_dir}"
                 )
+        optimizer = AdamW(model.parameters(), lr=stage2_learning_rate, weight_decay=weight_decay)
+        print(f"stage2_optimizer_reset=true lr={stage2_learning_rate:.10f}")
         print(f"stage2_start=true epochs={stage2_epochs}")
 
         pair_cycle = _make_pair_iterator(pair_train_loader)
@@ -6180,6 +6210,8 @@ def main() -> int:
         "eval_every_steps": int(eval_every_steps),
         "grad_accum_steps": int(grad_accum_steps),
         "learning_rate": float(learning_rate),
+        "stage1_learning_rate": float(stage1_learning_rate),
+        "stage2_learning_rate": float(stage2_learning_rate),
         "weight_decay": float(weight_decay),
         "max_length": int(max_length),
         "device": str(device),
