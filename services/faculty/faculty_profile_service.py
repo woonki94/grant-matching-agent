@@ -493,7 +493,7 @@ class FacultyProfileService:
     def _apply_publication_ops(self, *, sess, faculty_id: int, ops: Any) -> Dict[str, int]:
         if not isinstance(ops, dict):
             raise ValueError(
-                "data_from.publications must be an object with set_fetch_year_range/from/to and/or delete."
+                "data_from.publications must be an object with set_fetch_year_range/from/to and/or add/delete."
             )
 
         out = {
@@ -507,12 +507,13 @@ class FacultyProfileService:
             "publication_fetched_from_year",
             "set_fetch_upto_year",
             "publication_fetched_upto_year",
+            "add",
             "delete",
         }
         unknown = [k for k in ops.keys() if k not in allowed_keys]
         if unknown:
             raise ValueError(
-                "data_from.publications supports only set_fetch_year_range/from/to and delete."
+                "data_from.publications supports only set_fetch_year_range/from/to and add/delete."
             )
 
         year_range = ops.get("set_fetch_year_range")
@@ -649,6 +650,16 @@ class FacultyProfileService:
                 filters=(FacultyPublication.id == int(delete_id),),
             )
             out["publications_deleted"] += int(deleted_one or 0)
+
+        add_rows = FacultyProfileService._as_list(ops.get("add"))
+        if add_rows:
+            added_one, updated_one = self._apply_publication_add_ops(
+                sess=sess,
+                faculty_id=int(faculty_id),
+                rows=add_rows,
+            )
+            out["publications_added"] += int(added_one or 0)
+            out["publications_updated"] += int(updated_one or 0)
 
         logger.info(
             "FacultyProfileService._apply_publication_ops delta faculty_id=%s added=%s updated=%s deleted=%s",
@@ -825,6 +836,128 @@ class FacultyProfileService:
             pub.scholar_author_id = str(getattr(dto, "scholar_author_id", "") or "").strip() or None
             if work_id is not None:
                 pub.openalex_work_id = work_id
+
+        return added, updated
+
+    @staticmethod
+    def _extract_best_abstract_from_s2_paper(paper_row: Any) -> Optional[str]:
+        if not isinstance(paper_row, dict):
+            return None
+        abstract = str(paper_row.get("abstract") or "").strip()
+        if abstract:
+            return abstract
+        tldr = paper_row.get("tldr") or {}
+        if isinstance(tldr, dict):
+            tldr_text = str(tldr.get("text") or "").strip()
+            if tldr_text:
+                return tldr_text
+        return None
+
+    def _apply_publication_add_ops(
+        self,
+        *,
+        sess,
+        faculty_id: int,
+        rows: List[Any],
+    ) -> Tuple[int, int]:
+        if not rows:
+            return 0, 0
+
+        fetcher = None
+        try:
+            from services.faculty.author_publication_fetcher import AuthorPublicationFetcher
+
+            fetcher = AuthorPublicationFetcher()
+        except Exception:
+            fetcher = None
+        arxiv_abstract_fn = None
+        try:
+            from utils.publication_extractor import _abstract_from_arxiv as arxiv_abstract_fn
+        except Exception:
+            arxiv_abstract_fn = None
+
+        added = 0
+        updated = 0
+        current_year = datetime.now().year
+
+        for entry in rows:
+            if not isinstance(entry, dict):
+                raise ValueError("publications.add items must be objects.")
+
+            title_input = str(entry.get("title") or "").strip()
+            if not title_input:
+                raise ValueError("publications.add requires title.")
+
+            doi_input = str(entry.get("doi") or "").strip()
+            input_year = FacultyProfileService._safe_int_or_none(entry.get("year"))
+
+            title = title_input
+            abstract: Optional[str] = None
+            fetched_year: Optional[int] = None
+
+            if fetcher is not None and doi_input:
+                try:
+                    paper_by_doi = fetcher.fetch_semantic_scholar_paper_by_doi(doi=doi_input)
+                except Exception:
+                    paper_by_doi = None
+                if isinstance(paper_by_doi, dict):
+                    fetched_title = str(paper_by_doi.get("title") or "").strip()
+                    if fetched_title:
+                        title = fetched_title
+                    abstract = self._extract_best_abstract_from_s2_paper(paper_by_doi)
+                    fetched_year = FacultyProfileService._safe_int_or_none(paper_by_doi.get("year"))
+
+            if not abstract:
+                try:
+                    if arxiv_abstract_fn is not None:
+                        abstract = str(arxiv_abstract_fn(title)).strip() or None
+                except Exception:
+                    abstract = None
+
+            if not abstract and fetcher is not None:
+                try:
+                    abstract = fetcher.fetch_semantic_scholar_abstract_by_title(title=title)
+                except Exception:
+                    abstract = None
+
+            lookup_titles: List[str] = [title]
+            if title_input and title_input != title:
+                lookup_titles.append(title_input)
+
+            pub = None
+            for candidate_title in lookup_titles:
+                pub = (
+                    sess.query(FacultyPublication)
+                    .filter(
+                        FacultyPublication.faculty_id == int(faculty_id),
+                        FacultyPublication.title == candidate_title,
+                    )
+                    .order_by(FacultyPublication.id.desc())
+                    .first()
+                )
+                if pub is not None:
+                    break
+
+            row_year = input_year if input_year is not None else fetched_year
+            if pub is None:
+                pub = FacultyPublication(
+                    faculty_id=int(faculty_id),
+                    title=title,
+                    year=(int(row_year) if row_year is not None else int(current_year)),
+                    abstract=abstract,
+                )
+                sess.add(pub)
+                added += 1
+                continue
+
+            updated += 1
+            pub.title = title
+            if row_year is not None:
+                pub.year = int(row_year)
+            elif pub.year is None:
+                pub.year = int(current_year)
+            if abstract:
+                pub.abstract = abstract
 
         return added, updated
 

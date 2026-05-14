@@ -13,6 +13,7 @@ from mappers.page_to_faculty import map_faculty_profile_to_dto
 from services.faculty.author_publication_fetcher import AuthorPublicationFetcher
 from services.faculty.enrich_profile import enrich_faculty_publications_from_cv, enrich_new_faculty
 from services.faculty.profile_parser import parse_profile
+from services.matching.faculty_grant_matcher import FacultyGrantMatcher
 
 logger = logging.getLogger(__name__)
 
@@ -50,6 +51,17 @@ def _resolve_ingest_publication_years_back() -> int:
         5,
         minimum=0,
         maximum=50,
+    )
+
+
+def _resolve_single_faculty_rerank_chunk_workers() -> int:
+    cpu_hint = max(1, int(os.cpu_count() or 8))
+    default = max(8, cpu_hint * 2)
+    return _safe_env_int(
+        "FACULTY_SINGLE_RERANK_CHUNK_WORKERS",
+        default,
+        minimum=1,
+        maximum=64,
     )
 
 
@@ -268,6 +280,7 @@ class FacultyContextAgent:
         stale_threshold_days: int = _STALE_DAYS,
         cv_pdf_map: Optional[Dict[str, bytes]] = None,
         osu_url_map: Optional[Dict[str, str]] = None,
+        run_matching_for_new: bool = False,
     ) -> Dict[str, Any]:
         """
         Full resolution with automatic ingestion of missing or stale faculty.
@@ -283,6 +296,8 @@ class FacultyContextAgent:
              per-faculty CV PDFs.  Only emails present as keys in cv_pdf_map
              are enriched — the rest are skipped.  Title-based dedup makes
              re-runs safe.
+          5. (Optional) Run one-to-one matching generation for newly ingested
+             faculty and persist rows to match_results.
 
         cv_pdf_map: Dict[str, bytes]
             email (lowercase) → raw PDF bytes for that faculty member's CV.
@@ -300,6 +315,9 @@ class FacultyContextAgent:
                 "newly_added": List[str],   # emails successfully scraped + inserted
                 "failed":      List[str],   # emails whose ingestion failed
                 "missing_osu_url_emails": List[str],  # emails not in DB and missing osu_url
+                "match_rows_upserted": int,
+                "matching_failed_emails": List[str],
+                "matching_ran": bool,
             }
         """
         self._call("FacultyContextAgent.resolve_and_ingest_faculties")
@@ -433,12 +451,47 @@ class FacultyContextAgent:
                         fid,
                     )
 
+        # ── 5. Optional match generation for newly added faculty ──────
+        match_rows_upserted = 0
+        matching_failed_emails: List[str] = []
+        if run_matching_for_new and newly_added:
+            rerank_chunk_workers = _resolve_single_faculty_rerank_chunk_workers()
+            matcher = FacultyGrantMatcher(session_factory=self.session_factory)
+            for email in newly_added:
+                fid = email_to_fid.get(email)
+                if not fid:
+                    continue
+                try:
+                    upserted = matcher.run_for_faculty(
+                        faculty_id=int(fid),
+                        k=200,
+                        min_domain=0.3,
+                        rerank_chunk_workers=int(rerank_chunk_workers),
+                    )
+                    match_rows_upserted += int(upserted or 0)
+                    logger.info(
+                        "FacultyContextAgent: matching generated for email=%s faculty_id=%s rows=%s",
+                        email,
+                        int(fid),
+                        int(upserted or 0),
+                    )
+                except Exception:
+                    matching_failed_emails.append(email)
+                    logger.exception(
+                        "FacultyContextAgent: match generation failed for email=%s faculty_id=%s",
+                        email,
+                        int(fid),
+                    )
+
         resolved = list(email_to_fid.values())
         return {
             "resolved": resolved,
             "newly_added": newly_added,
             "failed": failed,
             "missing_osu_url_emails": list(unknown_without_url),
+            "match_rows_upserted": int(match_rows_upserted),
+            "matching_failed_emails": matching_failed_emails,
+            "matching_ran": bool(run_matching_for_new and bool(newly_added)),
         }
 
     # ──────────────────────────────────────────────────────────────────

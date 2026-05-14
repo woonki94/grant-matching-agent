@@ -132,7 +132,15 @@ class MatchDAO:
         if not rows:
             return 0
 
-        stmt = pg_insert(MatchResult).values(rows)
+        # Match regeneration should invalidate cached one-to-one justification text.
+        # Force NULL for all upserted rows so stale explanations are not reused.
+        payload_rows: List[Dict[str, Any]] = []
+        for row in rows:
+            payload = dict(row or {})
+            payload["justification"] = None
+            payload_rows.append(payload)
+
+        stmt = pg_insert(MatchResult).values(payload_rows)
         stmt = stmt.on_conflict_do_update(
             constraint="ux_match_grant_faculty",
             set_={
@@ -141,10 +149,11 @@ class MatchDAO:
                 "covered": stmt.excluded.covered,
                 "missing": stmt.excluded.missing,
                 "evidence": stmt.excluded.evidence,
+                "justification": None,
             },
         )
         self.session.execute(stmt)
-        return len(rows)
+        return len(payload_rows)
 
     # =============== Search/Ranking Actions ===============
     def topk_opps_for_faculty(self, faculty_id: int, k: int) -> List[Tuple[str, float]]:
