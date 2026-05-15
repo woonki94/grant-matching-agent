@@ -5,6 +5,7 @@ import hashlib
 import json
 import math
 import random
+import shutil
 import subprocess
 import sys
 import time
@@ -3692,6 +3693,37 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--stage2-oob-mid-weight", type=float, default=1.0, help="Weight for mid-band out-of-band rate in Stage2 selection objective.")
     p.add_argument("--stage2-oob-low-weight", type=float, default=1.0, help="Weight for low-band out-of-band rate in Stage2 selection objective.")
     p.add_argument(
+        "--stage2-gated-selection",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Enable gated Stage2 checkpoint selection: ranking-floor pass => min OOB; fallback => best ranking metric.",
+    )
+    p.add_argument(
+        "--stage2-gated-ranking-metric",
+        type=str,
+        choices=["ndcg@10", "mrr@10", "recall@50"],
+        default="mrr@10",
+        help="Ranking metric used for fallback Stage2 checkpoint selection when no gate-eligible epoch exists.",
+    )
+    p.add_argument(
+        "--stage2-gated-ndcg-min",
+        type=float,
+        default=0.0,
+        help="Minimum ndcg@10 floor for Stage2 gate eligibility.",
+    )
+    p.add_argument(
+        "--stage2-gated-mrr-min",
+        type=float,
+        default=0.0,
+        help="Minimum mrr@10 floor for Stage2 gate eligibility.",
+    )
+    p.add_argument(
+        "--stage2-gated-recall-min",
+        type=float,
+        default=0.0,
+        help="Minimum recall@50 floor for Stage2 gate eligibility.",
+    )
+    p.add_argument(
         "--stage2-early-stop",
         action=argparse.BooleanOptionalAction,
         default=True,
@@ -4109,6 +4141,13 @@ def main() -> int:
     stage2_oob_high_weight = _safe_float(args.stage2_oob_high_weight, default=2.0, minimum=0.0, maximum=100.0)
     stage2_oob_mid_weight = _safe_float(args.stage2_oob_mid_weight, default=1.0, minimum=0.0, maximum=100.0)
     stage2_oob_low_weight = _safe_float(args.stage2_oob_low_weight, default=1.0, minimum=0.0, maximum=100.0)
+    stage2_gated_selection = bool(args.stage2_gated_selection)
+    stage2_gated_ranking_metric = _clean_text(args.stage2_gated_ranking_metric) or "mrr@10"
+    if stage2_gated_ranking_metric not in {"ndcg@10", "mrr@10", "recall@50"}:
+        stage2_gated_ranking_metric = "mrr@10"
+    stage2_gated_ndcg_min = _safe_float(args.stage2_gated_ndcg_min, default=0.0, minimum=0.0, maximum=1.0)
+    stage2_gated_mrr_min = _safe_float(args.stage2_gated_mrr_min, default=0.0, minimum=0.0, maximum=1.0)
+    stage2_gated_recall_min = _safe_float(args.stage2_gated_recall_min, default=0.0, minimum=0.0, maximum=1.0)
     stage2_early_stop = bool(args.stage2_early_stop)
     stage2_early_stop_patience = _safe_int(args.stage2_early_stop_patience, default=2, minimum=0, maximum=1000)
     stage2_posthoc_calibration = bool(args.stage2_posthoc_calibration)
@@ -4392,6 +4431,12 @@ def main() -> int:
         f"patience:{stage2_early_stop_patience},"
         f"oob_selection_split:{stage2_oob_selection_split},"
         f"oob_weights(h/m/l):{stage2_oob_high_weight:.3f}/{stage2_oob_mid_weight:.3f}/{stage2_oob_low_weight:.3f}"
+    )
+    print(
+        "stage2_gated_selection="
+        f"enabled:{stage2_gated_selection},"
+        f"ranking_metric:{stage2_gated_ranking_metric},"
+        f"floors(ndcg/mrr/recall):{stage2_gated_ndcg_min:.4f}/{stage2_gated_mrr_min:.4f}/{stage2_gated_recall_min:.4f}"
     )
     print(f"train_band_thresholds=high:{train_band_high_threshold:.2f},mid:{train_band_mid_threshold:.2f}")
     print(
@@ -4916,6 +4961,16 @@ def main() -> int:
         "oob_mid_total": 0.0,
         "oob_low_total": 0.0,
     }
+    best_stage2_ranking_metric_value = float("-inf")
+    best_stage2_ranking_oob_objective = float("inf")
+    best_stage2_ranking_epoch = -1
+    best_stage2_ranking_source = ""
+    best_stage2_gated_oob_objective = float("inf")
+    best_stage2_gated_ranking_metric_value = float("-inf")
+    best_stage2_gated_epoch = -1
+    best_stage2_gated_source = ""
+    stage2_selected_checkpoint = ""
+    stage2_selected_source = ""
     history: List[Dict[str, Any]] = []
     global_step = 0
     start_time = time.time()
@@ -5282,6 +5337,141 @@ def main() -> int:
             f"epoch={best_val_oob_epoch} "
             f"step={best_val_oob_step} "
             f"source={best_val_oob_source}"
+        )
+
+    def _write_posthoc_if_present(target_dir: Path, posthoc_payload: Optional[Dict[str, Any]]) -> None:
+        if posthoc_payload is None:
+            return
+        (target_dir / "posthoc_calibration_affine.json").write_text(
+            json.dumps(posthoc_payload, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+
+    def maybe_save_best_stage2_ranking(
+        *,
+        epoch: int,
+        global_step_now: int,
+        ranking_metric_value: float,
+        oob_objective: float,
+        source: str,
+        posthoc_payload: Optional[Dict[str, Any]],
+    ) -> None:
+        nonlocal best_stage2_ranking_metric_value
+        nonlocal best_stage2_ranking_oob_objective
+        nonlocal best_stage2_ranking_epoch
+        nonlocal best_stage2_ranking_source
+
+        rank_val = float(ranking_metric_value)
+        oob_val = float(oob_objective)
+        if not math.isfinite(rank_val):
+            return
+        improved = (
+            (rank_val > float(best_stage2_ranking_metric_value) + 1e-12)
+            or (
+                abs(rank_val - float(best_stage2_ranking_metric_value)) <= 1e-12
+                and oob_val < float(best_stage2_ranking_oob_objective) - 1e-12
+            )
+        )
+        if not improved:
+            return
+
+        best_stage2_ranking_metric_value = rank_val
+        best_stage2_ranking_oob_objective = oob_val
+        best_stage2_ranking_epoch = int(epoch)
+        best_stage2_ranking_source = _clean_text(source) or "unknown"
+
+        best_rank_dir = output_dir / "best_stage2_ranking"
+        best_rank_dir.mkdir(parents=True, exist_ok=True)
+        model.save_pretrained(best_rank_dir)
+        tokenizer.save_pretrained(best_rank_dir)
+        _write_posthoc_if_present(best_rank_dir, posthoc_payload)
+        (best_rank_dir / "best_stage2_ranking_meta.json").write_text(
+            json.dumps(
+                {
+                    "ranking_metric": str(stage2_gated_ranking_metric),
+                    "ranking_metric_value": float(best_stage2_ranking_metric_value),
+                    "oob_objective": float(best_stage2_ranking_oob_objective),
+                    "epoch": int(best_stage2_ranking_epoch),
+                    "global_step": int(global_step_now),
+                    "source": str(best_stage2_ranking_source),
+                },
+                ensure_ascii=False,
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+        print(
+            "best_stage2_ranking_update="
+            f"metric={stage2_gated_ranking_metric} "
+            f"value={best_stage2_ranking_metric_value:.6f} "
+            f"oob={best_stage2_ranking_oob_objective:.6f} "
+            f"epoch={best_stage2_ranking_epoch}"
+        )
+
+    def maybe_save_best_stage2_gated(
+        *,
+        epoch: int,
+        global_step_now: int,
+        ranking_metric_value: float,
+        oob_objective: float,
+        source: str,
+        posthoc_payload: Optional[Dict[str, Any]],
+    ) -> None:
+        nonlocal best_stage2_gated_oob_objective
+        nonlocal best_stage2_gated_ranking_metric_value
+        nonlocal best_stage2_gated_epoch
+        nonlocal best_stage2_gated_source
+
+        rank_val = float(ranking_metric_value)
+        oob_val = float(oob_objective)
+        if not (math.isfinite(rank_val) and math.isfinite(oob_val)):
+            return
+        improved = (
+            (oob_val < float(best_stage2_gated_oob_objective) - 1e-12)
+            or (
+                abs(oob_val - float(best_stage2_gated_oob_objective)) <= 1e-12
+                and rank_val > float(best_stage2_gated_ranking_metric_value) + 1e-12
+            )
+        )
+        if not improved:
+            return
+
+        best_stage2_gated_oob_objective = oob_val
+        best_stage2_gated_ranking_metric_value = rank_val
+        best_stage2_gated_epoch = int(epoch)
+        best_stage2_gated_source = _clean_text(source) or "unknown"
+
+        best_gate_dir = output_dir / "best_stage2_gated"
+        best_gate_dir.mkdir(parents=True, exist_ok=True)
+        model.save_pretrained(best_gate_dir)
+        tokenizer.save_pretrained(best_gate_dir)
+        _write_posthoc_if_present(best_gate_dir, posthoc_payload)
+        (best_gate_dir / "best_stage2_gated_meta.json").write_text(
+            json.dumps(
+                {
+                    "ranking_metric": str(stage2_gated_ranking_metric),
+                    "ranking_metric_value": float(best_stage2_gated_ranking_metric_value),
+                    "oob_objective": float(best_stage2_gated_oob_objective),
+                    "epoch": int(best_stage2_gated_epoch),
+                    "global_step": int(global_step_now),
+                    "source": str(best_stage2_gated_source),
+                    "floors": {
+                        "ndcg@10": float(stage2_gated_ndcg_min),
+                        "mrr@10": float(stage2_gated_mrr_min),
+                        "recall@50": float(stage2_gated_recall_min),
+                    },
+                },
+                ensure_ascii=False,
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+        print(
+            "best_stage2_gated_update="
+            f"metric={stage2_gated_ranking_metric} "
+            f"value={best_stage2_gated_ranking_metric_value:.6f} "
+            f"oob={best_stage2_gated_oob_objective:.6f} "
+            f"epoch={best_stage2_gated_epoch}"
         )
 
     def run_step_validation(*, stage: int, epoch: int, global_step_now: int) -> None:
@@ -5812,6 +6002,15 @@ def main() -> int:
                 mrr_rel_threshold=_safe_float(args.mrr_rel_threshold, default=0.7, minimum=0.0, maximum=1.0),
                 recall_rel_threshold=_safe_float(args.recall_rel_threshold, default=0.7, minimum=0.0, maximum=1.0),
             )
+            ndcg10_epoch = float(eval_metrics.get("ndcg@10", 0.0))
+            mrr10_epoch = float(eval_metrics.get("mrr@10", 0.0))
+            recall50_epoch = float(eval_metrics.get("recall@50", 0.0))
+            ranking_metric_value = float(eval_metrics.get(stage2_gated_ranking_metric, 0.0))
+            stage2_gate_pass = bool(
+                (ndcg10_epoch >= float(stage2_gated_ndcg_min))
+                and (mrr10_epoch >= float(stage2_gated_mrr_min))
+                and (recall50_epoch >= float(stage2_gated_recall_min))
+            )
 
             metrics = {
                 "stage": 2,
@@ -5844,6 +6043,12 @@ def main() -> int:
                 "oob_selection_mid_rate": float(selection_oob_mid_rate),
                 "oob_selection_low_rate": float(selection_oob_low_rate),
                 "val_list_batches": int(val_list_loss.get("val_list_batches", 0.0)),
+                "stage2_gate_pass": int(1 if stage2_gate_pass else 0),
+                "stage2_gate_ranking_metric": str(stage2_gated_ranking_metric),
+                "stage2_gate_ranking_metric_value": float(ranking_metric_value),
+                "stage2_gate_ndcg_min": float(stage2_gated_ndcg_min),
+                "stage2_gate_mrr_min": float(stage2_gated_mrr_min),
+                "stage2_gate_recall_min": float(stage2_gated_recall_min),
                 "global_step": global_step,
             }
             metrics.update(eval_metrics)
@@ -5874,6 +6079,8 @@ def main() -> int:
                     "eval/ndcg@10": float(metrics.get("ndcg@10", 0.0)),
                     "eval/mrr@10": float(metrics.get("mrr@10", 0.0)),
                     "eval/recall@50": float(metrics.get("recall@50", 0.0)),
+                    "eval/stage2_gate_pass_epoch": int(metrics.get("stage2_gate_pass", 0)),
+                    "eval/stage2_gate_ranking_metric_value_epoch": float(metrics.get("stage2_gate_ranking_metric_value", 0.0)),
                     "eval/queries": int(metrics.get("eval_queries", 0)),
                 },
                 step=global_step if global_step > 0 else None,
@@ -5981,6 +6188,24 @@ def main() -> int:
                         encoding="utf-8",
                     )
 
+            maybe_save_best_stage2_ranking(
+                epoch=int(epoch),
+                global_step_now=int(global_step),
+                ranking_metric_value=float(ranking_metric_value),
+                oob_objective=float(selection_oob_objective),
+                source=f"epoch_eval/{selection_split}",
+                posthoc_payload=posthoc_payload,
+            )
+            if bool(stage2_gated_selection) and bool(stage2_gate_pass):
+                maybe_save_best_stage2_gated(
+                    epoch=int(epoch),
+                    global_step_now=int(global_step),
+                    ranking_metric_value=float(ranking_metric_value),
+                    oob_objective=float(selection_oob_objective),
+                    source=f"epoch_eval/{selection_split}",
+                    posthoc_payload=posthoc_payload,
+                )
+
             improved_epoch_oob = float(selection_oob_objective) < float(stage2_best_epoch_oob)
             if improved_epoch_oob:
                 stage2_best_epoch_oob = float(selection_oob_objective)
@@ -5996,6 +6221,48 @@ def main() -> int:
                     f"best_oob_objective={stage2_best_epoch_oob:.6f}"
                 )
                 break
+
+        if int(best_stage2_ranking_epoch) > 0:
+            if bool(stage2_gated_selection) and int(best_stage2_gated_epoch) > 0:
+                stage2_selected_checkpoint = str((output_dir / "best_stage2_gated").resolve())
+                stage2_selected_source = "gated_oob_among_ranking_floor"
+            else:
+                stage2_selected_checkpoint = str((output_dir / "best_stage2_ranking").resolve())
+                stage2_selected_source = "ranking_fallback"
+            selected_path = Path(stage2_selected_checkpoint)
+            if selected_path.exists() and selected_path.is_dir():
+                selected_dir = output_dir / "best_stage2_selected"
+                if selected_dir.exists():
+                    shutil.rmtree(selected_dir)
+                shutil.copytree(selected_path, selected_dir)
+                (selected_dir / "best_stage2_selected_meta.json").write_text(
+                    json.dumps(
+                        {
+                            "selected_source": str(stage2_selected_source),
+                            "selected_checkpoint": str(selected_path),
+                            "gated_enabled": bool(stage2_gated_selection),
+                            "gated_floors": {
+                                "ndcg@10": float(stage2_gated_ndcg_min),
+                                "mrr@10": float(stage2_gated_mrr_min),
+                                "recall@50": float(stage2_gated_recall_min),
+                            },
+                            "ranking_metric": str(stage2_gated_ranking_metric),
+                            "best_stage2_ranking_epoch": int(best_stage2_ranking_epoch),
+                            "best_stage2_ranking_metric_value": float(best_stage2_ranking_metric_value),
+                            "best_stage2_ranking_oob_objective": float(best_stage2_ranking_oob_objective),
+                            "best_stage2_gated_epoch": int(best_stage2_gated_epoch),
+                            "best_stage2_gated_ranking_metric_value": float(best_stage2_gated_ranking_metric_value),
+                            "best_stage2_gated_oob_objective": float(best_stage2_gated_oob_objective),
+                        },
+                        ensure_ascii=False,
+                        indent=2,
+                    ),
+                    encoding="utf-8",
+                )
+                print(f"best_stage2_selected_ckpt={selected_dir.resolve()}")
+                print(f"best_stage2_selected_source={stage2_selected_source}")
+            else:
+                print(f"best_stage2_selected_ckpt_missing={selected_path}")
 
     test_pair_loss = eval_pairwise_margin(pair_test_loader) if test_pairs else 0.0
     test_list_loss = eval_listwise_losses(test_list_loader)
@@ -6194,6 +6461,13 @@ def main() -> int:
             "mid": float(stage2_oob_mid_weight),
             "low": float(stage2_oob_low_weight),
         },
+        "stage2_gated_selection": bool(stage2_gated_selection),
+        "stage2_gated_ranking_metric": str(stage2_gated_ranking_metric),
+        "stage2_gated_floors": {
+            "ndcg@10": float(stage2_gated_ndcg_min),
+            "mrr@10": float(stage2_gated_mrr_min),
+            "recall@50": float(stage2_gated_recall_min),
+        },
         "stage2_posthoc_calibration": bool(stage2_posthoc_calibration),
         "stage2_posthoc_calibration_fit_split": str(stage2_posthoc_calibration_fit_split),
         "stage2_posthoc_grid": {
@@ -6238,6 +6512,27 @@ def main() -> int:
         "best_val_oob_source": str(best_val_oob_source),
         "best_val_oob_components": dict(best_val_oob_components),
         "best_val_oob_checkpoint": str((output_dir / "best_val_oob").resolve()),
+        "best_stage2_ranking_metric_value": (
+            float(best_stage2_ranking_metric_value) if math.isfinite(best_stage2_ranking_metric_value) else -1.0
+        ),
+        "best_stage2_ranking_oob_objective": (
+            float(best_stage2_ranking_oob_objective) if math.isfinite(best_stage2_ranking_oob_objective) else -1.0
+        ),
+        "best_stage2_ranking_epoch": int(best_stage2_ranking_epoch),
+        "best_stage2_ranking_source": str(best_stage2_ranking_source),
+        "best_stage2_ranking_checkpoint": str((output_dir / "best_stage2_ranking").resolve()),
+        "best_stage2_gated_oob_objective": (
+            float(best_stage2_gated_oob_objective) if math.isfinite(best_stage2_gated_oob_objective) else -1.0
+        ),
+        "best_stage2_gated_ranking_metric_value": (
+            float(best_stage2_gated_ranking_metric_value) if math.isfinite(best_stage2_gated_ranking_metric_value) else -1.0
+        ),
+        "best_stage2_gated_epoch": int(best_stage2_gated_epoch),
+        "best_stage2_gated_source": str(best_stage2_gated_source),
+        "best_stage2_gated_checkpoint": str((output_dir / "best_stage2_gated").resolve()),
+        "best_stage2_selected_source": str(stage2_selected_source),
+        "best_stage2_selected_checkpoint": str(stage2_selected_checkpoint),
+        "best_stage2_selected_materialized_checkpoint": str((output_dir / "best_stage2_selected").resolve()),
         "test_metrics": test_metrics,
         "elapsed_seconds": float(elapsed),
         "history": history,
@@ -6263,6 +6558,15 @@ def main() -> int:
             "run/best_val_total_loss": float(best_val_total_loss) if math.isfinite(best_val_total_loss) else -1.0,
             "run/best_val_oob_objective": (
                 float(best_val_oob_objective) if math.isfinite(best_val_oob_objective) else -1.0
+            ),
+            "run/best_stage2_ranking_metric_value": (
+                float(best_stage2_ranking_metric_value) if math.isfinite(best_stage2_ranking_metric_value) else -1.0
+            ),
+            "run/best_stage2_ranking_oob_objective": (
+                float(best_stage2_ranking_oob_objective) if math.isfinite(best_stage2_ranking_oob_objective) else -1.0
+            ),
+            "run/best_stage2_gated_oob_objective": (
+                float(best_stage2_gated_oob_objective) if math.isfinite(best_stage2_gated_oob_objective) else -1.0
             ),
             "run/elapsed_seconds": float(elapsed),
         },
@@ -6291,6 +6595,21 @@ def main() -> int:
         print(f"best_val_oob_step={best_val_oob_step}")
         print(f"best_val_oob_epoch={best_val_oob_epoch}")
         print(f"best_val_oob_ckpt={output_dir / 'best_val_oob'}")
+    if int(best_stage2_ranking_epoch) > 0:
+        print(f"best_stage2_ranking_metric={stage2_gated_ranking_metric}")
+        print(f"best_stage2_ranking_metric_value={best_stage2_ranking_metric_value:.6f}")
+        print(f"best_stage2_ranking_oob_objective={best_stage2_ranking_oob_objective:.6f}")
+        print(f"best_stage2_ranking_epoch={best_stage2_ranking_epoch}")
+        print(f"best_stage2_ranking_ckpt={output_dir / 'best_stage2_ranking'}")
+    if int(best_stage2_gated_epoch) > 0:
+        print(f"best_stage2_gated_oob_objective={best_stage2_gated_oob_objective:.6f}")
+        print(f"best_stage2_gated_ranking_metric_value={best_stage2_gated_ranking_metric_value:.6f}")
+        print(f"best_stage2_gated_epoch={best_stage2_gated_epoch}")
+        print(f"best_stage2_gated_ckpt={output_dir / 'best_stage2_gated'}")
+    if _clean_text(stage2_selected_checkpoint):
+        print(f"best_stage2_selected_source={stage2_selected_source}")
+        print(f"best_stage2_selected_ckpt={stage2_selected_checkpoint}")
+        print(f"best_stage2_selected_materialized_ckpt={output_dir / 'best_stage2_selected'}")
     print(f"elapsed_seconds={elapsed:.2f}")
     print(f"manifest={manifest_path}")
     return 0
