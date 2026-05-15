@@ -4,7 +4,7 @@ import hashlib
 import logging
 from datetime import datetime, timezone
 from types import SimpleNamespace
-from typing import Any, Callable, Dict, Optional, Type
+from typing import Any, Callable, Dict, List, Optional, Type
 
 import boto3
 import numpy as np
@@ -123,6 +123,7 @@ def run_extraction_pipeline(
     s3_prefix: Optional[str] = None,
     aws_region: Optional[str] = None,
     aws_profile: Optional[str] = None,
+    pending_ids: Optional[List[int]] = None,
 ) -> Dict[str, int]:
     """
     Extracts text for pending base rows (chunk_index=0) and stores chunk files in S3.
@@ -241,11 +242,17 @@ def run_extraction_pipeline(
     done = 0
     failed = 0
 
+    scoped_pending_ids = [int(x) for x in list(pending_ids or []) if x is not None]
+
     with SessionLocal() as sess:
         dao = ContentExtractionDAO(sess)
 
         while True:
-            items = dao.fetch_pending(model, limit=batch_size)
+            items = dao.fetch_pending(
+                model,
+                limit=batch_size,
+                ids=scoped_pending_ids or None,
+            )
             if not items:
                 break
 

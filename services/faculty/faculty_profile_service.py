@@ -147,6 +147,7 @@ class FacultyProfileService:
                 raise LookupError("Faculty not found.")
 
             source_changed = False
+            additional_info_refresh_ids: List[int] = []
             source_detail = {
                 "basic_info_updated": False,
                 "data_from_updated": False,
@@ -167,6 +168,11 @@ class FacultyProfileService:
                 changed, delta = self._apply_data_from_update(sess=sess, fac=fac, payload=data_from)
                 source_changed = source_changed or changed
                 source_detail["data_from_updated"] = bool(changed)
+                additional_info_refresh_ids = [
+                    int(x)
+                    for x in list(delta.get("attached_files_reextract_ids") or [])
+                    if x
+                ]
                 for k in (
                     "publications_added",
                     "publications_updated",
@@ -196,9 +202,14 @@ class FacultyProfileService:
             source_changed=bool(source_changed),
             direct_keyword_applied=bool(direct_keyword_applied),
             force_regeneration=bool(force_regeneration),
+            additional_info_refresh_ids=additional_info_refresh_ids,
         )
         postprocess_pending = bool(
-            (postprocess_plan.get("regenerate_keywords") or postprocess_plan.get("rebuild_matches"))
+            (
+                postprocess_plan.get("refresh_additional_info_embeddings")
+                or postprocess_plan.get("regenerate_keywords")
+                or postprocess_plan.get("rebuild_matches")
+            )
             and not run_postprocess
         )
 
@@ -219,6 +230,11 @@ class FacultyProfileService:
             "keyword_regenerated": False,
             "keyword_regeneration_forced": bool(force_regeneration),
             "keyword_regeneration_error": None,
+            "additional_info_embeddings_refreshed": False,
+            "additional_info_embedding_rows_processed": 0,
+            "additional_info_embedding_rows_done": 0,
+            "additional_info_embedding_rows_failed": 0,
+            "additional_info_embedding_refresh_error": None,
             "matches_rebuilt": False,
             "match_rows_upserted": 0,
             "match_rebuild_error": None,
@@ -260,6 +276,11 @@ class FacultyProfileService:
             "keyword_regenerated": bool(post_out.get("keyword_regenerated")),
             "keyword_regeneration_forced": bool(post_out.get("keyword_regeneration_forced")),
             "keyword_regeneration_error": post_out.get("keyword_regeneration_error"),
+            "additional_info_embeddings_refreshed": bool(post_out.get("additional_info_embeddings_refreshed")),
+            "additional_info_embedding_rows_processed": int(post_out.get("additional_info_embedding_rows_processed") or 0),
+            "additional_info_embedding_rows_done": int(post_out.get("additional_info_embedding_rows_done") or 0),
+            "additional_info_embedding_rows_failed": int(post_out.get("additional_info_embedding_rows_failed") or 0),
+            "additional_info_embedding_refresh_error": post_out.get("additional_info_embedding_refresh_error"),
             "updated_keywords": ((updated or {}).get("all_keywords") or {}),
             "matches_rebuilt": bool(post_out.get("matches_rebuilt")),
             "match_rows_upserted": int(post_out.get("match_rows_upserted") or 0),
@@ -277,11 +298,27 @@ class FacultyProfileService:
         source_changed: bool,
         direct_keyword_applied: bool,
         force_regeneration: bool,
+        additional_info_refresh_ids: Optional[List[int]] = None,
     ) -> Dict[str, Any]:
+        dedup_refresh_ids: List[int] = []
+        seen_refresh_ids = set()
+        for raw_id in list(additional_info_refresh_ids or []):
+            use_id = FacultyProfileService._safe_int_or_none(raw_id)
+            if not use_id:
+                continue
+            use_id = int(use_id)
+            if use_id in seen_refresh_ids:
+                continue
+            seen_refresh_ids.add(use_id)
+            dedup_refresh_ids.append(use_id)
+        refresh_additional_info_embeddings = bool(dedup_refresh_ids)
+
         regenerate_keywords = bool((not direct_keyword_applied) and (source_changed or force_regeneration))
         # Direct keyword updates skip keyword regeneration but still need fresh match rows.
         rebuild_matches = bool(regenerate_keywords or direct_keyword_applied)
         return {
+            "refresh_additional_info_embeddings": bool(refresh_additional_info_embeddings),
+            "additional_info_refresh_ids": dedup_refresh_ids,
             "regenerate_keywords": bool(regenerate_keywords),
             "rebuild_matches": bool(rebuild_matches),
             "force_regeneration": bool(force_regeneration),
@@ -297,6 +334,12 @@ class FacultyProfileService:
         request_email: Optional[str] = None,
     ) -> Dict[str, Any]:
         plan = dict(postprocess_plan or {})
+        refresh_additional_info_embeddings = bool(plan.get("refresh_additional_info_embeddings"))
+        additional_info_refresh_ids = [
+            int(x)
+            for x in list(plan.get("additional_info_refresh_ids") or [])
+            if self._safe_int_or_none(x)
+        ]
         regenerate_keywords = bool(plan.get("regenerate_keywords"))
         rebuild_matches = bool(plan.get("rebuild_matches"))
         force_regeneration = bool(plan.get("force_regeneration"))
@@ -318,6 +361,38 @@ class FacultyProfileService:
         keyword_regenerated = False
         keyword_regeneration_error = None
         keyword_update_mode = "none"
+
+        additional_info_embeddings_refreshed = False
+        additional_info_embedding_rows_processed = 0
+        additional_info_embedding_rows_done = 0
+        additional_info_embedding_rows_failed = 0
+        additional_info_embedding_refresh_error = None
+
+        if refresh_additional_info_embeddings and additional_info_refresh_ids:
+            stage_embedding_start = time.perf_counter()
+            try:
+                embedding_stats = self._refresh_faculty_additional_info_embeddings(
+                    faculty_id=int(faculty_id),
+                    row_ids=additional_info_refresh_ids,
+                )
+                additional_info_embedding_rows_processed = int(embedding_stats.get("processed") or 0)
+                additional_info_embedding_rows_done = int(embedding_stats.get("done") or 0)
+                additional_info_embedding_rows_failed = int(embedding_stats.get("failed") or 0)
+                additional_info_embeddings_refreshed = bool(
+                    (additional_info_embedding_rows_done > 0)
+                    or (
+                        additional_info_embedding_rows_processed == 0
+                        and additional_info_embedding_rows_failed == 0
+                    )
+                )
+            except Exception as e:
+                additional_info_embedding_refresh_error = f"{type(e).__name__}: {e}"
+                logger.exception(
+                    "FacultyProfileService additional info embedding refresh failed faculty_id=%s",
+                    int(faculty_id),
+                )
+            finally:
+                _mark_stage("additional_info_embedding_stage", stage_embedding_start)
 
         if direct_keyword_applied:
             keyword_update_mode = "frontend_override"
@@ -365,6 +440,11 @@ class FacultyProfileService:
             "keyword_regenerated": bool(keyword_regenerated),
             "keyword_regeneration_forced": bool(force_regeneration),
             "keyword_regeneration_error": keyword_regeneration_error,
+            "additional_info_embeddings_refreshed": bool(additional_info_embeddings_refreshed),
+            "additional_info_embedding_rows_processed": int(additional_info_embedding_rows_processed),
+            "additional_info_embedding_rows_done": int(additional_info_embedding_rows_done),
+            "additional_info_embedding_rows_failed": int(additional_info_embedding_rows_failed),
+            "additional_info_embedding_refresh_error": additional_info_embedding_refresh_error,
             "matches_rebuilt": bool(matches_rebuilt),
             "match_rows_upserted": int(match_rows_upserted),
             "match_rebuild_error": match_rebuild_error,
@@ -447,15 +527,16 @@ class FacultyProfileService:
         sess,
         fac: Faculty,
         payload: Dict[str, Any],
-    ) -> Tuple[bool, Dict[str, int]]:
+    ) -> Tuple[bool, Dict[str, Any]]:
         changed = False
-        delta = {
+        delta: Dict[str, Any] = {
             "publications_added": 0,
             "publications_updated": 0,
             "publications_deleted": 0,
             "attached_files_added": 0,
             "attached_files_updated": 0,
             "attached_files_deleted": 0,
+            "attached_files_reextract_ids": [],
         }
 
         if "info_source_url" in payload:
@@ -485,6 +566,13 @@ class FacultyProfileService:
             )
             for k in ("attached_files_added", "attached_files_updated", "attached_files_deleted"):
                 delta[k] += int(file_delta.get(k, 0))
+            delta["attached_files_reextract_ids"] = [
+                int(x)
+                for x in list(delta.get("attached_files_reextract_ids") or [])
+                + list(file_delta.get("attached_files_reextract_ids") or [])
+                if x
+            ]
+            delta["attached_files_reextract_ids"] = sorted(set(delta["attached_files_reextract_ids"]))
             if any(delta[k] > 0 for k in ("attached_files_added", "attached_files_updated", "attached_files_deleted")):
                 changed = True
 
@@ -535,17 +623,14 @@ class FacultyProfileService:
 
         if fetch_from_year is None:
             fetch_from_year = FacultyProfileService._safe_int_or_none(ops.get("set_fetch_from_year"))
-        if fetch_from_year is None:
-            fetch_from_year = FacultyProfileService._safe_int_or_none(
-                ops.get("publication_fetched_from_year")
-            )
 
         if fetch_upto_year is None:
             fetch_upto_year = FacultyProfileService._safe_int_or_none(ops.get("set_fetch_upto_year"))
-        if fetch_upto_year is None:
-            fetch_upto_year = FacultyProfileService._safe_int_or_none(
-                ops.get("publication_fetched_upto_year")
-            )
+        # NOTE:
+        # publication_fetched_from_year / publication_fetched_upto_year are
+        # read-only metadata fields returned by GET profile responses.
+        # They are intentionally accepted in PATCH payloads for compatibility,
+        # but must not trigger source sync/re-fetch behavior.
 
         if (
             fetch_from_year is not None
@@ -790,6 +875,7 @@ class FacultyProfileService:
     ) -> Tuple[int, int]:
         added = 0
         updated = 0
+        touched_rows: List[FacultyPublication] = []
         for dto in rows or []:
             title = str(getattr(dto, "title", "") or "").strip()
             if not title:
@@ -836,22 +922,65 @@ class FacultyProfileService:
             pub.scholar_author_id = str(getattr(dto, "scholar_author_id", "") or "").strip() or None
             if work_id is not None:
                 pub.openalex_work_id = work_id
+            touched_rows.append(pub)
+
+        FacultyProfileService._refresh_publication_abstract_embeddings(rows=touched_rows)
 
         return added, updated
 
     @staticmethod
-    def _extract_best_abstract_from_s2_paper(paper_row: Any) -> Optional[str]:
-        if not isinstance(paper_row, dict):
-            return None
-        abstract = str(paper_row.get("abstract") or "").strip()
-        if abstract:
-            return abstract
-        tldr = paper_row.get("tldr") or {}
-        if isinstance(tldr, dict):
-            tldr_text = str(tldr.get("text") or "").strip()
-            if tldr_text:
-                return tldr_text
-        return None
+    def _refresh_publication_abstract_embeddings(*, rows: List[FacultyPublication]) -> None:
+        """
+        Compute and assign abstract embeddings for touched publication rows.
+        Rows with empty abstracts are explicitly set to NULL embeddings.
+        """
+        if not rows:
+            return
+
+        dedup_rows: List[FacultyPublication] = []
+        seen_obj_ids = set()
+        for row in list(rows or []):
+            if row is None:
+                continue
+            row_key = id(row)
+            if row_key in seen_obj_ids:
+                continue
+            seen_obj_ids.add(row_key)
+            dedup_rows.append(row)
+
+        if not dedup_rows:
+            return
+
+        text_rows: List[FacultyPublication] = []
+        abstract_texts: List[str] = []
+        for row in dedup_rows:
+            abstract_text = str(getattr(row, "abstract", "") or "").strip()
+            if not abstract_text:
+                row.abstract_embedding = None
+                continue
+            text_rows.append(row)
+            abstract_texts.append(abstract_text)
+
+        if not abstract_texts:
+            return
+
+        try:
+            from config import get_embedding_client
+            from utils.embedder import embed_texts
+
+            emb_client = get_embedding_client().build()
+            emb = embed_texts(abstract_texts, embedding_client=emb_client)
+            if getattr(emb, "ndim", 0) == 2 and int(emb.shape[0]) == len(text_rows):
+                for idx, row in enumerate(text_rows):
+                    row.abstract_embedding = emb[idx].astype(float).tolist()
+            else:
+                logger.warning(
+                    "FacultyProfileService publication abstract embedding size mismatch (texts=%s emb_shape=%s)",
+                    len(abstract_texts),
+                    tuple(getattr(emb, "shape", ()) or ()),
+                )
+        except Exception:
+            logger.exception("FacultyProfileService publication abstract embedding refresh failed")
 
     def _apply_publication_add_ops(
         self,
@@ -863,114 +992,68 @@ class FacultyProfileService:
         if not rows:
             return 0, 0
 
-        fetcher = None
-        try:
-            from services.faculty.author_publication_fetcher import AuthorPublicationFetcher
-
-            fetcher = AuthorPublicationFetcher()
-        except Exception:
-            fetcher = None
-        arxiv_abstract_fn = None
-        try:
-            from utils.publication_extractor import _abstract_from_arxiv as arxiv_abstract_fn
-        except Exception:
-            arxiv_abstract_fn = None
-
         added = 0
         updated = 0
-        current_year = datetime.now().year
+        touched_rows: List[FacultyPublication] = []
 
         for entry in rows:
             if not isinstance(entry, dict):
                 raise ValueError("publications.add items must be objects.")
 
-            title_input = str(entry.get("title") or "").strip()
-            if not title_input:
+            title = str(entry.get("title") or "").strip()
+            if not title:
                 raise ValueError("publications.add requires title.")
-
-            doi_input = str(entry.get("doi") or "").strip()
-            input_year = FacultyProfileService._safe_int_or_none(entry.get("year"))
-
-            title = title_input
-            abstract: Optional[str] = None
-            fetched_year: Optional[int] = None
-
-            if fetcher is not None and doi_input:
-                try:
-                    paper_by_doi = fetcher.fetch_semantic_scholar_paper_by_doi(doi=doi_input)
-                except Exception:
-                    paper_by_doi = None
-                if isinstance(paper_by_doi, dict):
-                    fetched_title = str(paper_by_doi.get("title") or "").strip()
-                    if fetched_title:
-                        title = fetched_title
-                    abstract = self._extract_best_abstract_from_s2_paper(paper_by_doi)
-                    fetched_year = FacultyProfileService._safe_int_or_none(paper_by_doi.get("year"))
-
+            abstract = str(entry.get("abstract") or "").strip()
             if not abstract:
-                try:
-                    if arxiv_abstract_fn is not None:
-                        abstract = str(arxiv_abstract_fn(title)).strip() or None
-                except Exception:
-                    abstract = None
+                raise ValueError("publications.add requires abstract.")
+            row_year = FacultyProfileService._safe_int_or_none(entry.get("year"))
+            if row_year is None:
+                raise ValueError("publications.add requires year.")
 
-            if not abstract and fetcher is not None:
-                try:
-                    abstract = fetcher.fetch_semantic_scholar_abstract_by_title(title=title)
-                except Exception:
-                    abstract = None
-
-            lookup_titles: List[str] = [title]
-            if title_input and title_input != title:
-                lookup_titles.append(title_input)
-
-            pub = None
-            for candidate_title in lookup_titles:
-                pub = (
-                    sess.query(FacultyPublication)
-                    .filter(
-                        FacultyPublication.faculty_id == int(faculty_id),
-                        FacultyPublication.title == candidate_title,
-                    )
-                    .order_by(FacultyPublication.id.desc())
-                    .first()
+            pub = (
+                sess.query(FacultyPublication)
+                .filter(
+                    FacultyPublication.faculty_id == int(faculty_id),
+                    FacultyPublication.title == title,
                 )
-                if pub is not None:
-                    break
+                .order_by(FacultyPublication.id.desc())
+                .first()
+            )
 
-            row_year = input_year if input_year is not None else fetched_year
             if pub is None:
                 pub = FacultyPublication(
                     faculty_id=int(faculty_id),
                     title=title,
-                    year=(int(row_year) if row_year is not None else int(current_year)),
+                    year=int(row_year),
                     abstract=abstract,
                 )
                 sess.add(pub)
                 added += 1
+                touched_rows.append(pub)
                 continue
 
             updated += 1
             pub.title = title
-            if row_year is not None:
-                pub.year = int(row_year)
-            elif pub.year is None:
-                pub.year = int(current_year)
-            if abstract:
-                pub.abstract = abstract
+            pub.year = int(row_year)
+            pub.abstract = abstract
+            touched_rows.append(pub)
+
+        self._refresh_publication_abstract_embeddings(rows=touched_rows)
 
         return added, updated
 
     @staticmethod
-    def _apply_attached_file_ops(*, sess, faculty_id: int, ops: Any) -> Dict[str, int]:
+    def _apply_attached_file_ops(*, sess, faculty_id: int, ops: Any) -> Dict[str, Any]:
         if not isinstance(ops, dict):
             raise ValueError("data_from.attached_files must be an object with add/update/delete.")
 
-        out = {
+        out: Dict[str, Any] = {
             "attached_files_added": 0,
             "attached_files_updated": 0,
             "attached_files_deleted": 0,
+            "attached_files_reextract_ids": [],
         }
+        reextract_rows: List[FacultyAdditionalInfo] = []
 
         for row in FacultyProfileService._as_list(ops.get("add")):
             if not isinstance(row, dict):
@@ -998,6 +1081,13 @@ class FacultyProfileService:
                 sess.add(info)
                 out["attached_files_added"] += 1
             else:
+                info.extract_status = "pending"
+                info.extract_error = None
+                info.extracted_at = None
+                info.content_path = None
+                info.detected_type = None
+                info.content_char_count = None
+                info.content_embedding = None
                 out["attached_files_updated"] += 1
 
             if "content_path" in row:
@@ -1008,6 +1098,10 @@ class FacultyProfileService:
                 info.detected_type = str(row.get("detected_type") or "").strip() or None
             if "content_char_count" in row:
                 info.content_char_count = FacultyProfileService._safe_int_or_none(row.get("content_char_count"))
+            # New/added links should always be extracted from source URL.
+            info.extract_status = "pending"
+            info.extract_error = None
+            reextract_rows.append(info)
 
         for row in FacultyProfileService._as_list(ops.get("update")):
             if not isinstance(row, dict):
@@ -1027,21 +1121,42 @@ class FacultyProfileService:
             if info is None:
                 raise LookupError(f"Attached file not found: id={info_id}")
 
+            prior_url = str(getattr(info, "additional_info_url", "") or "").strip()
+            prior_content_path = str(getattr(info, "content_path", "") or "").strip()
+            url_updated = False
             if "source_url" in row or "additional_info_url" in row:
                 new_url = str(
                     row.get("source_url") or row.get("additional_info_url") or ""
                 ).strip()
                 if not new_url:
                     raise ValueError("attached_files source_url cannot be empty.")
+                url_updated = bool(new_url != prior_url)
                 info.additional_info_url = new_url
+            content_path_updated = False
             if "content_path" in row:
-                info.content_path = str(row.get("content_path") or "").strip() or None
+                next_content_path = str(row.get("content_path") or "").strip()
+                next_content_path = next_content_path or None
+                content_path_updated = bool((next_content_path or "") != prior_content_path)
+                info.content_path = next_content_path
             if "extract_status" in row:
                 info.extract_status = str(row.get("extract_status") or "").strip() or "pending"
             if "detected_type" in row:
                 info.detected_type = str(row.get("detected_type") or "").strip() or None
             if "content_char_count" in row:
                 info.content_char_count = FacultyProfileService._safe_int_or_none(row.get("content_char_count"))
+
+            needs_reextract = bool(url_updated or content_path_updated)
+            if needs_reextract:
+                info.extract_status = "pending"
+                info.extract_error = None
+                info.extracted_at = None
+                info.content_path = None
+                info.detected_type = None
+                info.content_char_count = None
+                info.content_embedding = None
+
+            if str(getattr(info, "extract_status", "") or "").strip().lower() == "pending":
+                reextract_rows.append(info)
             out["attached_files_updated"] += 1
 
         delete_ids = [
@@ -1060,7 +1175,61 @@ class FacultyProfileService:
             )
             out["attached_files_deleted"] += int(deleted or 0)
 
+        # Ensure newly added rows have PK ids before passing pending_ids downstream.
+        if reextract_rows:
+            sess.flush()
+
+        out["attached_files_reextract_ids"] = sorted(
+            {
+                int(getattr(info, "id"))
+                for info in reextract_rows
+                if getattr(info, "id", None)
+            }
+        )
         return out
+
+    def _refresh_faculty_additional_info_embeddings(
+        self,
+        *,
+        faculty_id: int,
+        row_ids: List[int],
+    ) -> Dict[str, int]:
+        scoped_ids = [
+            int(x)
+            for x in list(row_ids or [])
+            if self._safe_int_or_none(x)
+        ]
+        if not scoped_ids:
+            return {"processed": 0, "done": 0, "failed": 0}
+
+        with self.session_factory() as sess:
+            owned_ids = [
+                int(row_id)
+                for (row_id,) in (
+                    sess.query(FacultyAdditionalInfo.id)
+                    .filter(
+                        FacultyAdditionalInfo.faculty_id == int(faculty_id),
+                        FacultyAdditionalInfo.chunk_index == 0,
+                        FacultyAdditionalInfo.id.in_(scoped_ids),
+                    )
+                    .all()
+                )
+            ]
+        if not owned_ids:
+            return {"processed": 0, "done": 0, "failed": 0}
+
+        from services.extract_content import run_extraction_pipeline
+
+        return run_extraction_pipeline(
+            model=FacultyAdditionalInfo,
+            subdir="faculties_additional_links",
+            url_getter=lambda row: str(getattr(row, "additional_info_url", "") or ""),
+            s3_bucket=settings.extracted_content_bucket,
+            s3_prefix=settings.extracted_content_prefix_faculty,
+            aws_region=settings.aws_region,
+            aws_profile=settings.aws_profile,
+            pending_ids=owned_ids,
+        )
 
     def _regenerate_faculty_keywords(self, *, faculty_id: int) -> None:
         # Lazy import so retrieval path does not require keyword-stack deps.

@@ -586,6 +586,8 @@ class FacultyGrantMatcher:
     ) -> int:
         """
         Generate one-to-one match rows for exactly one faculty.
+        Rebuild semantics: replace all existing rows for the faculty with
+        freshly generated rows from current embeddings/keywords.
         Returns number of upserted match rows.
         """
         if not faculty_id:
@@ -600,24 +602,28 @@ class FacultyGrantMatcher:
 
             candidates = match_dao.topk_opps_for_faculty(faculty_id=int(faculty_id), k=int(k))
             candidates = [(oid, s) for (oid, s) in candidates if float(s) >= float(min_domain)]
-            if not candidates:
-                return 0
+            out_rows: List[Dict[str, Any]] = []
+            if candidates:
+                opp_ids = [opp_id for opp_id, _ in candidates]
+                opps = opp_dao.read_opportunities_by_ids_with_relations(opp_ids)
+                opp_map = {o.opportunity_id: o for o in opps}
+                out_rows = self._build_rows_for_faculty_candidates(
+                    fac=fac,
+                    faculty_id=int(faculty_id),
+                    candidates=candidates,
+                    opp_map=opp_map,
+                )
 
-            opp_ids = [opp_id for opp_id, _ in candidates]
-            opps = opp_dao.read_opportunities_by_ids_with_relations(opp_ids)
-            opp_map = {o.opportunity_id: o for o in opps}
-
-            out_rows = self._build_rows_for_faculty_candidates(
-                fac=fac,
-                faculty_id=int(faculty_id),
-                candidates=candidates,
-                opp_map=opp_map,
-            )
-
+            # Full rebuild for this faculty: remove all legacy rows first,
+            # then write the newly computed set in the same transaction.
+            match_dao.delete_matches_for_faculty(faculty_id=int(faculty_id))
             if out_rows:
                 match_dao.upsert_matches(out_rows)
-                # Commit first so reranker (separate session) can read the fresh rows.
-                sess.commit()
+
+            # Commit first so reranker (separate session) can read the fresh rows.
+            sess.commit()
+
+            if out_rows:
                 self._apply_reranked_scores_for_faculty(
                     sess=sess,
                     match_dao=match_dao,

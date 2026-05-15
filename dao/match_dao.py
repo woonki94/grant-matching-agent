@@ -155,6 +155,19 @@ class MatchDAO:
         self.session.execute(stmt)
         return len(payload_rows)
 
+    def delete_matches_for_faculty(self, *, faculty_id: int) -> int:
+        """Delete all one-to-one match rows for one faculty."""
+        result = self.session.execute(
+            text(
+                """
+                DELETE FROM match_results
+                WHERE faculty_id = :faculty_id
+                """
+            ),
+            {"faculty_id": int(faculty_id)},
+        )
+        return int(result.rowcount or 0)
+
     # =============== Search/Ranking Actions ===============
     def topk_opps_for_faculty(self, faculty_id: int, k: int) -> List[Tuple[str, float]]:
         """Find top-k opportunities using stored faculty embedding vectors."""

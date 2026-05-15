@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Any, Dict, List, Type
+from typing import Any, Dict, List, Optional, Type
 from sqlalchemy.orm import Session
 
 
@@ -17,10 +17,20 @@ class ContentExtractionDAO:
     def __init__(self, session: Session):
         self.session = session
 
-    def fetch_pending(self, model: Type[Any], limit: int = 200) -> List[Any]:
+    def fetch_pending(
+        self,
+        model: Type[Any],
+        limit: int = 200,
+        ids: Optional[List[int]] = None,
+    ) -> List[Any]:
         query = self.session.query(model).filter(
             (model.extract_status == "pending") | (model.extract_status.is_(None))
         )
+        if ids:
+            clean_ids = [int(x) for x in list(ids) if x is not None]
+            if not clean_ids:
+                return []
+            query = query.filter(model.id.in_(clean_ids))
         # Process only base rows; chunk rows are extraction outputs.
         if hasattr(model, "chunk_index"):
             query = query.filter(model.chunk_index == 0)
