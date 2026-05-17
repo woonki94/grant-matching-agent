@@ -1,9 +1,10 @@
 from __future__ import annotations
 
+import json
 import re
 import sys
 from pathlib import Path
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Sequence, Tuple
 
 
 def _find_project_root() -> Path:
@@ -26,11 +27,9 @@ from ce.llm_runtime_util import (  # noqa: E402
     extract_json_object as _extract_json_object,
     generate_responses_batch as _generate_responses_batch,
     load_llm as _load_llm,
-    model_slug as _model_slug,
     normalize_band as _normalize_band,
     normalize_ws as _normalize_ws,
     score_to_band as _score_to_band,
-    short_text as _short,
     unload_llm as _unload_llm,
 )
 
@@ -45,62 +44,36 @@ MODEL_IDS = [
     "Qwen/Qwen3-14B",
 ]
 
-MAX_NEW_TOKENS = 256
+MAX_NEW_TOKENS = 32
 TEMPERATURE = 0.0
 TOP_P = 1.0
 BATCH_SIZE = 10
 
-# One query + 10 docs (replace these with your own later).
-
-EVAL_QUERY = "demonstrated expertise in open geospatial data standards, metadata documentation, and biological field survey data management for environmental research programs"
-
-EVAL_DOCS = [
-
-    # HIGH (expected score: 0.92 - 0.98)
-    # Strong overlap in metadata standards, ecological surveys, interoperability, and geospatial biodiversity systems.
-    "Development of standardized metadata frameworks for ecological field surveys and interoperable geospatial biodiversity databases",
-
-    # HIGH (expected score: 0.90 - 0.96)
-    # Strong match on FAIR/open geospatial practices, metadata documentation, and habitat monitoring workflows.
-    "Implementation of FAIR geospatial data practices and metadata documentation pipelines for multi-agency habitat monitoring programs",
-
-    # HIGH (expected score: 0.88 - 0.95)
-    # Directly relevant to biological records, spatial schemas, and environmental data exchange standards.
-    "Management of biological observation records using standardized spatial schemas and environmental data exchange protocols",
-
-    # MID (expected score: 0.60 - 0.72)
-    # Relevant geospatial workflow terminology, but lacks biological survey and metadata documentation emphasis.
-    "Geospatial data quality control workflows for remote sensing and land-use classification systems",
-
-    # MID (expected score: 0.55 - 0.68)
-    # Ecological database relevance is present, but standards and metadata concepts are mostly absent.
-    "Design of biodiversity monitoring databases for long-term ecological restoration projects",
-
-    # MID / HARD NEGATIVE (expected score: 0.45 - 0.60)
-    # Shares ontology/annotation/repository semantics with metadata management, but focuses on genomics instead of geospatial field surveys.
-    "Ontology-backed annotation methods for environmental genomics and species occurrence repositories",
-
-    # MID (expected score: 0.50 - 0.65)
-    # Strong interoperability and environmental spatial data themes, but weaker alignment with biological surveys and metadata documentation.
-    "Spatial interoperability techniques for integrating hydrology, forestry, and climate datasets across research institutions",
-
-    # LOW / HARD NEGATIVE (expected score: 0.20 - 0.38)
-    # Contains species/ecology language that may confuse embedding models, but focuses on ML vision pipelines rather than standards or metadata management.
-    "Machine learning pipelines for automated species recognition in drone imagery",
-
-    # LOW / HARD NEGATIVE (expected score: 0.18 - 0.35)
-    # Heavy geospatial terminology overlap, but actually about storage infrastructure and distributed systems instead of environmental data stewardship.
-    "Cloud-native architectures for large-scale geospatial raster storage and distributed query optimization",
-
-    # LOW (expected score: 0.05 - 0.18)
-    # Generic data management concepts exist, but domain mismatch makes this largely irrelevant.
-    "Adaptive clinical data management systems for longitudinal public health studies",
-]
-
+# Use JSON input file so one run can include many queries, each with many docs.
+USE_EVAL_INPUT_JSON = True
+EVAL_INPUT_JSON = "ce/dataset/eval/teacher_scoring_eval_input.json"
+OUTPUT_JSON = "ce/eval/results/teacher_scoring_eval_output.json"
 
 METHOD_SYSTEM_PROMPT = """
 You are a strict evaluator of methodological similarity between a requirement query and a candidate specialization.
-Evaluate overlap in methods, techniques, procedures, and analytical approaches, not broad topical match.
+
+Evaluate overlap in:
+- methods
+- techniques
+- procedures
+- workflows
+- analytical approaches
+- technical mechanisms
+
+Do NOT reward overlap that is only:
+- same application area
+- same domain/topic
+- same population or environment
+- generic data work
+- broad scientific interest
+
+Two texts can be in the same domain and still have low method similarity if they use different approaches.
+
 Final output must be exactly one JSON object.
 
 Required JSON schema:
@@ -111,9 +84,9 @@ Required JSON schema:
 }
 
 Band guidance:
-- high: score >= 0.70 (strong method overlap)
-- mid: 0.40 <= score < 0.70 (partial method overlap)
-- low: score < 0.40 (little method overlap)
+- high: score >= 0.70 (strong overlap in methods/techniques/procedures)
+- mid: 0.40 <= score < 0.70 (partial or indirect method overlap)
+- low: score < 0.40 (little or no real method overlap)
 
 No markdown or extra text outside JSON.
 """.strip()
@@ -128,9 +101,24 @@ Candidate specialization:
 """.strip()
 
 
+
 DOMAIN_SYSTEM_PROMPT = """
 You are a strict evaluator of domain/topic similarity between a requirement query and a candidate specialization.
-Evaluate whether they operate in the same or very close application domain, not merely sharing generic methods.
+
+Evaluate overlap in:
+- application domain
+- subject area
+- problem space
+- research or operational context
+
+Do NOT reward overlap that is only:
+- same generic method
+- same data-processing language
+- same technical workflow
+- same analytical style
+
+Two texts can use similar methods and still have low domain similarity if they address different subject areas.
+
 Final output must be exactly one JSON object.
 
 Required JSON schema:
@@ -141,9 +129,9 @@ Required JSON schema:
 }
 
 Band guidance:
-- high: score >= 0.70 (same/very close domain)
-- mid: 0.40 <= score < 0.70 (related domain)
-- low: score < 0.40 (different domain)
+- high: score >= 0.70 (same or very close domain/topic)
+- mid: 0.40 <= score < 0.70 (related but not the same domain)
+- low: score < 0.40 (different domain/topic)
 
 No markdown or extra text outside JSON.
 """.strip()
@@ -185,6 +173,60 @@ Candidate specialization:
 """.strip()
 
 
+def _resolve_path(value: Any) -> Path:
+    p = Path(_clean_text(value)).expanduser()
+    if not p.is_absolute():
+        p = PROJECT_ROOT / p
+    return p.resolve()
+
+
+def _load_eval_pairs_from_json(path: Path) -> List[Dict[str, Any]]:
+    try:
+        obj = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        raise RuntimeError(f"Failed to parse eval JSON: {path} ({type(exc).__name__}: {exc})") from exc
+
+    if isinstance(obj, dict):
+        items = obj.get("items")
+        if not isinstance(items, list):
+            raise RuntimeError("Eval JSON object must contain `items` as a list.")
+    elif isinstance(obj, list):
+        items = obj
+    else:
+        raise RuntimeError("Eval JSON must be either a list or an object with `items` list.")
+
+    pairs: List[Dict[str, Any]] = []
+    pair_seq = 0
+    for qi, item in enumerate(items):
+        if not isinstance(item, dict):
+            continue
+        query_text = _normalize_ws(item.get("query") or item.get("query_text") or item.get("text"))
+        if not query_text:
+            continue
+        docs_raw = item.get("docs")
+        if not isinstance(docs_raw, list):
+            continue
+        for di, d in enumerate(docs_raw):
+            if isinstance(d, dict):
+                doc_text = _normalize_ws(d.get("text") or d.get("doc_text") or d.get("candidate"))
+            else:
+                doc_text = _normalize_ws(d)
+            if not doc_text:
+                continue
+            pair_seq += 1
+            pairs.append(
+                {
+                    "pair_idx": int(pair_seq - 1),
+                    "query_idx": int(qi),
+                    "doc_idx": int(di),
+                    "query_text": query_text,
+                    "doc_text": doc_text,
+                }
+            )
+
+    return pairs
+
+
 def _parse_score_response(raw: str) -> Dict[str, Any]:
     parsed = _extract_json_object(raw)
     score = _coerce_score((parsed or {}).get("score"))
@@ -211,59 +253,68 @@ def _parse_score_response(raw: str) -> Dict[str, Any]:
     }
 
 
-def _print_aspect_table(
+def _build_output_json(
     *,
-    aspect: str,
-    docs: Sequence[str],
-    model_ids: Sequence[str],
-    scored: Dict[Tuple[str, str, int], Dict[str, Any]],
-) -> None:
-    slugs = [_model_slug(m) for m in model_ids]
-    print("")
-    print(f"=== {aspect.upper()} ===")
-    print("doc_idx | doc_text | " + " | ".join([f"{slug}:score/band" for slug in slugs]))
-    print("-" * 140)
-    for di, doc in enumerate(docs):
-        cells = [str(di), _short(doc, 70)]
-        for model_id in model_ids:
-            r = scored[(model_id, aspect, di)]
-            cells.append(f"{float(r['score']):.3f}/{r['band']}")
-        print(" | ".join(cells))
-
-
-def _print_model_summary(
-    *,
+    pairs: Sequence[Dict[str, Any]],
     model_ids: Sequence[str],
     aspects: Sequence[str],
-    docs: Sequence[str],
     scored: Dict[Tuple[str, str, int], Dict[str, Any]],
-) -> None:
-    print("")
-    print("=== SUMMARY (mean score by model/aspect) ===")
-    print("model | " + " | ".join([f"{a}_mean" for a in aspects]) + " | parsed_ok")
-    print("-" * 100)
-    for model_id in model_ids:
-        means: List[str] = []
-        ok = 0
-        total = 0
-        for aspect in aspects:
-            vals = []
-            for di in range(len(docs)):
-                row = scored[(model_id, aspect, di)]
-                vals.append(float(row["score"]))
-                total += 1
-                ok += int(1 if bool(row["parsed_ok"]) else 0)
-            means.append(f"{(sum(vals)/max(1, len(vals))):.3f}")
-        print(f"{_model_slug(model_id)} | " + " | ".join(means) + f" | {ok}/{total}")
+) -> Dict[str, Any]:
+    grouped: Dict[int, List[Dict[str, Any]]] = {}
+    for p in pairs:
+        grouped.setdefault(int(p["query_idx"]), []).append(p)
+
+    queries_out: List[Dict[str, Any]] = []
+    for qidx in sorted(grouped.keys()):
+        rows = grouped[qidx]
+        query_text = _clean_text(rows[0].get("query_text"))
+        docs_out: List[Dict[str, Any]] = []
+        for p in rows:
+            pi = int(p["pair_idx"])
+            doc_row: Dict[str, Any] = {"doc": _clean_text(p.get("doc_text"))}
+            for aspect in aspects:
+                score_cols: Dict[str, float] = {}
+                for model_id in model_ids:
+                    score_cols[model_id] = float(scored[(model_id, aspect, pi)]["score"])
+                doc_row[f"{aspect}_scores"] = score_cols
+            docs_out.append(doc_row)
+        queries_out.append(
+            {
+                "query": query_text,
+                "docs": docs_out,
+            }
+        )
+
+    return {"queries": queries_out}
 
 
 def main() -> int:
-    query = _normalize_ws(EVAL_QUERY)
-    docs = [_normalize_ws(d) for d in EVAL_DOCS if _normalize_ws(d)]
-    if not query:
-        raise RuntimeError("EVAL_QUERY is empty.")
-    if len(docs) != 10:
-        raise RuntimeError(f"EVAL_DOCS must contain exactly 10 non-empty docs. Got {len(docs)}")
+    output_path = _resolve_path(OUTPUT_JSON)
+    if bool(USE_EVAL_INPUT_JSON):
+        input_path = _resolve_path(EVAL_INPUT_JSON)
+        if not input_path.exists():
+            raise RuntimeError(f"Eval input JSON not found: {input_path}")
+        pairs = _load_eval_pairs_from_json(input_path)
+        if not pairs:
+            raise RuntimeError(f"No valid query-doc pairs loaded from eval JSON: {input_path}")
+    else:
+        query = _normalize_ws(EVAL_QUERY)
+        docs = [_normalize_ws(d) for d in EVAL_DOCS if _normalize_ws(d)]
+        if not query:
+            raise RuntimeError("EVAL_QUERY is empty.")
+        if len(docs) != 10:
+            raise RuntimeError(f"EVAL_DOCS must contain exactly 10 non-empty docs. Got {len(docs)}")
+        pairs = []
+        for di, doc in enumerate(docs):
+            pairs.append(
+                {
+                    "pair_idx": int(di),
+                    "query_idx": 0,
+                    "doc_idx": int(di),
+                    "query_text": query,
+                    "doc_text": doc,
+                }
+            )
 
     model_ids = list(MODEL_IDS)
     batch_size = max(1, int(BATCH_SIZE))
@@ -274,23 +325,19 @@ def main() -> int:
         ("requirement", REQUIREMENT_SYSTEM_PROMPT, REQUIREMENT_USER_PROMPT_TEMPLATE),
     ]
 
-    print("teacher_scoring_eval_multi_model.py")
-    print(f"query={query}")
-    print(f"doc_count={len(docs)} model_count={len(model_ids)} aspect_count={len(aspects)}")
-    print(f"batch_size={batch_size} max_new_tokens={MAX_NEW_TOKENS} temperature={TEMPERATURE} top_p={TOP_P}")
-
     scored: Dict[Tuple[str, str, int], Dict[str, Any]] = {}
 
     for model_id in model_ids:
-        print("")
-        print(f"model_load={model_id}")
         llm_bundle = _load_llm(model_id)
         try:
             tokenizer = llm_bundle["tokenizer"]
             for aspect_name, system_prompt, user_template in aspects:
                 prompts: List[str] = []
-                for doc in docs:
-                    user_prompt = user_template.format(query=query, candidate=doc)
+                for p in pairs:
+                    user_prompt = user_template.format(
+                        query=_clean_text(p.get("query_text")),
+                        candidate=_clean_text(p.get("doc_text")),
+                    )
                     prompts.append(
                         _build_prompt(
                             tokenizer,
@@ -310,30 +357,21 @@ def main() -> int:
                         top_p=float(TOP_P),
                     )
                     for local_i, raw_text in enumerate(raw_batch):
-                        di = done + local_i
-                        scored[(model_id, aspect_name, di)] = _parse_score_response(raw_text)
+                        pi = done + local_i
+                        scored[(model_id, aspect_name, pi)] = _parse_score_response(raw_text)
                     done += len(raw_batch)
-                    print(
-                        f"model_progress model={model_id} aspect={aspect_name} doc={done}/{len(docs)}"
-                    )
         finally:
             _unload_llm(llm_bundle)
-            print(f"model_unload={model_id}")
 
     aspect_names = [a[0] for a in aspects]
-    for aspect_name in aspect_names:
-        _print_aspect_table(
-            aspect=aspect_name,
-            docs=docs,
-            model_ids=model_ids,
-            scored=scored,
-        )
-    _print_model_summary(
+    output_obj = _build_output_json(
+        pairs=pairs,
         model_ids=model_ids,
         aspects=aspect_names,
-        docs=docs,
         scored=scored,
     )
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(json.dumps(output_obj, ensure_ascii=False, indent=2), encoding="utf-8")
     return 0
 
 
