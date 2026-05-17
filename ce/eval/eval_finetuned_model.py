@@ -618,6 +618,71 @@ def _format_out_of_band_table(
     return "\n".join(lines)
 
 
+def _compute_metric_bundle(
+    *,
+    rows: Sequence[Dict[str, Any]],
+    order_top_k: int,
+    pair_eps: float,
+    hard_gap_max: float,
+    medium_gap_max: float,
+    high_threshold: float,
+    mid_threshold: float,
+    oob_margin: float,
+) -> Dict[str, Any]:
+    stats = _compute_margin_stats(rows)
+    order_finetuned = _compute_order_metrics_for_model(
+        rows=rows,
+        model_score_key="finetuned_score",
+        top_k=order_top_k,
+        pair_eps=pair_eps,
+        hard_gap_max=hard_gap_max,
+        medium_gap_max=medium_gap_max,
+        mrr_rel_threshold=high_threshold,
+        recall_rel_threshold=mid_threshold,
+    )
+    order_plain = _compute_order_metrics_for_model(
+        rows=rows,
+        model_score_key="base_score",
+        top_k=order_top_k,
+        pair_eps=pair_eps,
+        hard_gap_max=hard_gap_max,
+        medium_gap_max=medium_gap_max,
+        mrr_rel_threshold=high_threshold,
+        recall_rel_threshold=mid_threshold,
+    )
+    raw_sanity_finetuned = _compute_raw_score_sanity(
+        rows=rows,
+        model_score_key="finetuned_score",
+        high_threshold=high_threshold,
+        mid_threshold=mid_threshold,
+        oob_margin=oob_margin,
+    )
+    raw_sanity_plain = _compute_raw_score_sanity(
+        rows=rows,
+        model_score_key="base_score",
+        high_threshold=high_threshold,
+        mid_threshold=mid_threshold,
+        oob_margin=oob_margin,
+    )
+    raw_sanity_ground_truth = _compute_raw_score_sanity(
+        rows=rows,
+        model_score_key="teacher_score_used",
+        high_threshold=high_threshold,
+        mid_threshold=mid_threshold,
+        oob_margin=oob_margin,
+    )
+    return {
+        "row_count": int(len(rows)),
+        "order_metrics": {"finetuned": order_finetuned, "plain": order_plain},
+        "margin_stats": stats,
+        "raw_score_sanity": {
+            "ground_truth": raw_sanity_ground_truth,
+            "finetuned": raw_sanity_finetuned,
+            "plain": raw_sanity_plain,
+        },
+    }
+
+
 def _build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Evaluate CE finetuned vs plain STS base on domain+method listwise files.")
     p.add_argument("--finetuned-model", type=str, default=FINETUNED_MODEL_DEFAULT)
@@ -673,14 +738,15 @@ def main() -> int:
     if not method_path.exists():
         raise RuntimeError(f"Method input not found: {method_path}")
 
-    rows = _load_eval_rows(
+    rows_domain = _load_eval_rows(
         path=domain_path,
         aspect="domain",
         score_field=args.score_field,
         only_selected=bool(args.only_selected),
         high_threshold=high_threshold,
         mid_threshold=mid_threshold,
-    ) + _load_eval_rows(
+    )
+    rows_method = _load_eval_rows(
         path=method_path,
         aspect="method",
         score_field=args.score_field,
@@ -688,6 +754,7 @@ def main() -> int:
         high_threshold=high_threshold,
         mid_threshold=mid_threshold,
     )
+    rows = rows_domain + rows_method
     if not rows:
         raise RuntimeError("No rows loaded for evaluation.")
 
@@ -732,44 +799,32 @@ def main() -> int:
         row["base_abs_margin"] = abs(float(b - gt))
         row["abs_margin_gain"] = float(row["base_abs_margin"] - row["finetuned_abs_margin"])
 
-    stats = _compute_margin_stats(rows)
-    order_finetuned = _compute_order_metrics_for_model(
+    overall_bundle = _compute_metric_bundle(
         rows=rows,
-        model_score_key="finetuned_score",
-        top_k=order_top_k,
+        order_top_k=order_top_k,
         pair_eps=pair_eps,
         hard_gap_max=hard_gap_max,
         medium_gap_max=medium_gap_max,
-        mrr_rel_threshold=high_threshold,
-        recall_rel_threshold=mid_threshold,
-    )
-    order_base = _compute_order_metrics_for_model(
-        rows=rows,
-        model_score_key="base_score",
-        top_k=order_top_k,
-        pair_eps=pair_eps,
-        hard_gap_max=hard_gap_max,
-        medium_gap_max=medium_gap_max,
-        mrr_rel_threshold=high_threshold,
-        recall_rel_threshold=mid_threshold,
-    )
-    raw_sanity_finetuned = _compute_raw_score_sanity(
-        rows=rows,
-        model_score_key="finetuned_score",
         high_threshold=high_threshold,
         mid_threshold=mid_threshold,
         oob_margin=oob_margin,
     )
-    raw_sanity_base = _compute_raw_score_sanity(
-        rows=rows,
-        model_score_key="base_score",
+    domain_bundle = _compute_metric_bundle(
+        rows=rows_domain,
+        order_top_k=order_top_k,
+        pair_eps=pair_eps,
+        hard_gap_max=hard_gap_max,
+        medium_gap_max=medium_gap_max,
         high_threshold=high_threshold,
         mid_threshold=mid_threshold,
         oob_margin=oob_margin,
     )
-    raw_sanity_ground_truth = _compute_raw_score_sanity(
-        rows=rows,
-        model_score_key="teacher_score_used",
+    method_bundle = _compute_metric_bundle(
+        rows=rows_method,
+        order_top_k=order_top_k,
+        pair_eps=pair_eps,
+        hard_gap_max=hard_gap_max,
+        medium_gap_max=medium_gap_max,
         high_threshold=high_threshold,
         mid_threshold=mid_threshold,
         oob_margin=oob_margin,
@@ -790,6 +845,7 @@ def main() -> int:
         f"high_threshold={high_threshold} mid_threshold={mid_threshold}\n"
         f"oob_margin={oob_margin}\n"
         f"selected_high={by_band['high']} selected_mid={by_band['mid']} selected_low={by_band['low']}\n"
+        f"rows_domain={len(rows_domain)} rows_method={len(rows_method)} rows_total={len(rows)}\n"
         f"order_top_k={order_top_k} pair_eps={pair_eps} hard_gap_max={hard_gap_max} medium_gap_max={medium_gap_max}\n"
         f"finetuned_model={finetuned_ref}\n"
         f"base_model={base_ref}\n"
@@ -798,17 +854,61 @@ def main() -> int:
 
     blocks: List[str] = [
         meta_header,
-        _format_order_summary_table(finetuned=order_finetuned, plain=order_base),
-        _format_margin_summary_table(stats),
+        "=== OVERALL (DOMAIN + METHOD) ===",
+        _format_order_summary_table(
+            finetuned=overall_bundle["order_metrics"]["finetuned"],
+            plain=overall_bundle["order_metrics"]["plain"],
+        ),
+        _format_margin_summary_table(overall_bundle["margin_stats"]),
         _format_raw_sanity_table(
-            ground_truth=raw_sanity_ground_truth,
-            finetuned=raw_sanity_finetuned,
-            plain=raw_sanity_base,
+            ground_truth=overall_bundle["raw_score_sanity"]["ground_truth"],
+            finetuned=overall_bundle["raw_score_sanity"]["finetuned"],
+            plain=overall_bundle["raw_score_sanity"]["plain"],
         ),
         _format_out_of_band_table(
-            ground_truth=raw_sanity_ground_truth,
-            finetuned=raw_sanity_finetuned,
-            plain=raw_sanity_base,
+            ground_truth=overall_bundle["raw_score_sanity"]["ground_truth"],
+            finetuned=overall_bundle["raw_score_sanity"]["finetuned"],
+            plain=overall_bundle["raw_score_sanity"]["plain"],
+            high_threshold=high_threshold,
+            mid_threshold=mid_threshold,
+            oob_margin=oob_margin,
+        ),
+        "",
+        "=== DOMAIN ONLY ===",
+        _format_order_summary_table(
+            finetuned=domain_bundle["order_metrics"]["finetuned"],
+            plain=domain_bundle["order_metrics"]["plain"],
+        ),
+        _format_margin_summary_table(domain_bundle["margin_stats"]),
+        _format_raw_sanity_table(
+            ground_truth=domain_bundle["raw_score_sanity"]["ground_truth"],
+            finetuned=domain_bundle["raw_score_sanity"]["finetuned"],
+            plain=domain_bundle["raw_score_sanity"]["plain"],
+        ),
+        _format_out_of_band_table(
+            ground_truth=domain_bundle["raw_score_sanity"]["ground_truth"],
+            finetuned=domain_bundle["raw_score_sanity"]["finetuned"],
+            plain=domain_bundle["raw_score_sanity"]["plain"],
+            high_threshold=high_threshold,
+            mid_threshold=mid_threshold,
+            oob_margin=oob_margin,
+        ),
+        "",
+        "=== METHOD ONLY ===",
+        _format_order_summary_table(
+            finetuned=method_bundle["order_metrics"]["finetuned"],
+            plain=method_bundle["order_metrics"]["plain"],
+        ),
+        _format_margin_summary_table(method_bundle["margin_stats"]),
+        _format_raw_sanity_table(
+            ground_truth=method_bundle["raw_score_sanity"]["ground_truth"],
+            finetuned=method_bundle["raw_score_sanity"]["finetuned"],
+            plain=method_bundle["raw_score_sanity"]["plain"],
+        ),
+        _format_out_of_band_table(
+            ground_truth=method_bundle["raw_score_sanity"]["ground_truth"],
+            finetuned=method_bundle["raw_score_sanity"]["finetuned"],
+            plain=method_bundle["raw_score_sanity"]["plain"],
             high_threshold=high_threshold,
             mid_threshold=mid_threshold,
             oob_margin=oob_margin,
@@ -850,12 +950,12 @@ def main() -> int:
                 "max_length": int(max_length),
                 "elapsed_sec": float(elapsed),
             },
-            "order_metrics": {"finetuned": order_finetuned, "plain": order_base},
-            "margin_stats": stats,
-            "raw_score_sanity": {
-                "ground_truth": raw_sanity_ground_truth,
-                "finetuned": raw_sanity_finetuned,
-                "plain": raw_sanity_base,
+            "order_metrics": overall_bundle["order_metrics"],
+            "margin_stats": overall_bundle["margin_stats"],
+            "raw_score_sanity": overall_bundle["raw_score_sanity"],
+            "by_aspect": {
+                "domain": domain_bundle,
+                "method": method_bundle,
             },
             "rows": rows,
         }
