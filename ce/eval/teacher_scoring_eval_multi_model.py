@@ -39,12 +39,12 @@ from ce.llm_runtime_util import (  # noqa: E402
 # ======================================================
 MODEL_IDS = [
     "Qwen/Qwen2.5-14B-Instruct",
-    "deepseek-ai/DeepSeek-R1-Distill-Qwen-14B",
-    "prithivMLmods/Ophiuchi-Qwen3-14B-Instruct",
-    "Qwen/Qwen3-14B",
+    #"deepseek-ai/DeepSeek-R1-Distill-Qwen-14B",
+    #"prithivMLmods/Ophiuchi-Qwen3-14B-Instruct",
+    #"Qwen/Qwen3-14B",
 ]
 
-MAX_NEW_TOKENS = 32
+MAX_NEW_TOKENS = 64
 TEMPERATURE = 0.0
 TOP_P = 1.0
 BATCH_SIZE = 10
@@ -57,22 +57,36 @@ OUTPUT_JSON = "ce/eval/results/teacher_scoring_eval_output.json"
 METHOD_SYSTEM_PROMPT = """
 You are a strict evaluator of methodological similarity between a requirement query and a candidate specialization.
 
+Your task is to score similarity in METHODS ONLY.
+
 Evaluate overlap in:
-- methods
+- concrete methods
 - techniques
 - procedures
 - workflows
 - analytical approaches
 - technical mechanisms
 
+Important:
+Method similarity is about HOW the work is done, not WHAT topic it is about.
+
 Do NOT reward overlap that is only:
 - same application area
 - same domain/topic
-- same population or environment
+- same environment or population
+- same broad goal
 - generic data work
-- broad scientific interest
+- generic scientific or technical language
 
-Two texts can be in the same domain and still have low method similarity if they use different approaches.
+Scoring rules:
+- high (>= 0.70): both texts share the same or very closely related concrete methods/techniques/procedures
+- mid (0.40 to <0.70): partial method overlap, same general workflow family, or one text covers only some core method components
+- low (<0.40): little real method overlap, or overlap is mostly topical/domain-based rather than methodological
+
+Method-specific guidance:
+- If the candidate misses key method components named in the query, do NOT score high
+- If overlap is only generic terms like "data management", "analysis", "monitoring", or "workflow", score low unless the concrete method is actually shared
+- Same domain with different techniques should usually be low or mid, not high
 
 Final output must be exactly one JSON object.
 
@@ -83,41 +97,61 @@ Required JSON schema:
   "band": "<high|mid|low>"
 }
 
-Band guidance:
-- high: score >= 0.70 (strong overlap in methods/techniques/procedures)
-- mid: 0.40 <= score < 0.70 (partial or indirect method overlap)
-- low: score < 0.40 (little or no real method overlap)
+Band must match score:
+- high if score >= 0.70
+- mid if 0.40 <= score < 0.70
+- low if score < 0.40
 
 No markdown or extra text outside JSON.
 """.strip()
 
 
 METHOD_USER_PROMPT_TEMPLATE = """
+
 Requirement query:
+
 {query}
 
 Candidate specialization:
+
 {candidate}
+
+Return a method-only similarity judgment.
+
 """.strip()
-
-
 
 DOMAIN_SYSTEM_PROMPT = """
 You are a strict evaluator of domain/topic similarity between a requirement query and a candidate specialization.
+
+Your task is to score DOMAIN ONLY.
 
 Evaluate overlap in:
 - application domain
 - subject area
 - problem space
-- research or operational context
+- research context
+- operational context
+
+Important:
+Domain similarity is about WHAT area the work is about, not HOW it is done.
 
 Do NOT reward overlap that is only:
 - same generic method
 - same data-processing language
-- same technical workflow
-- same analytical style
+- same workflow style
+- same analytical approach
+- generic scientific/technical terminology
 
-Two texts can use similar methods and still have low domain similarity if they address different subject areas.
+Scoring rules:
+- high (>= 0.70): same or very closely matching domain/problem area/context
+- mid (0.40 to <0.70): related or adjacent domain, but not the same operational/research area
+- low (<0.40): clearly different domain/problem area/context
+
+Domain-specific guidance:
+- Broad adjacency is not enough for high
+- Sharing a broad umbrella area (for example "environmental", "geospatial", "health", "AI") should often be mid, not high, unless the actual problem area is also closely matched
+- If the candidate is in a neighboring subfield rather than the same problem space, score mid
+- If the main overlap is only methodological, do NOT score high
 
 Final output must be exactly one JSON object.
 
@@ -128,22 +162,30 @@ Required JSON schema:
   "band": "<high|mid|low>"
 }
 
-Band guidance:
-- high: score >= 0.70 (same or very close domain/topic)
-- mid: 0.40 <= score < 0.70 (related but not the same domain)
-- low: score < 0.40 (different domain/topic)
+Band must match score:
+- high if score >= 0.70
+- mid if 0.40 <= score < 0.70
+- low if score < 0.40
 
 No markdown or extra text outside JSON.
 """.strip()
 
 
 DOMAIN_USER_PROMPT_TEMPLATE = """
+
 Requirement query:
+
 {query}
 
 Candidate specialization:
+
 {candidate}
+
+Return a domain-only similarity judgment.
+
 """.strip()
+
+
 
 REQUIREMENT_SYSTEM_PROMPT = """
 You are a strict requirement-match judge.
