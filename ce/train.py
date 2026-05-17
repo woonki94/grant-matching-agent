@@ -12,7 +12,6 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Sequence, Tuple
 
 import torch
-import torch.nn.functional as F
 from torch import nn
 from torch.optim import AdamW
 from torch.utils.data import DataLoader, Dataset
@@ -65,6 +64,40 @@ def _safe_float(value: Any, default: float = 0.0) -> float:
     if out > 1.0:
         return 1.0
     return out
+
+
+def _safe_weight(value: Any, default: float = 1.0) -> float:
+    try:
+        out = float(value)
+    except Exception:
+        out = float(default)
+    if out <= 0.0:
+        return float(default)
+    return out
+
+
+def _prediction_from_logits(logits: torch.Tensor, *, prediction_space: str) -> torch.Tensor:
+    mode = _clean_text(prediction_space).lower()
+    if mode == "sigmoid":
+        return torch.sigmoid(logits)
+    return logits
+
+
+def _per_sample_mse_weights(
+    labels: torch.Tensor,
+    *,
+    high_threshold: float,
+    mid_threshold: float,
+    high_weight: float,
+    mid_weight: float,
+    low_weight: float,
+) -> torch.Tensor:
+    high_mask = labels >= float(high_threshold)
+    mid_mask = (labels >= float(mid_threshold)) & (~high_mask)
+    weights = torch.full_like(labels, float(low_weight))
+    weights = torch.where(mid_mask, torch.full_like(weights, float(mid_weight)), weights)
+    weights = torch.where(high_mask, torch.full_like(weights, float(high_weight)), weights)
+    return weights
 
 
 def _set_seed(seed: int) -> None:
@@ -209,6 +242,7 @@ def _evaluate(
     model: nn.Module,
     loader: DataLoader,
     device: torch.device,
+    prediction_space: str,
 ) -> Dict[str, float]:
     model.eval()
     total_count = 0
@@ -224,7 +258,7 @@ def _evaluate(
             labels = batch["labels"].to(device)
             aspects = list(batch["aspects"])
             out = model(**enc)
-            preds = out.logits.view(-1)
+            preds = _prediction_from_logits(out.logits.view(-1), prediction_space=prediction_space)
             err = preds - labels
 
             sq = (err * err).detach().cpu()
@@ -300,6 +334,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--max-grad-norm", type=float, default=1.0)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--use-bf16", action="store_true")
+    p.add_argument("--prediction-space", type=str, default="sigmoid", choices=["sigmoid", "logit"])
+    p.add_argument("--high-threshold", type=float, default=0.70)
+    p.add_argument("--mid-threshold", type=float, default=0.30)
+    p.add_argument("--loss-high-weight", type=float, default=1.50)
+    p.add_argument("--loss-mid-weight", type=float, default=1.00)
+    p.add_argument("--loss-low-weight", type=float, default=1.40)
     p.add_argument("--output-dir", type=str, default=OUTPUT_DIR_DEFAULT)
     p.add_argument("--wandb-project", type=str, default=WANDB_PROJECT_DEFAULT)
     p.add_argument("--wandb-entity", type=str, default="")
@@ -311,6 +351,16 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     args = parse_args()
     _set_seed(int(args.seed))
+    prediction_space = _clean_text(args.prediction_space).lower()
+    if prediction_space not in {"sigmoid", "logit"}:
+        prediction_space = "sigmoid"
+    high_threshold = float(max(0.0, min(1.0, float(args.high_threshold))))
+    mid_threshold = float(max(0.0, min(1.0, float(args.mid_threshold))))
+    if mid_threshold > high_threshold:
+        mid_threshold = high_threshold
+    loss_high_weight = _safe_weight(args.loss_high_weight, default=1.50)
+    loss_mid_weight = _safe_weight(args.loss_mid_weight, default=1.00)
+    loss_low_weight = _safe_weight(args.loss_low_weight, default=1.40)
 
     domain_arg = _clean_text(args.domain_listwise)
     method_arg = _clean_text(args.method_listwise)
@@ -456,6 +506,12 @@ def main() -> int:
         "warmup_steps": int(warmup_steps),
         "max_length": int(args.max_length),
         "use_bf16": bool(use_amp),
+        "prediction_space": prediction_space,
+        "high_threshold": float(high_threshold),
+        "mid_threshold": float(mid_threshold),
+        "loss_high_weight": float(loss_high_weight),
+        "loss_mid_weight": float(loss_mid_weight),
+        "loss_low_weight": float(loss_low_weight),
         "seed": int(args.seed),
         "wandb_project": _clean_text(args.wandb_project),
         "wandb_entity": _clean_text(args.wandb_entity),
@@ -468,6 +524,11 @@ def main() -> int:
     print(f"train_examples={len(train_ds)} val_examples={len(val_ds)}")
     print(f"train_domain={run_meta['train_domain_examples']} train_method={run_meta['train_method_examples']}")
     print(f"score_field={args.score_field} only_selected={bool(args.only_selected)}")
+    print(
+        f"prediction_space={prediction_space} "
+        f"band_thresholds={high_threshold:.2f}/{mid_threshold:.2f} "
+        f"loss_weights(high/mid/low)={loss_high_weight:.2f}/{loss_mid_weight:.2f}/{loss_low_weight:.2f}"
+    )
 
     best_metric = float("inf")
     best_epoch = 0
@@ -513,8 +574,17 @@ def main() -> int:
                 amp_ctx = torch.autocast(device_type="cuda", dtype=amp_dtype) if use_amp else nullcontext()
                 with amp_ctx:
                     out = model(**enc)
-                    preds = out.logits.view(-1)
-                    loss = F.mse_loss(preds, labels)
+                    preds = _prediction_from_logits(out.logits.view(-1), prediction_space=prediction_space)
+                    sq = (preds - labels) ** 2
+                    w = _per_sample_mse_weights(
+                        labels,
+                        high_threshold=high_threshold,
+                        mid_threshold=mid_threshold,
+                        high_weight=loss_high_weight,
+                        mid_weight=loss_mid_weight,
+                        low_weight=loss_low_weight,
+                    )
+                    loss = torch.mean(sq * w)
 
                 running_loss += float(loss.item()) * bs
                 (loss / grad_accum).backward()
@@ -527,7 +597,11 @@ def main() -> int:
                     global_step += 1
 
             train_mse = float(running_loss / max(1, seen))
-            val_metrics = _evaluate(model=model, loader=val_loader, device=device) if val_loader is not None else {}
+            val_metrics = (
+                _evaluate(model=model, loader=val_loader, device=device, prediction_space=prediction_space)
+                if val_loader is not None
+                else {}
+            )
             monitor = float(val_metrics.get("mse", train_mse))
             elapsed = max(1e-6, time.time() - started)
 
