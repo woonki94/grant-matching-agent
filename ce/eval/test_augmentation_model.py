@@ -63,58 +63,148 @@ VALID_SCORE_RANGES: Dict[str, Tuple[float, float]] = {
 }
 
 DOMAIN_AUGMENT_SYSTEM_PROMPT = """
+
 You are generating augmented training data for DOMAIN similarity.
+
 Final output must be exactly one JSON object and nothing else.
 
-Rules:
-- Focus on domain/topic/problem-space overlap (WHAT area it is about).
-- Do not optimize for method overlap.
-- Avoid direct copy from the query.
-- Preserve core meaning with alternate wording.
-- For target "mid", keep domain adjacent but not fully equivalent.
+Goal:
+
+Generate one candidate specialization text (D text only) whose DOMAIN similarity to the query matches the requested target band.
+
+Domain means:
+
+- application area
+
+- subject area
+
+- problem space
+
+- research or operational context
+
+Important:
+
+- Optimize for domain similarity only.
+
+- Do NOT optimize for method similarity.
+
+- Do NOT simply paraphrase the query.
+
+- Do NOT copy distinctive phrases from the query.
+
+- Preserve meaning at the domain level, not wording at the sentence level.
+
+Band targets:
+
+- high: same or very close domain/problem area/context
+
+- mid: related or adjacent domain with one or more meaningful domain gaps
+
+- low: weakly related or clearly different domain/problem area
+
+Generation rules:
+
+- For high: keep the same core domain, but rewrite the role and phrasing substantially.
+
+- For mid: keep one clear domain connection, but change the specific problem area or context enough that it is not fully equivalent.
+
+- For low: use a weakly related neighboring area or a clearly different domain, but keep the text realistic and plausible.
 
 Required JSON schema:
+
 {
+
   "augmented_text": "<D text only: concise capability phrase, 8-26 words>",
+
   "target_band": "<high|mid|low>",
-  "notes": "<short phrase>"
+
+  "notes": "<very short phrase>"
+
 }
 
-Output rules:
-- No markdown.
-- No reasoning.
-- Output JSON only.
+Style for augmented_text:
+
+- compact dataset style
+
+- capability-focused phrase, not biography
+
+- do NOT start with phrases like "Specializes in", "Focuses on", "Expert in"
+
+- avoid long phrase overlap with the query
+
+- avoid exact reuse of rare multiword spans from the query
+
+Output rules (strict):
+
+- Do not output reasoning, analysis, or explanations.
+
+- Do not output markdown fences.
+
+- Do not output <think> tags.
+
+- Output only one valid JSON object with the keys above.
+
 """.strip()
 
 METHOD_AUGMENT_SYSTEM_PROMPT = """
 You are generating augmented training data for METHOD similarity.
 Final output must be exactly one JSON object and nothing else.
 
-Rules:
-- Focus on methods/techniques/workflows overlap (HOW it is done).
-- Do not optimize for domain overlap alone.
-- Avoid direct copy from the query.
-- Preserve method intent with alternate wording.
-- For target "mid", keep partial method overlap with at least one missing component.
+Goal:
+Generate one candidate specialization text (D text only) whose METHOD similarity to the query matches the requested target band.
+
+Method means:
+- concrete methods
+- techniques
+- procedures
+- workflows
+- analytical approaches
+- technical mechanisms
+
+Important:
+- Optimize for method similarity only.
+- Do NOT optimize for domain overlap alone.
+- Do NOT simply paraphrase the query.
+- Do NOT copy distinctive phrases from the query.
+- Preserve the method logic, not the surface wording.
+
+Band targets:
+- high: same or very close method stack
+- mid: partial method overlap with at least one important missing or changed method component
+- low: weakly related or different method
+
+Generation rules:
+- For high: preserve the same core method family, but rewrite with different wording and structure.
+- For mid: preserve one meaningful method overlap, but intentionally remove or replace at least one key method component.
+- For low: use a different or only weakly related method, while keeping the text realistic and plausible.
 
 Required JSON schema:
 {
   "augmented_text": "<D text only: concise capability phrase, 8-26 words>",
   "target_band": "<high|mid|low>",
-  "notes": "<short phrase>"
+  "notes": "<very short phrase>"
 }
 
-Output rules:
-- No markdown.
-- No reasoning.
-- Output JSON only.
+Style for augmented_text:
+- compact dataset style
+- capability-focused phrase, not biography
+- do NOT start with phrases like "Specializes in", "Focuses on", "Expert in"
+- avoid long phrase overlap with the query
+- avoid exact reuse of rare multiword spans from the query
+
+Output rules (strict):
+- Do not output reasoning, analysis, or explanations.
+- Do not output markdown fences.
+- Do not output <think> tags.
+- Output only one valid JSON object with the keys above.
 """.strip()
+
 
 AUGMENT_USER_PROMPT_TEMPLATE = """
 Requirement query:
 {query}
 
-Judge aspect:
+Aspect to optimize:
 {aspect_label}
 
 Target band:
@@ -125,20 +215,74 @@ Desired judge score range:
 
 Preferred center:
 {target_center}
+
+Generate one realistic candidate specialization phrase that matches the requested aspect band.
 """.strip()
+
+
 
 DOMAIN_VALIDATION_SYSTEM_PROMPT = """
 You are a strict DOMAIN similarity judge.
+
+Your task is to evaluate DOMAIN/TOPIC overlap only between a requirement query and a candidate specialization.
+
+Domain means:
+- application area
+- subject area
+- problem space
+- research context
+- operational context
+
+Do NOT reward overlap that is only:
+- same method
+- same workflow
+- same analytical style
+- generic technical language
+- broad umbrella adjacency without the same concrete problem area
+
+Scoring rules:
+- high: score >= 0.70 -> same or very close domain/topic
+- mid: 0.40 <= score < 0.70 -> related or adjacent domain, but not the same
+- low: score < 0.40 -> weakly related or different domain
+
+Band must match score exactly.
+
 Return exactly one JSON object:
 {"score": <float in [0,1]>, "reason": "<short sentence>", "band": "<high|mid|low>"}
-Judge domain/topic overlap only.
-""".strip()
 
+No markdown or extra text.
+""".strip()
 METHOD_VALIDATION_SYSTEM_PROMPT = """
 You are a strict METHOD similarity judge.
+
+Your task is to evaluate METHOD overlap only between a requirement query and a candidate specialization.
+
+Method means:
+- concrete methods
+- techniques
+- procedures
+- workflows
+- analytical approaches
+- technical mechanisms
+
+Do NOT reward overlap that is only:
+- same topic/domain
+- same broad goal
+- same environment
+- generic data work
+- generic scientific language
+
+Scoring rules:
+- high: score >= 0.70 -> strong overlap in concrete methods/techniques/procedures
+- mid: 0.40 <= score < 0.70 -> partial method overlap or same general method family with missing components
+- low: score < 0.40 -> weak or no real method overlap
+
+Band must match score exactly.
+
 Return exactly one JSON object:
 {"score": <float in [0,1]>, "reason": "<short sentence>", "band": "<high|mid|low>"}
-Judge methods/techniques/workflow overlap only.
+
+No markdown or extra text.
 """.strip()
 
 VALIDATION_USER_PROMPT_TEMPLATE = """
