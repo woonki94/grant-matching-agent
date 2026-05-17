@@ -20,6 +20,8 @@ PROJECT_ROOT = _find_project_root()
 
 DOMAIN_INPUT_DEFAULT = "ce/dataset/distill/llm_distill_domain_listwise.jsonl"
 METHOD_INPUT_DEFAULT = "ce/dataset/distill/llm_distill_method_listwise.jsonl"
+DOMAIN_PAIRWISE_INPUT_DEFAULT = "ce/dataset/distill/llm_distill_domain_pairwise.jsonl"
+METHOD_PAIRWISE_INPUT_DEFAULT = "ce/dataset/distill/llm_distill_method_pairwise.jsonl"
 OUTPUT_DIR_DEFAULT = "ce/dataset/splits"
 
 DOMAIN_TRAIN_BASENAME = "llm_distill_domain_listwise_train.jsonl"
@@ -28,7 +30,13 @@ DOMAIN_TEST_BASENAME = "llm_distill_domain_listwise_test.jsonl"
 METHOD_TRAIN_BASENAME = "llm_distill_method_listwise_train.jsonl"
 METHOD_VAL_BASENAME = "llm_distill_method_listwise_val.jsonl"
 METHOD_TEST_BASENAME = "llm_distill_method_listwise_test.jsonl"
-MANIFEST_BASENAME = "llm_distill_domain_method_listwise_split_manifest.json"
+DOMAIN_PAIRWISE_TRAIN_BASENAME = "llm_distill_domain_pairwise_train.jsonl"
+DOMAIN_PAIRWISE_VAL_BASENAME = "llm_distill_domain_pairwise_val.jsonl"
+DOMAIN_PAIRWISE_TEST_BASENAME = "llm_distill_domain_pairwise_test.jsonl"
+METHOD_PAIRWISE_TRAIN_BASENAME = "llm_distill_method_pairwise_train.jsonl"
+METHOD_PAIRWISE_VAL_BASENAME = "llm_distill_method_pairwise_val.jsonl"
+METHOD_PAIRWISE_TEST_BASENAME = "llm_distill_method_pairwise_test.jsonl"
+MANIFEST_BASENAME = "llm_distill_domain_method_split_manifest.json"
 
 
 def _clean_text(value: Any) -> str:
@@ -166,13 +174,17 @@ def _write_split_files(
 
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Create shared query-level train/val/test split for domain+method listwise files.")
+    p = argparse.ArgumentParser(
+        description="Create shared query-level train/val/test split for domain+method listwise and pairwise files."
+    )
     p.add_argument("--domain-input", type=str, default=DOMAIN_INPUT_DEFAULT)
     p.add_argument("--method-input", type=str, default=METHOD_INPUT_DEFAULT)
+    p.add_argument("--domain-pairwise-input", type=str, default=DOMAIN_PAIRWISE_INPUT_DEFAULT)
+    p.add_argument("--method-pairwise-input", type=str, default=METHOD_PAIRWISE_INPUT_DEFAULT)
     p.add_argument("--output-dir", type=str, default=OUTPUT_DIR_DEFAULT)
     p.add_argument("--seed", type=int, default=42)
-    p.add_argument("--val-ratio", type=float, default=0.05)
-    p.add_argument("--test-ratio", type=float, default=0.05)
+    p.add_argument("--val-ratio", type=float, default=0.10)
+    p.add_argument("--test-ratio", type=float, default=0.10)
     p.add_argument("--overwrite", action="store_true")
     return p.parse_args()
 
@@ -182,6 +194,8 @@ def main() -> int:
 
     domain_input = _resolve_path(args.domain_input)
     method_input = _resolve_path(args.method_input)
+    domain_pairwise_input = _resolve_path(args.domain_pairwise_input)
+    method_pairwise_input = _resolve_path(args.method_pairwise_input)
     output_dir = _resolve_path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -189,6 +203,10 @@ def main() -> int:
         raise RuntimeError(f"Domain input not found: {domain_input}")
     if not method_input.exists():
         raise RuntimeError(f"Method input not found: {method_input}")
+    if not domain_pairwise_input.exists():
+        raise RuntimeError(f"Domain pairwise input not found: {domain_pairwise_input}")
+    if not method_pairwise_input.exists():
+        raise RuntimeError(f"Method pairwise input not found: {method_pairwise_input}")
 
     domain_train = output_dir / DOMAIN_TRAIN_BASENAME
     domain_val = output_dir / DOMAIN_VAL_BASENAME
@@ -196,9 +214,29 @@ def main() -> int:
     method_train = output_dir / METHOD_TRAIN_BASENAME
     method_val = output_dir / METHOD_VAL_BASENAME
     method_test = output_dir / METHOD_TEST_BASENAME
+    domain_pairwise_train = output_dir / DOMAIN_PAIRWISE_TRAIN_BASENAME
+    domain_pairwise_val = output_dir / DOMAIN_PAIRWISE_VAL_BASENAME
+    domain_pairwise_test = output_dir / DOMAIN_PAIRWISE_TEST_BASENAME
+    method_pairwise_train = output_dir / METHOD_PAIRWISE_TRAIN_BASENAME
+    method_pairwise_val = output_dir / METHOD_PAIRWISE_VAL_BASENAME
+    method_pairwise_test = output_dir / METHOD_PAIRWISE_TEST_BASENAME
     manifest_path = output_dir / MANIFEST_BASENAME
 
-    outputs = [domain_train, domain_val, domain_test, method_train, method_val, method_test, manifest_path]
+    outputs = [
+        domain_train,
+        domain_val,
+        domain_test,
+        method_train,
+        method_val,
+        method_test,
+        domain_pairwise_train,
+        domain_pairwise_val,
+        domain_pairwise_test,
+        method_pairwise_train,
+        method_pairwise_val,
+        method_pairwise_test,
+        manifest_path,
+    ]
     if (not bool(args.overwrite)) and any(p.exists() for p in outputs):
         raise RuntimeError(
             "Output files already exist. Use --overwrite to replace them."
@@ -206,12 +244,14 @@ def main() -> int:
 
     domain_keys = set(_collect_query_keys(domain_input))
     method_keys = set(_collect_query_keys(method_input))
-    all_keys = sorted(domain_keys | method_keys)
+    domain_pairwise_keys = set(_collect_query_keys(domain_pairwise_input))
+    method_pairwise_keys = set(_collect_query_keys(method_pairwise_input))
+    all_keys = sorted(domain_keys | method_keys | domain_pairwise_keys | method_pairwise_keys)
     split_map, split_query_counts = _build_split_map(
         keys=all_keys,
         seed=int(args.seed),
-        val_ratio=_safe_float(args.val_ratio, default=0.05),
-        test_ratio=_safe_float(args.test_ratio, default=0.05),
+        val_ratio=_safe_float(args.val_ratio, default=0.10),
+        test_ratio=_safe_float(args.test_ratio, default=0.10),
     )
 
     domain_row_counts = _write_split_files(
@@ -228,26 +268,50 @@ def main() -> int:
         output_val=method_val,
         output_test=method_test,
     )
+    domain_pairwise_row_counts = _write_split_files(
+        input_path=domain_pairwise_input,
+        split_map=split_map,
+        output_train=domain_pairwise_train,
+        output_val=domain_pairwise_val,
+        output_test=domain_pairwise_test,
+    )
+    method_pairwise_row_counts = _write_split_files(
+        input_path=method_pairwise_input,
+        split_map=split_map,
+        output_train=method_pairwise_train,
+        output_val=method_pairwise_val,
+        output_test=method_pairwise_test,
+    )
 
     manifest = {
         "created_at_utc": datetime.now(timezone.utc).isoformat(),
         "domain_input": str(domain_input),
         "method_input": str(method_input),
+        "domain_pairwise_input": str(domain_pairwise_input),
+        "method_pairwise_input": str(method_pairwise_input),
         "output_dir": str(output_dir),
         "seed": int(args.seed),
-        "val_ratio": float(_safe_float(args.val_ratio, default=0.05)),
-        "test_ratio": float(_safe_float(args.test_ratio, default=0.05)),
+        "val_ratio": float(_safe_float(args.val_ratio, default=0.10)),
+        "test_ratio": float(_safe_float(args.test_ratio, default=0.10)),
         "query_key_counts": {
             "domain": int(len(domain_keys)),
             "method": int(len(method_keys)),
+            "domain_pairwise": int(len(domain_pairwise_keys)),
+            "method_pairwise": int(len(method_pairwise_keys)),
             "union": int(len(all_keys)),
             "intersection": int(len(domain_keys & method_keys)),
             "domain_only": int(len(domain_keys - method_keys)),
             "method_only": int(len(method_keys - domain_keys)),
+            "listwise_vs_pairwise_overlap": {
+                "domain": int(len(domain_keys & domain_pairwise_keys)),
+                "method": int(len(method_keys & method_pairwise_keys)),
+            },
         },
         "split_query_counts": split_query_counts,
         "domain_row_counts": domain_row_counts,
         "method_row_counts": method_row_counts,
+        "domain_pairwise_row_counts": domain_pairwise_row_counts,
+        "method_pairwise_row_counts": method_pairwise_row_counts,
         "outputs": {
             "domain_train": str(domain_train),
             "domain_val": str(domain_val),
@@ -255,6 +319,12 @@ def main() -> int:
             "method_train": str(method_train),
             "method_val": str(method_val),
             "method_test": str(method_test),
+            "domain_pairwise_train": str(domain_pairwise_train),
+            "domain_pairwise_val": str(domain_pairwise_val),
+            "domain_pairwise_test": str(domain_pairwise_test),
+            "method_pairwise_train": str(method_pairwise_train),
+            "method_pairwise_val": str(method_pairwise_val),
+            "method_pairwise_test": str(method_pairwise_test),
             "manifest": str(manifest_path),
         },
     }
@@ -281,6 +351,20 @@ def main() -> int:
         f"val:{method_row_counts['val']},"
         f"test:{method_row_counts['test']},"
         f"skipped:{method_row_counts['skipped']}"
+    )
+    print(
+        "domain_pairwise_rows="
+        f"train:{domain_pairwise_row_counts['train']},"
+        f"val:{domain_pairwise_row_counts['val']},"
+        f"test:{domain_pairwise_row_counts['test']},"
+        f"skipped:{domain_pairwise_row_counts['skipped']}"
+    )
+    print(
+        "method_pairwise_rows="
+        f"train:{method_pairwise_row_counts['train']},"
+        f"val:{method_pairwise_row_counts['val']},"
+        f"test:{method_pairwise_row_counts['test']},"
+        f"skipped:{method_pairwise_row_counts['skipped']}"
     )
     print(f"manifest={manifest_path}")
     return 0
