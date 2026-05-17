@@ -3,13 +3,13 @@ from __future__ import annotations
 import re
 import sys
 from pathlib import Path
-from typing import Any, Dict, List, Sequence, Tuple
+from typing import Any, Dict, List, Tuple
 
 
 def _find_project_root() -> Path:
     here = Path(__file__).resolve()
     for parent in (here.parent, *here.parents):
-        if (parent / "cross_encoder").is_dir():
+        if (parent / "ce").is_dir():
             return parent
     return here.parent
 
@@ -18,16 +18,20 @@ PROJECT_ROOT = _find_project_root()
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-# Reuse proven local-LLM backend + requirement prompt style from cross_encoder.
-from cross_encoder.eval.test_augment_with_multi_model import (  # noqa: E402
-    JUDGE_SYSTEM_PROMPT as REQUIREMENT_SYSTEM_PROMPT,
-    JUDGE_USER_PROMPT_TEMPLATE as REQUIREMENT_USER_PROMPT_TEMPLATE,
-    _build_prompt,
-    _coerce_score,
-    _extract_json_object,
-    _load_llm,
-    _normalize_band,
-    _unload_llm,
+from ce.llm_runtime_util import (  # noqa: E402
+    batched as _batched,
+    build_prompt as _build_prompt,
+    clean_text as _clean_text,
+    coerce_score as _coerce_score,
+    extract_json_object as _extract_json_object,
+    generate_responses_batch as _generate_responses_batch,
+    load_llm as _load_llm,
+    model_slug as _model_slug,
+    normalize_band as _normalize_band,
+    normalize_ws as _normalize_ws,
+    score_to_band as _score_to_band,
+    short_text as _short,
+    unload_llm as _unload_llm,
 )
 
 
@@ -46,7 +50,6 @@ TEMPERATURE = 0.0
 TOP_P = 1.0
 BATCH_SIZE = 10
 
-# One query + 10 docs (replace these with your own later).
 # One query + 10 docs (replace these with your own later).
 
 EVAL_QUERY = "demonstrated expertise in open geospatial data standards, metadata documentation, and biological field survey data management for environmental research programs"
@@ -154,103 +157,32 @@ Candidate specialization:
 {candidate}
 """.strip()
 
+REQUIREMENT_SYSTEM_PROMPT = """
+You are a strict requirement-match judge.
+Final output must be exactly one JSON object.
 
-def _clean_text(value: Any) -> str:
-    return str(value or "").strip()
+Required JSON schema:
+{
+  "score": <float in [0,1]>,
+  "reason": "<one short sentence>",
+  "band": "<high|mid|low>"
+}
 
+Band mapping guidance:
+- high: score >= 0.70
+- mid: 0.40 <= score < 0.70
+- low: score < 0.40
 
-def _normalize_ws(text: Any) -> str:
-    return " ".join(_clean_text(text).split())
+No markdown or extra text outside JSON.
+""".strip()
 
+REQUIREMENT_USER_PROMPT_TEMPLATE = """
+Requirement query:
+{query}
 
-def _short(text: Any, limit: int = 72) -> str:
-    s = _normalize_ws(text)
-    if len(s) <= limit:
-        return s
-    return s[: max(0, limit - 3)] + "..."
-
-
-def _model_slug(model_id: str) -> str:
-    token = _clean_text(model_id).split("/")[-1].lower()
-    token = re.sub(r"[^a-z0-9]+", "_", token).strip("_")
-    return token or "model"
-
-
-def _score_to_band(score: float) -> str:
-    if score >= 0.70:
-        return "high"
-    if score >= 0.40:
-        return "mid"
-    return "low"
-
-
-def _batched(seq: Sequence[Any], size: int) -> Sequence[Sequence[Any]]:
-    step = max(1, int(size))
-    for i in range(0, len(seq), step):
-        yield seq[i : i + step]
-
-
-def _generate_responses_batch(
-    *,
-    llm_bundle: Dict[str, Any],
-    prompts: Sequence[str],
-    max_new_tokens: int,
-    temperature: float,
-    top_p: float,
-) -> List[str]:
-    backend = _clean_text(llm_bundle.get("backend"))
-    if backend == "vllm":
-        from vllm import SamplingParams
-
-        llm = llm_bundle["client"]
-        params = SamplingParams(
-            max_tokens=int(max_new_tokens),
-            temperature=float(max(0.0, temperature)),
-            top_p=float(max(0.01, min(1.0, top_p))),
-        )
-        outputs = llm.generate(list(prompts), params)
-        texts: List[str] = []
-        for out in outputs:
-            if not out.outputs:
-                texts.append("")
-            else:
-                texts.append(_clean_text(out.outputs[0].text))
-        return texts
-
-    if backend == "hf":
-        import torch
-
-        tokenizer = llm_bundle["tokenizer"]
-        model = llm_bundle["client"]
-        enc = tokenizer(list(prompts), return_tensors="pt", padding=True, truncation=True)
-        device = next(model.parameters()).device
-        enc = {k: v.to(device) for k, v in enc.items()}
-        do_sample = float(temperature) > 0.0
-        gen_kwargs: Dict[str, Any] = {
-            "max_new_tokens": int(max_new_tokens),
-            "do_sample": bool(do_sample),
-            "temperature": float(max(0.0, temperature)),
-        }
-        if tokenizer.eos_token_id is not None:
-            gen_kwargs["pad_token_id"] = int(tokenizer.eos_token_id)
-        if do_sample:
-            gen_kwargs["top_p"] = float(max(0.01, min(1.0, top_p)))
-        with torch.no_grad():
-            out_ids = model.generate(**enc, **gen_kwargs)
-
-        input_ids = enc["input_ids"]
-        attn = enc.get("attention_mask")
-        texts: List[str] = []
-        for i in range(out_ids.shape[0]):
-            if attn is not None:
-                prefix_len = int(attn[i].sum().item())
-            else:
-                prefix_len = int(input_ids.shape[-1])
-            new_ids = out_ids[i][prefix_len:]
-            texts.append(_clean_text(tokenizer.decode(new_ids, skip_special_tokens=True)))
-        return texts
-
-    raise RuntimeError(f"Unsupported backend: {backend}")
+Candidate specialization:
+{candidate}
+""".strip()
 
 
 def _parse_score_response(raw: str) -> Dict[str, Any]:
