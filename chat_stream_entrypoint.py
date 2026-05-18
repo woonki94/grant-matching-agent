@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import time
+import uuid
 from typing import Any, Dict, List, Optional
 
 from flask import Flask, Response, request, stream_with_context
@@ -95,6 +96,43 @@ def _to_email_list(v: Any) -> List[str]:
         x = v.strip()
         return [x] if x else []
     return []
+
+
+def _normalize_email(v: Any) -> Optional[str]:
+    s = str(v or "").strip().lower()
+    return s or None
+
+
+def _normalize_email_list(values: List[str]) -> List[str]:
+    out: List[str] = []
+    seen = set()
+    for raw in list(values or []):
+        email = _normalize_email(raw)
+        if not email or email in seen:
+            continue
+        seen.add(email)
+        out.append(email)
+    return out
+
+
+def _resolve_chat_thread_id(
+    *,
+    body: Dict[str, Any],
+    primary_email: Optional[str],
+    emails: List[str],
+) -> str:
+    raw = str(body.get("thread_id") or "").strip()
+    if raw:
+        return raw
+
+    participants = _normalize_email_list([primary_email, *list(emails or [])])
+    if participants:
+        if len(participants) == 1:
+            return f"chat:faculty:{participants[0]}"
+        return f"chat:group:{'|'.join(sorted(participants))}"
+
+    # Avoid shared-state leakage when frontend omits thread_id.
+    return f"chat:ephemeral:{uuid.uuid4().hex}"
 
 
 def _parse_json_value(v: Any) -> Any:
@@ -452,7 +490,18 @@ def _parse_request() -> tuple[dict, Optional[dict], Optional[dict]]:
 def chat():
     body, cv_pdf_map, osu_url_map = _parse_request()
     user_message = str(body.get("message") or "").strip()
-    thread_id = str(body.get("thread_id") or "default-thread")
+    actor_email, actor_role = _get_request_actor()
+    primary_email = _normalize_email(body.get("email"))
+    request_emails = _normalize_email_list(_to_email_list(body.get("emails")))
+    if not primary_email and len(request_emails) == 1:
+        primary_email = request_emails[0]
+    if not primary_email and not request_emails and actor_email and actor_role != "admin":
+        primary_email = _normalize_email(actor_email)
+    thread_id = _resolve_chat_thread_id(
+        body=body,
+        primary_email=primary_email,
+        emails=request_emails,
+    )
 
     def emit(event_name: str, payload: dict) -> str:
         return f"event: {event_name}\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
@@ -493,8 +542,8 @@ def chat():
 
         req = GrantMatchRequest(
             user_input=user_message,
-            email=body.get("email"),
-            emails=_to_email_list(body.get("emails")),
+            email=primary_email,
+            emails=request_emails,
             faculty_in_db=_to_optional_bool(body.get("faculty_in_db")),
             email_in_db=_to_optional_bool(body.get("email_in_db")),
             grant_link=body.get("grant_link"),
