@@ -65,6 +65,8 @@ MAX_LENGTH="${MAX_LENGTH:-256}"
 CANDIDATE_POOL_SIZE="${CANDIDATE_POOL_SIZE:-32}"
 MINI_LIST_SIZE="${MINI_LIST_SIZE:-8}"
 NUM_WORKERS="${NUM_WORKERS:-0}"
+LOG_EVERY_STEPS="${LOG_EVERY_STEPS:-50}"
+EVAL_EVERY_STEPS="${EVAL_EVERY_STEPS:-100}"
 LEARNING_RATE="${LEARNING_RATE:-5e-7}"
 STAGE1_LEARNING_RATE="${STAGE1_LEARNING_RATE:-1e-6}"
 STAGE2_LEARNING_RATE="${STAGE2_LEARNING_RATE:-5e-7}"
@@ -113,6 +115,7 @@ log "pairwise_input=${PAIRWISE_INPUT}"
 log "method_pairwise_input=${METHOD_PAIRWISE_INPUT}"
 log "split_dir=${SPLIT_DIR}"
 log "output_dir=${OUTPUT_DIR}"
+log "log_every_steps=${LOG_EVERY_STEPS} eval_every_steps=${EVAL_EVERY_STEPS}"
 
 CMD=(
   "${PYTHON_BIN}" ce/train2.py
@@ -147,6 +150,8 @@ CMD=(
   --candidate-pool-size "${CANDIDATE_POOL_SIZE}"
   --mini-list-size "${MINI_LIST_SIZE}"
   --num-workers "${NUM_WORKERS}"
+  --log-every-steps "${LOG_EVERY_STEPS}"
+  --eval-every-steps "${EVAL_EVERY_STEPS}"
   --learning-rate "${LEARNING_RATE}"
   --stage1-learning-rate "${STAGE1_LEARNING_RATE}"
   --stage2-learning-rate "${STAGE2_LEARNING_RATE}"
@@ -223,4 +228,3 @@ fi
 log "Running: ${CMD[*]}"
 "${CMD[@]}"
 log "Done."
-

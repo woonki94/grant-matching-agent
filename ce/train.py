@@ -17,6 +17,11 @@ from torch.optim import AdamW
 from torch.utils.data import DataLoader, Dataset
 from transformers import AutoModelForSequenceClassification, AutoTokenizer, get_linear_schedule_with_warmup
 
+try:
+    from tqdm.auto import tqdm
+except Exception:  # pragma: no cover - optional dependency
+    tqdm = None
+
 
 def _find_project_root() -> Path:
     here = Path(__file__).resolve()
@@ -345,6 +350,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--wandb-entity", type=str, default="")
     p.add_argument("--wandb-run-name", type=str, default="")
     p.add_argument("--wandb-mode", type=str, default=WANDB_MODE_DEFAULT, choices=["online", "offline", "disabled"])
+    p.add_argument("--no-tqdm", action="store_true", help="Disable tqdm progress bars.")
     return p.parse_args()
 
 
@@ -361,6 +367,7 @@ def main() -> int:
     loss_high_weight = _safe_weight(args.loss_high_weight, default=1.50)
     loss_mid_weight = _safe_weight(args.loss_mid_weight, default=1.00)
     loss_low_weight = _safe_weight(args.loss_low_weight, default=1.40)
+    use_tqdm = (not bool(args.no_tqdm)) and (tqdm is not None)
 
     domain_arg = _clean_text(args.domain_listwise)
     method_arg = _clean_text(args.method_listwise)
@@ -529,6 +536,7 @@ def main() -> int:
         f"band_thresholds={high_threshold:.2f}/{mid_threshold:.2f} "
         f"loss_weights(high/mid/low)={loss_high_weight:.2f}/{loss_mid_weight:.2f}/{loss_low_weight:.2f}"
     )
+    print(f"tqdm_enabled={bool(use_tqdm)}")
 
     best_metric = float("inf")
     best_epoch = 0
@@ -557,13 +565,21 @@ def main() -> int:
         wandb_run = wandb.init(**wandb_kwargs)
 
     try:
-        for epoch in range(1, max(1, int(args.epochs)) + 1):
+        total_epochs = max(1, int(args.epochs))
+        epoch_iter = range(1, total_epochs + 1)
+        if use_tqdm:
+            epoch_iter = tqdm(epoch_iter, desc="Epochs", leave=True)
+
+        for epoch in epoch_iter:
             model.train()
             started = time.time()
             running_loss = 0.0
             seen = 0
             optim.zero_grad(set_to_none=True)
             grad_accum = max(1, int(args.grad_accum))
+            progress = None
+            if use_tqdm:
+                progress = tqdm(total=len(train_loader), desc=f"Train {epoch}/{total_epochs}", leave=False)
 
             for step, batch in enumerate(train_loader, start=1):
                 enc = {k: v.to(device) for k, v in dict(batch["enc"]).items()}
@@ -595,6 +611,20 @@ def main() -> int:
                     scheduler.step()
                     optim.zero_grad(set_to_none=True)
                     global_step += 1
+
+                if progress is not None:
+                    progress.update(1)
+                    if (step % 10 == 0) or (step == len(train_loader)):
+                        avg_loss = float(running_loss / max(1, seen))
+                        progress.set_postfix(
+                            {
+                                "loss": f"{avg_loss:.4f}",
+                                "lr": f"{float(optim.param_groups[0]['lr']):.2e}",
+                            }
+                        )
+
+            if progress is not None:
+                progress.close()
 
             train_mse = float(running_loss / max(1, seen))
             val_metrics = (

@@ -30,7 +30,7 @@ DOMAIN_VAL_LISTWISE="${DOMAIN_VAL_LISTWISE:-ce/dataset/splits/llm_distill_domain
 METHOD_VAL_LISTWISE="${METHOD_VAL_LISTWISE:-ce/dataset/splits/llm_distill_method_listwise_val.jsonl}"
 SCORE_FIELD="${SCORE_FIELD:-teacher_score_raw}"    # teacher_score_raw | teacher_score
 ONLY_SELECTED="${ONLY_SELECTED:-false}"            # true | false
-VAL_RATIO="${VAL_RATIO:-0.05}"                     # used only if val files are missing
+VAL_RATIO="${VAL_RATIO:-0.10}"                     # used only if val files are missing
 
 # Optimization
 MAX_LENGTH="${MAX_LENGTH:-256}"
