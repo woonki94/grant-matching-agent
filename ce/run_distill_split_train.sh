@@ -23,7 +23,12 @@ PYTHON_BIN="${PYTHON_BIN:-python}"
 TARGET_HIGH="${TARGET_HIGH:-4}"
 TARGET_MID="${TARGET_MID:-8}"
 TARGET_LOW="${TARGET_LOW:-4}"
-PREFILTER_MULTIPLIER="${PREFILTER_MULTIPLIER:-30}"
+PREFILTER_MULTIPLIER="${PREFILTER_MULTIPLIER:-10}"
+# With TARGET_HIGH/MID/LOW=4/8/4, this gives:
+# high: 4*14=56, mid: 8*10=80, low: 4*6=24, total=160.
+PREFILTER_MULTIPLIER_HIGH="${PREFILTER_MULTIPLIER_HIGH:-17}"
+PREFILTER_MULTIPLIER_MID="${PREFILTER_MULTIPLIER_MID:-10}"
+PREFILTER_MULTIPLIER_LOW="${PREFILTER_MULTIPLIER_LOW:-3}"
 MAX_SPECS="${MAX_SPECS:-0}"   # 0 = all
 
 DOMAIN_ASPECT="${DOMAIN_ASPECT:-domain}"
@@ -121,7 +126,30 @@ WANDB_TAGS="${WANDB_TAGS:-ce,domain,method}"
 WANDB_GROUP="${WANDB_GROUP:-}"
 WANDB_DIR="${WANDB_DIR:-}"
 
-log "Stage 1/3: Distill+augment (${DOMAIN_ASPECT}) with target ${TARGET_HIGH}/${TARGET_MID}/${TARGET_LOW}"
+# ---------------------------
+# Stage 4) Eval (optional, post-train)
+# ---------------------------
+EVAL_AFTER_TRAIN="${EVAL_AFTER_TRAIN:-true}"  # true | false
+EVAL_BASE_MODEL="${EVAL_BASE_MODEL:-${MODEL_ID}}"
+EVAL_DOMAIN_INPUT="${EVAL_DOMAIN_INPUT:-${RAW_TEST_INPUT}}"
+EVAL_METHOD_INPUT="${EVAL_METHOD_INPUT:-${METHOD_RAW_TEST_INPUT}}"
+EVAL_SCORE_FIELD="${EVAL_SCORE_FIELD:-teacher_score_raw}"
+EVAL_ONLY_SELECTED="${EVAL_ONLY_SELECTED:-false}"  # true | false
+EVAL_BATCH_SIZE="${EVAL_BATCH_SIZE:-32}"
+EVAL_MAX_LENGTH="${EVAL_MAX_LENGTH:-512}"
+EVAL_HIGH_THRESHOLD="${EVAL_HIGH_THRESHOLD:-0.70}"
+EVAL_MID_THRESHOLD="${EVAL_MID_THRESHOLD:-0.30}"
+EVAL_OOB_MARGIN="${EVAL_OOB_MARGIN:-0.0}"
+EVAL_ORDER_TOP_K="${EVAL_ORDER_TOP_K:-5}"
+EVAL_PAIR_EPS="${EVAL_PAIR_EPS:-0.01}"
+EVAL_HARD_GAP_MAX="${EVAL_HARD_GAP_MAX:-0.15}"
+EVAL_MEDIUM_GAP_MAX="${EVAL_MEDIUM_GAP_MAX:-0.40}"
+EVAL_SAVE="${EVAL_SAVE:-true}"    # true | false
+EVAL_PRINT="${EVAL_PRINT:-true}"  # true | false
+EVAL_OUTPUT_DIR="${EVAL_OUTPUT_DIR:-ce/eval/results}"
+EVAL_SAVE_PREFIX="${EVAL_SAVE_PREFIX:-ce_distill_margin_compare}"
+
+log "Stage 1/4: Distill+augment (${DOMAIN_ASPECT}) with target ${TARGET_HIGH}/${TARGET_MID}/${TARGET_LOW}"
 "${PYTHON_BIN}" ce/data_preparation/llm_distillation/llm_distillation.py \
   --run-mode full \
   --judge-aspect "${DOMAIN_ASPECT}" \
@@ -129,9 +157,12 @@ log "Stage 1/3: Distill+augment (${DOMAIN_ASPECT}) with target ${TARGET_HIGH}/${
   --target-mid "${TARGET_MID}" \
   --target-low "${TARGET_LOW}" \
   --prefilter-multiplier "${PREFILTER_MULTIPLIER}" \
+  --prefilter-multiplier-high "${PREFILTER_MULTIPLIER_HIGH}" \
+  --prefilter-multiplier-mid "${PREFILTER_MULTIPLIER_MID}" \
+  --prefilter-multiplier-low "${PREFILTER_MULTIPLIER_LOW}" \
   --max-specs "${MAX_SPECS}"
 
-log "Stage 1/3: Distill+augment (${METHOD_ASPECT}) with target ${TARGET_HIGH}/${TARGET_MID}/${TARGET_LOW}"
+log "Stage 1/4: Distill+augment (${METHOD_ASPECT}) with target ${TARGET_HIGH}/${TARGET_MID}/${TARGET_LOW}"
 "${PYTHON_BIN}" ce/data_preparation/llm_distillation/llm_distillation.py \
   --run-mode full \
   --judge-aspect "${METHOD_ASPECT}" \
@@ -139,9 +170,12 @@ log "Stage 1/3: Distill+augment (${METHOD_ASPECT}) with target ${TARGET_HIGH}/${
   --target-mid "${TARGET_MID}" \
   --target-low "${TARGET_LOW}" \
   --prefilter-multiplier "${PREFILTER_MULTIPLIER}" \
+  --prefilter-multiplier-high "${PREFILTER_MULTIPLIER_HIGH}" \
+  --prefilter-multiplier-mid "${PREFILTER_MULTIPLIER_MID}" \
+  --prefilter-multiplier-low "${PREFILTER_MULTIPLIER_LOW}" \
   --max-specs "${MAX_SPECS}"
 
-log "Stage 2/3: Shared query split for domain+method listwise+pairwise"
+log "Stage 2/4: Shared query split for domain+method listwise+pairwise"
 SPLIT_ARGS=(
   --domain-input "${RAW_INPUT}"
   --method-input "${METHOD_RAW_INPUT}"
@@ -157,7 +191,7 @@ if bool_true "${SPLIT_OVERWRITE}"; then
 fi
 "${PYTHON_BIN}" ce/data_preparation/split_distill_listwise_domain_method.py "${SPLIT_ARGS[@]}"
 
-log "Stage 3/3: Train2 CE model"
+log "Stage 3/4: Train2 CE model"
 CMD=(
   "${PYTHON_BIN}" ce/train2.py
   --raw-input "${RAW_INPUT}"
@@ -268,5 +302,73 @@ fi
 
 log "Running: ${CMD[*]}"
 "${CMD[@]}"
+
+if bool_true "${EVAL_AFTER_TRAIN}"; then
+  log "Stage 4/4: Evaluate generated model with ce/eval/eval_finetuned_model.py"
+
+  # Resolve the concrete run directory created by train2.
+  TRAIN_RUN_DIR="${OUTPUT_DIR}"
+  if bool_true "${APPEND_ARGS_TO_OUTPUT_DIR}"; then
+    TRAIN_PARENT_DIR="$(dirname "${OUTPUT_DIR}")"
+    TRAIN_BASE_NAME="$(basename "${OUTPUT_DIR}")"
+    LATEST_APPENDED_RUN="$(ls -td "${TRAIN_PARENT_DIR}/${TRAIN_BASE_NAME}"__* 2>/dev/null | head -n 1 || true)"
+    if [[ -n "${LATEST_APPENDED_RUN}" && -d "${LATEST_APPENDED_RUN}" ]]; then
+      TRAIN_RUN_DIR="${LATEST_APPENDED_RUN}"
+    fi
+  fi
+
+  # Prefer the final stage checkpoint for this run (not auto-picked global best).
+  EVAL_FINETUNED_MODEL="${TRAIN_RUN_DIR}/stage2_epoch_${STAGE2_EPOCHS}"
+  if [[ ! -d "${EVAL_FINETUNED_MODEL}" ]]; then
+    EVAL_FINETUNED_MODEL="$(ls -d "${TRAIN_RUN_DIR}"/stage2_epoch_* 2>/dev/null | sort -V | tail -n 1 || true)"
+  fi
+  if [[ -z "${EVAL_FINETUNED_MODEL}" || ! -d "${EVAL_FINETUNED_MODEL}" ]]; then
+    EVAL_FINETUNED_MODEL="$(ls -d "${TRAIN_RUN_DIR}"/stage1_epoch_* 2>/dev/null | sort -V | tail -n 1 || true)"
+  fi
+  if [[ -z "${EVAL_FINETUNED_MODEL}" || ! -d "${EVAL_FINETUNED_MODEL}" ]]; then
+    EVAL_FINETUNED_MODEL="${TRAIN_RUN_DIR}"
+  fi
+
+  EVAL_CMD=(
+    "${PYTHON_BIN}" ce/eval/eval_finetuned_model.py
+    --no-auto-resolve-finetuned
+    --finetuned-model "${EVAL_FINETUNED_MODEL}"
+    --base-model "${EVAL_BASE_MODEL}"
+    --domain-input "${EVAL_DOMAIN_INPUT}"
+    --method-input "${EVAL_METHOD_INPUT}"
+    --score-field "${EVAL_SCORE_FIELD}"
+    --batch-size "${EVAL_BATCH_SIZE}"
+    --max-length "${EVAL_MAX_LENGTH}"
+    --high-threshold "${EVAL_HIGH_THRESHOLD}"
+    --mid-threshold "${EVAL_MID_THRESHOLD}"
+    --oob-margin "${EVAL_OOB_MARGIN}"
+    --order-top-k "${EVAL_ORDER_TOP_K}"
+    --pair-eps "${EVAL_PAIR_EPS}"
+    --hard-gap-max "${EVAL_HARD_GAP_MAX}"
+    --medium-gap-max "${EVAL_MEDIUM_GAP_MAX}"
+    --output-dir "${EVAL_OUTPUT_DIR}"
+    --save-prefix "${EVAL_SAVE_PREFIX}"
+  )
+  if bool_true "${EVAL_ONLY_SELECTED}"; then
+    EVAL_CMD+=(--only-selected)
+  else
+    EVAL_CMD+=(--no-only-selected)
+  fi
+  if bool_true "${EVAL_SAVE}"; then
+    EVAL_CMD+=(--save)
+  else
+    EVAL_CMD+=(--no-save)
+  fi
+  if bool_true "${EVAL_PRINT}"; then
+    EVAL_CMD+=(--print)
+  else
+    EVAL_CMD+=(--no-print)
+  fi
+
+  log "eval_train_run_dir=${TRAIN_RUN_DIR}"
+  log "eval_finetuned_model=${EVAL_FINETUNED_MODEL}"
+  log "Running: ${EVAL_CMD[*]}"
+  "${EVAL_CMD[@]}"
+fi
 
 log "Done: domain+method distill/augment -> split -> train2 completed."

@@ -908,8 +908,10 @@ def _augment_missing_high_mid_global(
             spec_text = _clean_text(row.get("spec_text"))
             if not spec_text:
                 continue
-            candidates = list(row.get("scored_candidates") or [])
-            per_spec_candidates[row_idx] = candidates
+            candidates = per_spec_candidates.get(row_idx)
+            if candidates is None:
+                candidates = list(row.get("scored_candidates") or [])
+                per_spec_candidates[row_idx] = candidates
             if row_idx not in used_text_per_spec:
                 used = {_dedup_text_key(c.get("fac_spec_text")) for c in candidates if _clean_text(c.get("fac_spec_text"))}
                 used_text_per_spec[row_idx] = {k for k in used if k}
@@ -1247,6 +1249,24 @@ def main() -> int:
         ),
     )
     parser.add_argument(
+        "--prefilter-multiplier-high",
+        type=float,
+        default=-1.0,
+        help="Per-band high multiplier. If <0, falls back to --prefilter-multiplier.",
+    )
+    parser.add_argument(
+        "--prefilter-multiplier-mid",
+        type=float,
+        default=-1.0,
+        help="Per-band mid multiplier. If <0, falls back to --prefilter-multiplier.",
+    )
+    parser.add_argument(
+        "--prefilter-multiplier-low",
+        type=float,
+        default=-1.0,
+        help="Per-band low multiplier. If <0, falls back to --prefilter-multiplier.",
+    )
+    parser.add_argument(
         "--max-specs",
         type=int,
         default=0,
@@ -1281,6 +1301,15 @@ def main() -> int:
     args = parser.parse_args()
 
     prefilter_multiplier = _safe_float(args.prefilter_multiplier, default=10.0, minimum=0.0, maximum=100.0)
+    prefilter_multiplier_high = _safe_float(args.prefilter_multiplier_high, default=-1.0, minimum=-1.0, maximum=100.0)
+    prefilter_multiplier_mid = _safe_float(args.prefilter_multiplier_mid, default=-1.0, minimum=-1.0, maximum=100.0)
+    prefilter_multiplier_low = _safe_float(args.prefilter_multiplier_low, default=-1.0, minimum=-1.0, maximum=100.0)
+    if float(prefilter_multiplier_high) < 0.0:
+        prefilter_multiplier_high = float(prefilter_multiplier)
+    if float(prefilter_multiplier_mid) < 0.0:
+        prefilter_multiplier_mid = float(prefilter_multiplier)
+    if float(prefilter_multiplier_low) < 0.0:
+        prefilter_multiplier_low = float(prefilter_multiplier)
     max_specs = _safe_int(args.max_specs, default=0, minimum=0, maximum=10_000_000)
     run_mode = _clean_text(args.run_mode).lower()
     target_high = _safe_int(args.target_high, default=1, minimum=0, maximum=100_000)
@@ -1288,9 +1317,21 @@ def main() -> int:
     target_low = _safe_int(args.target_low, default=1, minimum=0, maximum=100_000)
     judge_aspect = _clean_text(args.judge_aspect).lower()
     system_prompt, user_prompt_template = PROMPT_CONFIGS[judge_aspect]
-    prefilter_high = int(max(target_high, math.ceil(float(target_high) * float(prefilter_multiplier)))) if target_high > 0 else 0
-    prefilter_mid = int(max(target_mid, math.ceil(float(target_mid) * float(prefilter_multiplier)))) if target_mid > 0 else 0
-    prefilter_low = int(max(target_low, math.ceil(float(target_low) * float(prefilter_multiplier)))) if target_low > 0 else 0
+    prefilter_high = (
+        int(max(target_high, math.ceil(float(target_high) * float(prefilter_multiplier_high))))
+        if target_high > 0
+        else 0
+    )
+    prefilter_mid = (
+        int(max(target_mid, math.ceil(float(target_mid) * float(prefilter_multiplier_mid))))
+        if target_mid > 0
+        else 0
+    )
+    prefilter_low = (
+        int(max(target_low, math.ceil(float(target_low) * float(prefilter_multiplier_low))))
+        if target_low > 0
+        else 0
+    )
 
     # ======================================================
     # Step 2) Resolve fixed paths
@@ -1524,6 +1565,11 @@ def main() -> int:
             "judge_aspect": str(judge_aspect),
             "score_model_id": score_model_id,
             "prefilter_multiplier": float(prefilter_multiplier),
+            "prefilter_multiplier_by_band": {
+                "high": float(prefilter_multiplier_high),
+                "mid": float(prefilter_multiplier_mid),
+                "low": float(prefilter_multiplier_low),
+            },
             "prefilter_requested": {"high": int(prefilter_high), "mid": int(prefilter_mid), "low": int(prefilter_low)},
             "target_requested": {"high": int(target_high), "mid": int(target_mid), "low": int(target_low)},
             "spec_count_input_total": int(full_spec_count),
@@ -1877,6 +1923,11 @@ def main() -> int:
         "max_new_tokens": int(MAX_NEW_TOKENS_DEFAULT),
         "temperature": float(TEMPERATURE_DEFAULT),
         "prefilter_multiplier": float(prefilter_multiplier),
+        "prefilter_multiplier_by_band": {
+            "high": float(prefilter_multiplier_high),
+            "mid": float(prefilter_multiplier_mid),
+            "low": float(prefilter_multiplier_low),
+        },
         "max_specs": int(max_specs),
         "prefilter_requested": {
             "high": int(prefilter_high),
@@ -1916,7 +1967,7 @@ def main() -> int:
         "target_missing_mid_total": int(missing_mid_total_final),
         "target_missing_low_total": int(missing_low_total_final),
         "target_shortage_specs": int(shortage_specs_final),
-        "augmentation_enabled": bool(augmenter is not None),
+        "augmentation_enabled": bool(augment_needed),
         "augmentation_needed": bool(augment_needed),
         "augmentation_requested_high_total": int(augment_requested_high_total),
         "augmentation_requested_mid_total": int(augment_requested_mid_total),
@@ -2032,7 +2083,7 @@ def main() -> int:
             },
         },
         "augmentation": {
-            "enabled": bool(augmenter is not None),
+            "enabled": bool(augment_needed),
             "requested_high": int(augment_requested_high_total),
             "requested_mid": int(augment_requested_mid_total),
             "created_high": int(augment_created_high_total),
@@ -2060,6 +2111,12 @@ def main() -> int:
     print(f"score_model_id={score_model_id}")
     print(f"augment_model_id={augment_model_id if AUGMENT_ENABLE_DEFAULT else ''}")
     print(f"prefilter_multiplier={prefilter_multiplier:.4f}")
+    print(
+        "prefilter_multiplier_by_band="
+        f"high:{prefilter_multiplier_high:.4f},"
+        f"mid:{prefilter_multiplier_mid:.4f},"
+        f"low:{prefilter_multiplier_low:.4f}"
+    )
     print(f"prefilter_requested=high:{prefilter_high},mid:{prefilter_mid},low:{prefilter_low}")
     print(f"target_requested=high:{target_high},mid:{target_mid},low:{target_low}")
     print(
