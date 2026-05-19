@@ -47,12 +47,12 @@ BASE_MODEL="${BASE_MODEL:-dleemiller/ModernCE-base-sts}"
 # Training schedule (same knobs; Stage1 fixed to 0)
 SEED="${SEED:-42}"
 STAGE1_EPOCHS="${STAGE1_EPOCHS:-0}"
-STAGE2_EPOCHS="${STAGE2_EPOCHS:-4}"
+STAGE2_EPOCHS="${STAGE2_EPOCHS:-8}"
 STAGE1_EARLY_STOP="${STAGE1_EARLY_STOP:-true}"
 STAGE1_EARLY_STOP_PATIENCE="${STAGE1_EARLY_STOP_PATIENCE:-2}"
 STAGE2_START_FROM_BEST_STAGE1="${STAGE2_START_FROM_BEST_STAGE1:-true}"
 STAGE2_EARLY_STOP="${STAGE2_EARLY_STOP:-true}"
-STAGE2_EARLY_STOP_PATIENCE="${STAGE2_EARLY_STOP_PATIENCE:-2}"
+STAGE2_EARLY_STOP_PATIENCE="${STAGE2_EARLY_STOP_PATIENCE:-3}"
 
 TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-2}"
 EVAL_BATCH_SIZE="${EVAL_BATCH_SIZE:-16}"
@@ -65,7 +65,7 @@ LOG_EVERY_STEPS="${LOG_EVERY_STEPS:-50}"
 EVAL_EVERY_STEPS="${EVAL_EVERY_STEPS:-100}"
 LEARNING_RATE="${LEARNING_RATE:-5e-7}"
 STAGE1_LEARNING_RATE="${STAGE1_LEARNING_RATE:-1e-6}"
-STAGE2_LEARNING_RATE="${STAGE2_LEARNING_RATE:-5e-7}"
+STAGE2_LEARNING_RATE="${STAGE2_LEARNING_RATE:-4e-7}"
 WEIGHT_DECAY="${WEIGHT_DECAY:-0.01}"
 MAX_GRAD_NORM="${MAX_GRAD_NORM:-1.0}"
 MARGIN_MIN="${MARGIN_MIN:-0.32}"
@@ -73,20 +73,34 @@ MARGIN_MAX="${MARGIN_MAX:-1.0}"
 TEACHER_TEMPERATURE="${TEACHER_TEMPERATURE:-1.2}"
 
 LISTWISE_SCORE_MODE="${LISTWISE_SCORE_MODE:-raw}"  # raw | normalized
-LOSS_KL_WEIGHT="${LOSS_KL_WEIGHT:-0.50}"
-LOSS_PAIR_WEIGHT="${LOSS_PAIR_WEIGHT:-0.20}"
-LOSS_MSE_WEIGHT="${LOSS_MSE_WEIGHT:-0.15}"
-LOSS_CLUSTER_MARGIN_WEIGHT="${LOSS_CLUSTER_MARGIN_WEIGHT:-1.0}"
-LOSS_CALIBRATION_BAND_WEIGHT="${LOSS_CALIBRATION_BAND_WEIGHT:-0.30}"
+LOSS_KL_WEIGHT="${LOSS_KL_WEIGHT:-0.40}"
+LOSS_PAIR_WEIGHT="${LOSS_PAIR_WEIGHT:-0.12}"
+LOSS_MSE_WEIGHT="${LOSS_MSE_WEIGHT:-0.30}"
+LOSS_CLUSTER_MARGIN_WEIGHT="${LOSS_CLUSTER_MARGIN_WEIGHT:-0.90}"
+LOSS_CALIBRATION_BAND_WEIGHT="${LOSS_CALIBRATION_BAND_WEIGHT:-0.60}"
 STAGE2_CLUSTER_SOURCE="${STAGE2_CLUSTER_SOURCE:-teacher_raw}"  # teacher_raw | teacher_normalized | target_cluster
 STAGE2_CLUSTER_HIGH_THRESHOLD="${STAGE2_CLUSTER_HIGH_THRESHOLD:-0.70}"
 STAGE2_CLUSTER_MID_THRESHOLD="${STAGE2_CLUSTER_MID_THRESHOLD:-0.30}"
 CALIB_BAND_MODE="${CALIB_BAND_MODE:-fixed}"  # fixed | data_driven
 CALIB_ANCHOR_STAT="${CALIB_ANCHOR_STAT:-mean}"  # mean | median
-CALIB_HIGH_FLOOR="${CALIB_HIGH_FLOOR:-0.75}"
-CALIB_MID_CENTER="${CALIB_MID_CENTER:-0.42}"
-CALIB_MID_BANDWIDTH="${CALIB_MID_BANDWIDTH:-0.15}"
-CALIB_LOW_CEIL="${CALIB_LOW_CEIL:-0.12}"
+CALIB_HIGH_FLOOR="${CALIB_HIGH_FLOOR:-0.78}"
+CALIB_MID_CENTER="${CALIB_MID_CENTER:-0.40}"
+CALIB_MID_BANDWIDTH="${CALIB_MID_BANDWIDTH:-0.12}"
+CALIB_LOW_CEIL="${CALIB_LOW_CEIL:-0.10}"
+LOSS_CALIBRATION_HIGH_WEIGHT="${LOSS_CALIBRATION_HIGH_WEIGHT:-1.8}"
+LOSS_CALIBRATION_MID_WEIGHT="${LOSS_CALIBRATION_MID_WEIGHT:-1.5}"
+LOSS_CALIBRATION_LOW_WEIGHT="${LOSS_CALIBRATION_LOW_WEIGHT:-1.2}"
+STAGE2_OOB_SELECTION_SPLIT="${STAGE2_OOB_SELECTION_SPLIT:-val}"  # val | test
+STAGE2_OOB_HIGH_WEIGHT="${STAGE2_OOB_HIGH_WEIGHT:-3.0}"
+STAGE2_OOB_MID_WEIGHT="${STAGE2_OOB_MID_WEIGHT:-2.5}"
+STAGE2_OOB_LOW_WEIGHT="${STAGE2_OOB_LOW_WEIGHT:-1.2}"
+STAGE2_GATED_SELECTION="${STAGE2_GATED_SELECTION:-true}"  # true | false
+STAGE2_GATED_RANKING_METRIC="${STAGE2_GATED_RANKING_METRIC:-mrr@10}" # ndcg@10 | mrr@10 | recall@50
+STAGE2_GATED_NDCG_MIN="${STAGE2_GATED_NDCG_MIN:-0.95}"
+STAGE2_GATED_MRR_MIN="${STAGE2_GATED_MRR_MIN:-0.70}"
+STAGE2_GATED_RECALL_MIN="${STAGE2_GATED_RECALL_MIN:-0.70}"
+STAGE2_POSTHOC_CALIBRATION="${STAGE2_POSTHOC_CALIBRATION:-true}"  # true | false
+STAGE2_POSTHOC_CALIBRATION_FIT_SPLIT="${STAGE2_POSTHOC_CALIBRATION_FIT_SPLIT:-val}" # val | test
 
 USE_PREPARED_SPLITS="${USE_PREPARED_SPLITS:-true}"  # true | false
 REGENERATE_SPLITS="${REGENERATE_SPLITS:-false}"     # true | false
@@ -122,6 +136,7 @@ EVAL_SAVE="${EVAL_SAVE:-true}"    # true | false
 EVAL_PRINT="${EVAL_PRINT:-true}"  # true | false
 EVAL_OUTPUT_DIR="${EVAL_OUTPUT_DIR:-ce/eval/results}"
 EVAL_SAVE_PREFIX="${EVAL_SAVE_PREFIX:-ce_distill_margin_compare_stage2_only}"
+EVAL_MODEL_PICK="${EVAL_MODEL_PICK:-best_stage2_gated}"  # best_stage2_gated | best_stage2_ranking | best_val_oob | final_stage2 | auto
 
 log "Stage2-only train2 run"
 log "model_id=${MODEL_ID} stage1_epochs=${STAGE1_EPOCHS} stage2_epochs=${STAGE2_EPOCHS}"
@@ -176,6 +191,9 @@ CMD=(
   --loss-mse-weight "${LOSS_MSE_WEIGHT}"
   --loss-cluster-margin-weight "${LOSS_CLUSTER_MARGIN_WEIGHT}"
   --loss-calibration-band-weight "${LOSS_CALIBRATION_BAND_WEIGHT}"
+  --loss-calibration-high-weight "${LOSS_CALIBRATION_HIGH_WEIGHT}"
+  --loss-calibration-mid-weight "${LOSS_CALIBRATION_MID_WEIGHT}"
+  --loss-calibration-low-weight "${LOSS_CALIBRATION_LOW_WEIGHT}"
   --stage2-cluster-source "${STAGE2_CLUSTER_SOURCE}"
   --stage2-cluster-high-threshold "${STAGE2_CLUSTER_HIGH_THRESHOLD}"
   --stage2-cluster-mid-threshold "${STAGE2_CLUSTER_MID_THRESHOLD}"
@@ -185,6 +203,15 @@ CMD=(
   --calib-mid-center "${CALIB_MID_CENTER}"
   --calib-mid-bandwidth "${CALIB_MID_BANDWIDTH}"
   --calib-low-ceil "${CALIB_LOW_CEIL}"
+  --stage2-oob-selection-split "${STAGE2_OOB_SELECTION_SPLIT}"
+  --stage2-oob-high-weight "${STAGE2_OOB_HIGH_WEIGHT}"
+  --stage2-oob-mid-weight "${STAGE2_OOB_MID_WEIGHT}"
+  --stage2-oob-low-weight "${STAGE2_OOB_LOW_WEIGHT}"
+  --stage2-gated-ranking-metric "${STAGE2_GATED_RANKING_METRIC}"
+  --stage2-gated-ndcg-min "${STAGE2_GATED_NDCG_MIN}"
+  --stage2-gated-mrr-min "${STAGE2_GATED_MRR_MIN}"
+  --stage2-gated-recall-min "${STAGE2_GATED_RECALL_MIN}"
+  --stage2-posthoc-calibration-fit-split "${STAGE2_POSTHOC_CALIBRATION_FIT_SPLIT}"
   --wandb-project "${WANDB_PROJECT}"
   --wandb-entity "${WANDB_ENTITY}"
   --wandb-run-name "${WANDB_RUN_NAME}"
@@ -223,6 +250,16 @@ if bool_true "${STAGE2_EARLY_STOP}"; then
 else
   CMD+=(--no-stage2-early-stop)
 fi
+if bool_true "${STAGE2_GATED_SELECTION}"; then
+  CMD+=(--stage2-gated-selection)
+else
+  CMD+=(--no-stage2-gated-selection)
+fi
+if bool_true "${STAGE2_POSTHOC_CALIBRATION}"; then
+  CMD+=(--stage2-posthoc-calibration)
+else
+  CMD+=(--no-stage2-posthoc-calibration)
+fi
 if bool_true "${BF16}"; then
   CMD+=(--bf16)
 elif bool_true "${FP16}"; then
@@ -251,7 +288,32 @@ if bool_true "${EVAL_AFTER_TRAIN}"; then
     fi
   fi
 
-  EVAL_FINETUNED_MODEL="${TRAIN_RUN_DIR}/stage2_epoch_${STAGE2_EPOCHS}"
+  case "${EVAL_MODEL_PICK}" in
+    best_stage2_gated)
+      EVAL_FINETUNED_MODEL="${TRAIN_RUN_DIR}/best_stage2_gated"
+      ;;
+    best_stage2_ranking)
+      EVAL_FINETUNED_MODEL="${TRAIN_RUN_DIR}/best_stage2_ranking"
+      ;;
+    best_val_oob)
+      EVAL_FINETUNED_MODEL="${TRAIN_RUN_DIR}/best_val_oob"
+      ;;
+    final_stage2)
+      EVAL_FINETUNED_MODEL="${TRAIN_RUN_DIR}/stage2_epoch_${STAGE2_EPOCHS}"
+      ;;
+    auto|*)
+      EVAL_FINETUNED_MODEL="${TRAIN_RUN_DIR}/best_stage2_gated"
+      ;;
+  esac
+  if [[ ! -d "${EVAL_FINETUNED_MODEL}" ]]; then
+    EVAL_FINETUNED_MODEL="${TRAIN_RUN_DIR}/best_stage2_ranking"
+  fi
+  if [[ ! -d "${EVAL_FINETUNED_MODEL}" ]]; then
+    EVAL_FINETUNED_MODEL="${TRAIN_RUN_DIR}/best_val_oob"
+  fi
+  if [[ ! -d "${EVAL_FINETUNED_MODEL}" ]]; then
+    EVAL_FINETUNED_MODEL="${TRAIN_RUN_DIR}/stage2_epoch_${STAGE2_EPOCHS}"
+  fi
   if [[ ! -d "${EVAL_FINETUNED_MODEL}" ]]; then
     EVAL_FINETUNED_MODEL="$(ls -d "${TRAIN_RUN_DIR}"/stage2_epoch_* 2>/dev/null | sort -V | tail -n 1 || true)"
   fi
