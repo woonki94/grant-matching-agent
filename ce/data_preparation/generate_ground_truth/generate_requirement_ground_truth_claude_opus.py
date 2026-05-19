@@ -3,7 +3,6 @@ from __future__ import annotations
 import argparse
 import json
 import sys
-from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
@@ -35,12 +34,12 @@ DOMAIN_TEST_INPUT_DEFAULT = "ce/dataset/splits/llm_distill_domain_listwise_test.
 METHOD_TEST_INPUT_DEFAULT = "ce/dataset/splits/llm_distill_method_listwise_test.jsonl"
 OUTPUT_DEFAULT = "ce/dataset/distill/llm_ground_truth_requirement_common_test_listwise.jsonl"
 
-LLM_BATCH_SIZE_DEFAULT = 12
-LLM_MAX_RETRIES_DEFAULT = 2
+LLM_BATCH_SIZE_DEFAULT = 64
+LLM_MAX_RETRIES_DEFAULT = 0
 HIGH_THRESHOLD_DEFAULT = 0.70
 MID_THRESHOLD_DEFAULT = 0.30
-MAX_QUERY_CHARS = 900
-MAX_DOC_CHARS = 700
+MAX_QUERY_CHARS = 20_000
+MAX_DOC_CHARS = 20_000
 
 
 # ==========================================================
@@ -73,11 +72,11 @@ Scoring guide:
 - low (< 0.30): weak or no meaningful coverage
 
 Output MUST be exactly one JSON object with this schema:
-{
+{{
   "items": [
-    {"q": <int>, "score": <float 0..1>}
+    {{"q": <int>, "score": <float 0..1>}}
   ]
-}
+}}
 
 Rules:
 - Include exactly one item for each input q.
@@ -378,8 +377,8 @@ def main() -> int:
         mid_threshold = high_threshold
 
     model_id = _select_model_id(_clean_text(args.model_id))
-    batch_size = _safe_int(args.batch_size, default=LLM_BATCH_SIZE_DEFAULT, minimum=1, maximum=128)
-    max_retries = _safe_int(args.max_retries, default=LLM_MAX_RETRIES_DEFAULT, minimum=1, maximum=8)
+    batch_size = _safe_int(args.batch_size, default=LLM_BATCH_SIZE_DEFAULT, minimum=1, maximum=1024)
+    max_retries = _safe_int(args.max_retries, default=LLM_MAX_RETRIES_DEFAULT, minimum=0, maximum=8)
     max_pairs = _safe_int(args.max_pairs, default=0, minimum=0, maximum=50_000_000)
 
     print(f"domain_test_input={domain_path}")
@@ -429,47 +428,13 @@ def main() -> int:
         mid_threshold=mid_threshold,
     )
 
-    grouped: Dict[Tuple[str, int], Dict[str, Any]] = {}
-    by_query_docs: Dict[Tuple[str, int], List[Dict[str, Any]]] = defaultdict(list)
-    for row in scored_rows:
-        qk = (_clean_text(row.get("grant_id")), _safe_int(row.get("spec_idx"), default=0, minimum=0, maximum=50_000_000))
-        by_query_docs[qk].append(row)
-        if qk not in grouped:
-            grouped[qk] = {
-                "grant_id": qk[0],
-                "spec_idx": int(qk[1]),
-                "query_text": _normalize_ws(row.get("query_text")),
-            }
-
     rows_out: List[Dict[str, Any]] = []
-    for qk in sorted(grouped.keys(), key=lambda x: (x[0], int(x[1]))):
-        base = grouped[qk]
-        docs_sorted = sorted(
-            by_query_docs[qk],
-            key=lambda x: float(x.get("teacher_score_raw", 0.0)),
-            reverse=True,
-        )
-        docs: List[Dict[str, Any]] = []
-        for rank_idx, doc in enumerate(docs_sorted, start=1):
-            docs.append(
-                {
-                    "rank": int(rank_idx),
-                    "teacher_score": float(doc.get("teacher_score", 0.0)),
-                    "teacher_score_raw": float(doc.get("teacher_score_raw", 0.0)),
-                    "target_cluster": _clean_text(doc.get("target_cluster")) or "low",
-                    "fac_id": int(doc.get("fac_id") or 0),
-                    "fac_spec_id": int(doc.get("fac_spec_id") or 0),
-                    "fac_spec_idx": int(doc.get("fac_spec_idx") or 0),
-                }
-            )
-
+    for row in scored_rows:
         rows_out.append(
             {
-                "grant_id": base["grant_id"],
-                "spec_idx": int(base["spec_idx"]),
-                "source": "common_test_pairs_domain_method",
-                "score_model_id": model_id,
-                "docs": docs,
+                "query": _normalize_ws(row.get("query_text")),
+                "doc": _clean_text(row.get("text")),
+                "score": float(row.get("teacher_score_raw", row.get("teacher_score", 0.0))),
             }
         )
 
@@ -477,14 +442,14 @@ def main() -> int:
         for row in rows_out:
             f.write(json.dumps(row, ensure_ascii=False) + "\n")
 
-    total_docs = int(sum(len(list(r.get("docs") or [])) for r in rows_out))
+    total_docs = int(len(rows_out))
     elapsed_meta = {
         "created_at_utc": datetime.now(timezone.utc).isoformat(),
         "domain_test_input": str(domain_path),
         "method_test_input": str(method_path),
         "output": str(output_path),
         "model_id": model_id,
-        "queries": int(len(rows_out)),
+        "queries": int(len({_normalize_ws(r.get("query")) for r in rows_out})),
         "common_pairs": int(len(common_rows)),
         "docs_written": int(total_docs),
         "high_threshold": float(high_threshold),

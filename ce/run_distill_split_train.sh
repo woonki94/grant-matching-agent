@@ -33,6 +33,20 @@ MAX_SPECS="${MAX_SPECS:-0}"   # 0 = all
 
 DOMAIN_ASPECT="${DOMAIN_ASPECT:-domain}"
 METHOD_ASPECT="${METHOD_ASPECT:-method}"
+DOMAIN_TARGET_HIGH="${DOMAIN_TARGET_HIGH:-${TARGET_HIGH}}"
+DOMAIN_TARGET_MID="${DOMAIN_TARGET_MID:-${TARGET_MID}}"
+DOMAIN_TARGET_LOW="${DOMAIN_TARGET_LOW:-${TARGET_LOW}}"
+METHOD_TARGET_HIGH="${METHOD_TARGET_HIGH:-${TARGET_HIGH}}"
+METHOD_TARGET_MID="${METHOD_TARGET_MID:-${TARGET_MID}}"
+METHOD_TARGET_LOW="${METHOD_TARGET_LOW:-${TARGET_LOW}}"
+DOMAIN_PREFILTER_MULTIPLIER="${DOMAIN_PREFILTER_MULTIPLIER:-${PREFILTER_MULTIPLIER}}"
+DOMAIN_PREFILTER_MULTIPLIER_HIGH="${DOMAIN_PREFILTER_MULTIPLIER_HIGH:-${PREFILTER_MULTIPLIER_HIGH}}"
+DOMAIN_PREFILTER_MULTIPLIER_MID="${DOMAIN_PREFILTER_MULTIPLIER_MID:-${PREFILTER_MULTIPLIER_MID}}"
+DOMAIN_PREFILTER_MULTIPLIER_LOW="${DOMAIN_PREFILTER_MULTIPLIER_LOW:-${PREFILTER_MULTIPLIER_LOW}}"
+METHOD_PREFILTER_MULTIPLIER="${METHOD_PREFILTER_MULTIPLIER:-${PREFILTER_MULTIPLIER}}"
+METHOD_PREFILTER_MULTIPLIER_HIGH="${METHOD_PREFILTER_MULTIPLIER_HIGH:-${PREFILTER_MULTIPLIER_HIGH}}"
+METHOD_PREFILTER_MULTIPLIER_MID="${METHOD_PREFILTER_MULTIPLIER_MID:-${PREFILTER_MULTIPLIER_MID}}"
+METHOD_PREFILTER_MULTIPLIER_LOW="${METHOD_PREFILTER_MULTIPLIER_LOW:-${PREFILTER_MULTIPLIER_LOW}}"
 
 # Distill outputs (inputs for split/train2)
 RAW_INPUT="${RAW_INPUT:-ce/dataset/distill/llm_distill_domain_listwise.jsonl}"
@@ -102,6 +116,10 @@ LOSS_PAIR_WEIGHT="${LOSS_PAIR_WEIGHT:-0.20}"
 LOSS_MSE_WEIGHT="${LOSS_MSE_WEIGHT:-0.15}"
 LOSS_CLUSTER_MARGIN_WEIGHT="${LOSS_CLUSTER_MARGIN_WEIGHT:-1.0}"
 LOSS_CALIBRATION_BAND_WEIGHT="${LOSS_CALIBRATION_BAND_WEIGHT:-0.30}"
+DOMAIN_PAIR_LOSS_SCALE="${DOMAIN_PAIR_LOSS_SCALE:-1.0}"
+METHOD_PAIR_LOSS_SCALE="${METHOD_PAIR_LOSS_SCALE:-1.0}"
+DOMAIN_LIST_LOSS_SCALE="${DOMAIN_LIST_LOSS_SCALE:-1.0}"
+METHOD_LIST_LOSS_SCALE="${METHOD_LIST_LOSS_SCALE:-1.0}"
 STAGE2_CLUSTER_SOURCE="${STAGE2_CLUSTER_SOURCE:-teacher_raw}"  # teacher_raw | teacher_normalized | target_cluster
 STAGE2_CLUSTER_HIGH_THRESHOLD="${STAGE2_CLUSTER_HIGH_THRESHOLD:-0.70}"
 STAGE2_CLUSTER_MID_THRESHOLD="${STAGE2_CLUSTER_MID_THRESHOLD:-0.30}"
@@ -149,30 +167,30 @@ EVAL_PRINT="${EVAL_PRINT:-true}"  # true | false
 EVAL_OUTPUT_DIR="${EVAL_OUTPUT_DIR:-ce/eval/results}"
 EVAL_SAVE_PREFIX="${EVAL_SAVE_PREFIX:-ce_distill_margin_compare}"
 
-log "Stage 1/4: Distill+augment (${DOMAIN_ASPECT}) with target ${TARGET_HIGH}/${TARGET_MID}/${TARGET_LOW}"
+log "Stage 1/4: Distill+augment (${DOMAIN_ASPECT}) with target ${DOMAIN_TARGET_HIGH}/${DOMAIN_TARGET_MID}/${DOMAIN_TARGET_LOW}"
 "${PYTHON_BIN}" ce/data_preparation/llm_distillation/llm_distillation.py \
   --run-mode full \
   --judge-aspect "${DOMAIN_ASPECT}" \
-  --target-high "${TARGET_HIGH}" \
-  --target-mid "${TARGET_MID}" \
-  --target-low "${TARGET_LOW}" \
-  --prefilter-multiplier "${PREFILTER_MULTIPLIER}" \
-  --prefilter-multiplier-high "${PREFILTER_MULTIPLIER_HIGH}" \
-  --prefilter-multiplier-mid "${PREFILTER_MULTIPLIER_MID}" \
-  --prefilter-multiplier-low "${PREFILTER_MULTIPLIER_LOW}" \
+  --target-high "${DOMAIN_TARGET_HIGH}" \
+  --target-mid "${DOMAIN_TARGET_MID}" \
+  --target-low "${DOMAIN_TARGET_LOW}" \
+  --prefilter-multiplier "${DOMAIN_PREFILTER_MULTIPLIER}" \
+  --prefilter-multiplier-high "${DOMAIN_PREFILTER_MULTIPLIER_HIGH}" \
+  --prefilter-multiplier-mid "${DOMAIN_PREFILTER_MULTIPLIER_MID}" \
+  --prefilter-multiplier-low "${DOMAIN_PREFILTER_MULTIPLIER_LOW}" \
   --max-specs "${MAX_SPECS}"
 
-log "Stage 1/4: Distill+augment (${METHOD_ASPECT}) with target ${TARGET_HIGH}/${TARGET_MID}/${TARGET_LOW}"
+log "Stage 1/4: Distill+augment (${METHOD_ASPECT}) with target ${METHOD_TARGET_HIGH}/${METHOD_TARGET_MID}/${METHOD_TARGET_LOW}"
 "${PYTHON_BIN}" ce/data_preparation/llm_distillation/llm_distillation.py \
   --run-mode full \
   --judge-aspect "${METHOD_ASPECT}" \
-  --target-high "${TARGET_HIGH}" \
-  --target-mid "${TARGET_MID}" \
-  --target-low "${TARGET_LOW}" \
-  --prefilter-multiplier "${PREFILTER_MULTIPLIER}" \
-  --prefilter-multiplier-high "${PREFILTER_MULTIPLIER_HIGH}" \
-  --prefilter-multiplier-mid "${PREFILTER_MULTIPLIER_MID}" \
-  --prefilter-multiplier-low "${PREFILTER_MULTIPLIER_LOW}" \
+  --target-high "${METHOD_TARGET_HIGH}" \
+  --target-mid "${METHOD_TARGET_MID}" \
+  --target-low "${METHOD_TARGET_LOW}" \
+  --prefilter-multiplier "${METHOD_PREFILTER_MULTIPLIER}" \
+  --prefilter-multiplier-high "${METHOD_PREFILTER_MULTIPLIER_HIGH}" \
+  --prefilter-multiplier-mid "${METHOD_PREFILTER_MULTIPLIER_MID}" \
+  --prefilter-multiplier-low "${METHOD_PREFILTER_MULTIPLIER_LOW}" \
   --max-specs "${MAX_SPECS}"
 
 log "Stage 2/4: Shared query split for domain+method listwise+pairwise"
@@ -241,6 +259,10 @@ CMD=(
   --loss-mse-weight "${LOSS_MSE_WEIGHT}"
   --loss-cluster-margin-weight "${LOSS_CLUSTER_MARGIN_WEIGHT}"
   --loss-calibration-band-weight "${LOSS_CALIBRATION_BAND_WEIGHT}"
+  --domain-pair-loss-scale "${DOMAIN_PAIR_LOSS_SCALE}"
+  --method-pair-loss-scale "${METHOD_PAIR_LOSS_SCALE}"
+  --domain-list-loss-scale "${DOMAIN_LIST_LOSS_SCALE}"
+  --method-list-loss-scale "${METHOD_LIST_LOSS_SCALE}"
   --stage2-cluster-source "${STAGE2_CLUSTER_SOURCE}"
   --stage2-cluster-high-threshold "${STAGE2_CLUSTER_HIGH_THRESHOLD}"
   --stage2-cluster-mid-threshold "${STAGE2_CLUSTER_MID_THRESHOLD}"

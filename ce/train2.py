@@ -155,6 +155,8 @@ class PairCollator:
         *,
         pair_type_weights: Dict[str, float],
         default_pair_weight: float,
+        domain_pair_loss_scale: float,
+        method_pair_loss_scale: float,
     ) -> None:
         self.tokenizer = tokenizer
         self.max_length = int(max_length)
@@ -162,6 +164,8 @@ class PairCollator:
             _clean_text(k).lower(): float(v) for k, v in dict(pair_type_weights or {}).items() if _clean_text(k)
         }
         self.default_pair_weight = max(0.0, float(default_pair_weight))
+        self.domain_pair_loss_scale = max(0.0, float(domain_pair_loss_scale))
+        self.method_pair_loss_scale = max(0.0, float(method_pair_loss_scale))
 
     def __call__(self, batch: Sequence[PairExample]) -> Dict[str, Any]:
         queries = [x.query_text for x in batch]
@@ -191,18 +195,23 @@ class PairCollator:
         )
         pos_teacher = torch.tensor([float(x.teacher_pos_score) for x in batch], dtype=torch.float32)
         neg_teacher = torch.tensor([float(x.teacher_neg_score) for x in batch], dtype=torch.float32)
-        pair_weights = torch.tensor(
-            [
-                float(
-                    self.pair_type_weights.get(
-                        _clean_text(x.pair_type).lower(),
-                        self.default_pair_weight,
-                    )
+        pair_weights_list: List[float] = []
+        for x in batch:
+            base_weight = float(
+                self.pair_type_weights.get(
+                    _clean_text(x.pair_type).lower(),
+                    self.default_pair_weight,
                 )
-                for x in batch
-            ],
-            dtype=torch.float32,
-        ).clamp(min=0.0)
+            )
+            aspect = _aspect_from_prefixed_query(x.query_text)
+            if aspect == "domain":
+                aspect_scale = float(self.domain_pair_loss_scale)
+            elif aspect == "method":
+                aspect_scale = float(self.method_pair_loss_scale)
+            else:
+                aspect_scale = 1.0
+            pair_weights_list.append(max(0.0, float(base_weight * aspect_scale)))
+        pair_weights = torch.tensor(pair_weights_list, dtype=torch.float32).clamp(min=0.0)
 
         return {
             "pos": pos_enc,
@@ -225,6 +234,8 @@ class ListCollator:
         stage2_cluster_source: str,
         stage2_cluster_high_threshold: float,
         stage2_cluster_mid_threshold: float,
+        domain_list_loss_scale: float,
+        method_list_loss_scale: float,
     ) -> None:
         self.tokenizer = tokenizer
         self.max_length = int(max_length)
@@ -248,6 +259,18 @@ class ListCollator:
             minimum=0.0,
             maximum=1.0,
         )
+        self.domain_list_loss_scale = _safe_float(
+            domain_list_loss_scale,
+            default=1.0,
+            minimum=0.0,
+            maximum=100.0,
+        )
+        self.method_list_loss_scale = _safe_float(
+            method_list_loss_scale,
+            default=1.0,
+            minimum=0.0,
+            maximum=100.0,
+        )
         if self.stage2_cluster_mid_threshold > self.stage2_cluster_high_threshold:
             self.stage2_cluster_mid_threshold = self.stage2_cluster_high_threshold
 
@@ -265,6 +288,13 @@ class ListCollator:
             docs = list(item.get("docs") or [])
             if not query or not docs:
                 continue
+            aspect = _aspect_from_prefixed_query(query)
+            if aspect == "domain":
+                aspect_scale = float(self.domain_list_loss_scale)
+            elif aspect == "method":
+                aspect_scale = float(self.method_list_loss_scale)
+            else:
+                aspect_scale = 1.0
             list_sizes.append(len(docs))
             for d in docs:
                 queries_flat.append(query)
@@ -277,7 +307,8 @@ class ListCollator:
                     teacher_scores.append(teacher_norm)
                 teacher_scores_raw.append(teacher_raw)
                 is_augmented = bool(d.get("is_augmented", False))
-                doc_weights.append(float(self.augmented_doc_weight) if is_augmented else 1.0)
+                base_doc_weight = float(self.augmented_doc_weight) if is_augmented else 1.0
+                doc_weights.append(max(0.0, float(base_doc_weight * aspect_scale)))
                 target_cluster_id = int(_cluster_id_from_text(d.get("target_cluster")))
                 cluster_id = -1
                 if self.stage2_cluster_source == "teacher_raw":
@@ -375,6 +406,15 @@ def _clean_stage2_posthoc_calibration_fit_split(value: Any) -> str:
     if split in {"val", "test"}:
         return split
     return STAGE2_POSTHOC_CALIBRATION_FIT_SPLIT_DEFAULT
+
+
+def _aspect_from_prefixed_query(query_text: Any) -> str:
+    q = _clean_text(query_text).lstrip().upper()
+    if q.startswith("[DOMAIN]"):
+        return "domain"
+    if q.startswith("[METHOD]"):
+        return "method"
+    return "unknown"
 
 
 def _cluster_id_from_text(value: Any) -> int:
@@ -605,6 +645,10 @@ def _build_output_suffix(
     loss_mse_weight: float,
     loss_cluster_margin_weight: float,
     loss_calibration_band_weight: float,
+    domain_pair_loss_scale: float,
+    method_pair_loss_scale: float,
+    domain_list_loss_scale: float,
+    method_list_loss_scale: float,
 ) -> str:
     parts = [
         f"sd{int(seed)}",
@@ -623,6 +667,10 @@ def _build_output_suffix(
         f"mse{_float_token(float(loss_mse_weight))}",
         f"cm{_float_token(float(loss_cluster_margin_weight))}",
         f"cb{_float_token(float(loss_calibration_band_weight))}",
+        f"dpw{_float_token(float(domain_pair_loss_scale))}",
+        f"mpw{_float_token(float(method_pair_loss_scale))}",
+        f"dlw{_float_token(float(domain_list_loss_scale))}",
+        f"mlw{_float_token(float(method_list_loss_scale))}",
     ]
     return "_".join(parts)
 
@@ -3999,6 +4047,30 @@ def _build_parser() -> argparse.ArgumentParser:
         default=LIST_AUGMENTED_DOC_WEIGHT_DEFAULT,
         help="Listwise loss per-doc weight for synthetic/augmented docs (real docs use 1.0).",
     )
+    p.add_argument(
+        "--domain-pair-loss-scale",
+        type=float,
+        default=1.0,
+        help="Per-example multiplier for DOMAIN pairwise loss (applies in Stage1/Stage2 pairwise terms).",
+    )
+    p.add_argument(
+        "--method-pair-loss-scale",
+        type=float,
+        default=1.0,
+        help="Per-example multiplier for METHOD pairwise loss (applies in Stage1/Stage2 pairwise terms).",
+    )
+    p.add_argument(
+        "--domain-list-loss-scale",
+        type=float,
+        default=1.0,
+        help="Per-doc multiplier for DOMAIN listwise losses (KL/MSE/cluster/calibration through doc weights).",
+    )
+    p.add_argument(
+        "--method-list-loss-scale",
+        type=float,
+        default=1.0,
+        help="Per-doc multiplier for METHOD listwise losses (KL/MSE/cluster/calibration through doc weights).",
+    )
 
     p.add_argument("--mrr-rel-threshold", type=float, default=0.7)
     p.add_argument("--recall-rel-threshold", type=float, default=0.7)
@@ -4319,6 +4391,30 @@ def main() -> int:
         minimum=0.0,
         maximum=1.0,
     )
+    domain_pair_loss_scale = _safe_float(
+        args.domain_pair_loss_scale,
+        default=1.0,
+        minimum=0.0,
+        maximum=100.0,
+    )
+    method_pair_loss_scale = _safe_float(
+        args.method_pair_loss_scale,
+        default=1.0,
+        minimum=0.0,
+        maximum=100.0,
+    )
+    domain_list_loss_scale = _safe_float(
+        args.domain_list_loss_scale,
+        default=1.0,
+        minimum=0.0,
+        maximum=100.0,
+    )
+    method_list_loss_scale = _safe_float(
+        args.method_list_loss_scale,
+        default=1.0,
+        minimum=0.0,
+        maximum=100.0,
+    )
     pair_mid_pos_score_min = _safe_float(args.pair_mid_pos_score_min, default=0.4, minimum=0.0, maximum=1.0)
     pair_mid_pos_score_max = _safe_float(args.pair_mid_pos_score_max, default=0.7, minimum=0.0, maximum=1.0)
     pair_mid_neg_score_min = _safe_float(args.pair_mid_neg_score_min, default=0.2, minimum=0.0, maximum=1.0)
@@ -4400,6 +4496,10 @@ def main() -> int:
             loss_mse_weight=loss_mse_weight,
             loss_cluster_margin_weight=loss_cluster_margin_weight,
             loss_calibration_band_weight=loss_calibration_band_weight,
+            domain_pair_loss_scale=domain_pair_loss_scale,
+            method_pair_loss_scale=method_pair_loss_scale,
+            domain_list_loss_scale=domain_list_loss_scale,
+            method_list_loss_scale=method_list_loss_scale,
         )
         output_dir = (output_dir_base.parent / f"{output_dir_base.name}__{output_suffix}").resolve()
     else:
@@ -4565,6 +4665,11 @@ def main() -> int:
         f"map:{json.dumps(pair_type_weights, ensure_ascii=False)}"
     )
     print(f"list_augmented_doc_weight={list_augmented_doc_weight:.4f}")
+    print(
+        "aspect_loss_scales="
+        f"pair(domain/method):{domain_pair_loss_scale:.3f}/{method_pair_loss_scale:.3f},"
+        f"list(domain/method):{domain_list_loss_scale:.3f}/{method_list_loss_scale:.3f}"
+    )
     print(f"listwise_score_mode={listwise_score_mode}")
     print(
         "stage2_extra_losses="
@@ -4982,6 +5087,10 @@ def main() -> int:
             "dataset/pair_type_cap_applied": int(1 if bool((pair_type_cap_stats or {}).get("applied")) else 0),
             "dataset/pair_type_cap_dropped": int((pair_type_cap_stats or {}).get("dropped", 0)),
             "dataset/list_augmented_doc_weight": float(list_augmented_doc_weight),
+            "dataset/domain_pair_loss_scale": float(domain_pair_loss_scale),
+            "dataset/method_pair_loss_scale": float(method_pair_loss_scale),
+            "dataset/domain_list_loss_scale": float(domain_list_loss_scale),
+            "dataset/method_list_loss_scale": float(method_list_loss_scale),
             "dataset/train_low_cap_applied": int(1 if bool(train_low_cap_stats.get("applied")) else 0),
             "dataset/train_low_cap_ratio": float(train_low_cap_stats.get("ratio", 0.0)),
             "dataset/train_low_cap_target": int(train_low_cap_stats.get("low_cap_target", -1)),
@@ -5034,6 +5143,8 @@ def main() -> int:
         max_length=max_length,
         pair_type_weights=pair_type_weights,
         default_pair_weight=float(pair_default_weight),
+        domain_pair_loss_scale=float(domain_pair_loss_scale),
+        method_pair_loss_scale=float(method_pair_loss_scale),
     )
     list_collator = ListCollator(
         tokenizer,
@@ -5043,6 +5154,8 @@ def main() -> int:
         stage2_cluster_source=str(stage2_cluster_source),
         stage2_cluster_high_threshold=float(stage2_cluster_high_threshold),
         stage2_cluster_mid_threshold=float(stage2_cluster_mid_threshold),
+        domain_list_loss_scale=float(domain_list_loss_scale),
+        method_list_loss_scale=float(method_list_loss_scale),
     )
 
     pair_train_loader = DataLoader(
@@ -6563,6 +6676,16 @@ def main() -> int:
         "pair_type_weights": dict(pair_type_weights),
         "pair_type_cap_stats": pair_type_cap_stats,
         "list_augmented_doc_weight": float(list_augmented_doc_weight),
+        "aspect_loss_scales": {
+            "pair": {
+                "domain": float(domain_pair_loss_scale),
+                "method": float(method_pair_loss_scale),
+            },
+            "list": {
+                "domain": float(domain_list_loss_scale),
+                "method": float(method_list_loss_scale),
+            },
+        },
         "listwise_score_mode": str(listwise_score_mode),
         "stage2_cluster_source": str(stage2_cluster_source),
         "stage2_cluster_high_threshold": float(stage2_cluster_high_threshold),
