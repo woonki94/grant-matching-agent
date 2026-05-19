@@ -23,7 +23,7 @@ def _find_project_root() -> Path:
 PROJECT_ROOT = _find_project_root()
 
 FINETUNED_MODEL_ROOT_DEFAULT = "ce/models/mse_domain_method"
-FINETUNED_MODEL_DEFAULT = "ce/models/mse_domain_method/best"
+FINETUNED_MODEL_DEFAULT = "/nfs/stak/users/kimwoon/hpc-share/grant-matching-agent/ce/models/bge_reranker_distill__sd42_s15_s25_bs2_ga16_cp48_ml12_lr5em07_lr11p1em06_lr24p5em07_t1p2_kl0p5_pw0p24_mse0p22_cm0p85_cb0p65_dpw1_mpw1p2_dlw1_mlw0p9/stage2_epoch_5"
 BASE_MODEL_DEFAULT = "dleemiller/ModernCE-base-sts"
 DOMAIN_INPUT_DEFAULT = "ce/dataset/splits/llm_distill_domain_listwise_test.jsonl"
 METHOD_INPUT_DEFAULT = "ce/dataset/splits/llm_distill_method_listwise_test.jsonl"
@@ -686,7 +686,7 @@ def _compute_metric_bundle(
 def _build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Evaluate CE finetuned vs plain STS base on domain+method listwise files.")
     p.add_argument("--finetuned-model", type=str, default=FINETUNED_MODEL_DEFAULT)
-    p.add_argument("--auto-resolve-finetuned", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--auto-resolve-finetuned", action=argparse.BooleanOptionalAction, default=False)
     p.add_argument("--base-model", type=str, default=BASE_MODEL_DEFAULT)
     p.add_argument("--domain-input", type=str, default=DOMAIN_INPUT_DEFAULT)
     p.add_argument("--method-input", type=str, default=METHOD_INPUT_DEFAULT)
