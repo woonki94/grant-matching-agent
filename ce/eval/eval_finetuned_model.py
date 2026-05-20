@@ -6,7 +6,7 @@ import math
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import torch
 from transformers import AutoModelForSequenceClassification, AutoTokenizer
@@ -98,6 +98,72 @@ def _resolve_default_finetuned_model_ref() -> str:
         existing.sort(key=lambda x: x.stat().st_mtime, reverse=True)
         return str(existing[0])
     return _resolve_model_ref(FINETUNED_MODEL_DEFAULT)
+
+
+def _load_json_file(path: Path) -> Optional[Dict[str, Any]]:
+    if not path.exists() or not path.is_file():
+        return None
+    try:
+        obj = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    return obj if isinstance(obj, dict) else None
+
+
+def _resolve_score_calibration_json(*, model_ref: str, explicit_path: str) -> Tuple[Optional[Path], Optional[Dict[str, Any]]]:
+    raw_explicit = _clean_text(explicit_path)
+    if raw_explicit:
+        p = _resolve_path(raw_explicit)
+        return p, _load_json_file(p)
+
+    p_model = Path(_clean_text(model_ref)).expanduser()
+    if not p_model.is_absolute():
+        p_model = _resolve_path(str(p_model))
+    if p_model.is_dir():
+        p = p_model / "posthoc_calibration_affine.json"
+        return p, _load_json_file(p)
+    return None, None
+
+
+def _sigmoid(x: float) -> float:
+    if x >= 0.0:
+        z = math.exp(-x)
+        return float(1.0 / (1.0 + z))
+    z = math.exp(x)
+    return float(z / (1.0 + z))
+
+
+def _score_to_logit(score: float) -> float:
+    p = min(1.0 - 1e-6, max(1e-6, float(score)))
+    return float(math.log(p / (1.0 - p)))
+
+
+def _calibration_params_for_aspect(payload: Optional[Dict[str, Any]], aspect: str) -> Tuple[float, float]:
+    if not isinstance(payload, dict):
+        return 1.0, 0.0
+    aspect_key = _clean_text(aspect).lower()
+    aspects = payload.get("aspects")
+    if isinstance(aspects, dict):
+        obj = aspects.get(aspect_key)
+        if isinstance(obj, dict):
+            return _safe_float(obj.get("scale"), default=1.0, minimum=1e-6, maximum=100.0), _safe_float(
+                obj.get("bias"), default=0.0, minimum=-100.0, maximum=100.0
+            )
+    global_obj = payload.get("global")
+    if isinstance(global_obj, dict):
+        return _safe_float(global_obj.get("scale"), default=1.0, minimum=1e-6, maximum=100.0), _safe_float(
+            global_obj.get("bias"), default=0.0, minimum=-100.0, maximum=100.0
+        )
+    return _safe_float(payload.get("scale"), default=1.0, minimum=1e-6, maximum=100.0), _safe_float(
+        payload.get("bias"), default=0.0, minimum=-100.0, maximum=100.0
+    )
+
+
+def _apply_score_calibration(score: float, *, aspect: str, payload: Optional[Dict[str, Any]]) -> float:
+    if not isinstance(payload, dict):
+        return float(score)
+    scale, bias = _calibration_params_for_aspect(payload, aspect)
+    return float(_sigmoid(float(scale) * _score_to_logit(float(score)) + float(bias)))
 
 
 def _pick_device() -> torch.device:
@@ -468,11 +534,15 @@ def _compute_raw_score_sanity(
     high_vals = by_band["high"]
 
     low_out_count = int(sum(1 for x in low_vals if x >= low_upper))
-    mid_out_count = int(sum(1 for x in mid_vals if (x < mid_lower or x >= mid_upper)))
+    mid_low_out_count = int(sum(1 for x in mid_vals if x < mid_lower))
+    mid_high_out_count = int(sum(1 for x in mid_vals if x >= mid_upper))
+    mid_out_count = int(mid_low_out_count + mid_high_out_count)
     high_out_count = int(sum(1 for x in high_vals if x < high_lower))
 
     low_out_rate = float(low_out_count / float(max(1, len(low_vals))))
     mid_out_rate = float(mid_out_count / float(max(1, len(mid_vals))))
+    mid_low_out_rate = float(mid_low_out_count / float(max(1, len(mid_vals))))
+    mid_high_out_rate = float(mid_high_out_count / float(max(1, len(mid_vals))))
     high_out_rate = float(high_out_count / float(max(1, len(high_vals))))
     weak_leak = float(sum(1 for x in low_vals if x >= float(high_threshold)) / float(max(1, len(low_vals))))
     strong_collapse = float(sum(1 for x in high_vals if x < float(mid_threshold)) / float(max(1, len(high_vals))))
@@ -484,9 +554,13 @@ def _compute_raw_score_sanity(
         "monotonic_high_mid_low": bool(monotonic),
         "low_out_count": int(low_out_count),
         "mid_out_count": int(mid_out_count),
+        "mid_low_out_count": int(mid_low_out_count),
+        "mid_high_out_count": int(mid_high_out_count),
         "high_out_count": int(high_out_count),
         "low_out_rate": float(low_out_rate),
         "mid_out_rate": float(mid_out_rate),
+        "mid_low_out_rate": float(mid_low_out_rate),
+        "mid_high_out_rate": float(mid_high_out_rate),
         "high_out_rate": float(high_out_rate),
         "weak_leak_rate": float(weak_leak),
         "strong_collapse_rate": float(strong_collapse),
@@ -597,8 +671,8 @@ def _format_out_of_band_table(
     lines.append(
         f"thresholds: high>={float(high_threshold):.2f}, mid>={float(mid_threshold):.2f}, oob_margin={margin:.2f}"
     )
-    lines.append(f"{'MODEL':<12} {'LOW_OUT':>21} {'MID_OUT':>21} {'HIGH_OUT':>21}")
-    lines.append("-" * 78)
+    lines.append(f"{'MODEL':<12} {'LOW_OUT':>21} {'MID_OUT':>21} {'MID_LOW':>21} {'MID_HIGH':>21} {'HIGH_OUT':>21}")
+    lines.append("-" * 122)
 
     def _cell(obj: Dict[str, Any], *, out_key: str, count_key: str, rate_key: str) -> str:
         out_n = int(obj.get(out_key) or 0)
@@ -609,8 +683,10 @@ def _format_out_of_band_table(
     def _row(label: str, obj: Dict[str, Any]) -> str:
         low_cell = _cell(obj, out_key="low_out_count", count_key="count_low", rate_key="low_out_rate")
         mid_cell = _cell(obj, out_key="mid_out_count", count_key="count_mid", rate_key="mid_out_rate")
+        mid_low_cell = _cell(obj, out_key="mid_low_out_count", count_key="count_mid", rate_key="mid_low_out_rate")
+        mid_high_cell = _cell(obj, out_key="mid_high_out_count", count_key="count_mid", rate_key="mid_high_out_rate")
         high_cell = _cell(obj, out_key="high_out_count", count_key="count_high", rate_key="high_out_rate")
-        return f"{label:<12} {low_cell:>21} {mid_cell:>21} {high_cell:>21}"
+        return f"{label:<12} {low_cell:>21} {mid_cell:>21} {mid_low_cell:>21} {mid_high_cell:>21} {high_cell:>21}"
 
     lines.append(_row("ground_truth", ground_truth))
     lines.append(_row("finetuned", finetuned))
@@ -687,6 +763,8 @@ def _build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Evaluate CE finetuned vs plain STS base on domain+method listwise files.")
     p.add_argument("--finetuned-model", type=str, default=FINETUNED_MODEL_DEFAULT)
     p.add_argument("--auto-resolve-finetuned", action=argparse.BooleanOptionalAction, default=False)
+    p.add_argument("--apply-posthoc-calibration", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--score-calibration-json", type=str, default="")
     p.add_argument("--base-model", type=str, default=BASE_MODEL_DEFAULT)
     p.add_argument("--domain-input", type=str, default=DOMAIN_INPUT_DEFAULT)
     p.add_argument("--method-input", type=str, default=METHOD_INPUT_DEFAULT)
@@ -730,6 +808,13 @@ def main() -> int:
     else:
         finetuned_ref = _resolve_model_ref(_clean_text(args.finetuned_model) or FINETUNED_MODEL_DEFAULT)
     base_ref = _resolve_model_ref(_clean_text(args.base_model) or BASE_MODEL_DEFAULT)
+    score_calibration_path: Optional[Path] = None
+    score_calibration_payload: Optional[Dict[str, Any]] = None
+    if bool(args.apply_posthoc_calibration):
+        score_calibration_path, score_calibration_payload = _resolve_score_calibration_json(
+            model_ref=finetuned_ref,
+            explicit_path=args.score_calibration_json,
+        )
     domain_path = _resolve_path(args.domain_input)
     method_path = _resolve_path(args.method_input)
 
@@ -775,6 +860,11 @@ def main() -> int:
         query_key_name="query_text_prefixed",
         doc_key_name="doc_text_prefixed",
     )
+    if isinstance(score_calibration_payload, dict):
+        finetuned_scores = [
+            _apply_score_calibration(score, aspect=_clean_text(row.get("aspect")), payload=score_calibration_payload)
+            for score, row in zip(finetuned_scores, rows)
+        ]
     base_scores = _score_query_doc_rows(
         model=model_base,
         tokenizer=tok_base,
@@ -848,6 +938,8 @@ def main() -> int:
         f"rows_domain={len(rows_domain)} rows_method={len(rows_method)} rows_total={len(rows)}\n"
         f"order_top_k={order_top_k} pair_eps={pair_eps} hard_gap_max={hard_gap_max} medium_gap_max={medium_gap_max}\n"
         f"finetuned_model={finetuned_ref}\n"
+        f"score_calibration_json={score_calibration_path if score_calibration_path is not None else ''}\n"
+        f"score_calibration_loaded={bool(score_calibration_payload)}\n"
         f"base_model={base_ref}\n"
         f"device={device}\n"
     )
@@ -944,6 +1036,8 @@ def main() -> int:
                 "hard_gap_max": float(hard_gap_max),
                 "medium_gap_max": float(medium_gap_max),
                 "finetuned_model": finetuned_ref,
+                "score_calibration_json": str(score_calibration_path) if score_calibration_path is not None else "",
+                "score_calibration_loaded": bool(score_calibration_payload),
                 "base_model": base_ref,
                 "device": str(device),
                 "batch_size": int(batch_size),

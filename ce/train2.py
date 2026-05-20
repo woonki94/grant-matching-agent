@@ -1685,22 +1685,30 @@ def _compute_oob_summary_from_probs(
     high_total = int(high_mask.sum().item())
 
     low_out = int(((p >= float(mid)) & low_mask).sum().item())
-    mid_out = int((((p < float(mid)) | (p >= float(high))) & mid_mask).sum().item())
+    mid_low_out = int(((p < float(mid)) & mid_mask).sum().item())
+    mid_high_out = int(((p >= float(high)) & mid_mask).sum().item())
+    mid_out = int(mid_low_out + mid_high_out)
     high_out = int(((p < float(high)) & high_mask).sum().item())
 
     low_rate = float(low_out / float(max(1, low_total)))
     mid_rate = float(mid_out / float(max(1, mid_total)))
+    mid_low_rate = float(mid_low_out / float(max(1, mid_total)))
+    mid_high_rate = float(mid_high_out / float(max(1, mid_total)))
     high_rate = float(high_out / float(max(1, high_total)))
 
     return {
         "oob_low_out": float(low_out),
         "oob_mid_out": float(mid_out),
+        "oob_mid_low_out": float(mid_low_out),
+        "oob_mid_high_out": float(mid_high_out),
         "oob_high_out": float(high_out),
         "oob_low_total": float(low_total),
         "oob_mid_total": float(mid_total),
         "oob_high_total": float(high_total),
         "oob_low_rate": float(low_rate),
         "oob_mid_rate": float(mid_rate),
+        "oob_mid_low_rate": float(mid_low_rate),
+        "oob_mid_high_rate": float(mid_high_rate),
         "oob_high_rate": float(high_rate),
     }
 
@@ -5327,9 +5335,13 @@ def main() -> int:
         "oob_objective": 0.0,
         "oob_high_rate": 0.0,
         "oob_mid_rate": 0.0,
+        "oob_mid_low_rate": 0.0,
+        "oob_mid_high_rate": 0.0,
         "oob_low_rate": 0.0,
         "oob_high_out": 0.0,
         "oob_mid_out": 0.0,
+        "oob_mid_low_out": 0.0,
+        "oob_mid_high_out": 0.0,
         "oob_low_out": 0.0,
         "oob_high_total": 0.0,
         "oob_mid_total": 0.0,
@@ -5384,9 +5396,13 @@ def main() -> int:
                 "oob_objective": 0.0,
                 "oob_high_rate": 0.0,
                 "oob_mid_rate": 0.0,
+                "oob_mid_low_rate": 0.0,
+                "oob_mid_high_rate": 0.0,
                 "oob_low_rate": 0.0,
                 "oob_high_out": 0.0,
                 "oob_mid_out": 0.0,
+                "oob_mid_low_out": 0.0,
+                "oob_mid_high_out": 0.0,
                 "oob_low_out": 0.0,
                 "oob_high_total": 0.0,
                 "oob_mid_total": 0.0,
@@ -5400,6 +5416,8 @@ def main() -> int:
         calib_vals: List[float] = []
         oob_low_out_total = 0.0
         oob_mid_out_total = 0.0
+        oob_mid_low_out_total = 0.0
+        oob_mid_high_out_total = 0.0
         oob_high_out_total = 0.0
         oob_low_total = 0.0
         oob_mid_total = 0.0
@@ -5479,6 +5497,8 @@ def main() -> int:
                 calib_vals.append(float(calibration_band_loss.detach().cpu().item()))
                 oob_low_out_total += float(oob_summary_batch.get("oob_low_out", 0.0))
                 oob_mid_out_total += float(oob_summary_batch.get("oob_mid_out", 0.0))
+                oob_mid_low_out_total += float(oob_summary_batch.get("oob_mid_low_out", 0.0))
+                oob_mid_high_out_total += float(oob_summary_batch.get("oob_mid_high_out", 0.0))
                 oob_high_out_total += float(oob_summary_batch.get("oob_high_out", 0.0))
                 oob_low_total += float(oob_summary_batch.get("oob_low_total", 0.0))
                 oob_mid_total += float(oob_summary_batch.get("oob_mid_total", 0.0))
@@ -5487,6 +5507,8 @@ def main() -> int:
             model.train()
         oob_low_rate = float(oob_low_out_total / max(1.0, oob_low_total))
         oob_mid_rate = float(oob_mid_out_total / max(1.0, oob_mid_total))
+        oob_mid_low_rate = float(oob_mid_low_out_total / max(1.0, oob_mid_total))
+        oob_mid_high_rate = float(oob_mid_high_out_total / max(1.0, oob_mid_total))
         oob_high_rate = float(oob_high_out_total / max(1.0, oob_high_total))
         oob_objective = _compute_weighted_oob_objective(
             oob_summary={
@@ -5507,9 +5529,13 @@ def main() -> int:
             "oob_objective": float(oob_objective),
             "oob_high_rate": float(oob_high_rate),
             "oob_mid_rate": float(oob_mid_rate),
+            "oob_mid_low_rate": float(oob_mid_low_rate),
+            "oob_mid_high_rate": float(oob_mid_high_rate),
             "oob_low_rate": float(oob_low_rate),
             "oob_high_out": float(oob_high_out_total),
             "oob_mid_out": float(oob_mid_out_total),
+            "oob_mid_low_out": float(oob_mid_low_out_total),
+            "oob_mid_high_out": float(oob_mid_high_out_total),
             "oob_low_out": float(oob_low_out_total),
             "oob_high_total": float(oob_high_total),
             "oob_mid_total": float(oob_mid_total),
@@ -5518,12 +5544,13 @@ def main() -> int:
 
     def collect_listwise_eval_tensors(loader: Optional[DataLoader]) -> Dict[str, Optional[torch.Tensor]]:
         if loader is None:
-            return {"logits": None, "cluster_ids": None, "teacher_scores_raw": None}
+            return {"logits": None, "cluster_ids": None, "teacher_scores_raw": None, "aspect_ids": None}
         was_training = bool(model.training)
         model.eval()
         logits_parts: List[torch.Tensor] = []
         cluster_parts: List[torch.Tensor] = []
         teacher_raw_parts: List[torch.Tensor] = []
+        aspect_parts: List[torch.Tensor] = []
         with torch.no_grad():
             for batch in loader:
                 if batch.get("enc") is None:
@@ -5534,6 +5561,9 @@ def main() -> int:
                 cluster_ids = batch.get("cluster_ids")
                 if isinstance(cluster_ids, torch.Tensor):
                     cluster_parts.append(cluster_ids.detach().to("cpu", dtype=torch.int64))
+                aspect_ids = batch.get("aspect_ids")
+                if isinstance(aspect_ids, torch.Tensor):
+                    aspect_parts.append(aspect_ids.detach().to("cpu", dtype=torch.int64))
                 teacher_scores_raw = batch.get("teacher_scores_raw")
                 if isinstance(teacher_scores_raw, torch.Tensor):
                     teacher_raw_parts.append(teacher_scores_raw.detach().to("cpu", dtype=torch.float32))
@@ -5542,7 +5572,8 @@ def main() -> int:
         logits_all = torch.cat(logits_parts, dim=0) if logits_parts else None
         cluster_all = torch.cat(cluster_parts, dim=0) if cluster_parts else None
         teacher_raw_all = torch.cat(teacher_raw_parts, dim=0) if teacher_raw_parts else None
-        return {"logits": logits_all, "cluster_ids": cluster_all, "teacher_scores_raw": teacher_raw_all}
+        aspect_all = torch.cat(aspect_parts, dim=0) if aspect_parts else None
+        return {"logits": logits_all, "cluster_ids": cluster_all, "teacher_scores_raw": teacher_raw_all, "aspect_ids": aspect_all}
 
     def maybe_save_best_val_total_loss(
         *,
@@ -6356,9 +6387,13 @@ def main() -> int:
             val_oob_objective = float(val_list_loss.get("oob_objective", 0.0))
             val_oob_high_rate = float(val_list_loss.get("oob_high_rate", 0.0))
             val_oob_mid_rate = float(val_list_loss.get("oob_mid_rate", 0.0))
+            val_oob_mid_low_rate = float(val_list_loss.get("oob_mid_low_rate", 0.0))
+            val_oob_mid_high_rate = float(val_list_loss.get("oob_mid_high_rate", 0.0))
             val_oob_low_rate = float(val_list_loss.get("oob_low_rate", 0.0))
             val_oob_high_out = float(val_list_loss.get("oob_high_out", 0.0))
             val_oob_mid_out = float(val_list_loss.get("oob_mid_out", 0.0))
+            val_oob_mid_low_out = float(val_list_loss.get("oob_mid_low_out", 0.0))
+            val_oob_mid_high_out = float(val_list_loss.get("oob_mid_high_out", 0.0))
             val_oob_low_out = float(val_list_loss.get("oob_low_out", 0.0))
             val_oob_high_total = float(val_list_loss.get("oob_high_total", 0.0))
             val_oob_mid_total = float(val_list_loss.get("oob_mid_total", 0.0))
@@ -6381,9 +6416,13 @@ def main() -> int:
             selection_oob_objective = float(selection_list_loss.get("oob_objective", val_oob_objective))
             selection_oob_high_rate = float(selection_list_loss.get("oob_high_rate", val_oob_high_rate))
             selection_oob_mid_rate = float(selection_list_loss.get("oob_mid_rate", val_oob_mid_rate))
+            selection_oob_mid_low_rate = float(selection_list_loss.get("oob_mid_low_rate", val_oob_mid_low_rate))
+            selection_oob_mid_high_rate = float(selection_list_loss.get("oob_mid_high_rate", val_oob_mid_high_rate))
             selection_oob_low_rate = float(selection_list_loss.get("oob_low_rate", val_oob_low_rate))
             selection_oob_high_out = float(selection_list_loss.get("oob_high_out", val_oob_high_out))
             selection_oob_mid_out = float(selection_list_loss.get("oob_mid_out", val_oob_mid_out))
+            selection_oob_mid_low_out = float(selection_list_loss.get("oob_mid_low_out", val_oob_mid_low_out))
+            selection_oob_mid_high_out = float(selection_list_loss.get("oob_mid_high_out", val_oob_mid_high_out))
             selection_oob_low_out = float(selection_list_loss.get("oob_low_out", val_oob_low_out))
             selection_oob_high_total = float(selection_list_loss.get("oob_high_total", val_oob_high_total))
             selection_oob_mid_total = float(selection_list_loss.get("oob_mid_total", val_oob_mid_total))
@@ -6428,9 +6467,13 @@ def main() -> int:
                 "val_oob_objective": float(val_oob_objective),
                 "val_oob_high_rate": float(val_oob_high_rate),
                 "val_oob_mid_rate": float(val_oob_mid_rate),
+                "val_oob_mid_low_rate": float(val_oob_mid_low_rate),
+                "val_oob_mid_high_rate": float(val_oob_mid_high_rate),
                 "val_oob_low_rate": float(val_oob_low_rate),
                 "val_oob_high_out": float(val_oob_high_out),
                 "val_oob_mid_out": float(val_oob_mid_out),
+                "val_oob_mid_low_out": float(val_oob_mid_low_out),
+                "val_oob_mid_high_out": float(val_oob_mid_high_out),
                 "val_oob_low_out": float(val_oob_low_out),
                 "val_oob_high_total": float(val_oob_high_total),
                 "val_oob_mid_total": float(val_oob_mid_total),
@@ -6439,7 +6482,14 @@ def main() -> int:
                 "oob_selection_objective": float(selection_oob_objective),
                 "oob_selection_high_rate": float(selection_oob_high_rate),
                 "oob_selection_mid_rate": float(selection_oob_mid_rate),
+                "oob_selection_mid_low_rate": float(selection_oob_mid_low_rate),
+                "oob_selection_mid_high_rate": float(selection_oob_mid_high_rate),
                 "oob_selection_low_rate": float(selection_oob_low_rate),
+                "oob_selection_high_out": float(selection_oob_high_out),
+                "oob_selection_mid_out": float(selection_oob_mid_out),
+                "oob_selection_mid_low_out": float(selection_oob_mid_low_out),
+                "oob_selection_mid_high_out": float(selection_oob_mid_high_out),
+                "oob_selection_low_out": float(selection_oob_low_out),
                 "val_list_batches": int(val_list_loss.get("val_list_batches", 0.0)),
                 "stage2_gate_pass": int(1 if stage2_gate_pass else 0),
                 "stage2_gate_ranking_metric": str(stage2_gated_ranking_metric),
@@ -6472,6 +6522,8 @@ def main() -> int:
                     "eval/oob_objective_epoch": float(metrics["val_oob_objective"]),
                     "eval/oob_high_rate_epoch": float(metrics["val_oob_high_rate"]),
                     "eval/oob_mid_rate_epoch": float(metrics["val_oob_mid_rate"]),
+                    "eval/oob_mid_low_rate_epoch": float(metrics["val_oob_mid_low_rate"]),
+                    "eval/oob_mid_high_rate_epoch": float(metrics["val_oob_mid_high_rate"]),
                     "eval/oob_low_rate_epoch": float(metrics["val_oob_low_rate"]),
                     "eval/oob_selection_objective_epoch": float(metrics["oob_selection_objective"]),
                     "eval/ndcg@10": float(metrics.get("ndcg@10", 0.0)),
@@ -6526,6 +6578,7 @@ def main() -> int:
                 fit_logits = fit_tensors.get("logits")
                 fit_cluster = fit_tensors.get("cluster_ids")
                 fit_teacher_raw = fit_tensors.get("teacher_scores_raw")
+                fit_aspect = fit_tensors.get("aspect_ids")
                 if isinstance(fit_logits, torch.Tensor) and isinstance(fit_cluster, torch.Tensor) and fit_logits.numel() == fit_cluster.numel() and fit_logits.numel() > 0:
                     posthoc_fit = _fit_affine_oob_calibration(
                         logits_flat=fit_logits,
@@ -6543,8 +6596,34 @@ def main() -> int:
                         b_max=stage2_posthoc_b_max,
                         b_steps=stage2_posthoc_b_steps,
                     )
+                    aspect_fits: Dict[str, Dict[str, Any]] = {}
+                    if isinstance(fit_aspect, torch.Tensor) and fit_aspect.numel() == fit_logits.numel():
+                        for aspect_name, aspect_id in (("domain", 1), ("method", 2)):
+                            mask = fit_aspect == int(aspect_id)
+                            if bool(mask.any().item()):
+                                teacher_subset = (
+                                    fit_teacher_raw[mask]
+                                    if isinstance(fit_teacher_raw, torch.Tensor) and fit_teacher_raw.numel() == fit_logits.numel()
+                                    else None
+                                )
+                                aspect_fits[aspect_name] = _fit_affine_oob_calibration(
+                                    logits_flat=fit_logits[mask],
+                                    cluster_ids_flat=fit_cluster[mask],
+                                    teacher_scores_raw_flat=teacher_subset,
+                                    high_threshold=stage2_cluster_high_threshold,
+                                    mid_threshold=stage2_cluster_mid_threshold,
+                                    oob_high_weight=stage2_oob_high_weight,
+                                    oob_mid_weight=stage2_oob_mid_weight,
+                                    oob_low_weight=stage2_oob_low_weight,
+                                    a_min=stage2_posthoc_a_min,
+                                    a_max=stage2_posthoc_a_max,
+                                    a_steps=stage2_posthoc_a_steps,
+                                    b_min=stage2_posthoc_b_min,
+                                    b_max=stage2_posthoc_b_max,
+                                    b_steps=stage2_posthoc_b_steps,
+                                )
                     posthoc_payload = {
-                        "type": "affine_sigmoid",
+                        "type": "aspect_affine_sigmoid" if aspect_fits else "affine_sigmoid",
                         "scale": float(posthoc_fit.get("scale", 1.0)),
                         "bias": float(posthoc_fit.get("bias", 0.0)),
                         "fit_split": str(fit_split),
@@ -6555,6 +6634,8 @@ def main() -> int:
                             "mid": float(stage2_oob_mid_weight),
                             "low": float(stage2_oob_low_weight),
                         },
+                        "global": posthoc_fit,
+                        "aspects": aspect_fits,
                         "fit_metrics": posthoc_fit,
                     }
                     posthoc_path = epoch_dir / "posthoc_calibration_affine.json"
