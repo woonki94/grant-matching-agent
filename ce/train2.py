@@ -281,6 +281,7 @@ class ListCollator:
         teacher_scores_raw: List[float] = []
         doc_weights: List[float] = []
         cluster_ids: List[int] = []
+        aspect_ids: List[int] = []
         list_sizes: List[int] = []
 
         for item in batch:
@@ -295,6 +296,7 @@ class ListCollator:
                 aspect_scale = float(self.method_list_loss_scale)
             else:
                 aspect_scale = 1.0
+            aspect_id = int(_aspect_id_from_name(aspect))
             list_sizes.append(len(docs))
             for d in docs:
                 queries_flat.append(query)
@@ -338,6 +340,7 @@ class ListCollator:
                         )
                     )
                 cluster_ids.append(cluster_id)
+                aspect_ids.append(aspect_id)
 
         if not list_sizes:
             return {
@@ -346,6 +349,7 @@ class ListCollator:
                 "teacher_scores_raw": None,
                 "doc_weights": None,
                 "cluster_ids": None,
+                "aspect_ids": None,
                 "list_sizes": [],
             }
 
@@ -364,6 +368,7 @@ class ListCollator:
             "teacher_scores_raw": torch.tensor(teacher_scores_raw, dtype=torch.float32),
             "doc_weights": torch.tensor(doc_weights, dtype=torch.float32),
             "cluster_ids": torch.tensor(cluster_ids, dtype=torch.int64),
+            "aspect_ids": torch.tensor(aspect_ids, dtype=torch.int64),
             "list_sizes": list_sizes,
         }
 
@@ -415,6 +420,15 @@ def _aspect_from_prefixed_query(query_text: Any) -> str:
     if q.startswith("[METHOD]"):
         return "method"
     return "unknown"
+
+
+def _aspect_id_from_name(aspect: Any) -> int:
+    a = _clean_text(aspect).lower()
+    if a == "domain":
+        return 1
+    if a == "method":
+        return 2
+    return 0
 
 
 def _cluster_id_from_text(value: Any) -> int:
@@ -649,6 +663,12 @@ def _build_output_suffix(
     method_pair_loss_scale: float,
     domain_list_loss_scale: float,
     method_list_loss_scale: float,
+    domain_calibration_high_scale: float,
+    domain_calibration_mid_scale: float,
+    domain_calibration_low_scale: float,
+    method_calibration_high_scale: float,
+    method_calibration_mid_scale: float,
+    method_calibration_low_scale: float,
 ) -> str:
     parts = [
         f"sd{int(seed)}",
@@ -671,6 +691,12 @@ def _build_output_suffix(
         f"mpw{_float_token(float(method_pair_loss_scale))}",
         f"dlw{_float_token(float(domain_list_loss_scale))}",
         f"mlw{_float_token(float(method_list_loss_scale))}",
+        f"dch{_float_token(float(domain_calibration_high_scale))}",
+        f"dcm{_float_token(float(domain_calibration_mid_scale))}",
+        f"dcl{_float_token(float(domain_calibration_low_scale))}",
+        f"mch{_float_token(float(method_calibration_high_scale))}",
+        f"mcm{_float_token(float(method_calibration_mid_scale))}",
+        f"mcl{_float_token(float(method_calibration_low_scale))}",
     ]
     return "_".join(parts)
 
@@ -1496,6 +1522,7 @@ def _compute_calibration_band_loss(
     logits_flat: torch.Tensor,
     teacher_scores_flat: torch.Tensor,
     cluster_ids_flat: torch.Tensor,
+    aspect_ids_flat: Optional[torch.Tensor],
     doc_weights_flat: Optional[torch.Tensor],
     list_sizes: Sequence[int],
     band_mode: str,
@@ -1509,6 +1536,12 @@ def _compute_calibration_band_loss(
     weight_high: float,
     weight_mid: float,
     weight_low: float,
+    domain_high_scale: float,
+    domain_mid_scale: float,
+    domain_low_scale: float,
+    method_high_scale: float,
+    method_mid_scale: float,
+    method_low_scale: float,
 ) -> torch.Tensor:
     mode = _clean_calib_band_mode(band_mode)
     stat_mode = _clean_calib_anchor_stat(anchor_stat)
@@ -1527,6 +1560,34 @@ def _compute_calibration_band_loss(
     weight_high_val = max(0.0, float(weight_high))
     weight_mid_val = max(0.0, float(weight_mid))
     weight_low_val = max(0.0, float(weight_low))
+    aspect_scale_values = {
+        (1, 2): max(0.0, float(domain_high_scale)),
+        (1, 1): max(0.0, float(domain_mid_scale)),
+        (1, 0): max(0.0, float(domain_low_scale)),
+        (2, 2): max(0.0, float(method_high_scale)),
+        (2, 1): max(0.0, float(method_mid_scale)),
+        (2, 0): max(0.0, float(method_low_scale)),
+    }
+
+    def _aspect_scale_tensor(a: Optional[torch.Tensor], cluster_id: int, fallback: torch.Tensor) -> torch.Tensor:
+        if a is None:
+            return torch.ones_like(fallback)
+        out = torch.ones_like(fallback)
+        for aspect_id in (1, 2):
+            scale = float(aspect_scale_values.get((aspect_id, int(cluster_id)), 1.0))
+            out = torch.where(a == int(aspect_id), torch.full_like(out, scale), out)
+        return out
+
+    def _combine_weights(
+        base_weights: Optional[torch.Tensor],
+        aspect_scales: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        if base_weights is None:
+            effective = aspect_scales.clamp(min=0.0)
+        else:
+            effective = base_weights.clamp(min=0.0) * aspect_scales.clamp(min=0.0)
+        avg_scale = torch.clamp(aspect_scales.float().mean(), min=1e-6)
+        return effective, avg_scale
 
     for sz in list_sizes:
         n = int(sz)
@@ -1536,6 +1597,10 @@ def _compute_calibration_band_loss(
         s = probs[cursor : cursor + n]
         y = teacher[cursor : cursor + n]
         c = cluster_ids_flat[cursor : cursor + n]
+        if aspect_ids_flat is None:
+            a = None
+        else:
+            a = aspect_ids_flat[cursor : cursor + n]
         if doc_weights_flat is None:
             w = None
         else:
@@ -1548,19 +1613,23 @@ def _compute_calibration_band_loss(
 
         if bool(high_mask.any().item()) and weight_high_val > 0.0:
             s_high = s[high_mask]
-            w_high_tensor = None if w is None else w[high_mask]
+            a_high_tensor = None if a is None else a[high_mask]
+            high_scales = _aspect_scale_tensor(a_high_tensor, 2, s_high)
+            w_high_tensor, high_part_scale = _combine_weights(None if w is None else w[high_mask], high_scales)
             if mode == "fixed":
                 floor = torch.tensor(high_floor, device=s.device, dtype=s.dtype)
             else:
                 anchor = _cluster_anchor(y[high_mask], stat_mode=stat_mode)
                 floor = torch.clamp(anchor - high_slack, min=0.0, max=1.0)
             band_loss = _weighted_mean(F.relu(floor - s_high), w_high_tensor)
-            weighted_parts.append(band_loss * float(weight_high_val))
-            part_weights.append(torch.tensor(float(weight_high_val), device=s.device, dtype=s.dtype))
+            weighted_parts.append(band_loss * float(weight_high_val) * high_part_scale.to(dtype=s.dtype))
+            part_weights.append(torch.tensor(float(weight_high_val), device=s.device, dtype=s.dtype) * high_part_scale.to(dtype=s.dtype))
 
         if bool(mid_mask.any().item()) and weight_mid_val > 0.0:
             s_mid = s[mid_mask]
-            w_mid_tensor = None if w is None else w[mid_mask]
+            a_mid_tensor = None if a is None else a[mid_mask]
+            mid_scales = _aspect_scale_tensor(a_mid_tensor, 1, s_mid)
+            w_mid_tensor, mid_part_scale = _combine_weights(None if w is None else w[mid_mask], mid_scales)
             if mode == "fixed":
                 center = torch.tensor(mid_center, device=s.device, dtype=s.dtype)
             else:
@@ -1569,20 +1638,22 @@ def _compute_calibration_band_loss(
                 F.relu(torch.abs(s_mid - center) - mid_bw),
                 w_mid_tensor,
             )
-            weighted_parts.append(band_loss * float(weight_mid_val))
-            part_weights.append(torch.tensor(float(weight_mid_val), device=s.device, dtype=s.dtype))
+            weighted_parts.append(band_loss * float(weight_mid_val) * mid_part_scale.to(dtype=s.dtype))
+            part_weights.append(torch.tensor(float(weight_mid_val), device=s.device, dtype=s.dtype) * mid_part_scale.to(dtype=s.dtype))
 
         if bool(low_mask.any().item()) and weight_low_val > 0.0:
             s_low = s[low_mask]
-            w_low_tensor = None if w is None else w[low_mask]
+            a_low_tensor = None if a is None else a[low_mask]
+            low_scales = _aspect_scale_tensor(a_low_tensor, 0, s_low)
+            w_low_tensor, low_part_scale = _combine_weights(None if w is None else w[low_mask], low_scales)
             if mode == "fixed":
                 ceil = torch.tensor(low_ceil, device=s.device, dtype=s.dtype)
             else:
                 anchor = _cluster_anchor(y[low_mask], stat_mode=stat_mode)
                 ceil = torch.clamp(anchor + low_slack, min=0.0, max=1.0)
             band_loss = _weighted_mean(F.relu(s_low - ceil), w_low_tensor)
-            weighted_parts.append(band_loss * float(weight_low_val))
-            part_weights.append(torch.tensor(float(weight_low_val), device=s.device, dtype=s.dtype))
+            weighted_parts.append(band_loss * float(weight_low_val) * low_part_scale.to(dtype=s.dtype))
+            part_weights.append(torch.tensor(float(weight_low_val), device=s.device, dtype=s.dtype) * low_part_scale.to(dtype=s.dtype))
 
     if not weighted_parts:
         return torch.zeros((), device=logits_flat.device, dtype=logits_flat.dtype)
@@ -3843,6 +3914,12 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--loss-calibration-high-weight", type=float, default=1.0, help="Relative weight for high-band calibration loss.")
     p.add_argument("--loss-calibration-mid-weight", type=float, default=1.0, help="Relative weight for mid-band calibration loss.")
     p.add_argument("--loss-calibration-low-weight", type=float, default=1.0, help="Relative weight for low-band calibration loss.")
+    p.add_argument("--domain-calibration-high-scale", type=float, default=1.0, help="DOMAIN-only multiplier for high-band calibration loss.")
+    p.add_argument("--domain-calibration-mid-scale", type=float, default=1.0, help="DOMAIN-only multiplier for mid-band calibration loss.")
+    p.add_argument("--domain-calibration-low-scale", type=float, default=1.0, help="DOMAIN-only multiplier for low-band calibration loss.")
+    p.add_argument("--method-calibration-high-scale", type=float, default=1.0, help="METHOD-only multiplier for high-band calibration loss.")
+    p.add_argument("--method-calibration-mid-scale", type=float, default=1.0, help="METHOD-only multiplier for mid-band calibration loss.")
+    p.add_argument("--method-calibration-low-scale", type=float, default=1.0, help="METHOD-only multiplier for low-band calibration loss.")
     p.add_argument(
         "--stage2-oob-selection-split",
         type=str,
@@ -4299,6 +4376,12 @@ def main() -> int:
     loss_calibration_high_weight = _safe_float(args.loss_calibration_high_weight, default=1.0, minimum=0.0, maximum=100.0)
     loss_calibration_mid_weight = _safe_float(args.loss_calibration_mid_weight, default=1.0, minimum=0.0, maximum=100.0)
     loss_calibration_low_weight = _safe_float(args.loss_calibration_low_weight, default=1.0, minimum=0.0, maximum=100.0)
+    domain_calibration_high_scale = _safe_float(args.domain_calibration_high_scale, default=1.0, minimum=0.0, maximum=100.0)
+    domain_calibration_mid_scale = _safe_float(args.domain_calibration_mid_scale, default=1.0, minimum=0.0, maximum=100.0)
+    domain_calibration_low_scale = _safe_float(args.domain_calibration_low_scale, default=1.0, minimum=0.0, maximum=100.0)
+    method_calibration_high_scale = _safe_float(args.method_calibration_high_scale, default=1.0, minimum=0.0, maximum=100.0)
+    method_calibration_mid_scale = _safe_float(args.method_calibration_mid_scale, default=1.0, minimum=0.0, maximum=100.0)
+    method_calibration_low_scale = _safe_float(args.method_calibration_low_scale, default=1.0, minimum=0.0, maximum=100.0)
 
     cluster_margin_hm = _safe_float(args.cluster_margin_hm, default=0.20, minimum=0.0, maximum=1.0)
     cluster_margin_ml = _safe_float(args.cluster_margin_ml, default=0.20, minimum=0.0, maximum=1.0)
@@ -4500,6 +4583,12 @@ def main() -> int:
             method_pair_loss_scale=method_pair_loss_scale,
             domain_list_loss_scale=domain_list_loss_scale,
             method_list_loss_scale=method_list_loss_scale,
+            domain_calibration_high_scale=domain_calibration_high_scale,
+            domain_calibration_mid_scale=domain_calibration_mid_scale,
+            domain_calibration_low_scale=domain_calibration_low_scale,
+            method_calibration_high_scale=method_calibration_high_scale,
+            method_calibration_mid_scale=method_calibration_mid_scale,
+            method_calibration_low_scale=method_calibration_low_scale,
         )
         output_dir = (output_dir_base.parent / f"{output_dir_base.name}__{output_suffix}").resolve()
     else:
@@ -4678,6 +4767,11 @@ def main() -> int:
         f"cluster_margins(hm/ml/hl):{cluster_margin_hm:.3f}/{cluster_margin_ml:.3f}/{cluster_margin_hl:.3f},"
         f"cluster_margin_loss_weights(hm/ml/hl):{loss_cluster_margin_hm_weight:.3f}/{loss_cluster_margin_ml_weight:.3f}/{loss_cluster_margin_hl_weight:.3f},"
         f"calibration_loss_weights(high/mid/low):{loss_calibration_high_weight:.3f}/{loss_calibration_mid_weight:.3f}/{loss_calibration_low_weight:.3f}"
+    )
+    print(
+        "aspect_calibration_scales="
+        f"domain(high/mid/low):{domain_calibration_high_scale:.3f}/{domain_calibration_mid_scale:.3f}/{domain_calibration_low_scale:.3f},"
+        f"method(high/mid/low):{method_calibration_high_scale:.3f}/{method_calibration_mid_scale:.3f}/{method_calibration_low_scale:.3f}"
     )
     print(
         "calibration_band_config="
@@ -5091,6 +5185,12 @@ def main() -> int:
             "dataset/method_pair_loss_scale": float(method_pair_loss_scale),
             "dataset/domain_list_loss_scale": float(domain_list_loss_scale),
             "dataset/method_list_loss_scale": float(method_list_loss_scale),
+            "dataset/domain_calibration_high_scale": float(domain_calibration_high_scale),
+            "dataset/domain_calibration_mid_scale": float(domain_calibration_mid_scale),
+            "dataset/domain_calibration_low_scale": float(domain_calibration_low_scale),
+            "dataset/method_calibration_high_scale": float(method_calibration_high_scale),
+            "dataset/method_calibration_mid_scale": float(method_calibration_mid_scale),
+            "dataset/method_calibration_low_scale": float(method_calibration_low_scale),
             "dataset/train_low_cap_applied": int(1 if bool(train_low_cap_stats.get("applied")) else 0),
             "dataset/train_low_cap_ratio": float(train_low_cap_stats.get("ratio", 0.0)),
             "dataset/train_low_cap_target": int(train_low_cap_stats.get("low_cap_target", -1)),
@@ -5316,6 +5416,11 @@ def main() -> int:
                     doc_weights = doc_weights.to(device)
                 else:
                     doc_weights = None
+                aspect_ids = batch.get("aspect_ids")
+                if isinstance(aspect_ids, torch.Tensor):
+                    aspect_ids = aspect_ids.to(device)
+                else:
+                    aspect_ids = None
                 list_sizes = batch["list_sizes"]
                 logits_flat = model(**enc).logits.squeeze(-1)
                 kl_loss, mse_loss = _compute_listwise_kl_and_mse(
@@ -5341,6 +5446,7 @@ def main() -> int:
                     logits_flat=logits_flat,
                     teacher_scores_flat=teacher_scores,
                     cluster_ids_flat=cluster_ids,
+                    aspect_ids_flat=aspect_ids,
                     doc_weights_flat=doc_weights,
                     list_sizes=list_sizes,
                     band_mode=calib_band_mode,
@@ -5354,6 +5460,12 @@ def main() -> int:
                     weight_high=loss_calibration_high_weight,
                     weight_mid=loss_calibration_mid_weight,
                     weight_low=loss_calibration_low_weight,
+                    domain_high_scale=domain_calibration_high_scale,
+                    domain_mid_scale=domain_calibration_mid_scale,
+                    domain_low_scale=domain_calibration_low_scale,
+                    method_high_scale=method_calibration_high_scale,
+                    method_mid_scale=method_calibration_mid_scale,
+                    method_low_scale=method_calibration_low_scale,
                 )
                 oob_summary_batch = _compute_oob_summary_from_probs(
                     probs_flat=torch.sigmoid(logits_flat),
@@ -6080,6 +6192,11 @@ def main() -> int:
                     doc_weights = doc_weights.to(device)
                 else:
                     doc_weights = None
+                aspect_ids = list_batch.get("aspect_ids")
+                if isinstance(aspect_ids, torch.Tensor):
+                    aspect_ids = aspect_ids.to(device)
+                else:
+                    aspect_ids = None
                 list_sizes = list_batch["list_sizes"]
 
                 pair_batch = next(pair_cycle)
@@ -6118,6 +6235,7 @@ def main() -> int:
                         logits_flat=list_logits_flat,
                         teacher_scores_flat=teacher_scores,
                         cluster_ids_flat=cluster_ids,
+                        aspect_ids_flat=aspect_ids,
                         doc_weights_flat=doc_weights,
                         list_sizes=list_sizes,
                         band_mode=calib_band_mode,
@@ -6131,6 +6249,12 @@ def main() -> int:
                         weight_high=loss_calibration_high_weight,
                         weight_mid=loss_calibration_mid_weight,
                         weight_low=loss_calibration_low_weight,
+                        domain_high_scale=domain_calibration_high_scale,
+                        domain_mid_scale=domain_calibration_mid_scale,
+                        domain_low_scale=domain_calibration_low_scale,
+                        method_high_scale=method_calibration_high_scale,
+                        method_mid_scale=method_calibration_mid_scale,
+                        method_low_scale=method_calibration_low_scale,
                     )
 
                     pos_logits = model(**pos).logits.squeeze(-1)
@@ -6731,6 +6855,12 @@ def main() -> int:
             "calibration_high": float(loss_calibration_high_weight),
             "calibration_mid": float(loss_calibration_mid_weight),
             "calibration_low": float(loss_calibration_low_weight),
+            "domain_calibration_high_scale": float(domain_calibration_high_scale),
+            "domain_calibration_mid_scale": float(domain_calibration_mid_scale),
+            "domain_calibration_low_scale": float(domain_calibration_low_scale),
+            "method_calibration_high_scale": float(method_calibration_high_scale),
+            "method_calibration_mid_scale": float(method_calibration_mid_scale),
+            "method_calibration_low_scale": float(method_calibration_low_scale),
         },
         "margin_clip": {"min": float(margin_min), "max": float(margin_max)},
         "stage1_epochs": int(stage1_epochs),
