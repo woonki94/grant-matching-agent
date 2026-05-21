@@ -20,8 +20,10 @@ PROJECT_ROOT = _find_project_root()
 
 DOMAIN_INPUT_DEFAULT = "ce/dataset/distill/llm_distill_domain_listwise.jsonl"
 METHOD_INPUT_DEFAULT = "ce/dataset/distill/llm_distill_method_listwise.jsonl"
+CONSTRAINT_INPUT_DEFAULT = "ce/dataset/distill/llm_distill_constraint_listwise.jsonl"
 DOMAIN_PAIRWISE_INPUT_DEFAULT = "ce/dataset/distill/llm_distill_domain_pairwise.jsonl"
 METHOD_PAIRWISE_INPUT_DEFAULT = "ce/dataset/distill/llm_distill_method_pairwise.jsonl"
+CONSTRAINT_PAIRWISE_INPUT_DEFAULT = "ce/dataset/distill/llm_distill_constraint_pairwise.jsonl"
 OUTPUT_DIR_DEFAULT = "ce/dataset/splits"
 
 DOMAIN_TRAIN_BASENAME = "llm_distill_domain_listwise_train.jsonl"
@@ -30,12 +32,18 @@ DOMAIN_TEST_BASENAME = "llm_distill_domain_listwise_test.jsonl"
 METHOD_TRAIN_BASENAME = "llm_distill_method_listwise_train.jsonl"
 METHOD_VAL_BASENAME = "llm_distill_method_listwise_val.jsonl"
 METHOD_TEST_BASENAME = "llm_distill_method_listwise_test.jsonl"
+CONSTRAINT_TRAIN_BASENAME = "llm_distill_constraint_listwise_train.jsonl"
+CONSTRAINT_VAL_BASENAME = "llm_distill_constraint_listwise_val.jsonl"
+CONSTRAINT_TEST_BASENAME = "llm_distill_constraint_listwise_test.jsonl"
 DOMAIN_PAIRWISE_TRAIN_BASENAME = "llm_distill_domain_pairwise_train.jsonl"
 DOMAIN_PAIRWISE_VAL_BASENAME = "llm_distill_domain_pairwise_val.jsonl"
 DOMAIN_PAIRWISE_TEST_BASENAME = "llm_distill_domain_pairwise_test.jsonl"
 METHOD_PAIRWISE_TRAIN_BASENAME = "llm_distill_method_pairwise_train.jsonl"
 METHOD_PAIRWISE_VAL_BASENAME = "llm_distill_method_pairwise_val.jsonl"
 METHOD_PAIRWISE_TEST_BASENAME = "llm_distill_method_pairwise_test.jsonl"
+CONSTRAINT_PAIRWISE_TRAIN_BASENAME = "llm_distill_constraint_pairwise_train.jsonl"
+CONSTRAINT_PAIRWISE_VAL_BASENAME = "llm_distill_constraint_pairwise_val.jsonl"
+CONSTRAINT_PAIRWISE_TEST_BASENAME = "llm_distill_constraint_pairwise_test.jsonl"
 MANIFEST_BASENAME = "llm_distill_domain_method_split_manifest.json"
 
 
@@ -175,12 +183,14 @@ def _write_split_files(
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="Create shared query-level train/val/test split for domain+method listwise and pairwise files."
+        description="Create shared query-level train/val/test split for domain+method(+constraint) listwise and pairwise files."
     )
     p.add_argument("--domain-input", type=str, default=DOMAIN_INPUT_DEFAULT)
     p.add_argument("--method-input", type=str, default=METHOD_INPUT_DEFAULT)
+    p.add_argument("--constraint-input", type=str, default=CONSTRAINT_INPUT_DEFAULT)
     p.add_argument("--domain-pairwise-input", type=str, default=DOMAIN_PAIRWISE_INPUT_DEFAULT)
     p.add_argument("--method-pairwise-input", type=str, default=METHOD_PAIRWISE_INPUT_DEFAULT)
+    p.add_argument("--constraint-pairwise-input", type=str, default=CONSTRAINT_PAIRWISE_INPUT_DEFAULT)
     p.add_argument("--output-dir", type=str, default=OUTPUT_DIR_DEFAULT)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--val-ratio", type=float, default=0.10)
@@ -194,8 +204,10 @@ def main() -> int:
 
     domain_input = _resolve_path(args.domain_input)
     method_input = _resolve_path(args.method_input)
+    constraint_input = _resolve_path(args.constraint_input)
     domain_pairwise_input = _resolve_path(args.domain_pairwise_input)
     method_pairwise_input = _resolve_path(args.method_pairwise_input)
+    constraint_pairwise_input = _resolve_path(args.constraint_pairwise_input)
     output_dir = _resolve_path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -207,6 +219,8 @@ def main() -> int:
         raise RuntimeError(f"Domain pairwise input not found: {domain_pairwise_input}")
     if not method_pairwise_input.exists():
         raise RuntimeError(f"Method pairwise input not found: {method_pairwise_input}")
+    constraint_available = constraint_input.exists()
+    constraint_pairwise_available = constraint_pairwise_input.exists()
 
     domain_train = output_dir / DOMAIN_TRAIN_BASENAME
     domain_val = output_dir / DOMAIN_VAL_BASENAME
@@ -214,12 +228,18 @@ def main() -> int:
     method_train = output_dir / METHOD_TRAIN_BASENAME
     method_val = output_dir / METHOD_VAL_BASENAME
     method_test = output_dir / METHOD_TEST_BASENAME
+    constraint_train = output_dir / CONSTRAINT_TRAIN_BASENAME
+    constraint_val = output_dir / CONSTRAINT_VAL_BASENAME
+    constraint_test = output_dir / CONSTRAINT_TEST_BASENAME
     domain_pairwise_train = output_dir / DOMAIN_PAIRWISE_TRAIN_BASENAME
     domain_pairwise_val = output_dir / DOMAIN_PAIRWISE_VAL_BASENAME
     domain_pairwise_test = output_dir / DOMAIN_PAIRWISE_TEST_BASENAME
     method_pairwise_train = output_dir / METHOD_PAIRWISE_TRAIN_BASENAME
     method_pairwise_val = output_dir / METHOD_PAIRWISE_VAL_BASENAME
     method_pairwise_test = output_dir / METHOD_PAIRWISE_TEST_BASENAME
+    constraint_pairwise_train = output_dir / CONSTRAINT_PAIRWISE_TRAIN_BASENAME
+    constraint_pairwise_val = output_dir / CONSTRAINT_PAIRWISE_VAL_BASENAME
+    constraint_pairwise_test = output_dir / CONSTRAINT_PAIRWISE_TEST_BASENAME
     manifest_path = output_dir / MANIFEST_BASENAME
 
     outputs = [
@@ -237,6 +257,10 @@ def main() -> int:
         method_pairwise_test,
         manifest_path,
     ]
+    if constraint_available:
+        outputs.extend([constraint_train, constraint_val, constraint_test])
+    if constraint_pairwise_available:
+        outputs.extend([constraint_pairwise_train, constraint_pairwise_val, constraint_pairwise_test])
     if (not bool(args.overwrite)) and any(p.exists() for p in outputs):
         raise RuntimeError(
             "Output files already exist. Use --overwrite to replace them."
@@ -244,9 +268,18 @@ def main() -> int:
 
     domain_keys = set(_collect_query_keys(domain_input))
     method_keys = set(_collect_query_keys(method_input))
+    constraint_keys = set(_collect_query_keys(constraint_input)) if constraint_available else set()
     domain_pairwise_keys = set(_collect_query_keys(domain_pairwise_input))
     method_pairwise_keys = set(_collect_query_keys(method_pairwise_input))
-    all_keys = sorted(domain_keys | method_keys | domain_pairwise_keys | method_pairwise_keys)
+    constraint_pairwise_keys = set(_collect_query_keys(constraint_pairwise_input)) if constraint_pairwise_available else set()
+    all_keys = sorted(
+        domain_keys
+        | method_keys
+        | constraint_keys
+        | domain_pairwise_keys
+        | method_pairwise_keys
+        | constraint_pairwise_keys
+    )
     split_map, split_query_counts = _build_split_map(
         keys=all_keys,
         seed=int(args.seed),
@@ -268,6 +301,17 @@ def main() -> int:
         output_val=method_val,
         output_test=method_test,
     )
+    constraint_row_counts = (
+        _write_split_files(
+            input_path=constraint_input,
+            split_map=split_map,
+            output_train=constraint_train,
+            output_val=constraint_val,
+            output_test=constraint_test,
+        )
+        if constraint_available
+        else {"train": 0, "val": 0, "test": 0, "skipped": 0, "total_rows": 0}
+    )
     domain_pairwise_row_counts = _write_split_files(
         input_path=domain_pairwise_input,
         split_map=split_map,
@@ -282,13 +326,28 @@ def main() -> int:
         output_val=method_pairwise_val,
         output_test=method_pairwise_test,
     )
+    constraint_pairwise_row_counts = (
+        _write_split_files(
+            input_path=constraint_pairwise_input,
+            split_map=split_map,
+            output_train=constraint_pairwise_train,
+            output_val=constraint_pairwise_val,
+            output_test=constraint_pairwise_test,
+        )
+        if constraint_pairwise_available
+        else {"train": 0, "val": 0, "test": 0, "skipped": 0, "total_rows": 0}
+    )
 
     manifest = {
         "created_at_utc": datetime.now(timezone.utc).isoformat(),
         "domain_input": str(domain_input),
         "method_input": str(method_input),
+        "constraint_input": str(constraint_input),
+        "constraint_available": bool(constraint_available),
         "domain_pairwise_input": str(domain_pairwise_input),
         "method_pairwise_input": str(method_pairwise_input),
+        "constraint_pairwise_input": str(constraint_pairwise_input),
+        "constraint_pairwise_available": bool(constraint_pairwise_available),
         "output_dir": str(output_dir),
         "seed": int(args.seed),
         "val_ratio": float(_safe_float(args.val_ratio, default=0.10)),
@@ -296,22 +355,28 @@ def main() -> int:
         "query_key_counts": {
             "domain": int(len(domain_keys)),
             "method": int(len(method_keys)),
+            "constraint": int(len(constraint_keys)),
             "domain_pairwise": int(len(domain_pairwise_keys)),
             "method_pairwise": int(len(method_pairwise_keys)),
+            "constraint_pairwise": int(len(constraint_pairwise_keys)),
             "union": int(len(all_keys)),
             "intersection": int(len(domain_keys & method_keys)),
             "domain_only": int(len(domain_keys - method_keys)),
             "method_only": int(len(method_keys - domain_keys)),
+            "domain_method_constraint_intersection": int(len(domain_keys & method_keys & constraint_keys)) if constraint_available else 0,
             "listwise_vs_pairwise_overlap": {
                 "domain": int(len(domain_keys & domain_pairwise_keys)),
                 "method": int(len(method_keys & method_pairwise_keys)),
+                "constraint": int(len(constraint_keys & constraint_pairwise_keys)) if constraint_available and constraint_pairwise_available else 0,
             },
         },
         "split_query_counts": split_query_counts,
         "domain_row_counts": domain_row_counts,
         "method_row_counts": method_row_counts,
+        "constraint_row_counts": constraint_row_counts,
         "domain_pairwise_row_counts": domain_pairwise_row_counts,
         "method_pairwise_row_counts": method_pairwise_row_counts,
+        "constraint_pairwise_row_counts": constraint_pairwise_row_counts,
         "outputs": {
             "domain_train": str(domain_train),
             "domain_val": str(domain_val),
@@ -319,12 +384,18 @@ def main() -> int:
             "method_train": str(method_train),
             "method_val": str(method_val),
             "method_test": str(method_test),
+            "constraint_train": str(constraint_train) if constraint_available else "",
+            "constraint_val": str(constraint_val) if constraint_available else "",
+            "constraint_test": str(constraint_test) if constraint_available else "",
             "domain_pairwise_train": str(domain_pairwise_train),
             "domain_pairwise_val": str(domain_pairwise_val),
             "domain_pairwise_test": str(domain_pairwise_test),
             "method_pairwise_train": str(method_pairwise_train),
             "method_pairwise_val": str(method_pairwise_val),
             "method_pairwise_test": str(method_pairwise_test),
+            "constraint_pairwise_train": str(constraint_pairwise_train) if constraint_pairwise_available else "",
+            "constraint_pairwise_val": str(constraint_pairwise_val) if constraint_pairwise_available else "",
+            "constraint_pairwise_test": str(constraint_pairwise_test) if constraint_pairwise_available else "",
             "manifest": str(manifest_path),
         },
     }
@@ -332,6 +403,8 @@ def main() -> int:
 
     print(f"query_union={len(all_keys)}")
     print(f"query_intersection={len(domain_keys & method_keys)}")
+    if constraint_available:
+        print(f"query_domain_method_constraint_intersection={len(domain_keys & method_keys & constraint_keys)}")
     print(
         "split_queries="
         f"train:{split_query_counts['train']},"
@@ -352,6 +425,14 @@ def main() -> int:
         f"test:{method_row_counts['test']},"
         f"skipped:{method_row_counts['skipped']}"
     )
+    if constraint_available:
+        print(
+            "constraint_rows="
+            f"train:{constraint_row_counts['train']},"
+            f"val:{constraint_row_counts['val']},"
+            f"test:{constraint_row_counts['test']},"
+            f"skipped:{constraint_row_counts['skipped']}"
+        )
     print(
         "domain_pairwise_rows="
         f"train:{domain_pairwise_row_counts['train']},"
@@ -366,6 +447,14 @@ def main() -> int:
         f"test:{method_pairwise_row_counts['test']},"
         f"skipped:{method_pairwise_row_counts['skipped']}"
     )
+    if constraint_pairwise_available:
+        print(
+            "constraint_pairwise_rows="
+            f"train:{constraint_pairwise_row_counts['train']},"
+            f"val:{constraint_pairwise_row_counts['val']},"
+            f"test:{constraint_pairwise_row_counts['test']},"
+            f"skipped:{constraint_pairwise_row_counts['skipped']}"
+        )
     print(f"manifest={manifest_path}")
     return 0
 
