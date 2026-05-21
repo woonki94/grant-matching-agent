@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # ==========================================================
-# CE pipeline: distill(+augment) for domain+method -> split -> train2
+# CE pipeline: distill(+augment) for domain+method+constraint -> split -> train2
 # ==========================================================
 # Usage:
 #   bash ce/run_distill_split_train.sh
@@ -33,12 +33,16 @@ MAX_SPECS="${MAX_SPECS:-0}"   # 0 = all
 
 DOMAIN_ASPECT="${DOMAIN_ASPECT:-domain}"
 METHOD_ASPECT="${METHOD_ASPECT:-method}"
+CONSTRAINT_ASPECT="${CONSTRAINT_ASPECT:-constraint}"
 DOMAIN_TARGET_HIGH="${DOMAIN_TARGET_HIGH:-${TARGET_HIGH}}"
 DOMAIN_TARGET_MID="${DOMAIN_TARGET_MID:-${TARGET_MID}}"
 DOMAIN_TARGET_LOW="${DOMAIN_TARGET_LOW:-${TARGET_LOW}}"
 METHOD_TARGET_HIGH="${METHOD_TARGET_HIGH:-${TARGET_HIGH}}"
 METHOD_TARGET_MID="${METHOD_TARGET_MID:-${TARGET_MID}}"
 METHOD_TARGET_LOW="${METHOD_TARGET_LOW:-${TARGET_LOW}}"
+CONSTRAINT_TARGET_HIGH="${CONSTRAINT_TARGET_HIGH:-${TARGET_HIGH}}"
+CONSTRAINT_TARGET_MID="${CONSTRAINT_TARGET_MID:-${TARGET_MID}}"
+CONSTRAINT_TARGET_LOW="${CONSTRAINT_TARGET_LOW:-${TARGET_LOW}}"
 DOMAIN_PREFILTER_MULTIPLIER="${DOMAIN_PREFILTER_MULTIPLIER:-${PREFILTER_MULTIPLIER}}"
 DOMAIN_PREFILTER_MULTIPLIER_HIGH="${DOMAIN_PREFILTER_MULTIPLIER_HIGH:-${PREFILTER_MULTIPLIER_HIGH}}"
 DOMAIN_PREFILTER_MULTIPLIER_MID="${DOMAIN_PREFILTER_MULTIPLIER_MID:-${PREFILTER_MULTIPLIER_MID}}"
@@ -47,12 +51,18 @@ METHOD_PREFILTER_MULTIPLIER="${METHOD_PREFILTER_MULTIPLIER:-${PREFILTER_MULTIPLI
 METHOD_PREFILTER_MULTIPLIER_HIGH="${METHOD_PREFILTER_MULTIPLIER_HIGH:-${PREFILTER_MULTIPLIER_HIGH}}"
 METHOD_PREFILTER_MULTIPLIER_MID="${METHOD_PREFILTER_MULTIPLIER_MID:-${PREFILTER_MULTIPLIER_MID}}"
 METHOD_PREFILTER_MULTIPLIER_LOW="${METHOD_PREFILTER_MULTIPLIER_LOW:-${PREFILTER_MULTIPLIER_LOW}}"
+CONSTRAINT_PREFILTER_MULTIPLIER="${CONSTRAINT_PREFILTER_MULTIPLIER:-${PREFILTER_MULTIPLIER}}"
+CONSTRAINT_PREFILTER_MULTIPLIER_HIGH="${CONSTRAINT_PREFILTER_MULTIPLIER_HIGH:-${PREFILTER_MULTIPLIER_HIGH}}"
+CONSTRAINT_PREFILTER_MULTIPLIER_MID="${CONSTRAINT_PREFILTER_MULTIPLIER_MID:-${PREFILTER_MULTIPLIER_MID}}"
+CONSTRAINT_PREFILTER_MULTIPLIER_LOW="${CONSTRAINT_PREFILTER_MULTIPLIER_LOW:-${PREFILTER_MULTIPLIER_LOW}}"
 
 # Distill outputs (inputs for split/train2)
 RAW_INPUT="${RAW_INPUT:-ce/dataset/distill/llm_distill_domain_listwise.jsonl}"
 METHOD_RAW_INPUT="${METHOD_RAW_INPUT:-ce/dataset/distill/llm_distill_method_listwise.jsonl}"
+CONSTRAINT_RAW_INPUT="${CONSTRAINT_RAW_INPUT:-ce/dataset/distill/llm_distill_constraint_listwise.jsonl}"
 PAIRWISE_INPUT="${PAIRWISE_INPUT:-ce/dataset/distill/llm_distill_domain_pairwise.jsonl}"
 METHOD_PAIRWISE_INPUT="${METHOD_PAIRWISE_INPUT:-ce/dataset/distill/llm_distill_method_pairwise.jsonl}"
+CONSTRAINT_PAIRWISE_INPUT="${CONSTRAINT_PAIRWISE_INPUT:-ce/dataset/distill/llm_distill_constraint_pairwise.jsonl}"
 
 # ---------------------------
 # Stage 2) Shared split (listwise + pairwise)
@@ -69,6 +79,9 @@ RAW_TEST_INPUT="${RAW_TEST_INPUT:-${SPLIT_DIR}/llm_distill_domain_listwise_test.
 METHOD_RAW_TRAIN_INPUT="${METHOD_RAW_TRAIN_INPUT:-${SPLIT_DIR}/llm_distill_method_listwise_train.jsonl}"
 METHOD_RAW_VAL_INPUT="${METHOD_RAW_VAL_INPUT:-${SPLIT_DIR}/llm_distill_method_listwise_val.jsonl}"
 METHOD_RAW_TEST_INPUT="${METHOD_RAW_TEST_INPUT:-${SPLIT_DIR}/llm_distill_method_listwise_test.jsonl}"
+CONSTRAINT_RAW_TRAIN_INPUT="${CONSTRAINT_RAW_TRAIN_INPUT:-${SPLIT_DIR}/llm_distill_constraint_listwise_train.jsonl}"
+CONSTRAINT_RAW_VAL_INPUT="${CONSTRAINT_RAW_VAL_INPUT:-${SPLIT_DIR}/llm_distill_constraint_listwise_val.jsonl}"
+CONSTRAINT_RAW_TEST_INPUT="${CONSTRAINT_RAW_TEST_INPUT:-${SPLIT_DIR}/llm_distill_constraint_listwise_test.jsonl}"
 
 PAIRWISE_TRAIN_INPUT="${PAIRWISE_TRAIN_INPUT:-${SPLIT_DIR}/llm_distill_domain_pairwise_train.jsonl}"
 PAIRWISE_VAL_INPUT="${PAIRWISE_VAL_INPUT:-${SPLIT_DIR}/llm_distill_domain_pairwise_val.jsonl}"
@@ -76,6 +89,9 @@ PAIRWISE_TEST_INPUT="${PAIRWISE_TEST_INPUT:-${SPLIT_DIR}/llm_distill_domain_pair
 METHOD_PAIRWISE_TRAIN_INPUT="${METHOD_PAIRWISE_TRAIN_INPUT:-${SPLIT_DIR}/llm_distill_method_pairwise_train.jsonl}"
 METHOD_PAIRWISE_VAL_INPUT="${METHOD_PAIRWISE_VAL_INPUT:-${SPLIT_DIR}/llm_distill_method_pairwise_val.jsonl}"
 METHOD_PAIRWISE_TEST_INPUT="${METHOD_PAIRWISE_TEST_INPUT:-${SPLIT_DIR}/llm_distill_method_pairwise_test.jsonl}"
+CONSTRAINT_PAIRWISE_TRAIN_INPUT="${CONSTRAINT_PAIRWISE_TRAIN_INPUT:-${SPLIT_DIR}/llm_distill_constraint_pairwise_train.jsonl}"
+CONSTRAINT_PAIRWISE_VAL_INPUT="${CONSTRAINT_PAIRWISE_VAL_INPUT:-${SPLIT_DIR}/llm_distill_constraint_pairwise_val.jsonl}"
+CONSTRAINT_PAIRWISE_TEST_INPUT="${CONSTRAINT_PAIRWISE_TEST_INPUT:-${SPLIT_DIR}/llm_distill_constraint_pairwise_test.jsonl}"
 
 # ---------------------------
 # Stage 3) Train2 (same knobs as ce/train2.sh)
@@ -118,8 +134,10 @@ LOSS_CLUSTER_MARGIN_WEIGHT="${LOSS_CLUSTER_MARGIN_WEIGHT:-1.0}"
 LOSS_CALIBRATION_BAND_WEIGHT="${LOSS_CALIBRATION_BAND_WEIGHT:-0.30}"
 DOMAIN_PAIR_LOSS_SCALE="${DOMAIN_PAIR_LOSS_SCALE:-1.0}"
 METHOD_PAIR_LOSS_SCALE="${METHOD_PAIR_LOSS_SCALE:-1.0}"
+CONSTRAINT_PAIR_LOSS_SCALE="${CONSTRAINT_PAIR_LOSS_SCALE:-1.0}"
 DOMAIN_LIST_LOSS_SCALE="${DOMAIN_LIST_LOSS_SCALE:-1.0}"
 METHOD_LIST_LOSS_SCALE="${METHOD_LIST_LOSS_SCALE:-1.0}"
+CONSTRAINT_LIST_LOSS_SCALE="${CONSTRAINT_LIST_LOSS_SCALE:-1.0}"
 STAGE2_CLUSTER_SOURCE="${STAGE2_CLUSTER_SOURCE:-teacher_raw}"  # teacher_raw | teacher_normalized | target_cluster
 STAGE2_CLUSTER_HIGH_THRESHOLD="${STAGE2_CLUSTER_HIGH_THRESHOLD:-0.70}"
 STAGE2_CLUSTER_MID_THRESHOLD="${STAGE2_CLUSTER_MID_THRESHOLD:-0.30}"
@@ -129,6 +147,15 @@ CALIB_HIGH_FLOOR="${CALIB_HIGH_FLOOR:-0.75}"
 CALIB_MID_CENTER="${CALIB_MID_CENTER:-0.42}"
 CALIB_MID_BANDWIDTH="${CALIB_MID_BANDWIDTH:-0.15}"
 CALIB_LOW_CEIL="${CALIB_LOW_CEIL:-0.12}"
+DOMAIN_CALIBRATION_HIGH_SCALE="${DOMAIN_CALIBRATION_HIGH_SCALE:-1.0}"
+DOMAIN_CALIBRATION_MID_SCALE="${DOMAIN_CALIBRATION_MID_SCALE:-1.0}"
+DOMAIN_CALIBRATION_LOW_SCALE="${DOMAIN_CALIBRATION_LOW_SCALE:-1.0}"
+METHOD_CALIBRATION_HIGH_SCALE="${METHOD_CALIBRATION_HIGH_SCALE:-1.0}"
+METHOD_CALIBRATION_MID_SCALE="${METHOD_CALIBRATION_MID_SCALE:-1.0}"
+METHOD_CALIBRATION_LOW_SCALE="${METHOD_CALIBRATION_LOW_SCALE:-1.0}"
+CONSTRAINT_CALIBRATION_HIGH_SCALE="${CONSTRAINT_CALIBRATION_HIGH_SCALE:-1.0}"
+CONSTRAINT_CALIBRATION_MID_SCALE="${CONSTRAINT_CALIBRATION_MID_SCALE:-1.0}"
+CONSTRAINT_CALIBRATION_LOW_SCALE="${CONSTRAINT_CALIBRATION_LOW_SCALE:-1.0}"
 
 USE_PREPARED_SPLITS="${USE_PREPARED_SPLITS:-true}"  # true | false
 REGENERATE_SPLITS="${REGENERATE_SPLITS:-false}"     # true | false
@@ -140,7 +167,7 @@ NO_TQDM="${NO_TQDM:-false}"                          # true | false
 WANDB_PROJECT="${WANDB_PROJECT:-ce_distill}"
 WANDB_ENTITY="${WANDB_ENTITY:-}"
 WANDB_RUN_NAME="${WANDB_RUN_NAME:-}"
-WANDB_TAGS="${WANDB_TAGS:-ce,domain,method}"
+WANDB_TAGS="${WANDB_TAGS:-ce,domain,method,constraint}"
 WANDB_GROUP="${WANDB_GROUP:-}"
 WANDB_DIR="${WANDB_DIR:-}"
 
@@ -151,6 +178,7 @@ EVAL_AFTER_TRAIN="${EVAL_AFTER_TRAIN:-true}"  # true | false
 EVAL_BASE_MODEL="${EVAL_BASE_MODEL:-${MODEL_ID}}"
 EVAL_DOMAIN_INPUT="${EVAL_DOMAIN_INPUT:-${RAW_TEST_INPUT}}"
 EVAL_METHOD_INPUT="${EVAL_METHOD_INPUT:-${METHOD_RAW_TEST_INPUT}}"
+EVAL_CONSTRAINT_INPUT="${EVAL_CONSTRAINT_INPUT:-${CONSTRAINT_RAW_TEST_INPUT}}"
 EVAL_SCORE_FIELD="${EVAL_SCORE_FIELD:-teacher_score_raw}"
 EVAL_ONLY_SELECTED="${EVAL_ONLY_SELECTED:-false}"  # true | false
 EVAL_BATCH_SIZE="${EVAL_BATCH_SIZE:-32}"
@@ -193,12 +221,27 @@ log "Stage 1/4: Distill+augment (${METHOD_ASPECT}) with target ${METHOD_TARGET_H
   --prefilter-multiplier-low "${METHOD_PREFILTER_MULTIPLIER_LOW}" \
   --max-specs "${MAX_SPECS}"
 
-log "Stage 2/4: Shared query split for domain+method listwise+pairwise"
+log "Stage 1/4: Distill+augment (${CONSTRAINT_ASPECT}) with target ${CONSTRAINT_TARGET_HIGH}/${CONSTRAINT_TARGET_MID}/${CONSTRAINT_TARGET_LOW}"
+"${PYTHON_BIN}" ce/data_preparation/llm_distillation/llm_distillation.py \
+  --run-mode full \
+  --judge-aspect "${CONSTRAINT_ASPECT}" \
+  --target-high "${CONSTRAINT_TARGET_HIGH}" \
+  --target-mid "${CONSTRAINT_TARGET_MID}" \
+  --target-low "${CONSTRAINT_TARGET_LOW}" \
+  --prefilter-multiplier "${CONSTRAINT_PREFILTER_MULTIPLIER}" \
+  --prefilter-multiplier-high "${CONSTRAINT_PREFILTER_MULTIPLIER_HIGH}" \
+  --prefilter-multiplier-mid "${CONSTRAINT_PREFILTER_MULTIPLIER_MID}" \
+  --prefilter-multiplier-low "${CONSTRAINT_PREFILTER_MULTIPLIER_LOW}" \
+  --max-specs "${MAX_SPECS}"
+
+log "Stage 2/4: Shared query split for domain+method+constraint listwise+pairwise"
 SPLIT_ARGS=(
   --domain-input "${RAW_INPUT}"
   --method-input "${METHOD_RAW_INPUT}"
+  --constraint-input "${CONSTRAINT_RAW_INPUT}"
   --domain-pairwise-input "${PAIRWISE_INPUT}"
   --method-pairwise-input "${METHOD_PAIRWISE_INPUT}"
+  --constraint-pairwise-input "${CONSTRAINT_PAIRWISE_INPUT}"
   --output-dir "${SPLIT_DIR}"
   --seed "${SPLIT_SEED}"
   --val-ratio "${VAL_RATIO}"
@@ -214,8 +257,10 @@ CMD=(
   "${PYTHON_BIN}" ce/train2.py
   --raw-input "${RAW_INPUT}"
   --method-raw-input "${METHOD_RAW_INPUT}"
+  --constraint-raw-input "${CONSTRAINT_RAW_INPUT}"
   --pairwise-input "${PAIRWISE_INPUT}"
   --method-pairwise-input "${METHOD_PAIRWISE_INPUT}"
+  --constraint-pairwise-input "${CONSTRAINT_PAIRWISE_INPUT}"
   --split-dir "${SPLIT_DIR}"
   --raw-train-input "${RAW_TRAIN_INPUT}"
   --raw-val-input "${RAW_VAL_INPUT}"
@@ -223,12 +268,18 @@ CMD=(
   --method-raw-train-input "${METHOD_RAW_TRAIN_INPUT}"
   --method-raw-val-input "${METHOD_RAW_VAL_INPUT}"
   --method-raw-test-input "${METHOD_RAW_TEST_INPUT}"
+  --constraint-raw-train-input "${CONSTRAINT_RAW_TRAIN_INPUT}"
+  --constraint-raw-val-input "${CONSTRAINT_RAW_VAL_INPUT}"
+  --constraint-raw-test-input "${CONSTRAINT_RAW_TEST_INPUT}"
   --pairwise-train-input "${PAIRWISE_TRAIN_INPUT}"
   --pairwise-val-input "${PAIRWISE_VAL_INPUT}"
   --pairwise-test-input "${PAIRWISE_TEST_INPUT}"
   --method-pairwise-train-input "${METHOD_PAIRWISE_TRAIN_INPUT}"
   --method-pairwise-val-input "${METHOD_PAIRWISE_VAL_INPUT}"
   --method-pairwise-test-input "${METHOD_PAIRWISE_TEST_INPUT}"
+  --constraint-pairwise-train-input "${CONSTRAINT_PAIRWISE_TRAIN_INPUT}"
+  --constraint-pairwise-val-input "${CONSTRAINT_PAIRWISE_VAL_INPUT}"
+  --constraint-pairwise-test-input "${CONSTRAINT_PAIRWISE_TEST_INPUT}"
   --output-dir "${OUTPUT_DIR}"
   --model-id "${MODEL_ID}"
   --seed "${SEED}"
@@ -261,8 +312,19 @@ CMD=(
   --loss-calibration-band-weight "${LOSS_CALIBRATION_BAND_WEIGHT}"
   --domain-pair-loss-scale "${DOMAIN_PAIR_LOSS_SCALE}"
   --method-pair-loss-scale "${METHOD_PAIR_LOSS_SCALE}"
+  --constraint-pair-loss-scale "${CONSTRAINT_PAIR_LOSS_SCALE}"
   --domain-list-loss-scale "${DOMAIN_LIST_LOSS_SCALE}"
   --method-list-loss-scale "${METHOD_LIST_LOSS_SCALE}"
+  --constraint-list-loss-scale "${CONSTRAINT_LIST_LOSS_SCALE}"
+  --domain-calibration-high-scale "${DOMAIN_CALIBRATION_HIGH_SCALE}"
+  --domain-calibration-mid-scale "${DOMAIN_CALIBRATION_MID_SCALE}"
+  --domain-calibration-low-scale "${DOMAIN_CALIBRATION_LOW_SCALE}"
+  --method-calibration-high-scale "${METHOD_CALIBRATION_HIGH_SCALE}"
+  --method-calibration-mid-scale "${METHOD_CALIBRATION_MID_SCALE}"
+  --method-calibration-low-scale "${METHOD_CALIBRATION_LOW_SCALE}"
+  --constraint-calibration-high-scale "${CONSTRAINT_CALIBRATION_HIGH_SCALE}"
+  --constraint-calibration-mid-scale "${CONSTRAINT_CALIBRATION_MID_SCALE}"
+  --constraint-calibration-low-scale "${CONSTRAINT_CALIBRATION_LOW_SCALE}"
   --stage2-cluster-source "${STAGE2_CLUSTER_SOURCE}"
   --stage2-cluster-high-threshold "${STAGE2_CLUSTER_HIGH_THRESHOLD}"
   --stage2-cluster-mid-threshold "${STAGE2_CLUSTER_MID_THRESHOLD}"
@@ -358,6 +420,7 @@ if bool_true "${EVAL_AFTER_TRAIN}"; then
     --base-model "${EVAL_BASE_MODEL}"
     --domain-input "${EVAL_DOMAIN_INPUT}"
     --method-input "${EVAL_METHOD_INPUT}"
+    --constraint-input "${EVAL_CONSTRAINT_INPUT}"
     --score-field "${EVAL_SCORE_FIELD}"
     --batch-size "${EVAL_BATCH_SIZE}"
     --max-length "${EVAL_MAX_LENGTH}"
@@ -393,4 +456,4 @@ if bool_true "${EVAL_AFTER_TRAIN}"; then
   "${EVAL_CMD[@]}"
 fi
 
-log "Done: domain+method distill/augment -> split -> train2 completed."
+log "Done: domain+method+constraint distill/augment -> split -> train2 completed."

@@ -27,6 +27,7 @@ FINETUNED_MODEL_DEFAULT = "/nfs/stak/users/kimwoon/hpc-share/grant-matching-agen
 BASE_MODEL_DEFAULT = "dleemiller/ModernCE-base-sts"
 DOMAIN_INPUT_DEFAULT = "ce/dataset/splits/llm_distill_domain_listwise_test.jsonl"
 METHOD_INPUT_DEFAULT = "ce/dataset/splits/llm_distill_method_listwise_test.jsonl"
+CONSTRAINT_INPUT_DEFAULT = "ce/dataset/splits/llm_distill_constraint_listwise_test.jsonl"
 OUTPUT_DIR_DEFAULT = "ce/eval/results"
 
 
@@ -212,10 +213,15 @@ def _load_eval_rows(
     mid_threshold: float,
 ) -> List[Dict[str, Any]]:
     aspect_norm = _clean_text(aspect).lower()
-    if aspect_norm not in {"domain", "method"}:
+    aspect_prefixes = {
+        "domain": "[DOMAIN]",
+        "method": "[METHOD]",
+        "constraint": "[CONSTRAINT]",
+    }
+    if aspect_norm not in aspect_prefixes:
         raise RuntimeError(f"Unsupported aspect: {aspect}")
 
-    prefix = "[DOMAIN]" if aspect_norm == "domain" else "[METHOD]"
+    prefix = aspect_prefixes[aspect_norm]
     rows: List[Dict[str, Any]] = []
     for obj in _iter_jsonl(path):
         grant_id = _clean_text(obj.get("grant_id"))
@@ -760,7 +766,7 @@ def _compute_metric_bundle(
 
 
 def _build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(description="Evaluate CE finetuned vs plain STS base on domain+method listwise files.")
+    p = argparse.ArgumentParser(description="Evaluate CE finetuned vs plain STS base on domain+method(+constraint) listwise files.")
     p.add_argument("--finetuned-model", type=str, default=FINETUNED_MODEL_DEFAULT)
     p.add_argument("--auto-resolve-finetuned", action=argparse.BooleanOptionalAction, default=False)
     p.add_argument("--apply-posthoc-calibration", action=argparse.BooleanOptionalAction, default=True)
@@ -768,6 +774,18 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--base-model", type=str, default=BASE_MODEL_DEFAULT)
     p.add_argument("--domain-input", type=str, default=DOMAIN_INPUT_DEFAULT)
     p.add_argument("--method-input", type=str, default=METHOD_INPUT_DEFAULT)
+    p.add_argument(
+        "--constraint-input",
+        type=str,
+        default=CONSTRAINT_INPUT_DEFAULT,
+        help="Optional constraint-aspect listwise JSONL. Included when the file exists.",
+    )
+    p.add_argument(
+        "--include-constraint",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Include constraint-aspect eval when --constraint-input exists.",
+    )
     p.add_argument("--score-field", type=str, default="teacher_score_raw", choices=["teacher_score_raw", "teacher_score"])
     p.add_argument("--only-selected", action=argparse.BooleanOptionalAction, default=False)
     p.add_argument("--batch-size", type=int, default=32)
@@ -817,6 +835,8 @@ def main() -> int:
         )
     domain_path = _resolve_path(args.domain_input)
     method_path = _resolve_path(args.method_input)
+    constraint_path = _resolve_path(args.constraint_input)
+    constraint_enabled = bool(args.include_constraint) and bool(constraint_path.exists())
 
     if not domain_path.exists():
         raise RuntimeError(f"Domain input not found: {domain_path}")
@@ -839,7 +859,19 @@ def main() -> int:
         high_threshold=high_threshold,
         mid_threshold=mid_threshold,
     )
-    rows = rows_domain + rows_method
+    rows_constraint = (
+        _load_eval_rows(
+            path=constraint_path,
+            aspect="constraint",
+            score_field=args.score_field,
+            only_selected=bool(args.only_selected),
+            high_threshold=high_threshold,
+            mid_threshold=mid_threshold,
+        )
+        if constraint_enabled
+        else []
+    )
+    rows = rows_domain + rows_method + rows_constraint
     if not rows:
         raise RuntimeError("No rows loaded for evaluation.")
 
@@ -919,6 +951,20 @@ def main() -> int:
         mid_threshold=mid_threshold,
         oob_margin=oob_margin,
     )
+    constraint_bundle = (
+        _compute_metric_bundle(
+            rows=rows_constraint,
+            order_top_k=order_top_k,
+            pair_eps=pair_eps,
+            hard_gap_max=hard_gap_max,
+            medium_gap_max=medium_gap_max,
+            high_threshold=high_threshold,
+            mid_threshold=mid_threshold,
+            oob_margin=oob_margin,
+        )
+        if rows_constraint
+        else None
+    )
 
     by_band = {
         "high": int(sum(1 for r in rows if _clean_text(r.get("score_band")) == "high")),
@@ -930,12 +976,13 @@ def main() -> int:
         f"mode=distill\n"
         f"domain_input={domain_path}\n"
         f"method_input={method_path}\n"
+        f"constraint_input={constraint_path} exists={constraint_enabled}\n"
         f"score_field={_clean_text(args.score_field)}\n"
         f"only_selected={bool(args.only_selected)}\n"
         f"high_threshold={high_threshold} mid_threshold={mid_threshold}\n"
         f"oob_margin={oob_margin}\n"
         f"selected_high={by_band['high']} selected_mid={by_band['mid']} selected_low={by_band['low']}\n"
-        f"rows_domain={len(rows_domain)} rows_method={len(rows_method)} rows_total={len(rows)}\n"
+        f"rows_domain={len(rows_domain)} rows_method={len(rows_method)} rows_constraint={len(rows_constraint)} rows_total={len(rows)}\n"
         f"order_top_k={order_top_k} pair_eps={pair_eps} hard_gap_max={hard_gap_max} medium_gap_max={medium_gap_max}\n"
         f"finetuned_model={finetuned_ref}\n"
         f"score_calibration_json={score_calibration_path if score_calibration_path is not None else ''}\n"
@@ -946,7 +993,7 @@ def main() -> int:
 
     blocks: List[str] = [
         meta_header,
-        "=== OVERALL (DOMAIN + METHOD) ===",
+        "=== OVERALL (DOMAIN + METHOD + CONSTRAINT) ===" if rows_constraint else "=== OVERALL (DOMAIN + METHOD) ===",
         _format_order_summary_table(
             finetuned=overall_bundle["order_metrics"]["finetuned"],
             plain=overall_bundle["order_metrics"]["plain"],
@@ -1005,10 +1052,33 @@ def main() -> int:
             mid_threshold=mid_threshold,
             oob_margin=oob_margin,
         ),
-        "",
-        f"elapsed_sec={elapsed:.2f}",
-        f"rows_total={len(rows)}",
     ]
+    if constraint_bundle is not None:
+        blocks.extend(
+            [
+                "",
+                "=== CONSTRAINT ONLY ===",
+                _format_order_summary_table(
+                    finetuned=constraint_bundle["order_metrics"]["finetuned"],
+                    plain=constraint_bundle["order_metrics"]["plain"],
+                ),
+                _format_margin_summary_table(constraint_bundle["margin_stats"]),
+                _format_raw_sanity_table(
+                    ground_truth=constraint_bundle["raw_score_sanity"]["ground_truth"],
+                    finetuned=constraint_bundle["raw_score_sanity"]["finetuned"],
+                    plain=constraint_bundle["raw_score_sanity"]["plain"],
+                ),
+                _format_out_of_band_table(
+                    ground_truth=constraint_bundle["raw_score_sanity"]["ground_truth"],
+                    finetuned=constraint_bundle["raw_score_sanity"]["finetuned"],
+                    plain=constraint_bundle["raw_score_sanity"]["plain"],
+                    high_threshold=high_threshold,
+                    mid_threshold=mid_threshold,
+                    oob_margin=oob_margin,
+                ),
+            ]
+        )
+    blocks.extend(["", f"elapsed_sec={elapsed:.2f}", f"rows_total={len(rows)}"])
     report_text = "\n".join(blocks).strip() + "\n"
     if bool(args.print):
         print(report_text)
@@ -1026,6 +1096,8 @@ def main() -> int:
                 "mode": "distill",
                 "domain_input": str(domain_path),
                 "method_input": str(method_path),
+                "constraint_input": str(constraint_path),
+                "constraint_enabled": bool(constraint_enabled),
                 "score_field": _clean_text(args.score_field),
                 "only_selected": bool(args.only_selected),
                 "high_threshold": float(high_threshold),
@@ -1050,6 +1122,7 @@ def main() -> int:
             "by_aspect": {
                 "domain": domain_bundle,
                 "method": method_bundle,
+                "constraint": constraint_bundle,
             },
             "rows": rows,
         }

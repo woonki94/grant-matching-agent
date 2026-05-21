@@ -143,6 +143,59 @@ Output rules (strict):
 - Output only one valid JSON object with the keys above.
 """.strip()
 
+CONSTRAINT_AUGMENT_SYSTEM_PROMPT = """
+You are generating augmented training data for CONSTRAINT/SPECIFICITY match.
+Final output must be exactly one JSON object and nothing else.
+
+Goal:
+Generate one candidate specialization text (D text only) whose CONSTRAINT match to the query matches the requested target band.
+
+Constraint match means:
+- required objects or data types
+- standards, tools, systems, or named frameworks
+- populations, organisms, materials, or environments
+- deliverables, documentation, validation, or implementation conditions
+- qualifiers that make the requirement specific rather than broad
+
+Important:
+- Optimize for constraint/specificity match only.
+- Do NOT optimize for broad domain similarity alone.
+- Do NOT optimize for method similarity alone.
+- Do NOT simply paraphrase the query.
+- Do NOT copy distinctive phrases from the query.
+- Preserve or omit specific required details according to the target band.
+
+Band targets:
+- high: covers most or all central required constraints/details, with different wording
+- mid: covers some important constraints/details but omits or weakens at least one central constraint
+- low: may be in a related domain or use a related method, but misses the key required constraints/details
+
+Generation rules:
+- For high: include the concrete required details while rephrasing substantially.
+- For mid: include one meaningful required detail, but intentionally omit or alter another central detail.
+- For low: keep the text realistic and plausibly related, but remove the must-have specifics that would satisfy the query.
+
+Required JSON schema:
+{
+  "augmented_text": "<D text only: concise capability phrase, 8-26 words>",
+  "target_band": "<high|mid|low>",
+  "notes": "<very short phrase>"
+}
+
+Style for augmented_text:
+- compact dataset style
+- capability-focused phrase, not biography
+- do NOT start with phrases like "Specializes in", "Focuses on", "Expert in"
+- avoid long phrase overlap with the query
+- avoid exact reuse of rare multiword spans from the query
+
+Output rules (strict):
+- Do not output reasoning, analysis, or explanations.
+- Do not output markdown fences.
+- Do not output <think> tags.
+- Output only one valid JSON object with the keys above.
+""".strip()
+
 
 AUGMENT_USER_PROMPT_TEMPLATE = """
 Requirement query:
@@ -166,6 +219,7 @@ Generate one realistic candidate specialization phrase that matches the requeste
 AUGMENT_PROMPT_CONFIGS: Dict[str, Tuple[str, str]] = {
     "domain": (DOMAIN_AUGMENT_SYSTEM_PROMPT, "domain"),
     "method": (METHOD_AUGMENT_SYSTEM_PROMPT, "method"),
+    "constraint": (CONSTRAINT_AUGMENT_SYSTEM_PROMPT, "constraint/specificity"),
 }
 
 
@@ -256,9 +310,42 @@ Return exactly one JSON object:
 No markdown or extra text.
 """.strip()
 
+CONSTRAINT_VALIDATION_SYSTEM_PROMPT = """
+You are a strict CONSTRAINT/SPECIFICITY match judge.
+
+Your task is to evaluate whether the candidate specialization contains the specific required details in the requirement query.
+
+Constraint match means:
+- required objects or data types
+- standards, tools, systems, or named frameworks
+- populations, organisms, materials, or environments
+- deliverables, documentation, validation, or implementation conditions
+- qualifiers that narrow the requirement beyond broad domain or method
+
+Do NOT reward overlap that is only:
+- same broad topic/domain
+- same general method
+- same broad goal
+- generic data, analysis, modeling, or workflow language
+- adjacent but missing the specific requested objects/conditions
+
+Scoring rules:
+- high: score >= 0.70 -> most or all central required constraints/details are covered
+- mid: 0.30 <= score < 0.70 -> some important constraints/details are covered, but at least one central constraint is missing or weakened
+- low: score < 0.30 -> key required constraints/details are missing, even if domain or method is related
+
+Band must match score exactly.
+
+Return exactly one JSON object:
+{"score": <float in [0,1]>, "reason": "<short sentence>", "band": "<high|mid|low>"}
+
+No markdown or extra text.
+""".strip()
+
 VALIDATION_PROMPT_CONFIGS: Dict[str, str] = {
     "domain": DOMAIN_VALIDATION_SYSTEM_PROMPT,
     "method": METHOD_VALIDATION_SYSTEM_PROMPT,
+    "constraint": CONSTRAINT_VALIDATION_SYSTEM_PROMPT,
 }
 
 VALIDATION_USER_PROMPT_TEMPLATE = """
@@ -289,6 +376,8 @@ def _normalize_judge_aspect(value: Any) -> str:
     token = _clean_text(value).lower()
     if token in {"method", "methods"}:
         return "method"
+    if token in {"constraint", "constraints", "specificity", "specific", "detail", "details"}:
+        return "constraint"
     return "domain"
 
 
@@ -464,7 +553,18 @@ def _extract_json_object(text: str) -> Optional[Dict[str, Any]]:
 
 
 def _extract_augmented_text(parsed: Dict[str, Any]) -> str:
-    for key in ("augmented_text", "d_text", "domain_text", "candidate_text", "candidate", "text", "output"):
+    for key in (
+        "augmented_text",
+        "d_text",
+        "constraint_text",
+        "specificity_text",
+        "domain_text",
+        "method_text",
+        "candidate_text",
+        "candidate",
+        "text",
+        "output",
+    ):
         text = _clean_text(parsed.get(key))
         if text:
             return text

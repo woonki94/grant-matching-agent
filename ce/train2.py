@@ -47,6 +47,8 @@ RAW_INPUT_DEFAULT = "ce/dataset/distill/llm_distill_domain_listwise.jsonl"
 PAIRWISE_INPUT_DEFAULT = "ce/dataset/distill/llm_distill_domain_pairwise.jsonl"
 METHOD_RAW_INPUT_DEFAULT = "ce/dataset/distill/llm_distill_method_listwise.jsonl"
 METHOD_PAIRWISE_INPUT_DEFAULT = "ce/dataset/distill/llm_distill_method_pairwise.jsonl"
+CONSTRAINT_RAW_INPUT_DEFAULT = "ce/dataset/distill/llm_distill_constraint_listwise.jsonl"
+CONSTRAINT_PAIRWISE_INPUT_DEFAULT = "ce/dataset/distill/llm_distill_constraint_pairwise.jsonl"
 SPLIT_DIR_DEFAULT = "ce/dataset/splits"
 RAW_TRAIN_INPUT_DEFAULT = f"{SPLIT_DIR_DEFAULT}/llm_distill_domain_listwise_train.jsonl"
 RAW_VAL_INPUT_DEFAULT = f"{SPLIT_DIR_DEFAULT}/llm_distill_domain_listwise_val.jsonl"
@@ -54,12 +56,18 @@ RAW_TEST_INPUT_DEFAULT = f"{SPLIT_DIR_DEFAULT}/llm_distill_domain_listwise_test.
 METHOD_RAW_TRAIN_INPUT_DEFAULT = f"{SPLIT_DIR_DEFAULT}/llm_distill_method_listwise_train.jsonl"
 METHOD_RAW_VAL_INPUT_DEFAULT = f"{SPLIT_DIR_DEFAULT}/llm_distill_method_listwise_val.jsonl"
 METHOD_RAW_TEST_INPUT_DEFAULT = f"{SPLIT_DIR_DEFAULT}/llm_distill_method_listwise_test.jsonl"
+CONSTRAINT_RAW_TRAIN_INPUT_DEFAULT = f"{SPLIT_DIR_DEFAULT}/llm_distill_constraint_listwise_train.jsonl"
+CONSTRAINT_RAW_VAL_INPUT_DEFAULT = f"{SPLIT_DIR_DEFAULT}/llm_distill_constraint_listwise_val.jsonl"
+CONSTRAINT_RAW_TEST_INPUT_DEFAULT = f"{SPLIT_DIR_DEFAULT}/llm_distill_constraint_listwise_test.jsonl"
 PAIRWISE_TRAIN_INPUT_DEFAULT = f"{SPLIT_DIR_DEFAULT}/llm_distill_domain_pairwise_train.jsonl"
 PAIRWISE_VAL_INPUT_DEFAULT = f"{SPLIT_DIR_DEFAULT}/llm_distill_domain_pairwise_val.jsonl"
 PAIRWISE_TEST_INPUT_DEFAULT = f"{SPLIT_DIR_DEFAULT}/llm_distill_domain_pairwise_test.jsonl"
 METHOD_PAIRWISE_TRAIN_INPUT_DEFAULT = f"{SPLIT_DIR_DEFAULT}/llm_distill_method_pairwise_train.jsonl"
 METHOD_PAIRWISE_VAL_INPUT_DEFAULT = f"{SPLIT_DIR_DEFAULT}/llm_distill_method_pairwise_val.jsonl"
 METHOD_PAIRWISE_TEST_INPUT_DEFAULT = f"{SPLIT_DIR_DEFAULT}/llm_distill_method_pairwise_test.jsonl"
+CONSTRAINT_PAIRWISE_TRAIN_INPUT_DEFAULT = f"{SPLIT_DIR_DEFAULT}/llm_distill_constraint_pairwise_train.jsonl"
+CONSTRAINT_PAIRWISE_VAL_INPUT_DEFAULT = f"{SPLIT_DIR_DEFAULT}/llm_distill_constraint_pairwise_val.jsonl"
+CONSTRAINT_PAIRWISE_TEST_INPUT_DEFAULT = f"{SPLIT_DIR_DEFAULT}/llm_distill_constraint_pairwise_test.jsonl"
 OUTPUT_DIR_DEFAULT = "ce/models/bge_reranker_distill"
 WANDB_PROJECT_DEFAULT = "ce_distill"
 LISTWISE_SCORE_MODE_DEFAULT = "normalized"
@@ -157,6 +165,7 @@ class PairCollator:
         default_pair_weight: float,
         domain_pair_loss_scale: float,
         method_pair_loss_scale: float,
+        constraint_pair_loss_scale: float,
     ) -> None:
         self.tokenizer = tokenizer
         self.max_length = int(max_length)
@@ -166,6 +175,7 @@ class PairCollator:
         self.default_pair_weight = max(0.0, float(default_pair_weight))
         self.domain_pair_loss_scale = max(0.0, float(domain_pair_loss_scale))
         self.method_pair_loss_scale = max(0.0, float(method_pair_loss_scale))
+        self.constraint_pair_loss_scale = max(0.0, float(constraint_pair_loss_scale))
 
     def __call__(self, batch: Sequence[PairExample]) -> Dict[str, Any]:
         queries = [x.query_text for x in batch]
@@ -208,6 +218,8 @@ class PairCollator:
                 aspect_scale = float(self.domain_pair_loss_scale)
             elif aspect == "method":
                 aspect_scale = float(self.method_pair_loss_scale)
+            elif aspect == "constraint":
+                aspect_scale = float(self.constraint_pair_loss_scale)
             else:
                 aspect_scale = 1.0
             pair_weights_list.append(max(0.0, float(base_weight * aspect_scale)))
@@ -236,6 +248,7 @@ class ListCollator:
         stage2_cluster_mid_threshold: float,
         domain_list_loss_scale: float,
         method_list_loss_scale: float,
+        constraint_list_loss_scale: float,
     ) -> None:
         self.tokenizer = tokenizer
         self.max_length = int(max_length)
@@ -271,6 +284,12 @@ class ListCollator:
             minimum=0.0,
             maximum=100.0,
         )
+        self.constraint_list_loss_scale = _safe_float(
+            constraint_list_loss_scale,
+            default=1.0,
+            minimum=0.0,
+            maximum=100.0,
+        )
         if self.stage2_cluster_mid_threshold > self.stage2_cluster_high_threshold:
             self.stage2_cluster_mid_threshold = self.stage2_cluster_high_threshold
 
@@ -294,6 +313,8 @@ class ListCollator:
                 aspect_scale = float(self.domain_list_loss_scale)
             elif aspect == "method":
                 aspect_scale = float(self.method_list_loss_scale)
+            elif aspect == "constraint":
+                aspect_scale = float(self.constraint_list_loss_scale)
             else:
                 aspect_scale = 1.0
             aspect_id = int(_aspect_id_from_name(aspect))
@@ -419,6 +440,8 @@ def _aspect_from_prefixed_query(query_text: Any) -> str:
         return "domain"
     if q.startswith("[METHOD]"):
         return "method"
+    if q.startswith("[CONSTRAINT]"):
+        return "constraint"
     return "unknown"
 
 
@@ -428,6 +451,8 @@ def _aspect_id_from_name(aspect: Any) -> int:
         return 1
     if a == "method":
         return 2
+    if a == "constraint":
+        return 3
     return 0
 
 
@@ -661,14 +686,19 @@ def _build_output_suffix(
     loss_calibration_band_weight: float,
     domain_pair_loss_scale: float,
     method_pair_loss_scale: float,
+    constraint_pair_loss_scale: float,
     domain_list_loss_scale: float,
     method_list_loss_scale: float,
+    constraint_list_loss_scale: float,
     domain_calibration_high_scale: float,
     domain_calibration_mid_scale: float,
     domain_calibration_low_scale: float,
     method_calibration_high_scale: float,
     method_calibration_mid_scale: float,
     method_calibration_low_scale: float,
+    constraint_calibration_high_scale: float,
+    constraint_calibration_mid_scale: float,
+    constraint_calibration_low_scale: float,
 ) -> str:
     parts = [
         f"sd{int(seed)}",
@@ -689,14 +719,19 @@ def _build_output_suffix(
         f"cb{_float_token(float(loss_calibration_band_weight))}",
         f"dpw{_float_token(float(domain_pair_loss_scale))}",
         f"mpw{_float_token(float(method_pair_loss_scale))}",
+        f"cpw{_float_token(float(constraint_pair_loss_scale))}",
         f"dlw{_float_token(float(domain_list_loss_scale))}",
         f"mlw{_float_token(float(method_list_loss_scale))}",
+        f"clw{_float_token(float(constraint_list_loss_scale))}",
         f"dch{_float_token(float(domain_calibration_high_scale))}",
         f"dcm{_float_token(float(domain_calibration_mid_scale))}",
         f"dcl{_float_token(float(domain_calibration_low_scale))}",
         f"mch{_float_token(float(method_calibration_high_scale))}",
         f"mcm{_float_token(float(method_calibration_mid_scale))}",
         f"mcl{_float_token(float(method_calibration_low_scale))}",
+        f"cch{_float_token(float(constraint_calibration_high_scale))}",
+        f"ccm{_float_token(float(constraint_calibration_mid_scale))}",
+        f"ccl{_float_token(float(constraint_calibration_low_scale))}",
     ]
     return "_".join(parts)
 
@@ -923,6 +958,7 @@ def _load_groups_for_aspects(
     *,
     domain_path: Path,
     method_path: Optional[Path],
+    constraint_path: Optional[Path],
     max_queries: int,
 ) -> List[QueryGroup]:
     groups = _load_raw_groups(
@@ -939,6 +975,14 @@ def _load_groups_for_aspects(
             grant_namespace="method",
         )
         groups.extend(groups_method)
+    if constraint_path is not None and constraint_path.exists():
+        groups_constraint = _load_raw_groups(
+            constraint_path,
+            max_queries=max_queries,
+            query_prefix="[CONSTRAINT]",
+            grant_namespace="constraint",
+        )
+        groups.extend(groups_constraint)
     return groups
 
 
@@ -946,6 +990,7 @@ def _load_pairwise_for_aspects(
     *,
     domain_path: Optional[Path],
     method_path: Optional[Path],
+    constraint_path: Optional[Path],
     max_rows: int,
 ) -> List[PairExample]:
     out: List[PairExample] = []
@@ -964,6 +1009,15 @@ def _load_pairwise_for_aspects(
                 max_rows=max_rows,
                 query_prefix="[METHOD]",
                 grant_namespace="method",
+            )
+        )
+    if constraint_path is not None and constraint_path.exists():
+        out.extend(
+            _load_pairwise_rows(
+                constraint_path,
+                max_rows=max_rows,
+                query_prefix="[CONSTRAINT]",
+                grant_namespace="constraint",
             )
         )
     return out
@@ -1542,6 +1596,9 @@ def _compute_calibration_band_loss(
     method_high_scale: float,
     method_mid_scale: float,
     method_low_scale: float,
+    constraint_high_scale: float,
+    constraint_mid_scale: float,
+    constraint_low_scale: float,
 ) -> torch.Tensor:
     mode = _clean_calib_band_mode(band_mode)
     stat_mode = _clean_calib_anchor_stat(anchor_stat)
@@ -1567,13 +1624,16 @@ def _compute_calibration_band_loss(
         (2, 2): max(0.0, float(method_high_scale)),
         (2, 1): max(0.0, float(method_mid_scale)),
         (2, 0): max(0.0, float(method_low_scale)),
+        (3, 2): max(0.0, float(constraint_high_scale)),
+        (3, 1): max(0.0, float(constraint_mid_scale)),
+        (3, 0): max(0.0, float(constraint_low_scale)),
     }
 
     def _aspect_scale_tensor(a: Optional[torch.Tensor], cluster_id: int, fallback: torch.Tensor) -> torch.Tensor:
         if a is None:
             return torch.ones_like(fallback)
         out = torch.ones_like(fallback)
-        for aspect_id in (1, 2):
+        for aspect_id in (1, 2, 3):
             scale = float(aspect_scale_values.get((aspect_id, int(cluster_id)), 1.0))
             out = torch.where(a == int(aspect_id), torch.full_like(out, scale), out)
         return out
@@ -3703,6 +3763,12 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Method-aspect raw/listwise JSONL path (combined with --raw-input).",
     )
     p.add_argument(
+        "--constraint-raw-input",
+        type=str,
+        default=CONSTRAINT_RAW_INPUT_DEFAULT,
+        help="Constraint-aspect raw/listwise JSONL path (optional; combined with domain+method when present).",
+    )
+    p.add_argument(
         "--pairwise-input",
         type=str,
         default=PAIRWISE_INPUT_DEFAULT,
@@ -3713,6 +3779,12 @@ def _build_parser() -> argparse.ArgumentParser:
         type=str,
         default=METHOD_PAIRWISE_INPUT_DEFAULT,
         help="Method-aspect pairwise JSONL path (combined with --pairwise-input).",
+    )
+    p.add_argument(
+        "--constraint-pairwise-input",
+        type=str,
+        default=CONSTRAINT_PAIRWISE_INPUT_DEFAULT,
+        help="Constraint-aspect pairwise JSONL path (optional; combined with domain+method when present).",
     )
     p.add_argument("--output-dir", type=str, default=OUTPUT_DIR_DEFAULT, help="Output model/checkpoint directory.")
     p.add_argument(
@@ -3752,6 +3824,9 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--method-raw-train-input", type=str, default=METHOD_RAW_TRAIN_INPUT_DEFAULT, help="Prepared method raw train JSONL path.")
     p.add_argument("--method-raw-val-input", type=str, default=METHOD_RAW_VAL_INPUT_DEFAULT, help="Prepared method raw val/eval JSONL path.")
     p.add_argument("--method-raw-test-input", type=str, default=METHOD_RAW_TEST_INPUT_DEFAULT, help="Prepared method raw test JSONL path.")
+    p.add_argument("--constraint-raw-train-input", type=str, default=CONSTRAINT_RAW_TRAIN_INPUT_DEFAULT, help="Prepared constraint raw train JSONL path.")
+    p.add_argument("--constraint-raw-val-input", type=str, default=CONSTRAINT_RAW_VAL_INPUT_DEFAULT, help="Prepared constraint raw val/eval JSONL path.")
+    p.add_argument("--constraint-raw-test-input", type=str, default=CONSTRAINT_RAW_TEST_INPUT_DEFAULT, help="Prepared constraint raw test JSONL path.")
     p.add_argument(
         "--pairwise-train-input",
         type=str,
@@ -3787,6 +3862,24 @@ def _build_parser() -> argparse.ArgumentParser:
         type=str,
         default=METHOD_PAIRWISE_TEST_INPUT_DEFAULT,
         help="Prepared method pairwise test JSONL path.",
+    )
+    p.add_argument(
+        "--constraint-pairwise-train-input",
+        type=str,
+        default=CONSTRAINT_PAIRWISE_TRAIN_INPUT_DEFAULT,
+        help="Prepared constraint pairwise train JSONL path.",
+    )
+    p.add_argument(
+        "--constraint-pairwise-val-input",
+        type=str,
+        default=CONSTRAINT_PAIRWISE_VAL_INPUT_DEFAULT,
+        help="Prepared constraint pairwise val/eval JSONL path.",
+    )
+    p.add_argument(
+        "--constraint-pairwise-test-input",
+        type=str,
+        default=CONSTRAINT_PAIRWISE_TEST_INPUT_DEFAULT,
+        help="Prepared constraint pairwise test JSONL path.",
     )
     p.add_argument("--max-train-queries", type=int, default=0, help="Cap raw query groups loaded (0=all).")
     p.add_argument("--max-pairwise-rows", type=int, default=0, help="Cap pairwise rows loaded (0=all).")
@@ -3928,6 +4021,9 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--method-calibration-high-scale", type=float, default=1.0, help="METHOD-only multiplier for high-band calibration loss.")
     p.add_argument("--method-calibration-mid-scale", type=float, default=1.0, help="METHOD-only multiplier for mid-band calibration loss.")
     p.add_argument("--method-calibration-low-scale", type=float, default=1.0, help="METHOD-only multiplier for low-band calibration loss.")
+    p.add_argument("--constraint-calibration-high-scale", type=float, default=1.0, help="CONSTRAINT-only multiplier for high-band calibration loss.")
+    p.add_argument("--constraint-calibration-mid-scale", type=float, default=1.0, help="CONSTRAINT-only multiplier for mid-band calibration loss.")
+    p.add_argument("--constraint-calibration-low-scale", type=float, default=1.0, help="CONSTRAINT-only multiplier for low-band calibration loss.")
     p.add_argument(
         "--stage2-oob-selection-split",
         type=str,
@@ -4145,6 +4241,12 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Per-example multiplier for METHOD pairwise loss (applies in Stage1/Stage2 pairwise terms).",
     )
     p.add_argument(
+        "--constraint-pair-loss-scale",
+        type=float,
+        default=1.0,
+        help="Per-example multiplier for CONSTRAINT pairwise loss (applies in Stage1/Stage2 pairwise terms).",
+    )
+    p.add_argument(
         "--domain-list-loss-scale",
         type=float,
         default=1.0,
@@ -4155,6 +4257,12 @@ def _build_parser() -> argparse.ArgumentParser:
         type=float,
         default=1.0,
         help="Per-doc multiplier for METHOD listwise losses (KL/MSE/cluster/calibration through doc weights).",
+    )
+    p.add_argument(
+        "--constraint-list-loss-scale",
+        type=float,
+        default=1.0,
+        help="Per-doc multiplier for CONSTRAINT listwise losses (KL/MSE/cluster/calibration through doc weights).",
     )
 
     p.add_argument("--mrr-rel-threshold", type=float, default=0.7)
@@ -4323,12 +4431,15 @@ def main() -> int:
     pairwise_path = _resolve_path(args.pairwise_input)
     method_raw_path = _resolve_path(args.method_raw_input)
     method_pairwise_path = _resolve_path(args.method_pairwise_input)
+    constraint_raw_path = _resolve_path(args.constraint_raw_input)
+    constraint_pairwise_path = _resolve_path(args.constraint_pairwise_input)
     output_dir_base = _resolve_path(args.output_dir)
 
     if not raw_path.exists():
         raise RuntimeError(f"raw_input not found: {raw_path}")
     if not method_raw_path.exists():
         raise RuntimeError(f"method_raw_input not found: {method_raw_path}")
+    constraint_enabled = bool(constraint_raw_path.exists())
 
     seed = _safe_int(args.seed, default=42, minimum=0, maximum=2_147_483_647)
     random.seed(seed)
@@ -4390,6 +4501,9 @@ def main() -> int:
     method_calibration_high_scale = _safe_float(args.method_calibration_high_scale, default=1.0, minimum=0.0, maximum=100.0)
     method_calibration_mid_scale = _safe_float(args.method_calibration_mid_scale, default=1.0, minimum=0.0, maximum=100.0)
     method_calibration_low_scale = _safe_float(args.method_calibration_low_scale, default=1.0, minimum=0.0, maximum=100.0)
+    constraint_calibration_high_scale = _safe_float(args.constraint_calibration_high_scale, default=1.0, minimum=0.0, maximum=100.0)
+    constraint_calibration_mid_scale = _safe_float(args.constraint_calibration_mid_scale, default=1.0, minimum=0.0, maximum=100.0)
+    constraint_calibration_low_scale = _safe_float(args.constraint_calibration_low_scale, default=1.0, minimum=0.0, maximum=100.0)
 
     cluster_margin_hm = _safe_float(args.cluster_margin_hm, default=0.20, minimum=0.0, maximum=1.0)
     cluster_margin_ml = _safe_float(args.cluster_margin_ml, default=0.20, minimum=0.0, maximum=1.0)
@@ -4494,6 +4608,12 @@ def main() -> int:
         minimum=0.0,
         maximum=100.0,
     )
+    constraint_pair_loss_scale = _safe_float(
+        args.constraint_pair_loss_scale,
+        default=1.0,
+        minimum=0.0,
+        maximum=100.0,
+    )
     domain_list_loss_scale = _safe_float(
         args.domain_list_loss_scale,
         default=1.0,
@@ -4502,6 +4622,12 @@ def main() -> int:
     )
     method_list_loss_scale = _safe_float(
         args.method_list_loss_scale,
+        default=1.0,
+        minimum=0.0,
+        maximum=100.0,
+    )
+    constraint_list_loss_scale = _safe_float(
+        args.constraint_list_loss_scale,
         default=1.0,
         minimum=0.0,
         maximum=100.0,
@@ -4589,14 +4715,19 @@ def main() -> int:
             loss_calibration_band_weight=loss_calibration_band_weight,
             domain_pair_loss_scale=domain_pair_loss_scale,
             method_pair_loss_scale=method_pair_loss_scale,
+            constraint_pair_loss_scale=constraint_pair_loss_scale,
             domain_list_loss_scale=domain_list_loss_scale,
             method_list_loss_scale=method_list_loss_scale,
+            constraint_list_loss_scale=constraint_list_loss_scale,
             domain_calibration_high_scale=domain_calibration_high_scale,
             domain_calibration_mid_scale=domain_calibration_mid_scale,
             domain_calibration_low_scale=domain_calibration_low_scale,
             method_calibration_high_scale=method_calibration_high_scale,
             method_calibration_mid_scale=method_calibration_mid_scale,
             method_calibration_low_scale=method_calibration_low_scale,
+            constraint_calibration_high_scale=constraint_calibration_high_scale,
+            constraint_calibration_mid_scale=constraint_calibration_mid_scale,
+            constraint_calibration_low_scale=constraint_calibration_low_scale,
         )
         output_dir = (output_dir_base.parent / f"{output_dir_base.name}__{output_suffix}").resolve()
     else:
@@ -4612,12 +4743,18 @@ def main() -> int:
     method_raw_train_override_path = _resolve_path(args.method_raw_train_input)
     method_raw_val_override_path = _resolve_path(args.method_raw_val_input)
     method_raw_test_override_path = _resolve_path(args.method_raw_test_input)
+    constraint_raw_train_override_path = _resolve_path(args.constraint_raw_train_input)
+    constraint_raw_val_override_path = _resolve_path(args.constraint_raw_val_input)
+    constraint_raw_test_override_path = _resolve_path(args.constraint_raw_test_input)
     pair_train_override_path = _resolve_path(args.pairwise_train_input)
     pair_val_override_path = _resolve_path(args.pairwise_val_input)
     pair_test_override_path = _resolve_path(args.pairwise_test_input)
     method_pair_train_override_path = _resolve_path(args.method_pairwise_train_input)
     method_pair_val_override_path = _resolve_path(args.method_pairwise_val_input)
     method_pair_test_override_path = _resolve_path(args.method_pairwise_test_input)
+    constraint_pair_train_override_path = _resolve_path(args.constraint_pairwise_train_input)
+    constraint_pair_val_override_path = _resolve_path(args.constraint_pairwise_val_input)
+    constraint_pair_test_override_path = _resolve_path(args.constraint_pairwise_test_input)
     split_policy = "deterministic_hash_by_grant_id"
     split_generated = False
     split_result: Optional[Dict[str, Any]] = None
@@ -4628,12 +4765,18 @@ def main() -> int:
     split_method_raw_train_path = method_raw_train_override_path
     split_method_raw_val_path = method_raw_val_override_path
     split_method_raw_test_path = method_raw_test_override_path
+    split_constraint_raw_train_path = constraint_raw_train_override_path
+    split_constraint_raw_val_path = constraint_raw_val_override_path
+    split_constraint_raw_test_path = constraint_raw_test_override_path
     split_pair_train_path = pair_train_override_path
     split_pair_val_path = pair_val_override_path
     split_pair_test_path = pair_test_override_path
     split_method_pair_train_path = method_pair_train_override_path
     split_method_pair_val_path = method_pair_val_override_path
     split_method_pair_test_path = method_pair_test_override_path
+    split_constraint_pair_train_path = constraint_pair_train_override_path
+    split_constraint_pair_val_path = constraint_pair_val_override_path
+    split_constraint_pair_test_path = constraint_pair_test_override_path
 
     if use_prepared_splits:
         split_raw_ready = (
@@ -4643,6 +4786,14 @@ def main() -> int:
             and split_method_raw_train_path.exists()
             and split_method_raw_val_path.exists()
             and split_method_raw_test_path.exists()
+            and (
+                not constraint_enabled
+                or (
+                    split_constraint_raw_train_path.exists()
+                    and split_constraint_raw_val_path.exists()
+                    and split_constraint_raw_test_path.exists()
+                )
+            )
         )
         split_pair_ready = (
             split_pair_train_path.exists()
@@ -4651,13 +4802,21 @@ def main() -> int:
             and split_method_pair_train_path.exists()
             and split_method_pair_val_path.exists()
             and split_method_pair_test_path.exists()
+            and (
+                not constraint_pairwise_path.exists()
+                or (
+                    split_constraint_pair_train_path.exists()
+                    and split_constraint_pair_val_path.exists()
+                    and split_constraint_pair_test_path.exists()
+                )
+            )
         )
-        if split_raw_ready and (split_pair_ready or (not pairwise_path.exists() and not method_pairwise_path.exists())) and not regenerate_splits:
+        if split_raw_ready and (split_pair_ready or (not pairwise_path.exists() and not method_pairwise_path.exists() and not constraint_pairwise_path.exists())) and not regenerate_splits:
             split_policy = "prepared_split_files_manual_paths"
         else:
             print(
                 "prepared_split_fallback=true "
-                "reason=missing_domain_or_method_split_files "
+                "reason=missing_domain_method_or_constraint_split_files "
                 "hint=run ce/data_preparation/split_distill_listwise_domain_method.py first"
             )
             use_prepared_splits = False
@@ -4672,8 +4831,11 @@ def main() -> int:
             wandb_config = dict(vars(args))
             wandb_config["raw_input"] = str(raw_path)
             wandb_config["method_raw_input"] = str(method_raw_path)
+            wandb_config["constraint_raw_input"] = str(constraint_raw_path)
+            wandb_config["constraint_enabled"] = bool(constraint_enabled)
             wandb_config["pairwise_input"] = str(pairwise_path)
             wandb_config["method_pairwise_input"] = str(method_pairwise_path)
+            wandb_config["constraint_pairwise_input"] = str(constraint_pairwise_path)
             wandb_config["output_dir_base"] = str(output_dir_base)
             wandb_config["output_dir"] = str(output_dir)
             wandb_config["output_suffix"] = str(output_suffix)
@@ -4716,8 +4878,10 @@ def main() -> int:
 
     print(f"raw_input={raw_path}")
     print(f"method_raw_input={method_raw_path}")
+    print(f"constraint_raw_input={constraint_raw_path} exists={constraint_raw_path.exists()} enabled={constraint_enabled}")
     print(f"pairwise_input={pairwise_path} exists={pairwise_path.exists()}")
     print(f"method_pairwise_input={method_pairwise_path} exists={method_pairwise_path.exists()}")
+    print(f"constraint_pairwise_input={constraint_pairwise_path} exists={constraint_pairwise_path.exists()}")
     print(f"output_dir_base={output_dir_base}")
     print(f"append_args_to_output_dir={append_args_to_output_dir}")
     if output_suffix:
@@ -4764,8 +4928,8 @@ def main() -> int:
     print(f"list_augmented_doc_weight={list_augmented_doc_weight:.4f}")
     print(
         "aspect_loss_scales="
-        f"pair(domain/method):{domain_pair_loss_scale:.3f}/{method_pair_loss_scale:.3f},"
-        f"list(domain/method):{domain_list_loss_scale:.3f}/{method_list_loss_scale:.3f}"
+        f"pair(domain/method/constraint):{domain_pair_loss_scale:.3f}/{method_pair_loss_scale:.3f}/{constraint_pair_loss_scale:.3f},"
+        f"list(domain/method/constraint):{domain_list_loss_scale:.3f}/{method_list_loss_scale:.3f}/{constraint_list_loss_scale:.3f}"
     )
     print(f"listwise_score_mode={listwise_score_mode}")
     print(
@@ -4779,7 +4943,8 @@ def main() -> int:
     print(
         "aspect_calibration_scales="
         f"domain(high/mid/low):{domain_calibration_high_scale:.3f}/{domain_calibration_mid_scale:.3f}/{domain_calibration_low_scale:.3f},"
-        f"method(high/mid/low):{method_calibration_high_scale:.3f}/{method_calibration_mid_scale:.3f}/{method_calibration_low_scale:.3f}"
+        f"method(high/mid/low):{method_calibration_high_scale:.3f}/{method_calibration_mid_scale:.3f}/{method_calibration_low_scale:.3f},"
+        f"constraint(high/mid/low):{constraint_calibration_high_scale:.3f}/{constraint_calibration_mid_scale:.3f}/{constraint_calibration_low_scale:.3f}"
     )
     print(
         "calibration_band_config="
@@ -4803,12 +4968,20 @@ def main() -> int:
         print(f"method_raw_split_train={split_method_raw_train_path}")
         print(f"method_raw_split_val={split_method_raw_val_path}")
         print(f"method_raw_split_test={split_method_raw_test_path}")
+        if constraint_enabled:
+            print(f"constraint_raw_split_train={split_constraint_raw_train_path}")
+            print(f"constraint_raw_split_val={split_constraint_raw_val_path}")
+            print(f"constraint_raw_split_test={split_constraint_raw_test_path}")
         print(f"pair_split_train={split_pair_train_path} exists={split_pair_train_path.exists()}")
         print(f"pair_split_val={split_pair_val_path} exists={split_pair_val_path.exists()}")
         print(f"pair_split_test={split_pair_test_path} exists={split_pair_test_path.exists()}")
         print(f"method_pair_split_train={split_method_pair_train_path} exists={split_method_pair_train_path.exists()}")
         print(f"method_pair_split_val={split_method_pair_val_path} exists={split_method_pair_val_path.exists()}")
         print(f"method_pair_split_test={split_method_pair_test_path} exists={split_method_pair_test_path.exists()}")
+        if constraint_pairwise_path.exists():
+            print(f"constraint_pair_split_train={split_constraint_pair_train_path} exists={split_constraint_pair_train_path.exists()}")
+            print(f"constraint_pair_split_val={split_constraint_pair_val_path} exists={split_constraint_pair_val_path.exists()}")
+            print(f"constraint_pair_split_test={split_constraint_pair_test_path} exists={split_constraint_pair_test_path.exists()}")
         if split_result is not None:
             raw_band_counts = split_result.get("raw_file_band_counts") or {}
             if isinstance(raw_band_counts, dict):
@@ -4833,16 +5006,19 @@ def main() -> int:
         train_groups = _load_groups_for_aspects(
             domain_path=split_raw_train_path,
             method_path=split_method_raw_train_path,
+            constraint_path=split_constraint_raw_train_path if constraint_enabled else None,
             max_queries=max_train_queries,
         )
         val_groups = _load_groups_for_aspects(
             domain_path=split_raw_val_path,
             method_path=split_method_raw_val_path,
+            constraint_path=split_constraint_raw_val_path if constraint_enabled else None,
             max_queries=0,
         )
         test_groups = _load_groups_for_aspects(
             domain_path=split_raw_test_path,
             method_path=split_method_raw_test_path,
+            constraint_path=split_constraint_raw_test_path if constraint_enabled else None,
             max_queries=0,
         )
         groups_all = list(train_groups) + list(val_groups) + list(test_groups)
@@ -4850,6 +5026,7 @@ def main() -> int:
         groups_all = _load_groups_for_aspects(
             domain_path=raw_path,
             method_path=method_raw_path,
+            constraint_path=constraint_raw_path if constraint_enabled else None,
             max_queries=max_train_queries,
         )
         if not groups_all:
@@ -4913,20 +5090,31 @@ def main() -> int:
         and split_method_pair_train_path.exists()
         and split_method_pair_val_path.exists()
         and split_method_pair_test_path.exists()
+        and (
+            not constraint_pairwise_path.exists()
+            or (
+                split_constraint_pair_train_path.exists()
+                and split_constraint_pair_val_path.exists()
+                and split_constraint_pair_test_path.exists()
+            )
+        )
     ):
         train_pairs = _load_pairwise_for_aspects(
             domain_path=split_pair_train_path,
             method_path=split_method_pair_train_path,
+            constraint_path=split_constraint_pair_train_path if constraint_pairwise_path.exists() else None,
             max_rows=max_pairwise_rows,
         )
         val_pairs = _load_pairwise_for_aspects(
             domain_path=split_pair_val_path,
             method_path=split_method_pair_val_path,
+            constraint_path=split_constraint_pair_val_path if constraint_pairwise_path.exists() else None,
             max_rows=0,
         )
         test_pairs = _load_pairwise_for_aspects(
             domain_path=split_pair_test_path,
             method_path=split_method_pair_test_path,
+            constraint_path=split_constraint_pair_test_path if constraint_pairwise_path.exists() else None,
             max_rows=0,
         )
         pair_rows_source = "pairwise_split_files"
@@ -4934,6 +5122,7 @@ def main() -> int:
         pair_rows_loaded = _load_pairwise_for_aspects(
             domain_path=pairwise_path if pairwise_path.exists() else None,
             method_path=method_pairwise_path if method_pairwise_path.exists() else None,
+            constraint_path=constraint_pairwise_path if constraint_pairwise_path.exists() else None,
             max_rows=max_pairwise_rows,
         )
         if pair_rows_loaded:
@@ -5191,14 +5380,19 @@ def main() -> int:
             "dataset/list_augmented_doc_weight": float(list_augmented_doc_weight),
             "dataset/domain_pair_loss_scale": float(domain_pair_loss_scale),
             "dataset/method_pair_loss_scale": float(method_pair_loss_scale),
+            "dataset/constraint_pair_loss_scale": float(constraint_pair_loss_scale),
             "dataset/domain_list_loss_scale": float(domain_list_loss_scale),
             "dataset/method_list_loss_scale": float(method_list_loss_scale),
+            "dataset/constraint_list_loss_scale": float(constraint_list_loss_scale),
             "dataset/domain_calibration_high_scale": float(domain_calibration_high_scale),
             "dataset/domain_calibration_mid_scale": float(domain_calibration_mid_scale),
             "dataset/domain_calibration_low_scale": float(domain_calibration_low_scale),
             "dataset/method_calibration_high_scale": float(method_calibration_high_scale),
             "dataset/method_calibration_mid_scale": float(method_calibration_mid_scale),
             "dataset/method_calibration_low_scale": float(method_calibration_low_scale),
+            "dataset/constraint_calibration_high_scale": float(constraint_calibration_high_scale),
+            "dataset/constraint_calibration_mid_scale": float(constraint_calibration_mid_scale),
+            "dataset/constraint_calibration_low_scale": float(constraint_calibration_low_scale),
             "dataset/train_low_cap_applied": int(1 if bool(train_low_cap_stats.get("applied")) else 0),
             "dataset/train_low_cap_ratio": float(train_low_cap_stats.get("ratio", 0.0)),
             "dataset/train_low_cap_target": int(train_low_cap_stats.get("low_cap_target", -1)),
@@ -5253,6 +5447,7 @@ def main() -> int:
         default_pair_weight=float(pair_default_weight),
         domain_pair_loss_scale=float(domain_pair_loss_scale),
         method_pair_loss_scale=float(method_pair_loss_scale),
+        constraint_pair_loss_scale=float(constraint_pair_loss_scale),
     )
     list_collator = ListCollator(
         tokenizer,
@@ -5264,6 +5459,7 @@ def main() -> int:
         stage2_cluster_mid_threshold=float(stage2_cluster_mid_threshold),
         domain_list_loss_scale=float(domain_list_loss_scale),
         method_list_loss_scale=float(method_list_loss_scale),
+        constraint_list_loss_scale=float(constraint_list_loss_scale),
     )
 
     pair_train_loader = DataLoader(
@@ -5484,6 +5680,9 @@ def main() -> int:
                     method_high_scale=method_calibration_high_scale,
                     method_mid_scale=method_calibration_mid_scale,
                     method_low_scale=method_calibration_low_scale,
+                    constraint_high_scale=constraint_calibration_high_scale,
+                    constraint_mid_scale=constraint_calibration_mid_scale,
+                    constraint_low_scale=constraint_calibration_low_scale,
                 )
                 oob_summary_batch = _compute_oob_summary_from_probs(
                     probs_flat=torch.sigmoid(logits_flat),
@@ -6286,6 +6485,9 @@ def main() -> int:
                         method_high_scale=method_calibration_high_scale,
                         method_mid_scale=method_calibration_mid_scale,
                         method_low_scale=method_calibration_low_scale,
+                        constraint_high_scale=constraint_calibration_high_scale,
+                        constraint_mid_scale=constraint_calibration_mid_scale,
+                        constraint_low_scale=constraint_calibration_low_scale,
                     )
 
                     pos_logits = model(**pos).logits.squeeze(-1)
@@ -6598,7 +6800,7 @@ def main() -> int:
                     )
                     aspect_fits: Dict[str, Dict[str, Any]] = {}
                     if isinstance(fit_aspect, torch.Tensor) and fit_aspect.numel() == fit_logits.numel():
-                        for aspect_name, aspect_id in (("domain", 1), ("method", 2)):
+                        for aspect_name, aspect_id in (("domain", 1), ("method", 2), ("constraint", 3)):
                             mask = fit_aspect == int(aspect_id)
                             if bool(mask.any().item()):
                                 teacher_subset = (
@@ -6827,7 +7029,12 @@ def main() -> int:
     run_manifest = {
         "created_at_utc": datetime.now(timezone.utc).isoformat(),
         "raw_input": str(raw_path),
+        "method_raw_input": str(method_raw_path),
+        "constraint_raw_input": str(constraint_raw_path),
+        "constraint_enabled": bool(constraint_enabled),
         "pairwise_input": str(pairwise_path),
+        "method_pairwise_input": str(method_pairwise_path),
+        "constraint_pairwise_input": str(constraint_pairwise_path),
         "output_dir_base": str(output_dir_base),
         "output_dir": str(output_dir),
         "append_args_to_output_dir": bool(append_args_to_output_dir),
@@ -6843,9 +7050,21 @@ def main() -> int:
         "split_raw_train_path": str(split_raw_train_path),
         "split_raw_val_path": str(split_raw_val_path),
         "split_raw_test_path": str(split_raw_test_path),
+        "split_method_raw_train_path": str(split_method_raw_train_path),
+        "split_method_raw_val_path": str(split_method_raw_val_path),
+        "split_method_raw_test_path": str(split_method_raw_test_path),
+        "split_constraint_raw_train_path": str(split_constraint_raw_train_path),
+        "split_constraint_raw_val_path": str(split_constraint_raw_val_path),
+        "split_constraint_raw_test_path": str(split_constraint_raw_test_path),
         "split_pair_train_path": str(split_pair_train_path),
         "split_pair_val_path": str(split_pair_val_path),
         "split_pair_test_path": str(split_pair_test_path),
+        "split_method_pair_train_path": str(split_method_pair_train_path),
+        "split_method_pair_val_path": str(split_method_pair_val_path),
+        "split_method_pair_test_path": str(split_method_pair_test_path),
+        "split_constraint_pair_train_path": str(split_constraint_pair_train_path),
+        "split_constraint_pair_val_path": str(split_constraint_pair_val_path),
+        "split_constraint_pair_test_path": str(split_constraint_pair_test_path),
         "val_ratio": float(val_ratio),
         "test_ratio": float(test_ratio),
         "train_queries": int(len(train_groups)),
@@ -6885,10 +7104,12 @@ def main() -> int:
             "pair": {
                 "domain": float(domain_pair_loss_scale),
                 "method": float(method_pair_loss_scale),
+                "constraint": float(constraint_pair_loss_scale),
             },
             "list": {
                 "domain": float(domain_list_loss_scale),
                 "method": float(method_list_loss_scale),
+                "constraint": float(constraint_list_loss_scale),
             },
         },
         "listwise_score_mode": str(listwise_score_mode),
@@ -6942,6 +7163,9 @@ def main() -> int:
             "method_calibration_high_scale": float(method_calibration_high_scale),
             "method_calibration_mid_scale": float(method_calibration_mid_scale),
             "method_calibration_low_scale": float(method_calibration_low_scale),
+            "constraint_calibration_high_scale": float(constraint_calibration_high_scale),
+            "constraint_calibration_mid_scale": float(constraint_calibration_mid_scale),
+            "constraint_calibration_low_scale": float(constraint_calibration_low_scale),
         },
         "margin_clip": {"min": float(margin_min), "max": float(margin_max)},
         "stage1_epochs": int(stage1_epochs),

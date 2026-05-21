@@ -207,9 +207,68 @@ Faculty specialization:
 {fac_spec_text}
 """.strip()
 
+CONSTRAINT_SYSTEM_PROMPT = """
+You are a strict evaluator of constraint/specificity overlap between a requirement query and a candidate specialization.
+
+Your task is to score CONSTRAINT MATCH ONLY.
+
+Constraint match means whether the candidate contains the specific required details in the query, such as:
+- required objects or data types
+- standards, tools, systems, or named frameworks
+- populations, organisms, materials, or environments
+- deliverables, documentation, validation, or implementation conditions
+- qualifiers that narrow the requirement beyond broad domain or method
+
+Important:
+Constraint match is not broad relevance.
+Do NOT reward overlap that is only:
+- same application domain
+- same general method
+- same broad research goal
+- generic data, analysis, modeling, or workflow language
+- adjacent but missing the specific requested objects/conditions
+
+Scoring rules:
+- high (>= 0.70): candidate covers most or all explicit required constraints/details, even if phrased differently
+- mid (0.30 to <0.70): candidate covers some important constraints/details, but misses or weakens at least one central constraint
+- low (<0.30): candidate is missing the key required constraints/details, even if domain or method is related
+
+Constraint-specific guidance:
+- If the query has multiple must-have details, missing one central detail should usually prevent a high score
+- If the candidate is broadly relevant but omits the requested specific object, standard, population, condition, or deliverable, score low or mid
+- If overlap is only domain or method similarity, score low
+- Prefer conservative scores when the candidate does not explicitly support the requirement's specificity
+
+Final output must be exactly one JSON object.
+
+Required JSON schema:
+{
+  "score": <float in [0,1]>,
+  "reason": "<one short sentence>",
+  "band": "<high|mid|low>"
+}
+
+Band must match score:
+- high if score >= 0.70
+- mid if 0.30 <= score < 0.70
+- low if score < 0.30
+
+No markdown or extra text outside JSON.
+""".strip()
+
+
+CONSTRAINT_USER_PROMPT_TEMPLATE = """
+Grant specialization keyword:
+{spec_text}
+
+Faculty specialization:
+{fac_spec_text}
+""".strip()
+
 PROMPT_CONFIGS: Dict[str, Tuple[str, str]] = {
     "domain": (DOMAIN_SYSTEM_PROMPT, DOMAIN_USER_PROMPT_TEMPLATE),
     "method": (METHOD_SYSTEM_PROMPT, METHOD_USER_PROMPT_TEMPLATE),
+    "constraint": (CONSTRAINT_SYSTEM_PROMPT, CONSTRAINT_USER_PROMPT_TEMPLATE),
 }
 
 
@@ -1292,7 +1351,7 @@ def main() -> int:
         "--judge-aspect",
         type=str,
         default="domain",
-        choices=["domain", "method"],
+        choices=["domain", "method", "constraint"],
         help="Judge aspect/prompt set to run.",
     )
     parser.add_argument("--target-high", type=int, default=1, help="Exact target high count per spec after LLM scoring.")
