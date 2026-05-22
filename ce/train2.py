@@ -742,7 +742,29 @@ def _build_output_suffix(
         f"ccm{_float_token(float(constraint_calibration_mid_scale))}",
         f"ccl{_float_token(float(constraint_calibration_low_scale))}",
     ]
-    return "_".join(parts)
+    full = "_".join(parts)
+    # Many HPC/NFS filesystems cap a single path component at 255 bytes.
+    # Keep the most searchable knobs visible, then preserve uniqueness with a hash.
+    if len(full.encode("utf-8")) <= 140:
+        return full
+    digest = hashlib.sha1(full.encode("utf-8")).hexdigest()[:12]
+    keep = [
+        f"sd{int(seed)}",
+        f"s1{int(stage1_epochs)}",
+        f"s2{int(stage2_epochs)}",
+        f"bs{int(train_batch_size)}",
+        f"ga{int(grad_accum_steps)}",
+        f"lr2{_float_token(float(stage2_learning_rate))}",
+        f"kl{_float_token(float(loss_kl_weight))}",
+        f"mse{_float_token(float(loss_mse_weight))}",
+        f"cb{_float_token(float(loss_calibration_band_weight))}",
+        f"cml{_float_token(float(loss_calibration_mid_low_weight))}",
+        f"cmh{_float_token(float(loss_calibration_mid_high_weight))}",
+        f"oml{_float_token(float(stage2_oob_mid_low_weight if stage2_oob_mid_low_weight is not None else stage2_oob_mid_weight))}",
+        f"omh{_float_token(float(stage2_oob_mid_high_weight if stage2_oob_mid_high_weight is not None else stage2_oob_mid_weight))}",
+        f"h{digest}",
+    ]
+    return "_".join(keep)
 
 
 def _wandb_log(run: Any, metrics: Dict[str, Any], *, step: Optional[int] = None) -> None:
