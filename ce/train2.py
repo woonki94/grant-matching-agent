@@ -684,6 +684,11 @@ def _build_output_suffix(
     loss_mse_weight: float,
     loss_cluster_margin_weight: float,
     loss_calibration_band_weight: float,
+    loss_calibration_mid_low_weight: float,
+    loss_calibration_mid_high_weight: float,
+    stage2_oob_mid_low_weight: Optional[float],
+    stage2_oob_mid_high_weight: Optional[float],
+    stage2_oob_mid_weight: float,
     domain_pair_loss_scale: float,
     method_pair_loss_scale: float,
     constraint_pair_loss_scale: float,
@@ -717,6 +722,10 @@ def _build_output_suffix(
         f"mse{_float_token(float(loss_mse_weight))}",
         f"cm{_float_token(float(loss_cluster_margin_weight))}",
         f"cb{_float_token(float(loss_calibration_band_weight))}",
+        f"cml{_float_token(float(loss_calibration_mid_low_weight))}",
+        f"cmh{_float_token(float(loss_calibration_mid_high_weight))}",
+        f"oml{_float_token(float(stage2_oob_mid_low_weight if stage2_oob_mid_low_weight is not None else stage2_oob_mid_weight))}",
+        f"omh{_float_token(float(stage2_oob_mid_high_weight if stage2_oob_mid_high_weight is not None else stage2_oob_mid_weight))}",
         f"dpw{_float_token(float(domain_pair_loss_scale))}",
         f"mpw{_float_token(float(method_pair_loss_scale))}",
         f"cpw{_float_token(float(constraint_pair_loss_scale))}",
@@ -1627,6 +1636,8 @@ def _compute_calibration_band_loss(
     data_low_slack: float,
     weight_high: float,
     weight_mid: float,
+    weight_mid_low: float,
+    weight_mid_high: float,
     weight_low: float,
     domain_high_scale: float,
     domain_mid_scale: float,
@@ -1654,6 +1665,8 @@ def _compute_calibration_band_loss(
     cursor = 0
     weight_high_val = max(0.0, float(weight_high))
     weight_mid_val = max(0.0, float(weight_mid))
+    weight_mid_low_val = max(0.0, float(weight_mid_low))
+    weight_mid_high_val = max(0.0, float(weight_mid_high))
     weight_low_val = max(0.0, float(weight_low))
     aspect_scale_values = {
         (1, 2): max(0.0, float(domain_high_scale)),
@@ -1732,10 +1745,15 @@ def _compute_calibration_band_loss(
                 center = torch.tensor(mid_center, device=s.device, dtype=s.dtype)
             else:
                 center = _cluster_anchor(y[mid_mask], stat_mode=stat_mode)
-            band_loss = _weighted_mean(
-                F.relu(torch.abs(s_mid - center) - mid_bw),
-                w_mid_tensor,
-            )
+            lower_bound = center - torch.tensor(mid_bw, device=s.device, dtype=s.dtype)
+            upper_bound = center + torch.tensor(mid_bw, device=s.device, dtype=s.dtype)
+            lower_loss = _weighted_mean(F.relu(lower_bound - s_mid), w_mid_tensor)
+            upper_loss = _weighted_mean(F.relu(s_mid - upper_bound), w_mid_tensor)
+            side_den = max(1e-6, float(weight_mid_low_val + weight_mid_high_val))
+            band_loss = (
+                lower_loss * float(weight_mid_low_val)
+                + upper_loss * float(weight_mid_high_val)
+            ) / float(side_den)
             weighted_parts.append(band_loss * float(weight_mid_val) * mid_part_scale.to(dtype=s.dtype))
             part_weights.append(torch.tensor(float(weight_mid_val), device=s.device, dtype=s.dtype) * mid_part_scale.to(dtype=s.dtype))
 
@@ -1817,10 +1835,27 @@ def _compute_weighted_oob_objective(
     weight_high: float,
     weight_mid: float,
     weight_low: float,
+    weight_mid_low: Optional[float] = None,
+    weight_mid_high: Optional[float] = None,
 ) -> float:
     w_high = max(0.0, float(weight_high))
     w_mid = max(0.0, float(weight_mid))
     w_low = max(0.0, float(weight_low))
+    use_split_mid = weight_mid_low is not None or weight_mid_high is not None
+    if use_split_mid:
+        w_mid_low = max(0.0, float(w_mid if weight_mid_low is None else weight_mid_low))
+        w_mid_high = max(0.0, float(w_mid if weight_mid_high is None else weight_mid_high))
+        denom = max(1e-6, w_high + w_mid_low + w_mid_high + w_low)
+        return float(
+            (
+                w_high * float(oob_summary.get("oob_high_rate", 0.0))
+                + w_mid_low * float(oob_summary.get("oob_mid_low_rate", 0.0))
+                + w_mid_high * float(oob_summary.get("oob_mid_high_rate", 0.0))
+                + w_low * float(oob_summary.get("oob_low_rate", 0.0))
+            )
+            / denom
+        )
+
     denom = max(1e-6, w_high + w_mid + w_low)
     return float(
         (
@@ -1841,6 +1876,8 @@ def _fit_affine_oob_calibration(
     mid_threshold: float,
     oob_high_weight: float,
     oob_mid_weight: float,
+    oob_mid_low_weight: Optional[float],
+    oob_mid_high_weight: Optional[float],
     oob_low_weight: float,
     a_min: float,
     a_max: float,
@@ -1887,6 +1924,8 @@ def _fit_affine_oob_calibration(
                 weight_high=oob_high_weight,
                 weight_mid=oob_mid_weight,
                 weight_low=oob_low_weight,
+                weight_mid_low=oob_mid_low_weight,
+                weight_mid_high=oob_mid_high_weight,
             )
             mae = float("inf")
             if teacher_cpu is not None and teacher_cpu.numel() == probs.numel():
@@ -1924,6 +1963,8 @@ def _fit_affine_oob_calibration(
                     weight_high=oob_high_weight,
                     weight_mid=oob_mid_weight,
                     weight_low=oob_low_weight,
+                    weight_mid_low=oob_mid_low_weight,
+                    weight_mid_high=oob_mid_high_weight,
                 )
             ),
             "teacher_raw_mae": -1.0,
@@ -4052,6 +4093,18 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--loss-cluster-margin-hl-weight", type=float, default=1.0, help="Relative weight for high-low cluster margin loss.")
     p.add_argument("--loss-calibration-high-weight", type=float, default=1.0, help="Relative weight for high-band calibration loss.")
     p.add_argument("--loss-calibration-mid-weight", type=float, default=1.0, help="Relative weight for mid-band calibration loss.")
+    p.add_argument(
+        "--loss-calibration-mid-low-weight",
+        type=float,
+        default=1.0,
+        help="Relative weight inside mid-band calibration for mids predicted below the mid floor.",
+    )
+    p.add_argument(
+        "--loss-calibration-mid-high-weight",
+        type=float,
+        default=1.0,
+        help="Relative weight inside mid-band calibration for mids predicted above the mid ceiling.",
+    )
     p.add_argument("--loss-calibration-low-weight", type=float, default=1.0, help="Relative weight for low-band calibration loss.")
     p.add_argument("--domain-calibration-high-scale", type=float, default=1.0, help="DOMAIN-only multiplier for high-band calibration loss.")
     p.add_argument("--domain-calibration-mid-scale", type=float, default=1.0, help="DOMAIN-only multiplier for mid-band calibration loss.")
@@ -4071,6 +4124,18 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("--stage2-oob-high-weight", type=float, default=2.0, help="Weight for high-band out-of-band rate in Stage2 selection objective.")
     p.add_argument("--stage2-oob-mid-weight", type=float, default=1.0, help="Weight for mid-band out-of-band rate in Stage2 selection objective.")
+    p.add_argument(
+        "--stage2-oob-mid-low-weight",
+        type=float,
+        default=-1.0,
+        help="Optional Stage2 selection/posthoc weight for MID_LOW only. Negative falls back to --stage2-oob-mid-weight.",
+    )
+    p.add_argument(
+        "--stage2-oob-mid-high-weight",
+        type=float,
+        default=-1.0,
+        help="Optional Stage2 selection/posthoc weight for MID_HIGH only. Negative falls back to --stage2-oob-mid-weight.",
+    )
     p.add_argument("--stage2-oob-low-weight", type=float, default=1.0, help="Weight for low-band out-of-band rate in Stage2 selection objective.")
     p.add_argument(
         "--stage2-gated-selection",
@@ -4540,6 +4605,8 @@ def main() -> int:
     loss_cluster_margin_hl_weight = _safe_float(args.loss_cluster_margin_hl_weight, default=1.0, minimum=0.0, maximum=100.0)
     loss_calibration_high_weight = _safe_float(args.loss_calibration_high_weight, default=1.0, minimum=0.0, maximum=100.0)
     loss_calibration_mid_weight = _safe_float(args.loss_calibration_mid_weight, default=1.0, minimum=0.0, maximum=100.0)
+    loss_calibration_mid_low_weight = _safe_float(args.loss_calibration_mid_low_weight, default=1.0, minimum=0.0, maximum=100.0)
+    loss_calibration_mid_high_weight = _safe_float(args.loss_calibration_mid_high_weight, default=1.0, minimum=0.0, maximum=100.0)
     loss_calibration_low_weight = _safe_float(args.loss_calibration_low_weight, default=1.0, minimum=0.0, maximum=100.0)
     domain_calibration_high_scale = _safe_float(args.domain_calibration_high_scale, default=1.0, minimum=0.0, maximum=100.0)
     domain_calibration_mid_scale = _safe_float(args.domain_calibration_mid_scale, default=1.0, minimum=0.0, maximum=100.0)
@@ -4580,6 +4647,10 @@ def main() -> int:
     stage2_oob_selection_split = _clean_stage2_oob_selection_split(args.stage2_oob_selection_split)
     stage2_oob_high_weight = _safe_float(args.stage2_oob_high_weight, default=2.0, minimum=0.0, maximum=100.0)
     stage2_oob_mid_weight = _safe_float(args.stage2_oob_mid_weight, default=1.0, minimum=0.0, maximum=100.0)
+    stage2_oob_mid_low_weight_raw = _safe_float(args.stage2_oob_mid_low_weight, default=-1.0, minimum=-1.0, maximum=100.0)
+    stage2_oob_mid_high_weight_raw = _safe_float(args.stage2_oob_mid_high_weight, default=-1.0, minimum=-1.0, maximum=100.0)
+    stage2_oob_mid_low_weight: Optional[float] = None if stage2_oob_mid_low_weight_raw < 0.0 else float(stage2_oob_mid_low_weight_raw)
+    stage2_oob_mid_high_weight: Optional[float] = None if stage2_oob_mid_high_weight_raw < 0.0 else float(stage2_oob_mid_high_weight_raw)
     stage2_oob_low_weight = _safe_float(args.stage2_oob_low_weight, default=1.0, minimum=0.0, maximum=100.0)
     stage2_gated_selection = bool(args.stage2_gated_selection)
     stage2_gated_ranking_metric = _clean_text(args.stage2_gated_ranking_metric) or "mrr@10"
@@ -4759,6 +4830,11 @@ def main() -> int:
             loss_mse_weight=loss_mse_weight,
             loss_cluster_margin_weight=loss_cluster_margin_weight,
             loss_calibration_band_weight=loss_calibration_band_weight,
+            loss_calibration_mid_low_weight=loss_calibration_mid_low_weight,
+            loss_calibration_mid_high_weight=loss_calibration_mid_high_weight,
+            stage2_oob_mid_low_weight=stage2_oob_mid_low_weight,
+            stage2_oob_mid_high_weight=stage2_oob_mid_high_weight,
+            stage2_oob_mid_weight=stage2_oob_mid_weight,
             domain_pair_loss_scale=domain_pair_loss_scale,
             method_pair_loss_scale=method_pair_loss_scale,
             constraint_pair_loss_scale=constraint_pair_loss_scale,
@@ -4952,7 +5028,11 @@ def main() -> int:
         f"early_stop:{stage2_early_stop},"
         f"patience:{stage2_early_stop_patience},"
         f"oob_selection_split:{stage2_oob_selection_split},"
-        f"oob_weights(h/m/l):{stage2_oob_high_weight:.3f}/{stage2_oob_mid_weight:.3f}/{stage2_oob_low_weight:.3f}"
+        f"oob_weights(h/m/ml/mh/l):"
+        f"{stage2_oob_high_weight:.3f}/{stage2_oob_mid_weight:.3f}/"
+        f"{(stage2_oob_mid_low_weight if stage2_oob_mid_low_weight is not None else stage2_oob_mid_weight):.3f}/"
+        f"{(stage2_oob_mid_high_weight if stage2_oob_mid_high_weight is not None else stage2_oob_mid_weight):.3f}/"
+        f"{stage2_oob_low_weight:.3f}"
     )
     print(
         "stage2_gated_selection="
@@ -4984,7 +5064,10 @@ def main() -> int:
         f"calibration_band_weight:{loss_calibration_band_weight:.4f},"
         f"cluster_margins(hm/ml/hl):{cluster_margin_hm:.3f}/{cluster_margin_ml:.3f}/{cluster_margin_hl:.3f},"
         f"cluster_margin_loss_weights(hm/ml/hl):{loss_cluster_margin_hm_weight:.3f}/{loss_cluster_margin_ml_weight:.3f}/{loss_cluster_margin_hl_weight:.3f},"
-        f"calibration_loss_weights(high/mid/low):{loss_calibration_high_weight:.3f}/{loss_calibration_mid_weight:.3f}/{loss_calibration_low_weight:.3f}"
+        f"calibration_loss_weights(high/mid/ml/mh/low):"
+        f"{loss_calibration_high_weight:.3f}/{loss_calibration_mid_weight:.3f}/"
+        f"{loss_calibration_mid_low_weight:.3f}/{loss_calibration_mid_high_weight:.3f}/"
+        f"{loss_calibration_low_weight:.3f}"
     )
     print(
         "aspect_calibration_scales="
@@ -5731,6 +5814,8 @@ def main() -> int:
                     data_low_slack=calib_data_low_slack,
                     weight_high=loss_calibration_high_weight,
                     weight_mid=loss_calibration_mid_weight,
+                    weight_mid_low=loss_calibration_mid_low_weight,
+                    weight_mid_high=loss_calibration_mid_high_weight,
                     weight_low=loss_calibration_low_weight,
                     domain_high_scale=domain_calibration_high_scale,
                     domain_mid_scale=domain_calibration_mid_scale,
@@ -5771,11 +5856,15 @@ def main() -> int:
             oob_summary={
                 "oob_low_rate": float(oob_low_rate),
                 "oob_mid_rate": float(oob_mid_rate),
+                "oob_mid_low_rate": float(oob_mid_low_rate),
+                "oob_mid_high_rate": float(oob_mid_high_rate),
                 "oob_high_rate": float(oob_high_rate),
             },
             weight_high=stage2_oob_high_weight,
             weight_mid=stage2_oob_mid_weight,
             weight_low=stage2_oob_low_weight,
+            weight_mid_low=stage2_oob_mid_low_weight,
+            weight_mid_high=stage2_oob_mid_high_weight,
         )
         return {
             "val_kl_loss": float(sum(kl_vals) / max(1, len(kl_vals))),
@@ -5949,9 +6038,13 @@ def main() -> int:
         oob_objective: float,
         oob_high_rate: float,
         oob_mid_rate: float,
+        oob_mid_low_rate: float,
+        oob_mid_high_rate: float,
         oob_low_rate: float,
         oob_high_out: float,
         oob_mid_out: float,
+        oob_mid_low_out: float,
+        oob_mid_high_out: float,
         oob_low_out: float,
         oob_high_total: float,
         oob_mid_total: float,
@@ -5978,9 +6071,13 @@ def main() -> int:
             "oob_objective": float(oob_objective),
             "oob_high_rate": float(oob_high_rate),
             "oob_mid_rate": float(oob_mid_rate),
+            "oob_mid_low_rate": float(oob_mid_low_rate),
+            "oob_mid_high_rate": float(oob_mid_high_rate),
             "oob_low_rate": float(oob_low_rate),
             "oob_high_out": float(oob_high_out),
             "oob_mid_out": float(oob_mid_out),
+            "oob_mid_low_out": float(oob_mid_low_out),
+            "oob_mid_high_out": float(oob_mid_high_out),
             "oob_low_out": float(oob_low_out),
             "oob_high_total": float(oob_high_total),
             "oob_mid_total": float(oob_mid_total),
@@ -6186,9 +6283,13 @@ def main() -> int:
         val_oob_objective = float(val_list_loss.get("oob_objective", 0.0))
         val_oob_high_rate = float(val_list_loss.get("oob_high_rate", 0.0))
         val_oob_mid_rate = float(val_list_loss.get("oob_mid_rate", 0.0))
+        val_oob_mid_low_rate = float(val_list_loss.get("oob_mid_low_rate", 0.0))
+        val_oob_mid_high_rate = float(val_list_loss.get("oob_mid_high_rate", 0.0))
         val_oob_low_rate = float(val_list_loss.get("oob_low_rate", 0.0))
         val_oob_high_out = float(val_list_loss.get("oob_high_out", 0.0))
         val_oob_mid_out = float(val_list_loss.get("oob_mid_out", 0.0))
+        val_oob_mid_low_out = float(val_list_loss.get("oob_mid_low_out", 0.0))
+        val_oob_mid_high_out = float(val_list_loss.get("oob_mid_high_out", 0.0))
         val_oob_low_out = float(val_list_loss.get("oob_low_out", 0.0))
         val_oob_high_total = float(val_list_loss.get("oob_high_total", 0.0))
         val_oob_mid_total = float(val_list_loss.get("oob_mid_total", 0.0))
@@ -6207,7 +6308,9 @@ def main() -> int:
             f"val_cluster_margin_loss={val_cluster_margin_loss:.6f} "
             f"val_calibration_band_loss={val_calibration_band_loss:.6f} "
             f"val_oob_objective={val_oob_objective:.6f} "
-            f"val_oob_rates(h/m/l)={val_oob_high_rate:.4f}/{val_oob_mid_rate:.4f}/{val_oob_low_rate:.4f}"
+            f"val_oob_rates(h/m/ml/mh/l)="
+            f"{val_oob_high_rate:.4f}/{val_oob_mid_rate:.4f}/"
+            f"{val_oob_mid_low_rate:.4f}/{val_oob_mid_high_rate:.4f}/{val_oob_low_rate:.4f}"
         )
         _wandb_log(
             wandb_run,
@@ -6222,6 +6325,8 @@ def main() -> int:
                 "eval/oob_objective_step": float(val_oob_objective),
                 "eval/oob_high_rate_step": float(val_oob_high_rate),
                 "eval/oob_mid_rate_step": float(val_oob_mid_rate),
+                "eval/oob_mid_low_rate_step": float(val_oob_mid_low_rate),
+                "eval/oob_mid_high_rate_step": float(val_oob_mid_high_rate),
                 "eval/oob_low_rate_step": float(val_oob_low_rate),
             },
             step=int(global_step_now),
@@ -6244,9 +6349,13 @@ def main() -> int:
                 oob_objective=float(val_oob_objective),
                 oob_high_rate=float(val_oob_high_rate),
                 oob_mid_rate=float(val_oob_mid_rate),
+                oob_mid_low_rate=float(val_oob_mid_low_rate),
+                oob_mid_high_rate=float(val_oob_mid_high_rate),
                 oob_low_rate=float(val_oob_low_rate),
                 oob_high_out=float(val_oob_high_out),
                 oob_mid_out=float(val_oob_mid_out),
+                oob_mid_low_out=float(val_oob_mid_low_out),
+                oob_mid_high_out=float(val_oob_mid_high_out),
                 oob_low_out=float(val_oob_low_out),
                 oob_high_total=float(val_oob_high_total),
                 oob_mid_total=float(val_oob_mid_total),
@@ -6536,6 +6645,8 @@ def main() -> int:
                         data_low_slack=calib_data_low_slack,
                         weight_high=loss_calibration_high_weight,
                         weight_mid=loss_calibration_mid_weight,
+                        weight_mid_low=loss_calibration_mid_low_weight,
+                        weight_mid_high=loss_calibration_mid_high_weight,
                         weight_low=loss_calibration_low_weight,
                         domain_high_scale=domain_calibration_high_scale,
                         domain_mid_scale=domain_calibration_mid_scale,
@@ -6812,9 +6923,13 @@ def main() -> int:
                 oob_objective=float(selection_oob_objective),
                 oob_high_rate=float(selection_oob_high_rate),
                 oob_mid_rate=float(selection_oob_mid_rate),
+                oob_mid_low_rate=float(selection_oob_mid_low_rate),
+                oob_mid_high_rate=float(selection_oob_mid_high_rate),
                 oob_low_rate=float(selection_oob_low_rate),
                 oob_high_out=float(selection_oob_high_out),
                 oob_mid_out=float(selection_oob_mid_out),
+                oob_mid_low_out=float(selection_oob_mid_low_out),
+                oob_mid_high_out=float(selection_oob_mid_high_out),
                 oob_low_out=float(selection_oob_low_out),
                 oob_high_total=float(selection_oob_high_total),
                 oob_mid_total=float(selection_oob_mid_total),
@@ -6848,6 +6963,8 @@ def main() -> int:
                         mid_threshold=stage2_cluster_mid_threshold,
                         oob_high_weight=stage2_oob_high_weight,
                         oob_mid_weight=stage2_oob_mid_weight,
+                        oob_mid_low_weight=stage2_oob_mid_low_weight,
+                        oob_mid_high_weight=stage2_oob_mid_high_weight,
                         oob_low_weight=stage2_oob_low_weight,
                         a_min=stage2_posthoc_a_min,
                         a_max=stage2_posthoc_a_max,
@@ -6874,6 +6991,8 @@ def main() -> int:
                                     mid_threshold=stage2_cluster_mid_threshold,
                                     oob_high_weight=stage2_oob_high_weight,
                                     oob_mid_weight=stage2_oob_mid_weight,
+                                    oob_mid_low_weight=stage2_oob_mid_low_weight,
+                                    oob_mid_high_weight=stage2_oob_mid_high_weight,
                                     oob_low_weight=stage2_oob_low_weight,
                                     a_min=stage2_posthoc_a_min,
                                     a_max=stage2_posthoc_a_max,
@@ -6892,6 +7011,8 @@ def main() -> int:
                         "oob_weights": {
                             "high": float(stage2_oob_high_weight),
                             "mid": float(stage2_oob_mid_weight),
+                            "mid_low": float(stage2_oob_mid_low_weight if stage2_oob_mid_low_weight is not None else stage2_oob_mid_weight),
+                            "mid_high": float(stage2_oob_mid_high_weight if stage2_oob_mid_high_weight is not None else stage2_oob_mid_weight),
                             "low": float(stage2_oob_low_weight),
                         },
                         "global": posthoc_fit,
@@ -7214,6 +7335,8 @@ def main() -> int:
             "cluster_margin_hl": float(loss_cluster_margin_hl_weight),
             "calibration_high": float(loss_calibration_high_weight),
             "calibration_mid": float(loss_calibration_mid_weight),
+            "calibration_mid_low": float(loss_calibration_mid_low_weight),
+            "calibration_mid_high": float(loss_calibration_mid_high_weight),
             "calibration_low": float(loss_calibration_low_weight),
             "domain_calibration_high_scale": float(domain_calibration_high_scale),
             "domain_calibration_mid_scale": float(domain_calibration_mid_scale),
@@ -7236,6 +7359,8 @@ def main() -> int:
         "stage2_oob_weights": {
             "high": float(stage2_oob_high_weight),
             "mid": float(stage2_oob_mid_weight),
+            "mid_low": float(stage2_oob_mid_low_weight if stage2_oob_mid_low_weight is not None else stage2_oob_mid_weight),
+            "mid_high": float(stage2_oob_mid_high_weight if stage2_oob_mid_high_weight is not None else stage2_oob_mid_weight),
             "low": float(stage2_oob_low_weight),
         },
         "stage2_gated_selection": bool(stage2_gated_selection),
