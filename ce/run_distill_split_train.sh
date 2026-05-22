@@ -114,9 +114,12 @@ GRAD_ACCUM_STEPS="${GRAD_ACCUM_STEPS:-16}"
 MAX_LENGTH="${MAX_LENGTH:-256}"
 CANDIDATE_POOL_SIZE="${CANDIDATE_POOL_SIZE:-32}"
 MINI_LIST_SIZE="${MINI_LIST_SIZE:-8}"
-NUM_WORKERS="${NUM_WORKERS:-0}"
+NUM_WORKERS="${NUM_WORKERS:-2}"
+PIN_MEMORY="${PIN_MEMORY:-true}"
+PERSISTENT_WORKERS="${PERSISTENT_WORKERS:-true}"
+PREFETCH_FACTOR="${PREFETCH_FACTOR:-2}"
 LOG_EVERY_STEPS="${LOG_EVERY_STEPS:-50}"
-EVAL_EVERY_STEPS="${EVAL_EVERY_STEPS:-100}"
+EVAL_EVERY_STEPS="${EVAL_EVERY_STEPS:-0}"
 LEARNING_RATE="${LEARNING_RATE:-5e-7}"
 STAGE1_LEARNING_RATE="${STAGE1_LEARNING_RATE:-1e-6}"
 STAGE2_LEARNING_RATE="${STAGE2_LEARNING_RATE:-5e-7}"
@@ -294,6 +297,7 @@ CMD=(
   --candidate-pool-size "${CANDIDATE_POOL_SIZE}"
   --mini-list-size "${MINI_LIST_SIZE}"
   --num-workers "${NUM_WORKERS}"
+  --prefetch-factor "${PREFETCH_FACTOR}"
   --log-every-steps "${LOG_EVERY_STEPS}"
   --eval-every-steps "${EVAL_EVERY_STEPS}"
   --learning-rate "${LEARNING_RATE}"
@@ -371,6 +375,16 @@ if bool_true "${STAGE2_EARLY_STOP}"; then
   CMD+=(--stage2-early-stop)
 else
   CMD+=(--no-stage2-early-stop)
+fi
+if bool_true "${PIN_MEMORY}"; then
+  CMD+=(--pin-memory)
+else
+  CMD+=(--no-pin-memory)
+fi
+if bool_true "${PERSISTENT_WORKERS}"; then
+  CMD+=(--persistent-workers)
+else
+  CMD+=(--no-persistent-workers)
 fi
 if bool_true "${BF16}"; then
   CMD+=(--bf16)

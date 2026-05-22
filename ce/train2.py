@@ -1398,7 +1398,16 @@ def _build_sampled_list_rows(
 
 
 def _to_device(batch: Dict[str, torch.Tensor], device: torch.device) -> Dict[str, torch.Tensor]:
-    return {k: v.to(device) for k, v in batch.items()}
+    return {k: v.to(device, non_blocking=(device.type == "cuda")) for k, v in batch.items()}
+
+
+def _concat_encoder_batches(a: Dict[str, torch.Tensor], b: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+    return {k: torch.cat([a[k], b[k]], dim=0) for k in a.keys() if k in b}
+
+
+def _split_pair_logits(logits: torch.Tensor, n_pos: int) -> Tuple[torch.Tensor, torch.Tensor]:
+    logits = logits.squeeze(-1)
+    return logits[:n_pos], logits[n_pos:]
 
 
 def _make_pair_iterator(loader: DataLoader) -> Iterable[Dict[str, Any]]:
@@ -4272,10 +4281,18 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--eval-every-steps",
         type=int,
-        default=100,
+        default=0,
         help="Run validation losses every N optimizer steps (0 disables step validation).",
     )
     p.add_argument("--num-workers", type=int, default=0)
+    p.add_argument("--pin-memory", action=argparse.BooleanOptionalAction, default=True, help="Pin DataLoader memory when using CUDA.")
+    p.add_argument(
+        "--persistent-workers",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Keep DataLoader workers alive across epochs when num-workers > 0.",
+    )
+    p.add_argument("--prefetch-factor", type=int, default=2, help="DataLoader prefetch factor when num-workers > 0.")
     p.add_argument("--bf16", action="store_true", help="Use bfloat16 autocast on CUDA.")
     p.add_argument("--fp16", action="store_true", help="Use float16 autocast on CUDA.")
     p.add_argument("--no-tqdm", action="store_true", help="Disable tqdm progress bars.")
@@ -5433,6 +5450,18 @@ def main() -> int:
 
     use_amp = device.type == "cuda" and (bool(args.fp16) or bool(args.bf16))
     amp_dtype = torch.bfloat16 if bool(args.bf16) else torch.float16
+    loader_num_workers = _safe_int(args.num_workers, default=0, minimum=0, maximum=32)
+    loader_prefetch_factor = _safe_int(args.prefetch_factor, default=2, minimum=1, maximum=16)
+    loader_kwargs: Dict[str, Any] = {
+        "num_workers": int(loader_num_workers),
+        "pin_memory": bool(args.pin_memory) and device.type == "cuda",
+    }
+    if int(loader_num_workers) > 0:
+        loader_kwargs["persistent_workers"] = bool(args.persistent_workers)
+        loader_kwargs["prefetch_factor"] = int(loader_prefetch_factor)
+    if device.type == "cuda":
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
 
     tokenizer = AutoTokenizer.from_pretrained(_clean_text(args.model_id) or MODEL_ID_DEFAULT)
     model = AutoModelForSequenceClassification.from_pretrained(_clean_text(args.model_id) or MODEL_ID_DEFAULT, num_labels=1)
@@ -5466,25 +5495,25 @@ def main() -> int:
         PairwiseDataset(train_pairs),
         batch_size=train_batch_size,
         shuffle=True,
-        num_workers=_safe_int(args.num_workers, default=0, minimum=0, maximum=32),
         collate_fn=pair_collator,
         drop_last=False,
+        **loader_kwargs,
     )
     pair_val_loader = DataLoader(
         PairwiseDataset(val_pairs),
         batch_size=eval_batch_size,
         shuffle=False,
-        num_workers=_safe_int(args.num_workers, default=0, minimum=0, maximum=32),
         collate_fn=pair_collator,
         drop_last=False,
+        **loader_kwargs,
     )
     pair_test_loader = DataLoader(
         PairwiseDataset(test_pairs),
         batch_size=eval_batch_size,
         shuffle=False,
-        num_workers=_safe_int(args.num_workers, default=0, minimum=0, maximum=32),
         collate_fn=pair_collator,
         drop_last=False,
+        **loader_kwargs,
     )
     val_list_loader: Optional[DataLoader] = None
     if val_list_rows:
@@ -5492,9 +5521,9 @@ def main() -> int:
             ListwiseDataset(val_groups, val_list_rows),
             batch_size=eval_batch_size,
             shuffle=False,
-            num_workers=_safe_int(args.num_workers, default=0, minimum=0, maximum=32),
             collate_fn=list_collator,
             drop_last=False,
+            **loader_kwargs,
         )
     test_list_loader: Optional[DataLoader] = None
     if test_list_rows:
@@ -5502,9 +5531,9 @@ def main() -> int:
             ListwiseDataset(test_groups, test_list_rows),
             batch_size=eval_batch_size,
             shuffle=False,
-            num_workers=_safe_int(args.num_workers, default=0, minimum=0, maximum=32),
             collate_fn=list_collator,
             drop_last=False,
+            **loader_kwargs,
         )
 
     best_ndcg = -1.0
@@ -5573,8 +5602,8 @@ def main() -> int:
                 else:
                     pair_weights = None
 
-                pos_logits = model(**pos).logits.squeeze(-1)
-                neg_logits = model(**neg).logits.squeeze(-1)
+                pair_logits = model(**_concat_encoder_batches(pos, neg)).logits
+                pos_logits, neg_logits = _split_pair_logits(pair_logits, int(margins.shape[0]))
                 loss = _variable_margin_loss(pos_logits, neg_logits, margins, pair_weights)
                 vals.append(float(loss.detach().cpu().item()))
         if was_training:
@@ -6232,8 +6261,8 @@ def main() -> int:
 
                 amp_ctx = torch.autocast(device_type="cuda", dtype=amp_dtype) if use_amp else nullcontext()
                 with amp_ctx:
-                    pos_logits = model(**pos).logits.squeeze(-1)
-                    neg_logits = model(**neg).logits.squeeze(-1)
+                    pair_logits = model(**_concat_encoder_batches(pos, neg)).logits
+                    pos_logits, neg_logits = _split_pair_logits(pair_logits, int(margins.shape[0]))
                     loss = _variable_margin_loss(pos_logits, neg_logits, margins, pair_weights)
                     loss = loss / float(grad_accum_steps)
 
@@ -6380,9 +6409,9 @@ def main() -> int:
                 ListwiseDataset(train_groups, epoch_list_rows),
                 batch_size=train_batch_size,
                 shuffle=True,
-                num_workers=_safe_int(args.num_workers, default=0, minimum=0, maximum=32),
                 collate_fn=list_collator,
                 drop_last=False,
+                **loader_kwargs,
             )
 
             model.train()
@@ -6490,8 +6519,8 @@ def main() -> int:
                         constraint_low_scale=constraint_calibration_low_scale,
                     )
 
-                    pos_logits = model(**pos).logits.squeeze(-1)
-                    neg_logits = model(**neg).logits.squeeze(-1)
+                    pair_logits = model(**_concat_encoder_batches(pos, neg)).logits
+                    pos_logits, neg_logits = _split_pair_logits(pair_logits, int(margins.shape[0]))
                     pair_loss = _variable_margin_loss(pos_logits, neg_logits, margins, pair_weights)
 
                     total_loss = (
