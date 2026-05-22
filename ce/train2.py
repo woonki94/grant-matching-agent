@@ -1401,8 +1401,37 @@ def _to_device(batch: Dict[str, torch.Tensor], device: torch.device) -> Dict[str
     return {k: v.to(device, non_blocking=(device.type == "cuda")) for k, v in batch.items()}
 
 
+def _pad_encoder_tensor_to_length(x: torch.Tensor, target_len: int) -> torch.Tensor:
+    if x.dim() < 2:
+        return x
+    pad_len = int(target_len) - int(x.shape[1])
+    if pad_len <= 0:
+        return x
+    # Encoder batches are shaped [batch, seq_len, ...]. Pad only the sequence axis.
+    # A pad value of 0 is correct for masks/token types and safe for input_ids
+    # because padded positions are masked out by attention_mask.
+    pad: List[int] = []
+    for dim in range(x.dim() - 1, 0, -1):
+        if dim == 1:
+            pad.extend([0, pad_len])
+        else:
+            pad.extend([0, 0])
+    return F.pad(x, tuple(pad), value=0)
+
+
 def _concat_encoder_batches(a: Dict[str, torch.Tensor], b: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
-    return {k: torch.cat([a[k], b[k]], dim=0) for k in a.keys() if k in b}
+    out: Dict[str, torch.Tensor] = {}
+    for k in a.keys():
+        if k not in b:
+            continue
+        av = a[k]
+        bv = b[k]
+        if av.dim() >= 2 and bv.dim() >= 2 and int(av.shape[1]) != int(bv.shape[1]):
+            target_len = max(int(av.shape[1]), int(bv.shape[1]))
+            av = _pad_encoder_tensor_to_length(av, target_len)
+            bv = _pad_encoder_tensor_to_length(bv, target_len)
+        out[k] = torch.cat([av, bv], dim=0)
+    return out
 
 
 def _split_pair_logits(logits: torch.Tensor, n_pos: int) -> Tuple[torch.Tensor, torch.Tensor]:
