@@ -689,6 +689,12 @@ def _build_output_suffix(
     stage2_oob_mid_low_weight: Optional[float],
     stage2_oob_mid_high_weight: Optional[float],
     stage2_oob_mid_weight: float,
+    domain_calib_mid_center: float,
+    domain_calib_mid_bandwidth: float,
+    method_calib_mid_center: float,
+    method_calib_mid_bandwidth: float,
+    constraint_calib_mid_center: float,
+    constraint_calib_mid_bandwidth: float,
     domain_pair_loss_scale: float,
     method_pair_loss_scale: float,
     constraint_pair_loss_scale: float,
@@ -726,6 +732,12 @@ def _build_output_suffix(
         f"cmh{_float_token(float(loss_calibration_mid_high_weight))}",
         f"oml{_float_token(float(stage2_oob_mid_low_weight if stage2_oob_mid_low_weight is not None else stage2_oob_mid_weight))}",
         f"omh{_float_token(float(stage2_oob_mid_high_weight if stage2_oob_mid_high_weight is not None else stage2_oob_mid_weight))}",
+        f"dmc{_float_token(float(domain_calib_mid_center))}",
+        f"dmb{_float_token(float(domain_calib_mid_bandwidth))}",
+        f"mmc{_float_token(float(method_calib_mid_center))}",
+        f"mmb{_float_token(float(method_calib_mid_bandwidth))}",
+        f"cmc{_float_token(float(constraint_calib_mid_center))}",
+        f"cmb{_float_token(float(constraint_calib_mid_bandwidth))}",
         f"dpw{_float_token(float(domain_pair_loss_scale))}",
         f"mpw{_float_token(float(method_pair_loss_scale))}",
         f"cpw{_float_token(float(constraint_pair_loss_scale))}",
@@ -762,6 +774,9 @@ def _build_output_suffix(
         f"cmh{_float_token(float(loss_calibration_mid_high_weight))}",
         f"oml{_float_token(float(stage2_oob_mid_low_weight if stage2_oob_mid_low_weight is not None else stage2_oob_mid_weight))}",
         f"omh{_float_token(float(stage2_oob_mid_high_weight if stage2_oob_mid_high_weight is not None else stage2_oob_mid_weight))}",
+        f"dmc{_float_token(float(domain_calib_mid_center))}",
+        f"mmc{_float_token(float(method_calib_mid_center))}",
+        f"cmc{_float_token(float(constraint_calib_mid_center))}",
         f"h{digest}",
     ]
     return "_".join(keep)
@@ -1653,6 +1668,12 @@ def _compute_calibration_band_loss(
     high_floor: float,
     mid_center: float,
     mid_bandwidth: float,
+    domain_mid_center: float,
+    domain_mid_bandwidth: float,
+    method_mid_center: float,
+    method_mid_bandwidth: float,
+    constraint_mid_center: float,
+    constraint_mid_bandwidth: float,
     low_ceil: float,
     data_high_slack: float,
     data_low_slack: float,
@@ -1678,6 +1699,12 @@ def _compute_calibration_band_loss(
     mid_bw = max(0.0, float(mid_bandwidth))
     high_floor = float(_clamp_01(high_floor))
     mid_center = float(_clamp_01(mid_center))
+    domain_mid_center = float(_clamp_01(domain_mid_center))
+    method_mid_center = float(_clamp_01(method_mid_center))
+    constraint_mid_center = float(_clamp_01(constraint_mid_center))
+    domain_mid_bandwidth = max(0.0, float(domain_mid_bandwidth))
+    method_mid_bandwidth = max(0.0, float(method_mid_bandwidth))
+    constraint_mid_bandwidth = max(0.0, float(constraint_mid_bandwidth))
     low_ceil = float(_clamp_01(low_ceil))
     high_slack = max(0.0, float(data_high_slack))
     low_slack = max(0.0, float(data_low_slack))
@@ -1701,6 +1728,16 @@ def _compute_calibration_band_loss(
         (3, 1): max(0.0, float(constraint_mid_scale)),
         (3, 0): max(0.0, float(constraint_low_scale)),
     }
+    aspect_mid_centers = {
+        1: domain_mid_center,
+        2: method_mid_center,
+        3: constraint_mid_center,
+    }
+    aspect_mid_bandwidths = {
+        1: domain_mid_bandwidth,
+        2: method_mid_bandwidth,
+        3: constraint_mid_bandwidth,
+    }
 
     def _aspect_scale_tensor(a: Optional[torch.Tensor], cluster_id: int, fallback: torch.Tensor) -> torch.Tensor:
         if a is None:
@@ -1709,6 +1746,20 @@ def _compute_calibration_band_loss(
         for aspect_id in (1, 2, 3):
             scale = float(aspect_scale_values.get((aspect_id, int(cluster_id)), 1.0))
             out = torch.where(a == int(aspect_id), torch.full_like(out, scale), out)
+        return out
+
+    def _aspect_value_tensor(
+        a: Optional[torch.Tensor],
+        values: Dict[int, float],
+        default_value: float,
+        ref: torch.Tensor,
+    ) -> torch.Tensor:
+        out = torch.full_like(ref, float(default_value))
+        if a is None:
+            return out
+        for aspect_id in (1, 2, 3):
+            value = float(values.get(int(aspect_id), default_value))
+            out = torch.where(a == int(aspect_id), torch.full_like(out, value), out)
         return out
 
     def _combine_weights(
@@ -1764,11 +1815,13 @@ def _compute_calibration_band_loss(
             mid_scales = _aspect_scale_tensor(a_mid_tensor, 1, s_mid)
             w_mid_tensor, mid_part_scale = _combine_weights(None if w is None else w[mid_mask], mid_scales)
             if mode == "fixed":
-                center = torch.tensor(mid_center, device=s.device, dtype=s.dtype)
+                center = _aspect_value_tensor(a_mid_tensor, aspect_mid_centers, mid_center, s_mid)
+                bw = _aspect_value_tensor(a_mid_tensor, aspect_mid_bandwidths, mid_bw, s_mid)
             else:
                 center = _cluster_anchor(y[mid_mask], stat_mode=stat_mode)
-            lower_bound = center - torch.tensor(mid_bw, device=s.device, dtype=s.dtype)
-            upper_bound = center + torch.tensor(mid_bw, device=s.device, dtype=s.dtype)
+                bw = torch.full_like(s_mid, float(mid_bw))
+            lower_bound = torch.clamp(center - bw, min=0.0, max=1.0)
+            upper_bound = torch.clamp(center + bw, min=0.0, max=1.0)
             lower_loss = _weighted_mean(F.relu(lower_bound - s_mid), w_mid_tensor)
             upper_loss = _weighted_mean(F.relu(s_mid - upper_bound), w_mid_tensor)
             side_den = max(1e-6, float(weight_mid_low_val + weight_mid_high_val))
@@ -4040,6 +4093,12 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--calib-high-floor", type=float, default=0.75, help="Fixed-mode lower floor for high cluster.")
     p.add_argument("--calib-mid-center", type=float, default=0.50, help="Fixed-mode center for mid cluster.")
     p.add_argument("--calib-mid-bandwidth", type=float, default=0.15, help="Allowed band around mid center.")
+    p.add_argument("--domain-calib-mid-center", type=float, default=-1.0, help="DOMAIN fixed-mode mid center (-1 uses --calib-mid-center).")
+    p.add_argument("--domain-calib-mid-bandwidth", type=float, default=-1.0, help="DOMAIN fixed-mode mid bandwidth (-1 uses --calib-mid-bandwidth).")
+    p.add_argument("--method-calib-mid-center", type=float, default=-1.0, help="METHOD fixed-mode mid center (-1 uses --calib-mid-center).")
+    p.add_argument("--method-calib-mid-bandwidth", type=float, default=-1.0, help="METHOD fixed-mode mid bandwidth (-1 uses --calib-mid-bandwidth).")
+    p.add_argument("--constraint-calib-mid-center", type=float, default=-1.0, help="CONSTRAINT fixed-mode mid center (-1 uses --calib-mid-center).")
+    p.add_argument("--constraint-calib-mid-bandwidth", type=float, default=-1.0, help="CONSTRAINT fixed-mode mid bandwidth (-1 uses --calib-mid-bandwidth).")
     p.add_argument("--calib-low-ceil", type=float, default=0.25, help="Fixed-mode upper ceiling for low cluster.")
     p.add_argument(
         "--calib-data-high-slack",
@@ -4663,6 +4722,18 @@ def main() -> int:
     calib_high_floor = _safe_float(args.calib_high_floor, default=0.75, minimum=0.0, maximum=1.0)
     calib_mid_center = _safe_float(args.calib_mid_center, default=0.50, minimum=0.0, maximum=1.0)
     calib_mid_bandwidth = _safe_float(args.calib_mid_bandwidth, default=0.15, minimum=0.0, maximum=1.0)
+    domain_calib_mid_center_raw = _safe_float(args.domain_calib_mid_center, default=-1.0, minimum=-1.0, maximum=1.0)
+    domain_calib_mid_bandwidth_raw = _safe_float(args.domain_calib_mid_bandwidth, default=-1.0, minimum=-1.0, maximum=1.0)
+    method_calib_mid_center_raw = _safe_float(args.method_calib_mid_center, default=-1.0, minimum=-1.0, maximum=1.0)
+    method_calib_mid_bandwidth_raw = _safe_float(args.method_calib_mid_bandwidth, default=-1.0, minimum=-1.0, maximum=1.0)
+    constraint_calib_mid_center_raw = _safe_float(args.constraint_calib_mid_center, default=-1.0, minimum=-1.0, maximum=1.0)
+    constraint_calib_mid_bandwidth_raw = _safe_float(args.constraint_calib_mid_bandwidth, default=-1.0, minimum=-1.0, maximum=1.0)
+    domain_calib_mid_center = float(calib_mid_center if domain_calib_mid_center_raw < 0.0 else domain_calib_mid_center_raw)
+    domain_calib_mid_bandwidth = float(calib_mid_bandwidth if domain_calib_mid_bandwidth_raw < 0.0 else domain_calib_mid_bandwidth_raw)
+    method_calib_mid_center = float(calib_mid_center if method_calib_mid_center_raw < 0.0 else method_calib_mid_center_raw)
+    method_calib_mid_bandwidth = float(calib_mid_bandwidth if method_calib_mid_bandwidth_raw < 0.0 else method_calib_mid_bandwidth_raw)
+    constraint_calib_mid_center = float(calib_mid_center if constraint_calib_mid_center_raw < 0.0 else constraint_calib_mid_center_raw)
+    constraint_calib_mid_bandwidth = float(calib_mid_bandwidth if constraint_calib_mid_bandwidth_raw < 0.0 else constraint_calib_mid_bandwidth_raw)
     calib_low_ceil = _safe_float(args.calib_low_ceil, default=0.25, minimum=0.0, maximum=1.0)
     calib_data_high_slack = _safe_float(args.calib_data_high_slack, default=0.10, minimum=0.0, maximum=1.0)
     calib_data_low_slack = _safe_float(args.calib_data_low_slack, default=0.10, minimum=0.0, maximum=1.0)
@@ -4857,6 +4928,12 @@ def main() -> int:
             stage2_oob_mid_low_weight=stage2_oob_mid_low_weight,
             stage2_oob_mid_high_weight=stage2_oob_mid_high_weight,
             stage2_oob_mid_weight=stage2_oob_mid_weight,
+            domain_calib_mid_center=domain_calib_mid_center,
+            domain_calib_mid_bandwidth=domain_calib_mid_bandwidth,
+            method_calib_mid_center=method_calib_mid_center,
+            method_calib_mid_bandwidth=method_calib_mid_bandwidth,
+            constraint_calib_mid_center=constraint_calib_mid_center,
+            constraint_calib_mid_bandwidth=constraint_calib_mid_bandwidth,
             domain_pair_loss_scale=domain_pair_loss_scale,
             method_pair_loss_scale=method_pair_loss_scale,
             constraint_pair_loss_scale=constraint_pair_loss_scale,
@@ -5102,6 +5179,10 @@ def main() -> int:
         f"mode:{calib_band_mode},"
         f"anchor_stat:{calib_anchor_stat},"
         f"fixed(high/mid/low):{calib_high_floor:.3f}/{calib_mid_center:.3f}+/-{calib_mid_bandwidth:.3f}/{calib_low_ceil:.3f},"
+        f"aspect_mid(domain/method/constraint):"
+        f"{domain_calib_mid_center:.3f}+/-{domain_calib_mid_bandwidth:.3f}/"
+        f"{method_calib_mid_center:.3f}+/-{method_calib_mid_bandwidth:.3f}/"
+        f"{constraint_calib_mid_center:.3f}+/-{constraint_calib_mid_bandwidth:.3f},"
         f"data_slack(high/low):{calib_data_high_slack:.3f}/{calib_data_low_slack:.3f},"
         f"posthoc_calibration:{stage2_posthoc_calibration},"
         f"posthoc_fit_split:{stage2_posthoc_calibration_fit_split},"
@@ -5831,6 +5912,12 @@ def main() -> int:
                     high_floor=calib_high_floor,
                     mid_center=calib_mid_center,
                     mid_bandwidth=calib_mid_bandwidth,
+                    domain_mid_center=domain_calib_mid_center,
+                    domain_mid_bandwidth=domain_calib_mid_bandwidth,
+                    method_mid_center=method_calib_mid_center,
+                    method_mid_bandwidth=method_calib_mid_bandwidth,
+                    constraint_mid_center=constraint_calib_mid_center,
+                    constraint_mid_bandwidth=constraint_calib_mid_bandwidth,
                     low_ceil=calib_low_ceil,
                     data_high_slack=calib_data_high_slack,
                     data_low_slack=calib_data_low_slack,
@@ -6662,6 +6749,12 @@ def main() -> int:
                         high_floor=calib_high_floor,
                         mid_center=calib_mid_center,
                         mid_bandwidth=calib_mid_bandwidth,
+                        domain_mid_center=domain_calib_mid_center,
+                        domain_mid_bandwidth=domain_calib_mid_bandwidth,
+                        method_mid_center=method_calib_mid_center,
+                        method_mid_bandwidth=method_calib_mid_bandwidth,
+                        constraint_mid_center=constraint_calib_mid_center,
+                        constraint_mid_bandwidth=constraint_calib_mid_bandwidth,
                         low_ceil=calib_low_ceil,
                         data_high_slack=calib_data_high_slack,
                         data_low_slack=calib_data_low_slack,
@@ -7324,6 +7417,20 @@ def main() -> int:
             "mid_center": float(calib_mid_center),
             "mid_bandwidth": float(calib_mid_bandwidth),
             "low_ceil": float(calib_low_ceil),
+            "aspect_mid": {
+                "domain": {
+                    "center": float(domain_calib_mid_center),
+                    "bandwidth": float(domain_calib_mid_bandwidth),
+                },
+                "method": {
+                    "center": float(method_calib_mid_center),
+                    "bandwidth": float(method_calib_mid_bandwidth),
+                },
+                "constraint": {
+                    "center": float(constraint_calib_mid_center),
+                    "bandwidth": float(constraint_calib_mid_bandwidth),
+                },
+            },
         },
         "calibration_data_slack": {
             "high": float(calib_data_high_slack),
