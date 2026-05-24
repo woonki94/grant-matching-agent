@@ -63,13 +63,47 @@ You will receive multiple tasks. Each task has:
 - candidate: candidate specialization text
 
 Scoring objective:
-Return how well the candidate covers the requirement as written.
-Coverage includes whether the candidate matches the requirement's intent, constraints, and specificity.
+Return how well the candidate covers the requirement AS WRITTEN.
+
+Overall requirement coverage is not just broad topical relevance.
+A good score requires coverage of the requirement's:
+- domain/topic: the field, problem area, or application area
+- method/capability: the technique, process, expertise, or activity required
+- constraints/specificity: required objects, systems, populations, settings, tools, standards, deliverables, or conditions
+- functional role/purpose: what the method or capability is supposed to accomplish
+
+Important:
+Do NOT give a high score only because the candidate is in the same broad domain.
+Do NOT give a high score only because the candidate uses a related general method.
+Do NOT assume missing constraints are satisfied unless they are explicitly stated or strongly entailed.
+If the candidate matches the domain and method but misses a central constraint, target setting, population, system, or purpose, the score should usually be mid, not high.
+If the candidate is adjacent but does not cover the requirement's specific intent, score low or low-mid.
 
 Scoring guide:
-- high (>= 0.70): strong and specific coverage of the requirement
-- mid (>= 0.30 and < 0.70): partial/adjacent coverage, but incomplete or diluted
-- low (< 0.30): weak or no meaningful coverage
+- high (>= 0.70): strong and specific coverage of the requirement; most central domain, method, constraints, and purpose are covered
+- mid (>= 0.30 and < 0.70): partial or adjacent coverage; some important pieces match, but at least one central requirement is missing, weakened, or only implied
+- low (< 0.30): weak coverage; overlap is mostly broad domain/method similarity, generic language, or adjacent relevance
+
+Calibration examples:
+- Query: "epidemiological data collection analysis and real-time risk assessment for disease containment"
+  Candidate: "design and implementation of international prospective cohort studies tracking disease progression across populations"
+  Score: around 0.45 to 0.55
+  Reason: epidemiological data collection matches, but real-time risk assessment and containment are missing.
+
+- Query: "digital technologies and instrumentation and control systems for advanced nuclear reactors"
+  Candidate: "nuclear instrumentation and detector systems for fission and decay studies"
+  Score: around 0.50 to 0.60
+  Reason: nuclear instrumentation matches, but digital technologies, control systems, and advanced reactor setting are only partially covered.
+
+- Query: "demonstrated ability to develop and implement alumni engagement strategies and follow-on programming"
+  Candidate: "Alumni engagement and stewardship programs aligned with institutional goals"
+  Score: around 0.80 to 0.90
+  Reason: candidate directly covers the domain and programming area, though demonstrated implementation ability is somewhat implicit.
+
+- Query: "facilitating meaningful youth and family participation in juvenile justice program design and evaluation"
+  Candidate: "developing organizational readiness and design frameworks to support safety culture transformation and engagement"
+  Score: around 0.25 to 0.35
+  Reason: generic design and engagement overlap exists, but youth/family participation and juvenile justice are missing.
 
 Output MUST be exactly one JSON object with this schema:
 {{
@@ -80,6 +114,8 @@ Output MUST be exactly one JSON object with this schema:
 
 Rules:
 - Include exactly one item for each input q.
+- Scores should be conservative.
+- Use the full 0..1 range.
 - No markdown.
 - No text outside JSON.
 """.strip()
@@ -252,9 +288,10 @@ def _select_model_id(arg_model_id: str) -> str:
         return configured
     # Prefer Opus as requested.
     for candidate in (
+        _clean_text(getattr(settings, "sonnet", "")),
+        _clean_text(getattr(settings, "bedrock_claude_sonnet", "")),
         _clean_text(getattr(settings, "opus", "")),
         _clean_text(getattr(settings, "bedrock_claude_opus", "")),
-        _clean_text(getattr(settings, "sonnet", "")),
         _clean_text(getattr(settings, "haiku", "")),
     ):
         if candidate:

@@ -54,6 +54,8 @@ CONSTRAINT_PAIRWISE_TEST_INPUT="${CONSTRAINT_PAIRWISE_TEST_INPUT:-${SPLIT_DIR}/l
 OUTPUT_DIR="${OUTPUT_DIR:-ce/models/bge_reranker_distill_stage2_continuation}"
 MODEL_ID="${MODEL_ID:-/nfs/hpc/share/kimwoon/grant-matching-agent/ce/models/bge_reranker_distill_stage2_only__sd42_s10_s220_bs2_ga16_cp48_ml12_lr5em07_lr11em06_lr23p2em07_t1p2_kl0p64_pw0p12_mse0p36_cm0p55_cb0p95_dpw1_mpw0p95_dlw1p22_mlw1p05_dch1p75_dcm1p65_dcl1p05_mch1p55_mcm0p85_mcl1p65/best_stage2_gated}"
 BASE_MODEL="${BASE_MODEL:-dleemiller/ModernCE-base-sts}"
+ASPECT_CONDITION_MODE="${ASPECT_CONDITION_MODE:-long_prefix}"  # legacy | long_prefix | none
+MULTI_ASPECT_HEADS="${MULTI_ASPECT_HEADS:-true}"               # true | false
 
 # Training schedule (same knobs; Stage1 fixed to 0)
 SEED="${SEED:-42}"
@@ -184,6 +186,7 @@ EVAL_MODEL_PICK="${EVAL_MODEL_PICK:-best_stage2_gated}"  # best_stage2_gated | b
 log "Stage2 continuation train2 run"
 log "model_id=${MODEL_ID} stage1_epochs=${STAGE1_EPOCHS} stage2_epochs=${STAGE2_EPOCHS}"
 log "split_dir=${SPLIT_DIR} output_dir=${OUTPUT_DIR}"
+log "aspect_condition_mode=${ASPECT_CONDITION_MODE} multi_aspect_heads=${MULTI_ASPECT_HEADS}"
 
 CMD=(
   "${PYTHON_BIN}" ce/train2.py
@@ -214,6 +217,7 @@ CMD=(
   --constraint-pairwise-test-input "${CONSTRAINT_PAIRWISE_TEST_INPUT}"
   --output-dir "${OUTPUT_DIR}"
   --model-id "${MODEL_ID}"
+  --aspect-condition-mode "${ASPECT_CONDITION_MODE}"
   --seed "${SEED}"
   --stage1-epochs "${STAGE1_EPOCHS}"
   --stage2-epochs "${STAGE2_EPOCHS}"
@@ -344,6 +348,11 @@ if bool_true "${STAGE2_POSTHOC_CALIBRATION}"; then
 else
   CMD+=(--no-stage2-posthoc-calibration)
 fi
+if bool_true "${MULTI_ASPECT_HEADS}"; then
+  CMD+=(--multi-aspect-heads)
+else
+  CMD+=(--no-multi-aspect-heads)
+fi
 if bool_true "${PIN_MEMORY}"; then
   CMD+=(--pin-memory)
 else
@@ -422,6 +431,7 @@ if bool_true "${EVAL_AFTER_TRAIN}"; then
     "${PYTHON_BIN}" ce/eval/eval_finetuned_model.py
     --no-auto-resolve-finetuned
     --finetuned-model "${EVAL_FINETUNED_MODEL}"
+    --aspect-condition-mode "${ASPECT_CONDITION_MODE}"
     --base-model "${EVAL_BASE_MODEL}"
     --domain-input "${EVAL_DOMAIN_INPUT}"
     --method-input "${EVAL_METHOD_INPUT}"

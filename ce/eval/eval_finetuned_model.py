@@ -3,13 +3,14 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import sys
 import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import torch
-from transformers import AutoModelForSequenceClassification, AutoTokenizer
+from transformers import AutoTokenizer
 
 
 def _find_project_root() -> Path:
@@ -21,6 +22,16 @@ def _find_project_root() -> Path:
 
 
 PROJECT_ROOT = _find_project_root()
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from ce.aspect_modeling import (  # noqa: E402
+    aspect_id_from_name,
+    clean_aspect_condition_mode,
+    format_aspect_pair,
+    load_sequence_classifier_model,
+    model_logits,
+)
 
 FINETUNED_MODEL_ROOT_DEFAULT = "ce/models/mse_domain_method"
 FINETUNED_MODEL_DEFAULT = "/nfs/stak/users/kimwoon/hpc-share/grant-matching-agent/ce/models/bge_reranker_distill__sd42_s15_s25_bs2_ga16_cp48_ml12_lr5em07_lr11p1em06_lr24p5em07_t1p2_kl0p5_pw0p24_mse0p22_cm0p85_cb0p65_dpw1_mpw1p2_dlw1_mlw0p9/stage2_epoch_5"
@@ -263,6 +274,8 @@ def _score_docs_for_query(
     tokenizer: Any,
     query_text: str,
     doc_texts: Sequence[str],
+    aspect: str,
+    aspect_condition_mode: str,
     device: torch.device,
     batch_size: int,
     max_length: int,
@@ -272,7 +285,16 @@ def _score_docs_for_query(
     with torch.no_grad():
         for i in range(0, len(doc_texts), step):
             docs = list(doc_texts[i : i + step])
-            queries = [query_text] * len(docs)
+            formatted = [
+                format_aspect_pair(
+                    query_text,
+                    d,
+                    aspect_condition_mode=aspect_condition_mode,
+                )
+                for d in docs
+            ]
+            queries = [p[0] for p in formatted]
+            docs = [p[1] for p in formatted]
             enc = tokenizer(
                 queries,
                 docs,
@@ -282,7 +304,13 @@ def _score_docs_for_query(
                 return_tensors="pt",
             )
             enc = _to_device(enc, device)
-            logits = model(**enc).logits.squeeze(-1)
+            aspect_ids = torch.full(
+                (len(docs),),
+                int(aspect_id_from_name(aspect)),
+                dtype=torch.int64,
+                device=device,
+            )
+            logits = model_logits(model, enc, aspect_ids=aspect_ids).squeeze(-1)
             probs = torch.sigmoid(logits)
             out.extend(float(x) for x in probs.detach().cpu().tolist())
     return out
@@ -298,23 +326,27 @@ def _score_query_doc_rows(
     max_length: int,
     query_key_name: str,
     doc_key_name: str,
+    aspect_condition_mode: str,
 ) -> List[float]:
     if not rows:
         return []
 
-    query_to_indices: Dict[str, List[int]] = {}
+    query_to_indices: Dict[Tuple[str, str], List[int]] = {}
     for idx, row in enumerate(rows):
         q = _clean_text(row.get(query_key_name))
-        query_to_indices.setdefault(q, []).append(idx)
+        aspect = _clean_text(row.get("aspect")) or "domain"
+        query_to_indices.setdefault((aspect, q), []).append(idx)
 
     out = [0.0] * len(rows)
-    for q, idxs in query_to_indices.items():
+    for (aspect, q), idxs in query_to_indices.items():
         docs = [_clean_text(rows[i].get(doc_key_name)) for i in idxs]
         scores = _score_docs_for_query(
             model=model,
             tokenizer=tokenizer,
             query_text=q,
             doc_texts=docs,
+            aspect=aspect,
+            aspect_condition_mode=aspect_condition_mode,
             device=device,
             batch_size=batch_size,
             max_length=max_length,
@@ -772,6 +804,13 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--apply-posthoc-calibration", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--score-calibration-json", type=str, default="")
     p.add_argument("--base-model", type=str, default=BASE_MODEL_DEFAULT)
+    p.add_argument(
+        "--aspect-condition-mode",
+        type=str,
+        default="legacy",
+        choices=("legacy", "long_prefix", "none"),
+        help="Condition formatting for the finetuned model. Use long_prefix for C-STS-style trained checkpoints.",
+    )
     p.add_argument("--domain-input", type=str, default=DOMAIN_INPUT_DEFAULT)
     p.add_argument("--method-input", type=str, default=METHOD_INPUT_DEFAULT)
     p.add_argument(
@@ -809,6 +848,7 @@ def main() -> int:
 
     batch_size = _safe_int(args.batch_size, default=32, minimum=1, maximum=4096)
     max_length = _safe_int(args.max_length, default=512, minimum=64, maximum=4096)
+    aspect_condition_mode = clean_aspect_condition_mode(args.aspect_condition_mode)
     high_threshold = _safe_float(args.high_threshold, default=0.70, minimum=0.0, maximum=1.0)
     mid_threshold = _safe_float(args.mid_threshold, default=0.30, minimum=0.0, maximum=1.0)
     oob_margin = _safe_float(args.oob_margin, default=0.0, minimum=0.0, maximum=1.0)
@@ -877,9 +917,19 @@ def main() -> int:
 
     device = _pick_device()
     tok_finetuned = AutoTokenizer.from_pretrained(finetuned_ref, trust_remote_code=True)
-    model_finetuned = AutoModelForSequenceClassification.from_pretrained(finetuned_ref, num_labels=1, trust_remote_code=True).to(device).eval()
+    model_finetuned = load_sequence_classifier_model(
+        finetuned_ref,
+        num_labels=1,
+        multi_aspect_heads=False,
+        trust_remote_code=True,
+    ).to(device).eval()
     tok_base = AutoTokenizer.from_pretrained(base_ref, trust_remote_code=True)
-    model_base = AutoModelForSequenceClassification.from_pretrained(base_ref, num_labels=1, trust_remote_code=True).to(device).eval()
+    model_base = load_sequence_classifier_model(
+        base_ref,
+        num_labels=1,
+        multi_aspect_heads=False,
+        trust_remote_code=True,
+    ).to(device).eval()
 
     started = time.time()
     finetuned_scores = _score_query_doc_rows(
@@ -891,6 +941,7 @@ def main() -> int:
         max_length=max_length,
         query_key_name="query_text_prefixed",
         doc_key_name="doc_text_prefixed",
+        aspect_condition_mode=aspect_condition_mode,
     )
     if isinstance(score_calibration_payload, dict):
         finetuned_scores = [
@@ -906,6 +957,7 @@ def main() -> int:
         max_length=max_length,
         query_key_name="query_text_raw",
         doc_key_name="doc_text_raw",
+        aspect_condition_mode="legacy",
     )
     elapsed = max(1e-9, time.time() - started)
 
@@ -985,6 +1037,7 @@ def main() -> int:
         f"rows_domain={len(rows_domain)} rows_method={len(rows_method)} rows_constraint={len(rows_constraint)} rows_total={len(rows)}\n"
         f"order_top_k={order_top_k} pair_eps={pair_eps} hard_gap_max={hard_gap_max} medium_gap_max={medium_gap_max}\n"
         f"finetuned_model={finetuned_ref}\n"
+        f"aspect_condition_mode={aspect_condition_mode}\n"
         f"score_calibration_json={score_calibration_path if score_calibration_path is not None else ''}\n"
         f"score_calibration_loaded={bool(score_calibration_payload)}\n"
         f"base_model={base_ref}\n"
@@ -1108,6 +1161,7 @@ def main() -> int:
                 "hard_gap_max": float(hard_gap_max),
                 "medium_gap_max": float(medium_gap_max),
                 "finetuned_model": finetuned_ref,
+                "aspect_condition_mode": str(aspect_condition_mode),
                 "score_calibration_json": str(score_calibration_path) if score_calibration_path is not None else "",
                 "score_calibration_loaded": bool(score_calibration_payload),
                 "base_model": base_ref,

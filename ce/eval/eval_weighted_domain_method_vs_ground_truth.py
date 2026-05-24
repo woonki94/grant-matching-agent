@@ -4,12 +4,14 @@ import argparse
 import json
 import math
 import random
+import sys
 import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Sequence, Tuple
 
 import torch
+from transformers import AutoTokenizer
 
 
 def _find_project_root() -> Path:
@@ -21,11 +23,23 @@ def _find_project_root() -> Path:
 
 
 PROJECT_ROOT = _find_project_root()
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from ce.aspect_modeling import (  # noqa: E402
+    aspect_id_from_name,
+    clean_aspect_condition_mode,
+    format_aspect_pair,
+    load_sequence_classifier_model,
+    model_logits,
+)
 
 INPUT_DEFAULT = "ce/dataset/distill/llm_ground_truth_requirement_common_test_listwise.jsonl"
-FINETUNED_MODEL_DEFAULT = "ce/models/mse_domain_method/best"
+FINETUNED_MODEL_DEFAULT = "/Users/kimwoonki/Desktop/OSU/Fall2025/Capstone/GrantFetcher/ce/models/stage2_epoch_6"
 BASE_MODEL_DEFAULT = "dleemiller/ModernCE-base-sts"
 OUTPUT_DIR_DEFAULT = "ce/eval/results"
+HIGH_THRESHOLD_DEFAULT = 0.70
+MID_THRESHOLD_DEFAULT = 0.30
 
 
 def _clean_text(value: Any) -> str:
@@ -77,10 +91,10 @@ def _resolve_model_ref(value: str) -> str:
 
 
 def _pick_device() -> torch.device:
-    if torch.cuda.is_available():
-        return torch.device("cuda")
     if torch.backends.mps.is_available():
         return torch.device("mps")
+    if torch.cuda.is_available():
+        return torch.device("cuda")
     return torch.device("cpu")
 
 
@@ -154,6 +168,8 @@ def _score_pairs(
     tokenizer: Any,
     queries: Sequence[str],
     docs: Sequence[str],
+    aspect: str,
+    aspect_condition_mode: str,
     device: torch.device,
     batch_size: int,
     max_length: int,
@@ -164,8 +180,16 @@ def _score_pairs(
     step = max(1, int(batch_size))
     with torch.no_grad():
         for i in range(0, len(queries), step):
-            q_chunk = list(queries[i : i + step])
-            d_chunk = list(docs[i : i + step])
+            formatted = [
+                format_aspect_pair(
+                    q,
+                    d,
+                    aspect_condition_mode=aspect_condition_mode,
+                )
+                for q, d in zip(queries[i : i + step], docs[i : i + step])
+            ]
+            q_chunk = [p[0] for p in formatted]
+            d_chunk = [p[1] for p in formatted]
             enc = tokenizer(
                 q_chunk,
                 d_chunk,
@@ -175,7 +199,13 @@ def _score_pairs(
                 return_tensors="pt",
             )
             enc = _to_device(enc, device)
-            logits = model(**enc).logits.squeeze(-1)
+            aspect_ids = torch.full(
+                (len(q_chunk),),
+                int(aspect_id_from_name(aspect)),
+                dtype=torch.int64,
+                device=device,
+            )
+            logits = model_logits(model, enc, aspect_ids=aspect_ids).squeeze(-1)
             probs = torch.sigmoid(logits)
             out.extend(float(x) for x in probs.detach().cpu().tolist())
     return out
@@ -186,17 +216,45 @@ def _apply_weighted_scores(
     rows: List[Dict[str, Any]],
     dom_scores: Sequence[float],
     meth_scores: Sequence[float],
+    constraint_scores: Sequence[float],
     out_prefix: str,
     domain_weight: float,
     method_weight: float,
+    constraint_weight: float,
 ) -> None:
     for i, row in enumerate(rows):
         d = float(dom_scores[i])
         m = float(meth_scores[i])
-        blended = float(domain_weight * d + method_weight * m)
+        c = float(constraint_scores[i])
+        blended = float(domain_weight * d + method_weight * m + constraint_weight * c)
         row[f"{out_prefix}_domain"] = d
         row[f"{out_prefix}_method"] = m
+        row[f"{out_prefix}_constraint"] = c
         row[f"{out_prefix}_weighted"] = blended
+
+
+def _apply_three_way_scores(
+    *,
+    rows: List[Dict[str, Any]],
+    out_prefix: str,
+    domain_weight: float,
+    method_weight: float,
+    requirement_weight: float,
+    out_key: str,
+) -> None:
+    denom = float(domain_weight + method_weight + requirement_weight)
+    if denom <= 0.0:
+        domain_weight, method_weight, requirement_weight = 0.25, 0.25, 0.50
+        denom = 1.0
+    d_w = float(domain_weight / denom)
+    m_w = float(method_weight / denom)
+    r_w = float(requirement_weight / denom)
+
+    for row in rows:
+        d = float(row.get(f"{out_prefix}_domain") or 0.0)
+        m = float(row.get(f"{out_prefix}_method") or 0.0)
+        r = float(row.get("requirement_score") or 0.0)
+        row[out_key] = float(d_w * d + m_w * m + r_w * r)
 
 
 def _compute_regression(rows: Sequence[Dict[str, Any]], pred_key: str) -> Dict[str, float]:
@@ -262,6 +320,8 @@ def _compute_oob(
     high_total = 0
     low_out = 0
     mid_out = 0
+    mid_low_out = 0
+    mid_high_out = 0
     high_out = 0
 
     for r in rows:
@@ -274,6 +334,10 @@ def _compute_oob(
                 low_out += 1
         elif b == "mid":
             mid_total += 1
+            if p < float(mid_threshold):
+                mid_low_out += 1
+            if p >= float(high_threshold):
+                mid_high_out += 1
             if p < float(mid_threshold) or p >= float(high_threshold):
                 mid_out += 1
         else:
@@ -288,10 +352,49 @@ def _compute_oob(
         "mid_out": float(mid_out),
         "mid_total": float(mid_total),
         "mid_rate": float(mid_out / float(max(1, mid_total))),
+        "mid_low_out": float(mid_low_out),
+        "mid_low_rate": float(mid_low_out / float(max(1, mid_total))),
+        "mid_high_out": float(mid_high_out),
+        "mid_high_rate": float(mid_high_out / float(max(1, mid_total))),
         "high_out": float(high_out),
         "high_total": float(high_total),
         "high_rate": float(high_out / float(max(1, high_total))),
     }
+
+
+def _format_oob_counts(
+    *,
+    rows: Sequence[Dict[str, Any]],
+    pred_keys: Sequence[Tuple[str, str]],
+    high_threshold: float,
+    mid_threshold: float,
+) -> str:
+    lines: List[str] = []
+    lines.append("")
+    lines.append("=== Out-Of-Band Summary ===")
+    lines.append(f"thresholds: high>={high_threshold:.2f}, mid>={mid_threshold:.2f}")
+    lines.append(
+        f"{'SCORE':<14} {'LOW_OUT':>20} {'MID_OUT':>20} {'MID_LOW':>20} {'MID_HIGH':>20} {'HIGH_OUT':>20}"
+    )
+    lines.append("-" * 118)
+
+    def _cell(n: float, d: float) -> str:
+        ni = int(n)
+        di = int(d)
+        pct = float(ni / float(max(1, di))) * 100.0
+        return f"{ni}/{di} ({pct:.2f}%)"
+
+    for label, key in pred_keys:
+        oob = _compute_oob(rows=rows, pred_key=key, high_threshold=high_threshold, mid_threshold=mid_threshold)
+        lines.append(
+            f"{label:<14} "
+            f"{_cell(oob.get('low_out') or 0.0, oob.get('low_total') or 0.0):>20} "
+            f"{_cell(oob.get('mid_out') or 0.0, oob.get('mid_total') or 0.0):>20} "
+            f"{_cell(oob.get('mid_low_out') or 0.0, oob.get('mid_total') or 0.0):>20} "
+            f"{_cell(oob.get('mid_high_out') or 0.0, oob.get('mid_total') or 0.0):>20} "
+            f"{_cell(oob.get('high_out') or 0.0, oob.get('high_total') or 0.0):>20}"
+        )
+    return "\n".join(lines)
 
 
 def _compute_order(
@@ -421,6 +524,33 @@ def _set_alpha_weighted(rows: Sequence[Dict[str, Any]], *, prefix: str, alpha: f
         r[out_key] = float(a * d + b * m)
 
 
+def _set_three_way_weighted(
+    rows: Sequence[Dict[str, Any]],
+    *,
+    prefix: str,
+    domain_weight: float,
+    method_weight: float,
+    requirement_weight: float,
+    out_key: str,
+) -> None:
+    denom = float(domain_weight + method_weight + requirement_weight)
+    if denom <= 0.0:
+        domain_weight, method_weight, requirement_weight = 0.25, 0.25, 0.50
+        denom = 1.0
+    d_w = float(domain_weight / denom)
+    m_w = float(method_weight / denom)
+    r_w = float(requirement_weight / denom)
+
+    d_key = f"{prefix}_domain"
+    m_key = f"{prefix}_method"
+    r_key = "requirement_score"
+    for r in rows:
+        d = float(r.get(d_key) or 0.0)
+        m = float(r.get(m_key) or 0.0)
+        req = float(r.get(r_key) or 0.0)
+        r[out_key] = float(d_w * d + m_w * m + r_w * req)
+
+
 def _weighted_oob_objective(
     *,
     oob: Dict[str, float],
@@ -488,6 +618,25 @@ def _make_alpha_grid(alpha_min: float, alpha_max: float, alpha_step: float) -> L
     return vals
 
 
+def _make_three_way_grid(step: float) -> List[Tuple[float, float, float]]:
+    step = float(max(1e-4, min(1.0, step)))
+    n = int(round(1.0 / step))
+    n = max(1, n)
+    vals: List[Tuple[float, float, float]] = []
+    for i in range(n + 1):
+        for j in range(n + 1 - i):
+            k = n - i - j
+            d = float(i / n)
+            m = float(j / n)
+            r = float(k / n)
+            vals.append((d, m, r))
+
+    default = (0.25, 0.25, 0.50)
+    if all(sum(abs(a - b) for a, b in zip(x, default)) > 1e-9 for x in vals):
+        vals.append(default)
+    return vals
+
+
 def _search_alpha(
     *,
     rows_val: Sequence[Dict[str, Any]],
@@ -511,7 +660,13 @@ def _search_alpha(
     best_obj = float("inf")
     best_mae = 0.0
     best_oob_obj = 0.0
-    best_oob_rates = {"high_rate": 0.0, "mid_rate": 0.0, "low_rate": 0.0}
+    best_oob_rates = {
+        "high_rate": 0.0,
+        "mid_rate": 0.0,
+        "mid_low_rate": 0.0,
+        "mid_high_rate": 0.0,
+        "low_rate": 0.0,
+    }
 
     for a in grid:
         key = "__alpha_eval__"
@@ -542,6 +697,8 @@ def _search_alpha(
                 "oob_objective": float(oob_obj),
                 "oob_high_rate": float(oob.get("high_rate") or 0.0),
                 "oob_mid_rate": float(oob.get("mid_rate") or 0.0),
+                "oob_mid_low_rate": float(oob.get("mid_low_rate") or 0.0),
+                "oob_mid_high_rate": float(oob.get("mid_high_rate") or 0.0),
                 "oob_low_rate": float(oob.get("low_rate") or 0.0),
             }
         )
@@ -560,12 +717,125 @@ def _search_alpha(
             best_oob_rates = {
                 "high_rate": float(oob.get("high_rate") or 0.0),
                 "mid_rate": float(oob.get("mid_rate") or 0.0),
+                "mid_low_rate": float(oob.get("mid_low_rate") or 0.0),
+                "mid_high_rate": float(oob.get("mid_high_rate") or 0.0),
                 "low_rate": float(oob.get("low_rate") or 0.0),
             }
 
     trial_out.sort(key=lambda x: (float(x.get("objective") or 0.0), abs(float(x.get("alpha") or 0.5) - 0.5)))
     return {
         "best_alpha": float(best_alpha),
+        "best_objective": float(best_obj),
+        "best_mae": float(best_mae),
+        "best_oob_objective": float(best_oob_obj),
+        "best_oob_rates": best_oob_rates,
+        "trials_top10": trial_out[:10],
+        "grid_count": int(len(grid)),
+    }
+
+
+def _search_three_way(
+    *,
+    rows_val: Sequence[Dict[str, Any]],
+    prefix: str,
+    step: float,
+    objective: str,
+    high_threshold: float,
+    mid_threshold: float,
+    oob_high_weight: float,
+    oob_mid_weight: float,
+    oob_low_weight: float,
+    hybrid_oob_scale: float,
+) -> Dict[str, Any]:
+    work = [dict(r) for r in rows_val]
+    grid = _make_three_way_grid(step)
+    trial_out: List[Dict[str, Any]] = []
+
+    best_weights = (0.25, 0.25, 0.50)
+    best_obj = float("inf")
+    best_mae = 0.0
+    best_oob_obj = 0.0
+    best_oob_rates = {
+        "high_rate": 0.0,
+        "mid_rate": 0.0,
+        "mid_low_rate": 0.0,
+        "mid_high_rate": 0.0,
+        "low_rate": 0.0,
+    }
+
+    for d_w, m_w, r_w in grid:
+        key = "__three_way_eval__"
+        _set_three_way_weighted(
+            work,
+            prefix=prefix,
+            domain_weight=d_w,
+            method_weight=m_w,
+            requirement_weight=r_w,
+            out_key=key,
+        )
+        obj, reg, oob = _alpha_objective(
+            rows=work,
+            pred_key=key,
+            objective=objective,
+            high_threshold=high_threshold,
+            mid_threshold=mid_threshold,
+            oob_high_weight=oob_high_weight,
+            oob_mid_weight=oob_mid_weight,
+            oob_low_weight=oob_low_weight,
+            hybrid_oob_scale=hybrid_oob_scale,
+        )
+        oob_obj = _weighted_oob_objective(
+            oob=oob,
+            w_high=oob_high_weight,
+            w_mid=oob_mid_weight,
+            w_low=oob_low_weight,
+        )
+        mae = float(reg.get("mae") or 0.0)
+        trial_out.append(
+            {
+                "domain_weight": float(d_w),
+                "method_weight": float(m_w),
+                "requirement_weight": float(r_w),
+                "objective": float(obj),
+                "mae": float(mae),
+                "oob_objective": float(oob_obj),
+                "oob_high_rate": float(oob.get("high_rate") or 0.0),
+                "oob_mid_rate": float(oob.get("mid_rate") or 0.0),
+                "oob_mid_low_rate": float(oob.get("mid_low_rate") or 0.0),
+                "oob_mid_high_rate": float(oob.get("mid_high_rate") or 0.0),
+                "oob_low_rate": float(oob.get("low_rate") or 0.0),
+            }
+        )
+        better = False
+        if obj < best_obj - 1e-12:
+            better = True
+        elif abs(obj - best_obj) <= 1e-12:
+            # Prefer keeping some requirement authority when validation objective ties.
+            if abs(r_w - 0.5) < abs(best_weights[2] - 0.5):
+                better = True
+        if better:
+            best_obj = float(obj)
+            best_weights = (float(d_w), float(m_w), float(r_w))
+            best_mae = float(mae)
+            best_oob_obj = float(oob_obj)
+            best_oob_rates = {
+                "high_rate": float(oob.get("high_rate") or 0.0),
+                "mid_rate": float(oob.get("mid_rate") or 0.0),
+                "mid_low_rate": float(oob.get("mid_low_rate") or 0.0),
+                "mid_high_rate": float(oob.get("mid_high_rate") or 0.0),
+                "low_rate": float(oob.get("low_rate") or 0.0),
+            }
+
+    trial_out.sort(
+        key=lambda x: (
+            float(x.get("objective") or 0.0),
+            abs(float(x.get("requirement_weight") or 0.0) - 0.5),
+        )
+    )
+    return {
+        "best_domain_weight": float(best_weights[0]),
+        "best_method_weight": float(best_weights[1]),
+        "best_requirement_weight": float(best_weights[2]),
         "best_objective": float(best_obj),
         "best_mae": float(best_mae),
         "best_oob_objective": float(best_oob_obj),
@@ -582,11 +852,16 @@ def _format_summary(
     mid_threshold: float,
     domain_weight: float,
     method_weight: float,
+    dmr_domain_weight: float,
+    dmr_method_weight: float,
+    dmr_requirement_weight: float,
 ) -> str:
     lines: List[str] = []
-    lines.append("=== Weighted Domain+Method vs Ground Truth ===")
+    lines.append("=== Weighted Domain+Method(+Requirement) vs Ground Truth ===")
     lines.append(
-        f"weights: domain={domain_weight:.4f}, method={method_weight:.4f} | thresholds: high>={high_threshold:.2f}, mid>={mid_threshold:.2f}"
+        f"dm_weights: domain={domain_weight:.4f}, method={method_weight:.4f} | "
+        f"dmr_weights: domain={dmr_domain_weight:.4f}, method={dmr_method_weight:.4f}, requirement={dmr_requirement_weight:.4f} | "
+        f"thresholds: high>={high_threshold:.2f}, mid>={mid_threshold:.2f}"
     )
     lines.append("")
     lines.append(
@@ -594,7 +869,7 @@ def _format_summary(
     )
     lines.append("-" * 104)
 
-    for name in ("finetuned", "base"):
+    for name in model_stats.keys():
         if name not in model_stats:
             continue
         reg = model_stats[name]["regression"]
@@ -613,7 +888,28 @@ def _format_summary(
             f"{float(oob.get('high_rate') or 0.0):>9.4f}"
         )
 
-    for name in ("finetuned", "base"):
+    lines.append("")
+    lines.append("=== Out-Of-Band Percentages ===")
+    lines.append(f"{'MODEL':<12} {'LOW':>10} {'MID':>10} {'MID_LOW':>10} {'MID_HIGH':>10} {'HIGH':>10}")
+    lines.append("-" * 70)
+    for name in model_stats.keys():
+        if name not in model_stats:
+            continue
+        oob = model_stats[name]["oob"]
+
+        def _pct(key: str) -> float:
+            return float(oob.get(key) or 0.0) * 100.0
+
+        lines.append(
+            f"{name:<12} "
+            f"{_pct('low_rate'):>9.2f}% "
+            f"{_pct('mid_rate'):>9.2f}% "
+            f"{_pct('mid_low_rate'):>9.2f}% "
+            f"{_pct('mid_high_rate'):>9.2f}% "
+            f"{_pct('high_rate'):>9.2f}%"
+        )
+
+    for name in model_stats.keys():
         if name not in model_stats:
             continue
         band = model_stats[name]["band"]
@@ -671,44 +967,110 @@ def _format_alpha_search_summary(
             f"{float(d.get('test_low_oob') or 0.0):>13.4f}"
         )
 
+    lines.append("")
+    lines.append("=== Best-Alpha Out-Of-Band Percentages ===")
+    lines.append(f"{'MODEL':<12} {'LOW':>10} {'MID':>10} {'MID_LOW':>10} {'MID_HIGH':>10} {'HIGH':>10}")
+    lines.append("-" * 70)
+    for name in ("finetuned", "base"):
+        if name not in alpha_results:
+            continue
+        d = alpha_results[name]
+
+        def _pct(key: str) -> float:
+            return float(d.get(key) or 0.0) * 100.0
+
+        lines.append(
+            f"{name:<12} "
+            f"{_pct('test_low_oob'):>9.2f}% "
+            f"{_pct('test_mid_oob'):>9.2f}% "
+            f"{_pct('test_mid_low_oob'):>9.2f}% "
+            f"{_pct('test_mid_high_oob'):>9.2f}% "
+            f"{_pct('test_high_oob'):>9.2f}%"
+        )
+
+    return "\n".join(lines)
+
+
+def _format_three_way_search_summary(
+    *,
+    split_meta: Dict[str, int],
+    objective: str,
+    three_way_results: Dict[str, Dict[str, Any]],
+) -> str:
+    lines: List[str] = []
+    lines.append("")
+    lines.append("=== In-Memory Three-Way Search (Domain+Method+Requirement) ===")
+    lines.append(
+        f"queries_total={int(split_meta.get('queries_total') or 0)} "
+        f"val_queries={int(split_meta.get('val_queries') or 0)} "
+        f"test_queries={int(split_meta.get('test_queries') or 0)} "
+        f"val_rows={int(split_meta.get('val_rows') or 0)} "
+        f"test_rows={int(split_meta.get('test_rows') or 0)}"
+    )
+    lines.append(f"objective={_clean_text(objective) or 'mae'}")
+    lines.append(
+        f"{'MODEL':<12} {'D_W':>7} {'M_W':>7} {'R_W':>7} {'VAL_OBJ':>10} {'VAL_MAE':>9} {'TEST_MAE':>9} {'TEST_PAIR':>10}"
+    )
+    lines.append("-" * 88)
+    for name, d in three_way_results.items():
+        lines.append(
+            f"{name:<12} "
+            f"{float(d.get('best_domain_weight') or 0.0):>7.3f} "
+            f"{float(d.get('best_method_weight') or 0.0):>7.3f} "
+            f"{float(d.get('best_requirement_weight') or 0.0):>7.3f} "
+            f"{float(d.get('val_objective') or 0.0):>10.4f} "
+            f"{float(d.get('val_mae') or 0.0):>9.4f} "
+            f"{float(d.get('test_mae') or 0.0):>9.4f} "
+            f"{float(d.get('test_pair_acc') or 0.0):>10.4f}"
+        )
+
+    lines.append("")
+    lines.append("=== Best Three-Way Out-Of-Band Percentages ===")
+    lines.append(f"{'MODEL':<12} {'LOW':>10} {'MID':>10} {'MID_LOW':>10} {'MID_HIGH':>10} {'HIGH':>10}")
+    lines.append("-" * 70)
+    for name, d in three_way_results.items():
+
+        def _pct(key: str) -> float:
+            return float(d.get(key) or 0.0) * 100.0
+
+        lines.append(
+            f"{name:<12} "
+            f"{_pct('test_low_oob'):>9.2f}% "
+            f"{_pct('test_mid_oob'):>9.2f}% "
+            f"{_pct('test_mid_low_oob'):>9.2f}% "
+            f"{_pct('test_mid_high_oob'):>9.2f}% "
+            f"{_pct('test_high_oob'):>9.2f}%"
+        )
+
     return "\n".join(lines)
 
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
         description=(
-            "Evaluate weighted blend of [DOMAIN] and [METHOD] model inference "
-            "against query/doc/score ground truth JSONL."
+            "Score ground-truth query/doc pairs with finetuned [DOMAIN], [METHOD], and [CONSTRAINT] heads."
         )
     )
     p.add_argument("--input", type=str, default=INPUT_DEFAULT)
     p.add_argument("--finetuned-model", type=str, default=FINETUNED_MODEL_DEFAULT)
-    p.add_argument("--base-model", type=str, default=BASE_MODEL_DEFAULT)
-    p.add_argument("--no-base", action="store_true", help="Disable base-model evaluation.")
+    p.add_argument(
+        "--aspect-condition-mode",
+        type=str,
+        default="legacy",
+        choices=("legacy", "long_prefix", "none"),
+        help="Condition formatting for the finetuned aspect scorer.",
+    )
     p.add_argument("--domain-weight", type=float, default=0.5)
     p.add_argument("--method-weight", type=float, default=0.5)
+    p.add_argument("--constraint-weight", type=float, default=0.5)
+    p.add_argument("--high-threshold", type=float, default=HIGH_THRESHOLD_DEFAULT)
+    p.add_argument("--mid-threshold", type=float, default=MID_THRESHOLD_DEFAULT)
     p.add_argument("--batch-size", type=int, default=64)
     p.add_argument("--max-length", type=int, default=512)
-    p.add_argument("--high-threshold", type=float, default=0.70)
-    p.add_argument("--mid-threshold", type=float, default=0.30)
-    p.add_argument("--pair-eps", type=float, default=0.01)
-    p.add_argument("--hard-gap-max", type=float, default=0.15)
-    p.add_argument("--auto-search-alpha", action=argparse.BooleanOptionalAction, default=True)
-    p.add_argument("--alpha-val-ratio", type=float, default=0.5)
-    p.add_argument("--alpha-seed", type=int, default=42)
-    p.add_argument("--alpha-min", type=float, default=0.0)
-    p.add_argument("--alpha-max", type=float, default=1.0)
-    p.add_argument("--alpha-step", type=float, default=0.02)
-    p.add_argument("--alpha-objective", type=str, default="hybrid", choices=["mae", "oob", "hybrid"])
-    p.add_argument("--alpha-oob-high-weight", type=float, default=1.0)
-    p.add_argument("--alpha-oob-mid-weight", type=float, default=1.0)
-    p.add_argument("--alpha-oob-low-weight", type=float, default=1.0)
-    p.add_argument("--alpha-hybrid-oob-scale", type=float, default=0.5)
     p.add_argument("--output-dir", type=str, default=OUTPUT_DIR_DEFAULT)
-    p.add_argument("--save-prefix", type=str, default="weighted_domain_method_vs_ground_truth")
+    p.add_argument("--save-prefix", type=str, default="domain_method_constraint_pair_scores")
     p.add_argument("--save", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--print", action=argparse.BooleanOptionalAction, default=True)
-    p.add_argument("--save-rows", action=argparse.BooleanOptionalAction, default=False)
     return p.parse_args()
 
 
@@ -720,18 +1082,13 @@ def _run_model(
     max_length: int,
     domain_weight: float,
     method_weight: float,
+    constraint_weight: float,
     device: torch.device,
     out_prefix: str,
+    aspect_condition_mode: str,
 ) -> Dict[str, Any]:
-    try:
-        from transformers import AutoModelForSequenceClassification, AutoTokenizer
-    except Exception as exc:
-        raise RuntimeError(
-            "Failed to import transformers. Run this script in the same env where training/eval dependencies are installed."
-        ) from exc
-
     tokenizer = AutoTokenizer.from_pretrained(model_ref)
-    model = AutoModelForSequenceClassification.from_pretrained(model_ref)
+    model = load_sequence_classifier_model(model_ref, num_labels=1, multi_aspect_heads=False)
     model.to(device)
     model.eval()
 
@@ -739,12 +1096,16 @@ def _run_model(
     d_domain = [f"[DOMAIN] {_clean_text(r.get('doc'))}" for r in rows]
     q_method = [f"[METHOD] {_clean_text(r.get('query'))}" for r in rows]
     d_method = [f"[METHOD] {_clean_text(r.get('doc'))}" for r in rows]
+    q_constraint = [f"[CONSTRAINT] {_clean_text(r.get('query'))}" for r in rows]
+    d_constraint = [f"[CONSTRAINT] {_clean_text(r.get('doc'))}" for r in rows]
 
     s_domain = _score_pairs(
         model=model,
         tokenizer=tokenizer,
         queries=q_domain,
         docs=d_domain,
+        aspect="domain",
+        aspect_condition_mode=aspect_condition_mode,
         device=device,
         batch_size=batch_size,
         max_length=max_length,
@@ -754,6 +1115,19 @@ def _run_model(
         tokenizer=tokenizer,
         queries=q_method,
         docs=d_method,
+        aspect="method",
+        aspect_condition_mode=aspect_condition_mode,
+        device=device,
+        batch_size=batch_size,
+        max_length=max_length,
+    )
+    s_constraint = _score_pairs(
+        model=model,
+        tokenizer=tokenizer,
+        queries=q_constraint,
+        docs=d_constraint,
+        aspect="constraint",
+        aspect_condition_mode=aspect_condition_mode,
         device=device,
         batch_size=batch_size,
         max_length=max_length,
@@ -763,9 +1137,11 @@ def _run_model(
         rows=rows,
         dom_scores=s_domain,
         meth_scores=s_method,
+        constraint_scores=s_constraint,
         out_prefix=out_prefix,
         domain_weight=domain_weight,
         method_weight=method_weight,
+        constraint_weight=constraint_weight,
     )
 
     try:
@@ -792,36 +1168,27 @@ def main() -> int:
         raise RuntimeError(f"Input not found: {in_path}")
 
     finetuned_model = _resolve_model_ref(args.finetuned_model)
-    base_model = _resolve_model_ref(args.base_model)
 
     domain_w = max(0.0, float(args.domain_weight))
     method_w = max(0.0, float(args.method_weight))
-    if (domain_w + method_w) <= 0.0:
-        domain_w = 0.5
-        method_w = 0.5
-    denom = domain_w + method_w
-    domain_w = float(domain_w / denom)
-    method_w = float(method_w / denom)
+    constraint_w = max(0.0, float(args.constraint_weight))
+    if (domain_w + method_w + constraint_w) <= 0.0:
+        domain_w = 1.0
+        method_w = 1.0
+        constraint_w = 1.0
+    denom = domain_w + method_w + constraint_w
+    domain_w = 0.55#float(domain_w / denom)
+    method_w = 0.35#float(method_w / denom)
+    constraint_w = 0.1#float(constraint_w / denom)
+
+    high_threshold = _safe_float(args.high_threshold, default=HIGH_THRESHOLD_DEFAULT, minimum=0.0, maximum=1.0)
+    mid_threshold = _safe_float(args.mid_threshold, default=MID_THRESHOLD_DEFAULT, minimum=0.0, maximum=1.0)
+    if mid_threshold > high_threshold:
+        mid_threshold = high_threshold
 
     batch_size = _safe_int(args.batch_size, default=64, minimum=1, maximum=2048)
     max_length = _safe_int(args.max_length, default=512, minimum=16, maximum=8192)
-    high_threshold = _safe_float(args.high_threshold, default=0.70, minimum=0.0, maximum=1.0)
-    mid_threshold = _safe_float(args.mid_threshold, default=0.30, minimum=0.0, maximum=1.0)
-    if mid_threshold > high_threshold:
-        mid_threshold = high_threshold
-    pair_eps = _safe_float(args.pair_eps, default=0.01, minimum=0.0, maximum=1.0)
-    hard_gap_max = _safe_float(args.hard_gap_max, default=0.15, minimum=0.0, maximum=1.0)
-    auto_search_alpha = bool(args.auto_search_alpha)
-    alpha_val_ratio = _safe_float(args.alpha_val_ratio, default=0.5, minimum=0.05, maximum=0.95)
-    alpha_seed = _safe_int(args.alpha_seed, default=42, minimum=0, maximum=2_147_483_647)
-    alpha_min = _safe_float(args.alpha_min, default=0.0, minimum=0.0, maximum=1.0)
-    alpha_max = _safe_float(args.alpha_max, default=1.0, minimum=0.0, maximum=1.0)
-    alpha_step = _safe_float(args.alpha_step, default=0.02, minimum=1e-4, maximum=1.0)
-    alpha_objective = _clean_text(args.alpha_objective).lower() or "hybrid"
-    alpha_oob_high_weight = _safe_float(args.alpha_oob_high_weight, default=1.0, minimum=0.0, maximum=100.0)
-    alpha_oob_mid_weight = _safe_float(args.alpha_oob_mid_weight, default=1.0, minimum=0.0, maximum=100.0)
-    alpha_oob_low_weight = _safe_float(args.alpha_oob_low_weight, default=1.0, minimum=0.0, maximum=100.0)
-    alpha_hybrid_oob_scale = _safe_float(args.alpha_hybrid_oob_scale, default=0.5, minimum=0.0, maximum=100.0)
+    aspect_condition_mode = clean_aspect_condition_mode(args.aspect_condition_mode)
 
     rows = _load_ground_truth_rows(in_path)
     if not rows:
@@ -830,8 +1197,10 @@ def main() -> int:
     print(f"input={in_path}")
     print(f"rows_total={len(rows)}")
     print(f"finetuned_model={finetuned_model}")
-    if not bool(args.no_base):
-        print(f"base_model={base_model}")
+    print(f"aspect_condition_mode={aspect_condition_mode}")
+    print(
+        f"weights: domain={domain_w:.4f}, method={method_w:.4f}, constraint={constraint_w:.4f}"
+    )
 
     device = _pick_device()
     print(f"device={device.type}")
@@ -845,203 +1214,60 @@ def main() -> int:
         max_length=max_length,
         domain_weight=domain_w,
         method_weight=method_w,
+        constraint_weight=constraint_w,
         device=device,
         out_prefix="finetuned",
+        aspect_condition_mode=aspect_condition_mode,
     )
 
-    run_base = not bool(args.no_base)
-    if run_base:
-        _run_model(
-            model_ref=base_model,
-            rows=rows,
-            batch_size=batch_size,
-            max_length=max_length,
-            domain_weight=domain_w,
-            method_weight=method_w,
-            device=device,
-            out_prefix="base",
-        )
-
-    model_stats: Dict[str, Dict[str, Any]] = {}
-
-    def _collect(prefix: str) -> Dict[str, Any]:
-        pred_key = f"{prefix}_weighted"
-        return {
-            "regression": _compute_regression(rows, pred_key),
-            "band": _compute_band_mae(
-                rows=rows,
-                pred_key=pred_key,
-                high_threshold=high_threshold,
-                mid_threshold=mid_threshold,
-            ),
-            "oob": _compute_oob(
-                rows=rows,
-                pred_key=pred_key,
-                high_threshold=high_threshold,
-                mid_threshold=mid_threshold,
-            ),
-            "order": _compute_order(
-                rows=rows,
-                pred_key=pred_key,
-                pair_eps=pair_eps,
-                hard_gap_max=hard_gap_max,
-            ),
-        }
-
-    model_stats["finetuned"] = _collect("finetuned")
-    if run_base:
-        model_stats["base"] = _collect("base")
-
-    alpha_split_meta: Dict[str, int] = {}
-    alpha_results: Dict[str, Dict[str, Any]] = {}
-    if auto_search_alpha:
-        val_rows, test_rows, alpha_split_meta = _split_rows_by_query_group(
-            rows=rows,
-            val_ratio=alpha_val_ratio,
-            seed=alpha_seed,
-        )
-
-        def _run_alpha_for_model(prefix: str, label: str) -> None:
-            search = _search_alpha(
-                rows_val=val_rows,
-                prefix=prefix,
-                alpha_min=alpha_min,
-                alpha_max=alpha_max,
-                alpha_step=alpha_step,
-                objective=alpha_objective,
-                high_threshold=high_threshold,
-                mid_threshold=mid_threshold,
-                oob_high_weight=alpha_oob_high_weight,
-                oob_mid_weight=alpha_oob_mid_weight,
-                oob_low_weight=alpha_oob_low_weight,
-                hybrid_oob_scale=alpha_hybrid_oob_scale,
-            )
-            best_alpha = float(search.get("best_alpha") or 0.5)
-
-            val_eval = [dict(r) for r in val_rows]
-            test_eval = [dict(r) for r in test_rows]
-            _set_alpha_weighted(val_eval, prefix=prefix, alpha=best_alpha, out_key="__alpha_weighted__")
-            _set_alpha_weighted(test_eval, prefix=prefix, alpha=best_alpha, out_key="__alpha_weighted__")
-
-            val_reg = _compute_regression(val_eval, "__alpha_weighted__")
-            test_reg = _compute_regression(test_eval, "__alpha_weighted__")
-            test_oob = _compute_oob(
-                rows=test_eval,
-                pred_key="__alpha_weighted__",
-                high_threshold=high_threshold,
-                mid_threshold=mid_threshold,
-            )
-            test_order = _compute_order(
-                rows=test_eval,
-                pred_key="__alpha_weighted__",
-                pair_eps=pair_eps,
-                hard_gap_max=hard_gap_max,
-            )
-
-            # Baseline comparison on same test subset with fixed incoming blend weights.
-            _set_alpha_weighted(test_eval, prefix=prefix, alpha=domain_w, out_key="__fixed_weighted__")
-            fixed_test_reg = _compute_regression(test_eval, "__fixed_weighted__")
-            fixed_test_oob = _compute_oob(
-                rows=test_eval,
-                pred_key="__fixed_weighted__",
-                high_threshold=high_threshold,
-                mid_threshold=mid_threshold,
-            )
-
-            alpha_results[label] = {
-                "best_alpha": float(best_alpha),
-                "val_objective": float(search.get("best_objective") or 0.0),
-                "val_mae": float(val_reg.get("mae") or 0.0),
-                "test_mae": float(test_reg.get("mae") or 0.0),
-                "test_pair_acc": float(test_order.get("pair_acc") or 0.0),
-                "test_mid_oob": float(test_oob.get("mid_rate") or 0.0),
-                "test_low_oob": float(test_oob.get("low_rate") or 0.0),
-                "test_high_oob": float(test_oob.get("high_rate") or 0.0),
-                "fixed_alpha": float(domain_w),
-                "fixed_test_mae": float(fixed_test_reg.get("mae") or 0.0),
-                "fixed_test_mid_oob": float(fixed_test_oob.get("mid_rate") or 0.0),
-                "fixed_test_low_oob": float(fixed_test_oob.get("low_rate") or 0.0),
-                "fixed_test_high_oob": float(fixed_test_oob.get("high_rate") or 0.0),
-                "search": search,
+    pair_rows: List[Dict[str, Any]] = []
+    for row in rows:
+        pair_rows.append(
+            {
+                "query": _clean_text(row.get("query")),
+                "doc": _clean_text(row.get("doc")),
+                "gt_score": float(row.get("gt_score") or 0.0),
+                "gt_band": _score_band(
+                    float(row.get("gt_score") or 0.0),
+                    high_threshold=high_threshold,
+                    mid_threshold=mid_threshold,
+                ),
+                "domain_score": float(row.get("finetuned_domain") or 0.0),
+                "method_score": float(row.get("finetuned_method") or 0.0),
+                "constraint_score": float(row.get("finetuned_constraint") or 0.0),
+                "weighted_score": float(row.get("finetuned_weighted") or 0.0),
             }
-
-        _run_alpha_for_model("finetuned", "finetuned")
-        if run_base:
-            _run_alpha_for_model("base", "base")
-
-    summary = _format_summary(
-        model_stats=model_stats,
-        high_threshold=high_threshold,
-        mid_threshold=mid_threshold,
-        domain_weight=domain_w,
-        method_weight=method_w,
-    )
-    if auto_search_alpha:
-        summary = summary + "\n" + _format_alpha_search_summary(
-            split_meta=alpha_split_meta,
-            objective=alpha_objective,
-            alpha_results=alpha_results,
         )
 
     elapsed = float(time.time() - started)
-
-    payload: Dict[str, Any] = {
-        "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        "input": str(in_path),
-        "rows_total": int(len(rows)),
-        "finetuned_model": str(finetuned_model),
-        "base_model": str(base_model) if run_base else "",
-        "weights": {"domain": float(domain_w), "method": float(method_w)},
-        "thresholds": {
-            "high": float(high_threshold),
-            "mid": float(mid_threshold),
-            "pair_eps": float(pair_eps),
-            "hard_gap_max": float(hard_gap_max),
-        },
-        "alpha_search": {
-            "enabled": bool(auto_search_alpha),
-            "val_ratio": float(alpha_val_ratio),
-            "seed": int(alpha_seed),
-            "alpha_min": float(alpha_min),
-            "alpha_max": float(alpha_max),
-            "alpha_step": float(alpha_step),
-            "objective": str(alpha_objective),
-            "oob_weights": {
-                "high": float(alpha_oob_high_weight),
-                "mid": float(alpha_oob_mid_weight),
-                "low": float(alpha_oob_low_weight),
-            },
-            "hybrid_oob_scale": float(alpha_hybrid_oob_scale),
-            "split_meta": alpha_split_meta,
-            "results": alpha_results,
-        },
-        "model_stats": model_stats,
-        "elapsed_sec": float(elapsed),
-        "summary": summary,
-    }
-
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    save_prefix = _clean_text(args.save_prefix) or "weighted_domain_method_vs_ground_truth"
-    save_json = out_dir / f"{save_prefix}_{timestamp}.json"
-    save_txt = out_dir / f"{save_prefix}_{timestamp}.txt"
+    save_prefix = _clean_text(args.save_prefix) or "domain_method_constraint_pair_scores"
+    save_path = out_dir / f"{save_prefix}_{timestamp}.jsonl"
 
     if bool(args.save):
-        save_json.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-        save_txt.write_text(summary + "\n", encoding="utf-8")
-
-        if bool(args.save_rows):
-            rows_path = out_dir / f"{save_prefix}_{timestamp}_rows.jsonl"
-            with rows_path.open("w", encoding="utf-8") as f:
-                for r in rows:
-                    f.write(json.dumps(r, ensure_ascii=False) + "\n")
-            payload["rows_output"] = str(rows_path)
+        with save_path.open("w", encoding="utf-8") as f:
+            for row in pair_rows:
+                f.write(json.dumps(row, ensure_ascii=False) + "\n")
 
     if bool(args.print):
-        print(summary)
+        print("=== Domain/Method/Constraint Pair Score Export ===")
+        print(f"rows_total={len(pair_rows)}")
         print(f"elapsed_sec={elapsed:.2f}")
+        print(
+            _format_oob_counts(
+                rows=rows,
+                pred_keys=[
+                    ("weighted", "finetuned_weighted"),
+                    ("domain", "finetuned_domain"),
+                    ("method", "finetuned_method"),
+                    ("constraint", "finetuned_constraint"),
+                ],
+                high_threshold=high_threshold,
+                mid_threshold=mid_threshold,
+            )
+        )
         if bool(args.save):
-            print(f"saved_json={save_json}")
-            print(f"saved_txt={save_txt}")
+            print(f"saved_jsonl={save_path}")
 
     return 0
 

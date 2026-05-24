@@ -98,13 +98,15 @@ CONSTRAINT_PAIRWISE_TEST_INPUT="${CONSTRAINT_PAIRWISE_TEST_INPUT:-${SPLIT_DIR}/l
 # ---------------------------
 OUTPUT_DIR="${OUTPUT_DIR:-ce/models/bge_reranker_distill}"
 MODEL_ID="${MODEL_ID:-dleemiller/ModernCE-base-sts}"
+ASPECT_CONDITION_MODE="${ASPECT_CONDITION_MODE:-long_prefix}"  # legacy | long_prefix | none
+MULTI_ASPECT_HEADS="${MULTI_ASPECT_HEADS:-true}"               # true | false
 
 SEED="${SEED:-42}"
 STAGE1_EPOCHS="${STAGE1_EPOCHS:-4}"
 STAGE2_EPOCHS="${STAGE2_EPOCHS:-4}"
 STAGE1_EARLY_STOP="${STAGE1_EARLY_STOP:-true}"
 STAGE1_EARLY_STOP_PATIENCE="${STAGE1_EARLY_STOP_PATIENCE:-2}"
-STAGE2_START_FROM_BEST_STAGE1="${STAGE2_START_FROM_BEST_STAGE1:-true}"
+STAGE2_START_FROM_BEST_STAGE1="${STAGE2_START_FROM_BEST_STAGE1:-false}"
 STAGE2_EARLY_STOP="${STAGE2_EARLY_STOP:-true}"
 STAGE2_EARLY_STOP_PATIENCE="${STAGE2_EARLY_STOP_PATIENCE:-2}"
 
@@ -285,6 +287,7 @@ CMD=(
   --constraint-pairwise-test-input "${CONSTRAINT_PAIRWISE_TEST_INPUT}"
   --output-dir "${OUTPUT_DIR}"
   --model-id "${MODEL_ID}"
+  --aspect-condition-mode "${ASPECT_CONDITION_MODE}"
   --seed "${SEED}"
   --stage1-epochs "${STAGE1_EPOCHS}"
   --stage2-epochs "${STAGE2_EPOCHS}"
@@ -376,6 +379,11 @@ if bool_true "${STAGE2_EARLY_STOP}"; then
 else
   CMD+=(--no-stage2-early-stop)
 fi
+if bool_true "${MULTI_ASPECT_HEADS}"; then
+  CMD+=(--multi-aspect-heads)
+else
+  CMD+=(--no-multi-aspect-heads)
+fi
 if bool_true "${PIN_MEMORY}"; then
   CMD+=(--pin-memory)
 else
@@ -431,6 +439,7 @@ if bool_true "${EVAL_AFTER_TRAIN}"; then
     "${PYTHON_BIN}" ce/eval/eval_finetuned_model.py
     --no-auto-resolve-finetuned
     --finetuned-model "${EVAL_FINETUNED_MODEL}"
+    --aspect-condition-mode "${ASPECT_CONDITION_MODE}"
     --base-model "${EVAL_BASE_MODEL}"
     --domain-input "${EVAL_DOMAIN_INPUT}"
     --method-input "${EVAL_METHOD_INPUT}"

@@ -1,0 +1,43 @@
+=== Weighted Domain+Method vs Ground Truth ===
+weights: domain=0.5000, method=0.5000 | thresholds: high>=0.70, mid>=0.30
+
+MODEL             MAE     RMSE  PEARSON     TOP1  PAIR_ACC  HARD_ACC   MID_OOB   LOW_OOB  HIGH_OOB
+--------------------------------------------------------------------------------------------------------
+finetuned      0.1710   0.2158   0.7474   0.7245    0.7821    0.6301    0.1196    0.3563    0.4600
+base           0.1436   0.1872   0.7385   0.6556    0.7666    0.6107    0.0548    0.3647    0.8600
+
+=== Out-Of-Band Percentages ===
+MODEL               LOW        MID    MID_LOW   MID_HIGH       HIGH
+----------------------------------------------------------------------
+finetuned        35.63%     11.96%      3.24%      8.72%     46.00%
+base             36.47%      5.48%      4.36%      1.12%     86.00%
+
+=== FINETUNED Band MAE ===
+BAND        COUNT     AVG_GT   AVG_PRED        MAE
+----------------------------------------------------
+overall      1681     0.2548     0.4065     0.1710
+high           50     0.7294     0.6780     0.0956
+mid           803     0.4223     0.5345     0.1427
+low           828     0.0638     0.2659     0.2030
+
+=== BASE Band MAE ===
+BAND        COUNT     AVG_GT   AVG_PRED        MAE
+----------------------------------------------------
+overall      1681     0.2548     0.3663     0.1436
+high           50     0.7294     0.5825     0.1509
+mid           803     0.4223     0.4841     0.1091
+low           828     0.0638     0.2391     0.1767
+
+=== In-Memory Alpha Search (Query-Group Split) ===
+queries_total=426 val_queries=213 test_queries=213 val_rows=828 test_rows=853
+alpha_objective=hybrid
+MODEL          BEST_A    VAL_OBJ   VAL_MAE  TEST_MAE  TEST_PAIR  TEST_MID_OOB  TEST_LOW_OOB
+------------------------------------------------------------------------------------------------
+finetuned       0.380     0.6549    0.1639    0.1701     0.7643        0.1025        0.3605
+base            0.580     0.7395    0.1399    0.1468     0.7568        0.0550        0.3674
+
+=== Best-Alpha Out-Of-Band Percentages ===
+MODEL               LOW        MID    MID_LOW   MID_HIGH       HIGH
+----------------------------------------------------------------------
+finetuned        36.05%     10.25%      3.50%      6.75%     39.13%
+base             36.74%      5.50%      4.25%      1.25%     95.65%

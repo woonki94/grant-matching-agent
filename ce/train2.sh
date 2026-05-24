@@ -54,6 +54,8 @@ CONSTRAINT_PAIRWISE_TEST_INPUT="${CONSTRAINT_PAIRWISE_TEST_INPUT:-ce/dataset/spl
 # Outputs / model
 OUTPUT_DIR="${OUTPUT_DIR:-ce/models/bge_reranker_distill}"
 MODEL_ID="${MODEL_ID:-dleemiller/ModernCE-base-sts}"
+ASPECT_CONDITION_MODE="${ASPECT_CONDITION_MODE:-long_prefix}"  # legacy | long_prefix | none
+MULTI_ASPECT_HEADS="${MULTI_ASPECT_HEADS:-true}"               # true | false
 
 # Training schedule
 SEED="${SEED:-42}"
@@ -61,7 +63,7 @@ STAGE1_EPOCHS="${STAGE1_EPOCHS:-5}"
 STAGE2_EPOCHS="${STAGE2_EPOCHS:-6}"
 STAGE1_EARLY_STOP="${STAGE1_EARLY_STOP:-true}"                  # true | false
 STAGE1_EARLY_STOP_PATIENCE="${STAGE1_EARLY_STOP_PATIENCE:-2}"
-STAGE2_START_FROM_BEST_STAGE1="${STAGE2_START_FROM_BEST_STAGE1:-true}"  # true | false
+STAGE2_START_FROM_BEST_STAGE1="${STAGE2_START_FROM_BEST_STAGE1:-false}" # true | false
 STAGE2_EARLY_STOP="${STAGE2_EARLY_STOP:-true}"                  # true | false
 STAGE2_EARLY_STOP_PATIENCE="${STAGE2_EARLY_STOP_PATIENCE:-2}"
 
@@ -170,6 +172,7 @@ log "method_pairwise_input=${METHOD_PAIRWISE_INPUT}"
 log "constraint_pairwise_input=${CONSTRAINT_PAIRWISE_INPUT}"
 log "split_dir=${SPLIT_DIR}"
 log "output_dir=${OUTPUT_DIR}"
+log "aspect_condition_mode=${ASPECT_CONDITION_MODE} multi_aspect_heads=${MULTI_ASPECT_HEADS}"
 log "log_every_steps=${LOG_EVERY_STEPS} eval_every_steps=${EVAL_EVERY_STEPS}"
 
 CMD=(
@@ -201,6 +204,7 @@ CMD=(
   --constraint-pairwise-test-input "${CONSTRAINT_PAIRWISE_TEST_INPUT}"
   --output-dir "${OUTPUT_DIR}"
   --model-id "${MODEL_ID}"
+  --aspect-condition-mode "${ASPECT_CONDITION_MODE}"
   --seed "${SEED}"
   --stage1-epochs "${STAGE1_EPOCHS}"
   --stage2-epochs "${STAGE2_EPOCHS}"
@@ -330,6 +334,11 @@ if bool_true "${STAGE2_POSTHOC_CALIBRATION}"; then
   CMD+=(--stage2-posthoc-calibration)
 else
   CMD+=(--no-stage2-posthoc-calibration)
+fi
+if bool_true "${MULTI_ASPECT_HEADS}"; then
+  CMD+=(--multi-aspect-heads)
+else
+  CMD+=(--no-multi-aspect-heads)
 fi
 if bool_true "${PIN_MEMORY}"; then
   CMD+=(--pin-memory)

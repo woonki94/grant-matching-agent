@@ -20,7 +20,7 @@ import torch.nn.functional as F
 from torch import nn
 from torch.optim import AdamW
 from torch.utils.data import DataLoader, Dataset
-from transformers import AutoModelForSequenceClassification, AutoTokenizer
+from transformers import AutoTokenizer
 
 try:
     from tqdm.auto import tqdm
@@ -40,6 +40,15 @@ def _find_project_root() -> Path:
 PROJECT_ROOT = _find_project_root()
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
+
+from ce.aspect_modeling import (  # noqa: E402
+    aspect_from_prefixed_query,
+    aspect_id_from_name,
+    clean_aspect_condition_mode,
+    format_aspect_pair,
+    load_sequence_classifier_model,
+    model_logits,
+)
 
 
 MODEL_ID_DEFAULT = "dleemiller/ModernCE-base-sts"
@@ -166,9 +175,11 @@ class PairCollator:
         domain_pair_loss_scale: float,
         method_pair_loss_scale: float,
         constraint_pair_loss_scale: float,
+        aspect_condition_mode: str,
     ) -> None:
         self.tokenizer = tokenizer
         self.max_length = int(max_length)
+        self.aspect_condition_mode = clean_aspect_condition_mode(aspect_condition_mode)
         self.pair_type_weights = {
             _clean_text(k).lower(): float(v) for k, v in dict(pair_type_weights or {}).items() if _clean_text(k)
         }
@@ -178,12 +189,30 @@ class PairCollator:
         self.constraint_pair_loss_scale = max(0.0, float(constraint_pair_loss_scale))
 
     def __call__(self, batch: Sequence[PairExample]) -> Dict[str, Any]:
-        queries = [x.query_text for x in batch]
-        pos_docs = [x.pos_text for x in batch]
-        neg_docs = [x.neg_text for x in batch]
+        pos_queries: List[str] = []
+        neg_queries: List[str] = []
+        pos_docs: List[str] = []
+        neg_docs: List[str] = []
+        aspect_ids_list: List[int] = []
+        for x in batch:
+            pos_q, pos_d = format_aspect_pair(
+                x.query_text,
+                x.pos_text,
+                aspect_condition_mode=self.aspect_condition_mode,
+            )
+            neg_q, neg_d = format_aspect_pair(
+                x.query_text,
+                x.neg_text,
+                aspect_condition_mode=self.aspect_condition_mode,
+            )
+            pos_queries.append(pos_q)
+            neg_queries.append(neg_q)
+            pos_docs.append(pos_d)
+            neg_docs.append(neg_d)
+            aspect_ids_list.append(int(_aspect_id_from_name(_aspect_from_prefixed_query(x.query_text))))
 
         pos_enc = self.tokenizer(
-            queries,
+            pos_queries,
             pos_docs,
             max_length=self.max_length,
             truncation=True,
@@ -191,7 +220,7 @@ class PairCollator:
             return_tensors="pt",
         )
         neg_enc = self.tokenizer(
-            queries,
+            neg_queries,
             neg_docs,
             max_length=self.max_length,
             truncation=True,
@@ -232,6 +261,7 @@ class PairCollator:
             "teacher_pos": pos_teacher,
             "teacher_neg": neg_teacher,
             "pair_weights": pair_weights,
+            "aspect_ids": torch.tensor(aspect_ids_list, dtype=torch.int64),
         }
 
 
@@ -249,9 +279,11 @@ class ListCollator:
         domain_list_loss_scale: float,
         method_list_loss_scale: float,
         constraint_list_loss_scale: float,
+        aspect_condition_mode: str,
     ) -> None:
         self.tokenizer = tokenizer
         self.max_length = int(max_length)
+        self.aspect_condition_mode = clean_aspect_condition_mode(aspect_condition_mode)
         self.augmented_doc_weight = _safe_float(
             augmented_doc_weight,
             default=LIST_AUGMENTED_DOC_WEIGHT_DEFAULT,
@@ -320,8 +352,13 @@ class ListCollator:
             aspect_id = int(_aspect_id_from_name(aspect))
             list_sizes.append(len(docs))
             for d in docs:
-                queries_flat.append(query)
-                docs_flat.append(str(d.get("text") or "").strip())
+                query_fmt, doc_fmt = format_aspect_pair(
+                    query,
+                    str(d.get("text") or "").strip(),
+                    aspect_condition_mode=self.aspect_condition_mode,
+                )
+                queries_flat.append(query_fmt)
+                docs_flat.append(doc_fmt)
                 teacher_raw = _clamp_01(d.get("teacher_score_raw", d.get("teacher_score")))
                 teacher_norm = _clamp_01(d.get("teacher_score_norm", d.get("teacher_score")))
                 if self.listwise_score_mode == "raw":
@@ -435,25 +472,11 @@ def _clean_stage2_posthoc_calibration_fit_split(value: Any) -> str:
 
 
 def _aspect_from_prefixed_query(query_text: Any) -> str:
-    q = _clean_text(query_text).lstrip().upper()
-    if q.startswith("[DOMAIN]"):
-        return "domain"
-    if q.startswith("[METHOD]"):
-        return "method"
-    if q.startswith("[CONSTRAINT]"):
-        return "constraint"
-    return "unknown"
+    return aspect_from_prefixed_query(query_text)
 
 
 def _aspect_id_from_name(aspect: Any) -> int:
-    a = _clean_text(aspect).lower()
-    if a == "domain":
-        return 1
-    if a == "method":
-        return 2
-    if a == "constraint":
-        return 3
-    return 0
+    return aspect_id_from_name(aspect)
 
 
 def _cluster_id_from_text(value: Any) -> int:
@@ -710,6 +733,8 @@ def _build_output_suffix(
     constraint_calibration_high_scale: float,
     constraint_calibration_mid_scale: float,
     constraint_calibration_low_scale: float,
+    aspect_condition_mode: str,
+    multi_aspect_heads: bool,
 ) -> str:
     parts = [
         f"sd{int(seed)}",
@@ -753,6 +778,8 @@ def _build_output_suffix(
         f"cch{_float_token(float(constraint_calibration_high_scale))}",
         f"ccm{_float_token(float(constraint_calibration_mid_scale))}",
         f"ccl{_float_token(float(constraint_calibration_low_scale))}",
+        f"act{clean_aspect_condition_mode(aspect_condition_mode)}",
+        f"mh{int(bool(multi_aspect_heads))}",
     ]
     full = "_".join(parts)
     # Many HPC/NFS filesystems cap a single path component at 255 bytes.
@@ -777,6 +804,8 @@ def _build_output_suffix(
         f"dmc{_float_token(float(domain_calib_mid_center))}",
         f"mmc{_float_token(float(method_calib_mid_center))}",
         f"cmc{_float_token(float(constraint_calib_mid_center))}",
+        f"act{clean_aspect_condition_mode(aspect_condition_mode)}",
+        f"mh{int(bool(multi_aspect_heads))}",
         f"h{digest}",
     ]
     return "_".join(keep)
@@ -2070,6 +2099,7 @@ def _evaluate(
     candidate_pool_size: int,
     mrr_rel_threshold: float,
     recall_rel_threshold: float,
+    aspect_condition_mode: str,
 ) -> Dict[str, float]:
     model.eval()
 
@@ -2083,8 +2113,18 @@ def _evaluate(
             if len(pool) < 2:
                 continue
 
-            queries = [g.query_text] * len(pool)
-            docs = [c.text for c in pool]
+            aspect = _aspect_from_prefixed_query(g.query_text)
+            aspect_id = int(_aspect_id_from_name(aspect))
+            formatted_pairs = [
+                format_aspect_pair(
+                    g.query_text,
+                    c.text,
+                    aspect_condition_mode=aspect_condition_mode,
+                )
+                for c in pool
+            ]
+            queries = [p[0] for p in formatted_pairs]
+            docs = [p[1] for p in formatted_pairs]
 
             logits_parts: List[torch.Tensor] = []
             for i in range(0, len(pool), max(1, int(eval_batch_size))):
@@ -2099,7 +2139,8 @@ def _evaluate(
                     return_tensors="pt",
                 )
                 enc = _to_device(enc, device)
-                logits = model(**enc).logits.squeeze(-1)
+                aspect_ids = torch.full((len(q_b),), int(aspect_id), dtype=torch.int64, device=device)
+                logits = model_logits(model, enc, aspect_ids=aspect_ids).squeeze(-1)
                 logits_parts.append(logits.detach().cpu())
 
             student_logits = torch.cat(logits_parts, dim=0).tolist()
@@ -3819,7 +3860,11 @@ def _run_iterative_orchestration(args: argparse.Namespace, *, raw_argv: Sequence
         recall_rel_threshold = _safe_float(args.recall_rel_threshold, default=0.7, minimum=0.0, maximum=1.0)
 
         tok_final = AutoTokenizer.from_pretrained(str(final_model_dir))
-        model_final = AutoModelForSequenceClassification.from_pretrained(str(final_model_dir), num_labels=1)
+        model_final = load_sequence_classifier_model(
+            str(final_model_dir),
+            num_labels=1,
+            multi_aspect_heads=bool(getattr(args, "multi_aspect_heads", False)),
+        )
         model_final.to(eval_device)
         final_test_metrics = _evaluate(
             model=model_final,
@@ -3831,6 +3876,7 @@ def _run_iterative_orchestration(args: argparse.Namespace, *, raw_argv: Sequence
             candidate_pool_size=candidate_pool_size,
             mrr_rel_threshold=mrr_rel_threshold,
             recall_rel_threshold=recall_rel_threshold,
+            aspect_condition_mode=clean_aspect_condition_mode(getattr(args, "aspect_condition_mode", "legacy")),
         )
         final_test_metrics["device"] = str(eval_device)
         print(json.dumps({"final_test_metrics": final_test_metrics}, ensure_ascii=False))
@@ -3950,6 +3996,22 @@ def _build_parser() -> argparse.ArgumentParser:
 
     p.add_argument("--model-id", type=str, default=MODEL_ID_DEFAULT, help="Cross-encoder base model id.")
     p.add_argument("--max-length", type=int, default=512, help="Tokenizer max sequence length.")
+    p.add_argument(
+        "--aspect-condition-mode",
+        type=str,
+        default="legacy",
+        choices=("legacy", "long_prefix", "none"),
+        help=(
+            "How to present aspect conditioning. legacy keeps existing text, "
+            "long_prefix adds C-STS-style instruction text, none strips aspect tags."
+        ),
+    )
+    p.add_argument(
+        "--multi-aspect-heads",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Use separate scalar scoring heads for domain/method/constraint while sharing the transformer.",
+    )
 
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--val-ratio", type=float, default=0.1)
@@ -4892,6 +4954,8 @@ def main() -> int:
         pair_lower_mid_end_ratio = pair_lower_mid_start_ratio
 
     max_length = _safe_int(args.max_length, default=512, minimum=16, maximum=8192)
+    aspect_condition_mode = clean_aspect_condition_mode(args.aspect_condition_mode)
+    multi_aspect_heads = bool(args.multi_aspect_heads)
     val_ratio = _safe_float(args.val_ratio, default=0.1, minimum=0.0, maximum=0.5)
     test_ratio = _safe_float(args.test_ratio, default=0.1, minimum=0.0, maximum=0.5)
     if val_ratio + test_ratio >= 0.99:
@@ -4949,6 +5013,8 @@ def main() -> int:
             constraint_calibration_high_scale=constraint_calibration_high_scale,
             constraint_calibration_mid_scale=constraint_calibration_mid_scale,
             constraint_calibration_low_scale=constraint_calibration_low_scale,
+            aspect_condition_mode=aspect_condition_mode,
+            multi_aspect_heads=multi_aspect_heads,
         )
         output_dir = (output_dir_base.parent / f"{output_dir_base.name}__{output_suffix}").resolve()
     else:
@@ -5109,6 +5175,8 @@ def main() -> int:
         print(f"output_suffix={output_suffix}")
     print(f"output_dir={output_dir}")
     print(f"use_tqdm={use_tqdm}")
+    print(f"aspect_condition_mode={aspect_condition_mode}")
+    print(f"multi_aspect_heads={multi_aspect_heads}")
     print(f"use_prepared_splits={use_prepared_splits}")
     print(
         "stage1_control="
@@ -5679,7 +5747,11 @@ def main() -> int:
         torch.backends.cudnn.allow_tf32 = True
 
     tokenizer = AutoTokenizer.from_pretrained(_clean_text(args.model_id) or MODEL_ID_DEFAULT)
-    model = AutoModelForSequenceClassification.from_pretrained(_clean_text(args.model_id) or MODEL_ID_DEFAULT, num_labels=1)
+    model = load_sequence_classifier_model(
+        _clean_text(args.model_id) or MODEL_ID_DEFAULT,
+        num_labels=1,
+        multi_aspect_heads=multi_aspect_heads,
+    )
     model.to(device)
 
     initial_learning_rate = float(stage1_learning_rate if int(stage1_epochs) > 0 else stage2_learning_rate)
@@ -5692,6 +5764,7 @@ def main() -> int:
         domain_pair_loss_scale=float(domain_pair_loss_scale),
         method_pair_loss_scale=float(method_pair_loss_scale),
         constraint_pair_loss_scale=float(constraint_pair_loss_scale),
+        aspect_condition_mode=aspect_condition_mode,
     )
     list_collator = ListCollator(
         tokenizer,
@@ -5704,6 +5777,7 @@ def main() -> int:
         domain_list_loss_scale=float(domain_list_loss_scale),
         method_list_loss_scale=float(method_list_loss_scale),
         constraint_list_loss_scale=float(constraint_list_loss_scale),
+        aspect_condition_mode=aspect_condition_mode,
     )
 
     pair_train_loader = DataLoader(
@@ -5816,8 +5890,13 @@ def main() -> int:
                     pair_weights = pair_weights.to(device)
                 else:
                     pair_weights = None
+                aspect_ids = batch.get("aspect_ids")
+                pair_aspect_ids = None
+                if isinstance(aspect_ids, torch.Tensor):
+                    aspect_ids = aspect_ids.to(device)
+                    pair_aspect_ids = torch.cat([aspect_ids, aspect_ids], dim=0)
 
-                pair_logits = model(**_concat_encoder_batches(pos, neg)).logits
+                pair_logits = model_logits(model, _concat_encoder_batches(pos, neg), aspect_ids=pair_aspect_ids)
                 pos_logits, neg_logits = _split_pair_logits(pair_logits, int(margins.shape[0]))
                 loss = _variable_margin_loss(pos_logits, neg_logits, margins, pair_weights)
                 vals.append(float(loss.detach().cpu().item()))
@@ -5880,7 +5959,7 @@ def main() -> int:
                 else:
                     aspect_ids = None
                 list_sizes = batch["list_sizes"]
-                logits_flat = model(**enc).logits.squeeze(-1)
+                logits_flat = model_logits(model, enc, aspect_ids=aspect_ids).squeeze(-1)
                 kl_loss, mse_loss = _compute_listwise_kl_and_mse(
                     logits_flat=logits_flat,
                     teacher_scores_flat=teacher_scores,
@@ -6011,7 +6090,12 @@ def main() -> int:
                 if batch.get("enc") is None:
                     continue
                 enc = _to_device(batch["enc"], device)
-                logits_flat = model(**enc).logits.squeeze(-1).detach().to("cpu", dtype=torch.float32)
+                aspect_ids = batch.get("aspect_ids")
+                if isinstance(aspect_ids, torch.Tensor):
+                    aspect_ids_dev = aspect_ids.to(device)
+                else:
+                    aspect_ids_dev = None
+                logits_flat = model_logits(model, enc, aspect_ids=aspect_ids_dev).squeeze(-1).detach().to("cpu", dtype=torch.float32)
                 logits_parts.append(logits_flat)
                 cluster_ids = batch.get("cluster_ids")
                 if isinstance(cluster_ids, torch.Tensor):
@@ -6505,10 +6589,15 @@ def main() -> int:
                     pair_weights = pair_weights.to(device)
                 else:
                     pair_weights = None
+                aspect_ids = batch.get("aspect_ids")
+                pair_aspect_ids = None
+                if isinstance(aspect_ids, torch.Tensor):
+                    aspect_ids = aspect_ids.to(device)
+                    pair_aspect_ids = torch.cat([aspect_ids, aspect_ids], dim=0)
 
                 amp_ctx = torch.autocast(device_type="cuda", dtype=amp_dtype) if use_amp else nullcontext()
                 with amp_ctx:
-                    pair_logits = model(**_concat_encoder_batches(pos, neg)).logits
+                    pair_logits = model_logits(model, _concat_encoder_batches(pos, neg), aspect_ids=pair_aspect_ids)
                     pos_logits, neg_logits = _split_pair_logits(pair_logits, int(margins.shape[0]))
                     loss = _variable_margin_loss(pos_logits, neg_logits, margins, pair_weights)
                     loss = loss / float(grad_accum_steps)
@@ -6616,7 +6705,11 @@ def main() -> int:
             best_stage1_dir = output_dir / "best_stage1_val_pair_loss"
             if best_stage1_dir.exists():
                 print(f"stage2_init_from_best_stage1=true ckpt={best_stage1_dir}")
-                model = AutoModelForSequenceClassification.from_pretrained(str(best_stage1_dir), num_labels=1).to(device)
+                model = load_sequence_classifier_model(
+                    str(best_stage1_dir),
+                    num_labels=1,
+                    multi_aspect_heads=multi_aspect_heads,
+                ).to(device)
             else:
                 print(
                     "stage2_init_from_best_stage1=false "
@@ -6714,10 +6807,15 @@ def main() -> int:
                     pair_weights = pair_weights.to(device)
                 else:
                     pair_weights = None
+                pair_aspect_ids_raw = pair_batch.get("aspect_ids")
+                pair_aspect_ids = None
+                if isinstance(pair_aspect_ids_raw, torch.Tensor):
+                    pair_aspect_ids_raw = pair_aspect_ids_raw.to(device)
+                    pair_aspect_ids = torch.cat([pair_aspect_ids_raw, pair_aspect_ids_raw], dim=0)
 
                 amp_ctx = torch.autocast(device_type="cuda", dtype=amp_dtype) if use_amp else nullcontext()
                 with amp_ctx:
-                    list_logits_flat = model(**list_enc).logits.squeeze(-1)
+                    list_logits_flat = model_logits(model, list_enc, aspect_ids=aspect_ids).squeeze(-1)
                     kl_loss, mse_loss = _compute_listwise_kl_and_mse(
                         logits_flat=list_logits_flat,
                         teacher_scores_flat=teacher_scores,
@@ -6774,7 +6872,7 @@ def main() -> int:
                         constraint_low_scale=constraint_calibration_low_scale,
                     )
 
-                    pair_logits = model(**_concat_encoder_batches(pos, neg)).logits
+                    pair_logits = model_logits(model, _concat_encoder_batches(pos, neg), aspect_ids=pair_aspect_ids)
                     pos_logits, neg_logits = _split_pair_logits(pair_logits, int(margins.shape[0]))
                     pair_loss = _variable_margin_loss(pos_logits, neg_logits, margins, pair_weights)
 
@@ -6924,6 +7022,7 @@ def main() -> int:
                 candidate_pool_size=candidate_pool_size,
                 mrr_rel_threshold=_safe_float(args.mrr_rel_threshold, default=0.7, minimum=0.0, maximum=1.0),
                 recall_rel_threshold=_safe_float(args.recall_rel_threshold, default=0.7, minimum=0.0, maximum=1.0),
+                aspect_condition_mode=aspect_condition_mode,
             )
             ndcg10_epoch = float(eval_metrics.get("ndcg@10", 0.0))
             mrr10_epoch = float(eval_metrics.get("mrr@10", 0.0))
@@ -7272,6 +7371,7 @@ def main() -> int:
         candidate_pool_size=candidate_pool_size,
         mrr_rel_threshold=_safe_float(args.mrr_rel_threshold, default=0.7, minimum=0.0, maximum=1.0),
         recall_rel_threshold=_safe_float(args.recall_rel_threshold, default=0.7, minimum=0.0, maximum=1.0),
+        aspect_condition_mode=aspect_condition_mode,
     ) if test_groups else {"ndcg@10": 0.0, "mrr@10": 0.0, "recall@50": 0.0, "eval_queries": 0}
     test_metrics = {
         "stage": "test",
@@ -7334,6 +7434,8 @@ def main() -> int:
         "append_args_to_output_dir": bool(append_args_to_output_dir),
         "output_suffix": str(output_suffix),
         "model_id": _clean_text(args.model_id) or MODEL_ID_DEFAULT,
+        "aspect_condition_mode": str(aspect_condition_mode),
+        "multi_aspect_heads": bool(multi_aspect_heads),
         "seed": int(seed),
         "split_policy": str(split_policy),
         "use_prepared_splits": bool(use_prepared_splits),
