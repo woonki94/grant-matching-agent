@@ -189,10 +189,12 @@ class AspectHeadSequenceClassifier(nn.Module):
         for aspect_id, aspect_name in ((0, "domain"), (1, "domain"), (2, "method"), (3, "constraint")):
             mask = aspect_ids == int(aspect_id)
             if bool(mask.any().item()):
-                logits[mask] = self.heads[aspect_name](pooled[mask])
+                head_logits = self.heads[aspect_name](pooled[mask])
+                logits[mask] = head_logits.to(dtype=logits.dtype)
                 handled = handled | mask
         if bool((~handled).any().item()):
-            logits[~handled] = self.heads["domain"](pooled[~handled])
+            head_logits = self.heads["domain"](pooled[~handled])
+            logits[~handled] = head_logits.to(dtype=logits.dtype)
         return SimpleNamespace(logits=logits)
 
     def save_pretrained(self, save_directory: Any, **kwargs: Any) -> None:
