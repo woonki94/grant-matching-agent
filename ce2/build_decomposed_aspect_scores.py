@@ -156,6 +156,10 @@ def _row_needs_redecompose(row: Dict[str, Any]) -> bool:
     decomp = row.get("decomposition")
     if not isinstance(decomp, dict):
         return True
+    # Force refresh when cached row is from an old schema
+    # (e.g., domain/method/constraints) instead of current 5-aspect schema.
+    if any(aspect not in decomp for aspect in ASPECTS):
+        return True
     has_any = False
     for aspect in ASPECTS:
         value = decomp.get(aspect)
@@ -325,6 +329,111 @@ def _parse_decomposition_items(obj: Optional[Dict[str, Any]], aspect: str) -> Tu
     return [], False
 
 
+_METHOD_CUE_RE = re.compile(
+    r"\b("
+    r"manag(?:e|es|ed|ing|ment)?|"
+    r"identif(?:y|ies|ied|ying|ication)?|"
+    r"evaluat(?:e|es|ed|ing|ion)?|"
+    r"measur(?:e|es|ed|ing|ement)?|"
+    r"assess(?:ment|e|es|ed|ing)?|"
+    r"screen(?:ing|ed|s)?|survey(?:ing|ed|s)?|"
+    r"model(?:ing|led|s)?|analy(?:sis|ze|zes|zed|zing|tical)?|"
+    r"map(?:ping|ped|s)?|monitor(?:ing|ed|s)?|"
+    r"implement(?:ation|ing|ed|s)?|"
+    r"develop(?:ing|ed|s)?|design(?:ing|ed|s)?|"
+    r"creat(?:e|es|ed|ing|ion)?|distribut(?:e|es|ed|ing|ion)?|"
+    r"train(?:ing|ed|s)?|optimiz(?:e|es|ed|ing|ation)?|simulate(?:d|s|ing)?|validate(?:d|s|ing)?|"
+    r"case management|legal aid|workflow|protocol|algorithm|method\w*|technique\w*"
+    r")\b"
+)
+
+_CONTEXT_CUE_RE = re.compile(
+    r"\b("
+    r"consortium|institution\w*|university|college|school|classroom|community|"
+    r"clinic\w*|hospital\w*|laborator\w*|field|online|digital|platform|"
+    r"program|service|initiative|industry|policy|government|public|private|"
+    r"rural|urban|regional|state|country|international|environmental|clinical|educational"
+    r")\b"
+)
+
+_DELIVERABLE_CUE_RE = re.compile(
+    r"\b("
+    r"tool\w*|dataset\w*|model\w*|report\w*|protocol\w*|platform\w*|"
+    r"textbook\w*|resource\w*|content|software|infrastructure|program|service\w*|"
+    r"intervention\w*|training|guideline\w*"
+    r")\b"
+)
+
+
+def _dedupe_phrases(values: Sequence[str]) -> List[str]:
+    seen: set[str] = set()
+    out: List[str] = []
+    for v in values:
+        phrase = normalize_ws(v)
+        if not phrase:
+            continue
+        key = phrase.casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(phrase)
+    return out
+
+
+def _strip_capability_prefix(phrase: str) -> str:
+    p = normalize_ws(phrase)
+    p = re.sub(
+        r"^(experience|expertise|skill|ability|proficiency|competence)\s+(with|in|for)\s+",
+        "",
+        p,
+        flags=re.IGNORECASE,
+    )
+    p = re.sub(r"^(experience|expertise|skill|ability)\s+", "", p, flags=re.IGNORECASE)
+    return normalize_ws(p)
+
+
+def _extract_method_fallbacks(text: str) -> List[str]:
+    parts = re.split(r",|;", normalize_ws(text), flags=re.IGNORECASE)
+    out: List[str] = []
+    for part in parts:
+        phrase = _strip_capability_prefix(part)
+        if not phrase:
+            continue
+        if not _METHOD_CUE_RE.search(phrase.lower()):
+            continue
+        words = phrase.split()
+        if len(words) < 2:
+            continue
+        out.append(phrase)
+    return _dedupe_phrases(out)
+
+
+def _clean_decomposition(text: str, decomp: Dict[str, List[str]]) -> Dict[str, List[str]]:
+    cleaned: Dict[str, List[str]] = {aspect: _dedupe_phrases(decomp.get(aspect, [])) for aspect in ASPECTS}
+
+    cleaned["method"] = [p for p in cleaned["method"] if _METHOD_CUE_RE.search(p.lower())]
+    if not cleaned["method"]:
+        cleaned["method"] = _extract_method_fallbacks(text)
+
+    cleaned["application_context"] = [
+        p for p in cleaned["application_context"] if _CONTEXT_CUE_RE.search(p.lower())
+    ]
+
+    cleaned["deliverable"] = [p for p in cleaned["deliverable"] if _DELIVERABLE_CUE_RE.search(p.lower())]
+
+    # Reduce cross-aspect duplication that hurts separability.
+    method_keys = {p.casefold() for p in cleaned["method"]}
+    deliverable_keys = {p.casefold() for p in cleaned["deliverable"]}
+
+    cleaned["target"] = [p for p in cleaned["target"] if p.casefold() not in method_keys]
+    cleaned["domain"] = [p for p in cleaned["domain"] if p.casefold() not in method_keys]
+    cleaned["target"] = [p for p in cleaned["target"] if p.casefold() not in deliverable_keys]
+
+    for aspect in ASPECTS:
+        cleaned[aspect] = _dedupe_phrases(cleaned[aspect])
+    return cleaned
+
+
 def _decompose_specs(
     *,
     llm_bundle: Dict[str, Any],
@@ -388,7 +497,7 @@ def _decompose_specs(
 
             for item_id, bucket in grouped.items():
                 item = bucket["item"]
-                decomp = bucket["decomposition"]
+                decomp = _clean_decomposition(item.text, bucket["decomposition"])
                 ok_map = bucket["ok"]
                 parsed_aspects = [aspect for aspect in ASPECTS if bool(ok_map.get(aspect))]
                 nonempty_aspects = [aspect for aspect in ASPECTS if len(decomp.get(aspect, [])) > 0]

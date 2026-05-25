@@ -51,6 +51,8 @@ Include phrases about:
 - algorithms, models, instruments, mechanisms, or procedures
 - service components such as case management, legal aid, screening, counseling, training, or assessment
 - analytical or implementation workflows
+- action/process phrases such as managing, identifying, evaluating, measuring, designing, developing, creating, distributing, implementing
+- "experience/expertise/skill in X" patterns: extract X as method phrase when X is a concrete process
 
 Do not include:
 - broad topic/domain phrases
@@ -76,6 +78,7 @@ Do not include:
 - methods used on the target
 - deliverables produced for the target
 - broad domain labels unless they identify the served/studied entity
+- pure setting/institution context when no served/studied entity is specified
 
 {DECOMPOSITION_BASE_RULES}
 """.strip()
@@ -116,6 +119,7 @@ Do not include:
 - the target entity alone unless it describes a setting
 - methods or deliverables
 - broad domain phrases unless they clearly name an application setting
+- if no clear setting/deployment context is present, return an empty list
 
 {DECOMPOSITION_BASE_RULES}
 """.strip()
