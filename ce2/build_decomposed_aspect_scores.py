@@ -431,6 +431,15 @@ _METHOD_SINGLETON_WHITELIST = {
     "simulation",
     "optimization",
     "modeling",
+    "implementation",
+    "management",
+    "evaluation",
+    "assessment",
+    "analysis",
+    "monitoring",
+    "design",
+    "development",
+    "training",
 }
 
 _NEAR_DUP_STOPWORDS = {
@@ -555,6 +564,87 @@ def _extract_method_fallbacks(text: str) -> List[str]:
     return _normalize_aspect_items("method", out)
 
 
+def _extract_domain_fallbacks(text: str) -> List[str]:
+    base = _strip_capability_prefix(text)
+    if not base:
+        return []
+    preferred = base
+    # When phrase contains "for/in/on X", X is often the topical area.
+    m = re.search(r"\b(?:for|in|on)\b\s+(.+)$", base, flags=re.IGNORECASE)
+    if m:
+        preferred = normalize_ws(m.group(1))
+    # Trim at clause boundaries.
+    preferred = re.split(r",|;|\bwith\b|\busing\b|\bvia\b|\bthrough\b", preferred, maxsplit=1, flags=re.IGNORECASE)[0]
+    preferred = _strip_capability_prefix(preferred)
+    # Remove a leading action word so domain does not collapse into method.
+    preferred = re.sub(
+        r"^(manag(?:e|es|ed|ing)|identif(?:y|ies|ied|ying)|evaluat(?:e|es|ed|ing)|"
+        r"measur(?:e|es|ed|ing)|implement(?:ation|ing|ed|s)|design(?:ing|ed|s)|"
+        r"develop(?:ing|ed|s)|creat(?:e|es|ed|ing)|distribut(?:e|es|ed|ing))\s+",
+        "",
+        preferred,
+        flags=re.IGNORECASE,
+    )
+    cleaned = _normalize_aspect_items("domain", [preferred])
+    if cleaned:
+        return cleaned
+    # Last-resort phrase from start of text.
+    return _normalize_aspect_items("domain", [_limit_words(base, max_words=int(ASPECT_WORD_LIMITS["domain"]))])
+
+
+def _extract_target_fallbacks(text: str) -> List[str]:
+    base = _strip_capability_prefix(text)
+    if not base:
+        return []
+    candidates: List[str] = []
+    for m in re.finditer(
+        r"\b(?:for|involving|among|serving|targeting|toward|towards|within)\b\s+([^,;]+)",
+        base,
+        flags=re.IGNORECASE,
+    ):
+        seg = normalize_ws(m.group(1))
+        if not seg:
+            continue
+        parts = re.split(r"\band\b|,|;", seg, flags=re.IGNORECASE)
+        candidates.extend(normalize_ws(p) for p in parts if normalize_ws(p))
+    targetish: List[str] = []
+    for c in candidates:
+        if _TARGET_LIKE_RE.search(c.lower()):
+            targetish.append(c)
+    if targetish:
+        return _normalize_aspect_items("target", targetish)
+    return _normalize_aspect_items("target", candidates)
+
+
+def _ensure_dense_decomposition(text: str, decomp: Dict[str, List[str]]) -> Dict[str, List[str]]:
+    out = {aspect: list(decomp.get(aspect, [])) for aspect in ASPECTS}
+    if not out.get("domain"):
+        out["domain"] = _extract_domain_fallbacks(text)
+    if not out.get("method"):
+        out["method"] = _extract_method_fallbacks(text)
+    if not out.get("target"):
+        out["target"] = _extract_target_fallbacks(text)
+
+    # Cross-fill as a final safety net so no aspect is missing.
+    if not out["domain"] and out["target"]:
+        out["domain"] = _normalize_aspect_items("domain", [out["target"][0]])
+    if not out["target"] and out["domain"]:
+        out["target"] = _normalize_aspect_items("target", [out["domain"][0]])
+    if not out["method"]:
+        seed = ""
+        if out["domain"]:
+            seed = out["domain"][0]
+        elif out["target"]:
+            seed = out["target"][0]
+        else:
+            seed = _limit_words(_strip_capability_prefix(text), max_words=int(ASPECT_WORD_LIMITS["method"]))
+        out["method"] = _normalize_aspect_items("method", [seed])
+        if not out["method"]:
+            # Guarantee non-empty even when seed is a single non-whitelisted token.
+            out["method"] = _normalize_aspect_items("method", [f"{seed} method"])
+    return {aspect: _normalize_aspect_items(aspect, out.get(aspect, [])) for aspect in ASPECTS}
+
+
 def _clean_decomposition(text: str, decomp: Dict[str, List[str]]) -> Dict[str, List[str]]:
     cleaned: Dict[str, List[str]] = {
         aspect: _normalize_aspect_items(aspect, decomp.get(aspect, []))
@@ -612,6 +702,7 @@ def _clean_decomposition(text: str, decomp: Dict[str, List[str]]) -> Dict[str, L
         if pruned_target:
             cleaned["target"] = pruned_target
 
+    cleaned = _ensure_dense_decomposition(text, cleaned)
     for aspect in ASPECTS:
         cleaned[aspect] = _normalize_aspect_items(aspect, cleaned[aspect])
     return cleaned
@@ -720,12 +811,13 @@ def _decompose_specs(
     if pending:
         rows = []
         for item in pending:
+            decomp = _ensure_dense_decomposition(item.text, {aspect: [] for aspect in ASPECTS})
             row = {
                 "item_id": item.item_id,
                 "kind": item.kind,
                 "text": item.text,
                 "meta": item.meta,
-                "decomposition": {aspect: [] for aspect in ASPECTS},
+                "decomposition": decomp,
                 "parse_ok": False,
                 "attempt": int(max(1, int(max_attempts))),
                 "model_id": model_id,

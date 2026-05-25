@@ -9,8 +9,9 @@ Rules:
 - Do not explain your reasoning.
 - Do not output chain-of-thought or <think> blocks.
 - Do not add "must", "should", or requirement wording unless present in source.
-- If the aspect is absent, return an empty list.
-- Do not invent missing aspects.
+- Prefer at least one best-effort phrase when the aspect is weakly implied.
+- Return [] only when the text is truly non-informative for that aspect.
+- Do not invent concepts not grounded in the source text.
 - Lowercase unless proper nouns.
 - Each phrase should appear in only one aspect unless absolutely necessary.
 - Prefer the most specific role:
@@ -83,7 +84,7 @@ Target means the population, entity, system, material, organism, dataset object,
 
 Length rule:
 - each target item must be 1-4 words.
-- if target is unclear or implicit only, return [].
+- if target is unclear, infer the acted-on entity/object from the text when possible; return [] only if impossible.
 
 Include phrases about:
 - populations, communities, beneficiaries, stakeholders, or study subjects
