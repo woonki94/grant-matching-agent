@@ -408,19 +408,6 @@ _SHORT_FILLER_WORDS = {
     "a",
     "an",
     "the",
-    "of",
-    "for",
-    "with",
-    "to",
-    "in",
-    "on",
-    "and",
-    "or",
-    "by",
-    "via",
-    "through",
-    "including",
-    "involving",
 }
 
 _TRAILING_DROP_WORDS = {
@@ -437,15 +424,55 @@ _TRAILING_DROP_WORDS = {
     "involving",
 }
 
+_METHOD_SINGLETON_WHITELIST = {
+    "screening",
+    "surveying",
+    "triage",
+    "simulation",
+    "optimization",
+    "modeling",
+}
+
+_NEAR_DUP_STOPWORDS = {
+    "a",
+    "an",
+    "the",
+    "of",
+    "for",
+    "with",
+    "to",
+    "in",
+    "on",
+    "and",
+    "or",
+    "by",
+    "via",
+    "through",
+}
+
+_TARGET_LIKE_RE = re.compile(
+    r"\b("
+    r"patient\w*|famil\w*|youth|children|child|student\w*|participant\w*|"
+    r"institution\w*|university|college|school|institute\w*|entity|entities|"
+    r"community|communities|clinic\w*|hospital\w*|agency|agencies|"
+    r"service\w*|program\w*|initiative\w*|platform\w*|resource\w*|textbook\w*|"
+    r"dataset\w*|tool\w*|fish|species|system\w*|infrastructure"
+    r")\b"
+)
+
+_DELIVERABLE_LIKE_RE = re.compile(
+    r"\b("
+    r"textbook\w*|resource\w*|platform\w*|dataset\w*|tool\w*|software|"
+    r"report\w*|protocol\w*|model\w*|content|materials?"
+    r")\b"
+)
+
 
 def _limit_words(phrase: str, *, max_words: int) -> str:
     text = normalize_ws(phrase)
     if not text:
         return ""
     words = text.split()
-    compact = [w for w in words if w.lower() not in _SHORT_FILLER_WORDS]
-    if compact:
-        words = compact
     while words and words[-1].lower() in _TRAILING_DROP_WORDS:
         words = words[:-1]
     if len(words) <= int(max_words):
@@ -464,11 +491,52 @@ def _normalize_aspect_items(aspect: str, values: Sequence[str]) -> List[str]:
         phrase = re.sub(r"^[\-\u2022\*\d\.\)\(]+\s*", "", phrase)
         if aspect == "method":
             phrase = _strip_capability_prefix(phrase)
-        phrase = _limit_words(phrase, max_words=max_words)
+            words = phrase.split()
+            if len(words) > max_words and words and words[0].lower().endswith("ing"):
+                # Keep action + most informative tail nouns (short-form but still meaningful).
+                phrase = " ".join([words[0], *words[-(max_words - 1) :]])
+            else:
+                phrase = _limit_words(phrase, max_words=max_words)
+        else:
+            phrase = _limit_words(phrase, max_words=max_words)
         if not phrase:
             continue
+        if aspect == "method":
+            w = phrase.split()
+            if len(w) < 2 and phrase.lower() not in _METHOD_SINGLETON_WHITELIST:
+                continue
         out.append(phrase)
     return _dedupe_phrases(out)[:max_items]
+
+
+def _token_set_loose(phrase: str) -> set[str]:
+    toks = []
+    for t in re.findall(r"[A-Za-z0-9][A-Za-z0-9\-]*", normalize_ws(phrase).lower()):
+        if t in _NEAR_DUP_STOPWORDS:
+            continue
+        toks.append(t)
+    return set(toks)
+
+
+def _is_near_duplicate(a: str, b: str) -> bool:
+    aa = a.casefold()
+    bb = b.casefold()
+    if aa == bb:
+        return True
+    ta = _token_set_loose(a)
+    tb = _token_set_loose(b)
+    if not ta or not tb:
+        return False
+    inter = len(ta & tb)
+    uni = len(ta | tb)
+    if uni == 0:
+        return False
+    j = inter / uni
+    if j >= 0.80:
+        return True
+    if ta.issubset(tb) or tb.issubset(ta):
+        return True
+    return False
 
 
 def _extract_method_fallbacks(text: str) -> List[str]:
@@ -492,15 +560,57 @@ def _clean_decomposition(text: str, decomp: Dict[str, List[str]]) -> Dict[str, L
         aspect: _normalize_aspect_items(aspect, decomp.get(aspect, []))
         for aspect in ASPECTS
     }
+    original_domain = list(cleaned.get("domain", []))
 
     cleaned["method"] = [p for p in cleaned["method"] if _METHOD_CUE_RE.search(p.lower())]
     if not cleaned["method"]:
         cleaned["method"] = _extract_method_fallbacks(text)
 
-    # Reduce cross-aspect duplication for cleaner training signals.
+    # Anti-leakage priority: method > target > domain.
     method_keys = {p.casefold() for p in cleaned["method"]}
     cleaned["target"] = [p for p in cleaned["target"] if p.casefold() not in method_keys]
     cleaned["domain"] = [p for p in cleaned["domain"] if p.casefold() not in method_keys]
+    cleaned["domain"] = [p for p in cleaned["domain"] if not _METHOD_CUE_RE.search(p.lower())]
+
+    # Keep target when overlapping; drop overlapping domain instead.
+    target_vals = list(cleaned["target"])
+    cleaned["domain"] = [
+        d for d in cleaned["domain"]
+        if not any(_is_near_duplicate(d, t) for t in target_vals)
+    ]
+
+    # If target exists, remove target-like/object-like phrases from domain.
+    if target_vals:
+        cleaned["domain"] = [
+            d for d in cleaned["domain"]
+            if not _TARGET_LIKE_RE.search(d.lower())
+        ]
+
+    # Domain should avoid obvious deliverable objects.
+    cleaned["domain"] = [
+        d for d in cleaned["domain"]
+        if not _DELIVERABLE_LIKE_RE.search(d.lower())
+    ]
+
+    # Rescue one topical domain phrase if anti-leakage filtering over-prunes domain.
+    if not cleaned["domain"]:
+        for d in original_domain:
+            dl = d.lower()
+            if _METHOD_CUE_RE.search(dl):
+                continue
+            if _DELIVERABLE_LIKE_RE.search(dl):
+                continue
+            cleaned["domain"] = [d]
+            break
+
+    # If target has multiple candidates, remove domain-duplicate targets first.
+    if len(cleaned["target"]) > 1 and cleaned["domain"]:
+        pruned_target = [
+            t for t in cleaned["target"]
+            if not any(_is_near_duplicate(t, d) for d in cleaned["domain"])
+        ]
+        if pruned_target:
+            cleaned["target"] = pruned_target
 
     for aspect in ASPECTS:
         cleaned[aspect] = _normalize_aspect_items(aspect, cleaned[aspect])

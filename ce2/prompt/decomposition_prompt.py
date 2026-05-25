@@ -12,6 +12,11 @@ Rules:
 - If the aspect is absent, return an empty list.
 - Do not invent missing aspects.
 - Lowercase unless proper nouns.
+- Each phrase should appear in only one aspect unless absolutely necessary.
+- Prefer the most specific role:
+  - method beats domain for techniques/actions
+  - target beats domain for populations/systems/objects
+  - domain is only the topic/problem area left after method/target phrases are removed
 - Return exactly one JSON object and no markdown.
 
 Required schema:
@@ -38,6 +43,8 @@ Include phrases about:
 Do not include:
 - concrete methods or procedures
 - populations/entities unless they define the topic area itself
+- institution/entity/object lists (e.g., universities, institutes, entities, patients, fish) when they are targets
+- deliverable/object nouns (e.g., textbooks, resources, platforms, datasets, tools)
 
 {DECOMPOSITION_BASE_RULES}
 """.strip()
@@ -63,6 +70,7 @@ Do not include:
 - broad topic/domain phrases
 - populations/entities unless they are part of a method phrase
 - settings or application environments unless central to the method phrase
+- generic single-word method labels when a more specific phrase is available
 
 {DECOMPOSITION_BASE_RULES}
 """.strip()
@@ -81,10 +89,10 @@ Include phrases about:
 - populations, communities, beneficiaries, stakeholders, or study subjects
 - entities, systems, organisms, materials, infrastructure, or data objects
 - what the work is applied to, measured on, protecting, improving, or serving
+- institution/entity/system types (e.g., hospitals, schools, institutes, agencies, fish populations) when they are the acted-on object
 
 Do not include:
 - methods used on the target
-- deliverables produced for the target
 - broad domain labels unless they identify the served/studied entity
 - pure setting/institution context when no served/studied entity is specified
 
