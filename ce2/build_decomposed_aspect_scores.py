@@ -148,6 +148,23 @@ def _load_scored_pair_keys(path: Path) -> set[str]:
     return keys
 
 
+def _refresh_decomposition_cache(
+    existing: Dict[str, Dict[str, Any]],
+    *,
+    refresh_failed_only: bool,
+    refresh_all: bool,
+) -> Dict[str, Dict[str, Any]]:
+    if refresh_all:
+        return {}
+    if not refresh_failed_only:
+        return existing
+    return {
+        item_id: row
+        for item_id, row in existing.items()
+        if not _row_needs_redecompose(row)
+    }
+
+
 def _row_needs_redecompose(row: Dict[str, Any]) -> bool:
     if not isinstance(row, dict):
         return True
@@ -807,6 +824,12 @@ def parse_args() -> argparse.Namespace:
         default=True,
         help="Re-run decomposition for cached rows that are parse-failed or all-empty.",
     )
+    p.add_argument(
+        "--refresh-all-decompositions",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Ignore all cached decomposition rows and regenerate every item.",
+    )
     p.add_argument("--decompose-only", action="store_true")
     p.add_argument("--score-only", action="store_true")
     return p.parse_args()
@@ -859,19 +882,19 @@ def main() -> int:
             tensor_parallel_size=args.tensor_parallel_size,
         )
         decompositions = _load_jsonl_by_key(decomposition_path, "item_id")
-        if args.refresh_failed_decompositions:
-            before = len(decompositions)
-            decompositions = {
-                item_id: row
-                for item_id, row in decompositions.items()
-                if not _row_needs_redecompose(row)
-            }
-            refreshed = before - len(decompositions)
-            if refreshed > 0:
-                print(
-                    f"decompose_refresh_failed_or_empty={refreshed} "
-                    f"decompose_cached_kept={len(decompositions)}"
-                )
+        before = len(decompositions)
+        decompositions = _refresh_decomposition_cache(
+            decompositions,
+            refresh_failed_only=bool(args.refresh_failed_decompositions),
+            refresh_all=bool(args.refresh_all_decompositions),
+        )
+        refreshed = before - len(decompositions)
+        if refreshed > 0:
+            mode = "all" if args.refresh_all_decompositions else "failed_or_empty"
+            print(
+                f"decompose_refresh_{mode}={refreshed} "
+                f"decompose_cached_kept={len(decompositions)}"
+            )
         if not args.score_only:
             decompositions = _decompose_specs(
                 llm_bundle=bundle,

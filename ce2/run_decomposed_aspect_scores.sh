@@ -19,10 +19,11 @@ MODEL_ID="${MODEL_ID:-Qwen/Qwen3-14B}"
 GRANT_DB="${GRANT_DB:-ce/dataset/source/grant_keywords_spec_keywords_db.json}"
 FAC_DB="${FAC_DB:-ce/dataset/source/fac_specs_db.json}"
 
-OUTPUT_DIR="${OUTPUT_DIR:-ce2/dataset/distill}"
-DECOMPOSITION_OUTPUT="${DECOMPOSITION_OUTPUT:-${OUTPUT_DIR}/spec_decompositions_5aspect_splitprompt.jsonl}"
-SCORES_OUTPUT="${SCORES_OUTPUT:-${OUTPUT_DIR}/decomposed_5aspect_splitprompt_pair_scores.jsonl}"
-SUMMARY_OUTPUT="${SUMMARY_OUTPUT:-${OUTPUT_DIR}/decomposed_5aspect_splitprompt_pair_scores_summary.json}"
+RUN_ID="${RUN_ID:-$(date +%Y%m%d_%H%M%S)}"
+OUTPUT_DIR="${OUTPUT_DIR:-ce2/dataset/distill/runs}"
+DECOMPOSITION_OUTPUT="${DECOMPOSITION_OUTPUT:-${OUTPUT_DIR}/spec_decompositions_5aspect_splitprompt_${RUN_ID}.jsonl}"
+SCORES_OUTPUT="${SCORES_OUTPUT:-${OUTPUT_DIR}/decomposed_5aspect_splitprompt_pair_scores_${RUN_ID}.jsonl}"
+SUMMARY_OUTPUT="${SUMMARY_OUTPUT:-${OUTPUT_DIR}/decomposed_5aspect_splitprompt_pair_scores_summary_${RUN_ID}.json}"
 
 SEED="${SEED:-42}"
 MAX_GRANT_SPECS="${MAX_GRANT_SPECS:-60}"
@@ -42,9 +43,10 @@ MAX_MODEL_LEN="${MAX_MODEL_LEN:-4096}"
 GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.90}"
 TENSOR_PARALLEL_SIZE="${TENSOR_PARALLEL_SIZE:-1}"
 
-OVERWRITE="${OVERWRITE:-false}"
+OVERWRITE="${OVERWRITE:-true}"
 REFRESH_FAILED_DECOMPOSITIONS="${REFRESH_FAILED_DECOMPOSITIONS:-true}"
-DECOMPOSE_ONLY="${DECOMPOSE_ONLY:-false}"
+REFRESH_ALL_DECOMPOSITIONS="${REFRESH_ALL_DECOMPOSITIONS:-true}"
+DECOMPOSE_ONLY="${DECOMPOSE_ONLY:-true}"
 SCORE_ONLY="${SCORE_ONLY:-false}"
 
 log "CE2 decomposed aspect score pilot"
@@ -53,7 +55,9 @@ log "grant_db=${GRANT_DB}"
 log "fac_db=${FAC_DB}"
 log "max_grant_specs=${MAX_GRANT_SPECS} max_fac_specs=${MAX_FAC_SPECS}"
 log "candidates_per_grant_spec=${CANDIDATES_PER_GRANT_SPEC} random=${RANDOM_CANDIDATES_PER_GRANT_SPEC}"
+log "run_id=${RUN_ID}"
 log "scores_output=${SCORES_OUTPUT}"
+log "overwrite=${OVERWRITE} refresh_failed_decompositions=${REFRESH_FAILED_DECOMPOSITIONS} refresh_all_decompositions=${REFRESH_ALL_DECOMPOSITIONS} decompose_only=${DECOMPOSE_ONLY} score_only=${SCORE_ONLY}"
 
 CMD=(
   "${PYTHON_BIN}" ce2/build_decomposed_aspect_scores.py
@@ -88,6 +92,11 @@ if [[ "${REFRESH_FAILED_DECOMPOSITIONS}" == "true" ]]; then
   CMD+=(--refresh-failed-decompositions)
 else
   CMD+=(--no-refresh-failed-decompositions)
+fi
+if [[ "${REFRESH_ALL_DECOMPOSITIONS}" == "true" ]]; then
+  CMD+=(--refresh-all-decompositions)
+else
+  CMD+=(--no-refresh-all-decompositions)
 fi
 if [[ "${DECOMPOSE_ONLY}" == "true" ]]; then
   CMD+=(--decompose-only)
