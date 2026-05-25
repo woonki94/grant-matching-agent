@@ -26,10 +26,8 @@ SCORES_OUTPUT="${SCORES_OUTPUT:-${OUTPUT_DIR}/decomposed_3aspect_shortform_pair_
 SUMMARY_OUTPUT="${SUMMARY_OUTPUT:-${OUTPUT_DIR}/decomposed_3aspect_shortform_pair_scores_summary_${RUN_ID}.json}"
 
 SEED="${SEED:-42}"
-MAX_GRANT_SPECS="${MAX_GRANT_SPECS:-60}"
-MAX_FAC_SPECS="${MAX_FAC_SPECS:-1000}"
-CANDIDATES_PER_GRANT_SPEC="${CANDIDATES_PER_GRANT_SPEC:-10}"
-RANDOM_CANDIDATES_PER_GRANT_SPEC="${RANDOM_CANDIDATES_PER_GRANT_SPEC:-3}"
+MAX_GRANT_SPECS="${MAX_GRANT_SPECS:-0}"
+MAX_FAC_SPECS="${MAX_FAC_SPECS:-0}"
 
 DECOMPOSE_BATCH_SIZE="${DECOMPOSE_BATCH_SIZE:-16}"
 SCORE_BATCH_SIZE="${SCORE_BATCH_SIZE:-24}"
@@ -46,7 +44,7 @@ TENSOR_PARALLEL_SIZE="${TENSOR_PARALLEL_SIZE:-1}"
 OVERWRITE="${OVERWRITE:-true}"
 REFRESH_FAILED_DECOMPOSITIONS="${REFRESH_FAILED_DECOMPOSITIONS:-true}"
 REFRESH_ALL_DECOMPOSITIONS="${REFRESH_ALL_DECOMPOSITIONS:-true}"
-DECOMPOSE_ONLY="${DECOMPOSE_ONLY:-true}"
+DECOMPOSE_ONLY="${DECOMPOSE_ONLY:-false}"
 SCORE_ONLY="${SCORE_ONLY:-false}"
 
 log "CE2 decomposed aspect score pilot"
@@ -54,57 +52,81 @@ log "model_id=${MODEL_ID}"
 log "grant_db=${GRANT_DB}"
 log "fac_db=${FAC_DB}"
 log "max_grant_specs=${MAX_GRANT_SPECS} max_fac_specs=${MAX_FAC_SPECS}"
-log "candidates_per_grant_spec=${CANDIDATES_PER_GRANT_SPEC} random=${RANDOM_CANDIDATES_PER_GRANT_SPEC}"
 log "run_id=${RUN_ID}"
 log "scores_output=${SCORES_OUTPUT}"
 log "overwrite=${OVERWRITE} refresh_failed_decompositions=${REFRESH_FAILED_DECOMPOSITIONS} refresh_all_decompositions=${REFRESH_ALL_DECOMPOSITIONS} decompose_only=${DECOMPOSE_ONLY} score_only=${SCORE_ONLY}"
 
-CMD=(
-  "${PYTHON_BIN}" ce2/build_decomposed_aspect_scores.py
-  --model-id "${MODEL_ID}"
-  --grant-db "${GRANT_DB}"
-  --fac-db "${FAC_DB}"
-  --output-dir "${OUTPUT_DIR}"
-  --decomposition-output "${DECOMPOSITION_OUTPUT}"
-  --scores-output "${SCORES_OUTPUT}"
-  --summary-output "${SUMMARY_OUTPUT}"
-  --seed "${SEED}"
-  --max-grant-specs "${MAX_GRANT_SPECS}"
-  --max-fac-specs "${MAX_FAC_SPECS}"
-  --candidates-per-grant-spec "${CANDIDATES_PER_GRANT_SPEC}"
-  --random-candidates-per-grant-spec "${RANDOM_CANDIDATES_PER_GRANT_SPEC}"
-  --decompose-batch-size "${DECOMPOSE_BATCH_SIZE}"
-  --score-batch-size "${SCORE_BATCH_SIZE}"
-  --decompose-max-new-tokens "${DECOMPOSE_MAX_NEW_TOKENS}"
-  --score-max-new-tokens "${SCORE_MAX_NEW_TOKENS}"
-  --temperature "${TEMPERATURE}"
-  --top-p "${TOP_P}"
-  --max-attempts "${MAX_ATTEMPTS}"
-  --max-model-len "${MAX_MODEL_LEN}"
-  --gpu-memory-utilization "${GPU_MEMORY_UTILIZATION}"
-  --tensor-parallel-size "${TENSOR_PARALLEL_SIZE}"
-)
-
-if [[ "${OVERWRITE}" == "true" ]]; then
-  CMD+=(--overwrite)
-fi
-if [[ "${REFRESH_FAILED_DECOMPOSITIONS}" == "true" ]]; then
-  CMD+=(--refresh-failed-decompositions)
-else
-  CMD+=(--no-refresh-failed-decompositions)
-fi
-if [[ "${REFRESH_ALL_DECOMPOSITIONS}" == "true" ]]; then
-  CMD+=(--refresh-all-decompositions)
-else
-  CMD+=(--no-refresh-all-decompositions)
-fi
-if [[ "${DECOMPOSE_ONLY}" == "true" ]]; then
-  CMD+=(--decompose-only)
-fi
-if [[ "${SCORE_ONLY}" == "true" ]]; then
-  CMD+=(--score-only)
+run_decompose=true
+run_score=true
+if [[ "${DECOMPOSE_ONLY}" == "true" && "${SCORE_ONLY}" != "true" ]]; then
+  run_score=false
+elif [[ "${SCORE_ONLY}" == "true" && "${DECOMPOSE_ONLY}" != "true" ]]; then
+  run_decompose=false
 fi
 
-log "Running: ${CMD[*]}"
-"${CMD[@]}"
+if [[ "${run_decompose}" == "true" ]]; then
+  DECOMP_CMD=(
+    "${PYTHON_BIN}" ce2/decompose_aspect_specs.py
+    --model-id "${MODEL_ID}"
+    --grant-db "${GRANT_DB}"
+    --fac-db "${FAC_DB}"
+    --output-dir "${OUTPUT_DIR}"
+    --decomposition-output "${DECOMPOSITION_OUTPUT}"
+    --seed "${SEED}"
+    --max-grant-specs "${MAX_GRANT_SPECS}"
+    --max-fac-specs "${MAX_FAC_SPECS}"
+    --decompose-batch-size "${DECOMPOSE_BATCH_SIZE}"
+    --decompose-max-new-tokens "${DECOMPOSE_MAX_NEW_TOKENS}"
+    --temperature "${TEMPERATURE}"
+    --top-p "${TOP_P}"
+    --max-attempts "${MAX_ATTEMPTS}"
+    --max-model-len "${MAX_MODEL_LEN}"
+    --gpu-memory-utilization "${GPU_MEMORY_UTILIZATION}"
+    --tensor-parallel-size "${TENSOR_PARALLEL_SIZE}"
+  )
+  if [[ "${OVERWRITE}" == "true" ]]; then
+    DECOMP_CMD+=(--overwrite)
+  fi
+  if [[ "${REFRESH_FAILED_DECOMPOSITIONS}" == "true" ]]; then
+    DECOMP_CMD+=(--refresh-failed-decompositions)
+  else
+    DECOMP_CMD+=(--no-refresh-failed-decompositions)
+  fi
+  if [[ "${REFRESH_ALL_DECOMPOSITIONS}" == "true" ]]; then
+    DECOMP_CMD+=(--refresh-all-decompositions)
+  else
+    DECOMP_CMD+=(--no-refresh-all-decompositions)
+  fi
+  log "Running (decompose): ${DECOMP_CMD[*]}"
+  "${DECOMP_CMD[@]}"
+fi
+
+if [[ "${run_score}" == "true" ]]; then
+  SCORE_CMD=(
+    "${PYTHON_BIN}" ce2/score_decomposed_aspect_pairs.py
+    --model-id "${MODEL_ID}"
+    --grant-db "${GRANT_DB}"
+    --fac-db "${FAC_DB}"
+    --output-dir "${OUTPUT_DIR}"
+    --decomposition-output "${DECOMPOSITION_OUTPUT}"
+    --scores-output "${SCORES_OUTPUT}"
+    --summary-output "${SUMMARY_OUTPUT}"
+    --seed "${SEED}"
+    --max-grant-specs "${MAX_GRANT_SPECS}"
+    --max-fac-specs "${MAX_FAC_SPECS}"
+    --score-batch-size "${SCORE_BATCH_SIZE}"
+    --score-max-new-tokens "${SCORE_MAX_NEW_TOKENS}"
+    --temperature "${TEMPERATURE}"
+    --top-p "${TOP_P}"
+    --max-attempts "${MAX_ATTEMPTS}"
+    --max-model-len "${MAX_MODEL_LEN}"
+    --gpu-memory-utilization "${GPU_MEMORY_UTILIZATION}"
+    --tensor-parallel-size "${TENSOR_PARALLEL_SIZE}"
+  )
+  if [[ "${OVERWRITE}" == "true" ]]; then
+    SCORE_CMD+=(--overwrite)
+  fi
+  log "Running (score): ${SCORE_CMD[*]}"
+  "${SCORE_CMD[@]}"
+fi
 log "Done."
