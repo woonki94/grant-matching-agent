@@ -14,13 +14,12 @@ from ce2.llm_runtime import clean_text, normalize_ws, score_to_band
 
 
 MODEL_ID_DEFAULT = "Qwen/Qwen3-14B"
-GRANT_DB_DEFAULT = "ce2/dataset/source/grant_keywords_spec_keywords_db.json"
-FAC_DB_DEFAULT = "ce2/dataset/source/fac_specs_db.json"
+GRANT_DB_DEFAULT = "ce/dataset/source/grant_keywords_spec_keywords_db.json"
+FAC_DB_DEFAULT = "ce/dataset/source/fac_specs_db.json"
 OUTPUT_DIR_DEFAULT = "ce2/dataset/distill"
 DECOMPOSITION_OUTPUT_DEFAULT = "ce2/dataset/distill/spec_decompositions_3aspect_shortform.jsonl"
 SCORES_OUTPUT_DEFAULT = "ce2/dataset/distill/decomposed_3aspect_shortform_pair_scores.jsonl"
 SUMMARY_OUTPUT_DEFAULT = "ce2/dataset/distill/decomposed_3aspect_shortform_pair_scores_summary.json"
-STS_CACHE_PATH_DEFAULT = "ce2/dataset/source/spec_facspec_sts_cache.jsonl"
 
 SEED_DEFAULT = 42
 MAX_GRANT_SPECS_DEFAULT = 80
@@ -43,7 +42,11 @@ ASPECT_PREFILTER_LOW_PER_ASPECT_DEFAULT = 2
 ASPECT_PREFILTER_HIGH_POOL_SIZE_DEFAULT = 24
 ASPECT_PREFILTER_MID_RANK_START_DEFAULT = 24
 ASPECT_PREFILTER_MID_RANK_END_DEFAULT = 220
-STS_CACHE_LOW_TAIL_POOL_DEFAULT = 400
+STS_PREFILTER_MODEL_ID_DEFAULT = "dleemiller/ModernCE-base-sts"
+STS_PREFILTER_BATCH_SIZE_DEFAULT = 256
+STS_PREFILTER_MAX_LENGTH_DEFAULT = 64
+STS_PREFILTER_GRANT_BLOCK_SIZE_DEFAULT = 256
+STS_PREFILTER_LOW_TAIL_POOL_DEFAULT = 400
 
 
 @dataclass(frozen=True)
@@ -209,59 +212,70 @@ def load_fac_specs(path: Path, *, max_items: int, seed: int) -> List[SpecItem]:
     return items
 
 
-def load_sts_cache(path: Path) -> Dict[str, List[Tuple[str, float]]]:
-    if not path.exists():
-        raise FileNotFoundError(f"STS cache not found: {path}")
-    out: Dict[str, List[Tuple[str, float]]] = {}
-    with path.open("r", encoding="utf-8") as f:
-        for raw in f:
-            line = clean_text(raw)
-            if not line:
-                continue
-            try:
-                row = json.loads(line)
-            except Exception:
-                continue
-            if not isinstance(row, dict):
-                continue
-            grant_id = clean_text(row.get("grant_id"))
-            try:
-                spec_idx = int(row.get("spec_idx"))
-            except Exception:
-                continue
-            grant_item_id = f"grant:{grant_id}:{spec_idx}"
-            cands = row.get("candidates")
-            if not isinstance(cands, list):
-                continue
-            parsed: List[Tuple[str, float]] = []
-            for c in cands:
-                if not isinstance(c, dict):
-                    continue
-                fac_id = c.get("fac_id")
-                fac_spec_id = c.get("fac_spec_id")
-                fac_spec_idx = c.get("fac_spec_idx")
-                if fac_id is None or fac_spec_id is None or fac_spec_idx is None:
-                    continue
-                fac_item_id = f"fac:{fac_id}:{fac_spec_id}:{fac_spec_idx}"
-                score_val = c.get("sts_score", c.get("cosine_score", 0.0))
-                try:
-                    score = float(score_val)
-                except Exception:
-                    score = 0.0
-                parsed.append((fac_item_id, score))
-            if parsed:
-                parsed.sort(key=lambda x: x[1], reverse=True)
-                out[grant_item_id] = parsed
-    if not out:
-        raise RuntimeError(f"STS cache loaded but empty or malformed: {path}")
-    return out
+def _pick_device() -> Any:
+    import torch
+
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    if torch.backends.mps.is_available():
+        return torch.device("mps")
+    return torch.device("cpu")
+
+
+def _encode_texts_sts(
+    *,
+    texts: Sequence[str],
+    tokenizer: Any,
+    model: Any,
+    device: Any,
+    batch_size: int,
+    max_length: int,
+) -> Any:
+    import torch
+    import torch.nn.functional as F
+
+    outputs: List[Any] = []
+    step = max(1, int(batch_size))
+    with torch.no_grad():
+        for i in range(0, len(texts), step):
+            batch = list(texts[i : i + step])
+            enc = tokenizer(
+                batch,
+                padding=True,
+                truncation=True,
+                max_length=int(max_length),
+                return_tensors="pt",
+            )
+            enc = {k: v.to(device) for k, v in enc.items()}
+            out = model(**enc)
+            hidden = out.last_hidden_state if hasattr(out, "last_hidden_state") else out[0]
+            mask = enc["attention_mask"].unsqueeze(-1).to(hidden.dtype)
+            pooled = (hidden * mask).sum(dim=1) / mask.sum(dim=1).clamp(min=1e-9)
+            pooled = F.normalize(pooled, p=2, dim=1)
+            outputs.append(pooled)
+    return torch.cat(outputs, dim=0) if outputs else torch.empty((0, 0), device=device)
+
+def _aspect_text_for_item(
+    item: SpecItem,
+    *,
+    aspect: str,
+    decompositions: Dict[str, Dict[str, Any]],
+) -> str:
+    row = decompositions.get(item.item_id, {})
+    decomp = row.get("decomposition") if isinstance(row, dict) else {}
+    values = decomp.get(aspect) if isinstance(decomp, dict) else []
+    if isinstance(values, list):
+        phrases = [normalize_ws(v) for v in values if normalize_ws(v)]
+        if phrases:
+            return " ".join(phrases)
+    return item.text
 
 
 def select_pairs_aspect_prefilter(
     grant_specs: Sequence[SpecItem],
     fac_specs: Sequence[SpecItem],
     *,
-    sts_cache: Dict[str, List[Tuple[str, float]]],
+    decompositions: Dict[str, Dict[str, Any]],
     seed: int,
     high_per_aspect: int = ASPECT_PREFILTER_HIGH_PER_ASPECT_DEFAULT,
     mid_per_aspect: int = ASPECT_PREFILTER_MID_PER_ASPECT_DEFAULT,
@@ -269,11 +283,36 @@ def select_pairs_aspect_prefilter(
     high_pool_size: int = ASPECT_PREFILTER_HIGH_POOL_SIZE_DEFAULT,
     mid_rank_start: int = ASPECT_PREFILTER_MID_RANK_START_DEFAULT,
     mid_rank_end: int = ASPECT_PREFILTER_MID_RANK_END_DEFAULT,
+    sts_model_id: str = STS_PREFILTER_MODEL_ID_DEFAULT,
+    sts_batch_size: int = STS_PREFILTER_BATCH_SIZE_DEFAULT,
+    sts_max_length: int = STS_PREFILTER_MAX_LENGTH_DEFAULT,
+    grant_block_size: int = STS_PREFILTER_GRANT_BLOCK_SIZE_DEFAULT,
 ) -> List[Tuple[SpecItem, SpecItem, float, str]]:
+    try:
+        import torch
+    except Exception as e:
+        raise RuntimeError("STS prefilter requires torch to be installed.") from e
+    try:
+        from transformers import AutoModel, AutoTokenizer
+    except Exception as e:
+        raise RuntimeError(
+            "STS prefilter requires transformers to be installed. "
+            "Install `transformers` in your runtime."
+        ) from e
+
     rng = random.Random(int(seed) + 911)
-    fac_by_id = {f.item_id: f for f in fac_specs}
+    n_fac = len(fac_specs)
     selected: Dict[str, Dict[str, Any]] = {}
-    print(f"prefilter_method=sts_cache grants_in_cache={len(sts_cache)}")
+    device = _pick_device()
+    model_ref = clean_text(sts_model_id) or STS_PREFILTER_MODEL_ID_DEFAULT
+    tokenizer = AutoTokenizer.from_pretrained(model_ref, trust_remote_code=True)
+    model = AutoModel.from_pretrained(model_ref, trust_remote_code=True)
+    model.to(device)
+    model.eval()
+    print(
+        f"prefilter_method=sts_embed_cosine "
+        f"prefilter_model={model_ref} prefilter_device={device}"
+    )
 
     def _add_pair(grant: SpecItem, fac: SpecItem, score: float, source: str) -> None:
         pair_id = f"{grant.item_id}::{fac.item_id}"
@@ -289,43 +328,71 @@ def select_pairs_aspect_prefilter(
         bucket["score"] = max(float(bucket["score"]), float(score))
         bucket["sources"].add(source)
 
-    for aspect_idx, aspect in enumerate(ASPECTS):
-        aspect_rng = random.Random(int(seed) + 911 + (aspect_idx + 1) * 7919)
+    for aspect in ASPECTS:
+        grant_aspect_texts = [
+            _aspect_text_for_item(g, aspect=aspect, decompositions=decompositions)
+            for g in grant_specs
+        ]
+        fac_aspect_texts = [
+            _aspect_text_for_item(f, aspect=aspect, decompositions=decompositions)
+            for f in fac_specs
+        ]
+        grant_emb = _encode_texts_sts(
+            texts=grant_aspect_texts,
+            tokenizer=tokenizer,
+            model=model,
+            device=device,
+            batch_size=int(sts_batch_size),
+            max_length=int(sts_max_length),
+        )
+        fac_emb = _encode_texts_sts(
+            texts=fac_aspect_texts,
+            tokenizer=tokenizer,
+            model=model,
+            device=device,
+            batch_size=int(sts_batch_size),
+            max_length=int(sts_max_length),
+        )
+        fac_emb_t = fac_emb.transpose(0, 1)
+        block = max(1, int(grant_block_size))
         mid_start = max(0, int(mid_rank_start))
         mid_end = max(mid_start, int(mid_rank_end))
-        low_tail = max(32, int(STS_CACHE_LOW_TAIL_POOL_DEFAULT))
+        low_tail = max(32, int(STS_PREFILTER_LOW_TAIL_POOL_DEFAULT))
 
-        for grant in grant_specs:
-            ranked = sts_cache.get(grant.item_id, [])
-            ranked = [(fid, s) for fid, s in ranked if fid in fac_by_id]
-            ranked_ids = [fid for fid, _ in ranked]
-            if not ranked_ids:
-                continue
-            score_by_id = {fid: float(s) for fid, s in ranked}
+        for start in range(0, len(grant_specs), block):
+            end = min(len(grant_specs), start + block)
+            sims = torch.matmul(grant_emb[start:end], fac_emb_t)
+            for local_i, grant in enumerate(grant_specs[start:end]):
+                row = sims[local_i]
+                order = torch.argsort(row, descending=True)
+                sorted_idx = order.detach().cpu().tolist()
 
-            high_pool = ranked_ids[: max(0, int(high_pool_size))]
-            high_k = min(max(0, int(high_per_aspect)), len(high_pool))
-            high_pick = aspect_rng.sample(high_pool, high_k) if high_k > 0 else []
+                high_pool = sorted_idx[: max(0, int(high_pool_size))]
+                high_k = min(max(0, int(high_per_aspect)), len(high_pool))
+                high_pick = rng.sample(high_pool, high_k) if high_k > 0 else []
 
-            mid_pool = ranked_ids[mid_start:mid_end]
-            mid_k = min(max(0, int(mid_per_aspect)), len(mid_pool))
-            mid_pick = aspect_rng.sample(mid_pool, mid_k) if mid_k > 0 else []
+                mid_pool = sorted_idx[mid_start:mid_end]
+                mid_k = min(max(0, int(mid_per_aspect)), len(mid_pool))
+                mid_pick = rng.sample(mid_pool, mid_k) if mid_k > 0 else []
 
-            low_pool = ranked_ids[max(mid_end, len(ranked_ids) - low_tail) :]
-            if not low_pool:
-                low_pool = ranked_ids
-            low_k = min(max(0, int(low_per_aspect)), len(low_pool))
-            low_pick = aspect_rng.sample(low_pool, low_k) if low_k > 0 else []
+                low_start = max(mid_end, n_fac - low_tail)
+                low_pool = sorted_idx[low_start:]
+                if not low_pool:
+                    low_pool = sorted_idx[mid_end:] if mid_end < len(sorted_idx) else sorted_idx
+                low_k = min(max(0, int(low_per_aspect)), len(low_pool))
+                low_pick = rng.sample(low_pool, low_k) if low_k > 0 else []
 
-            for fac_id in high_pick:
-                fac = fac_by_id[fac_id]
-                _add_pair(grant, fac, score_by_id.get(fac_id, 0.0), f"apf_{aspect}_high")
-            for fac_id in mid_pick:
-                fac = fac_by_id[fac_id]
-                _add_pair(grant, fac, score_by_id.get(fac_id, 0.0), f"apf_{aspect}_mid")
-            for fac_id in low_pick:
-                fac = fac_by_id[fac_id]
-                _add_pair(grant, fac, score_by_id.get(fac_id, 0.0), f"apf_{aspect}_low")
+                for idx in high_pick:
+                    fac = fac_specs[idx]
+                    _add_pair(grant, fac, (float(row[idx].item()) + 1.0) / 2.0, f"apf_{aspect}_high")
+                for idx in mid_pick:
+                    fac = fac_specs[idx]
+                    _add_pair(grant, fac, (float(row[idx].item()) + 1.0) / 2.0, f"apf_{aspect}_mid")
+                for idx in low_pick:
+                    fac = fac_specs[idx]
+                    _add_pair(grant, fac, (float(row[idx].item()) + 1.0) / 2.0, f"apf_{aspect}_low")
+
+    del model
 
     pairs: List[Tuple[SpecItem, SpecItem, float, str]] = []
     for item in selected.values():
