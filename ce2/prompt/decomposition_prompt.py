@@ -6,6 +6,8 @@ Rules:
 - Extract only information actually present or strongly implied by the text.
 - Use short noun phrases, usually 2-8 words.
 - Prefer phrases over full sentences.
+- Do not explain your reasoning.
+- Do not output chain-of-thought or <think> blocks.
 - Do not add "must", "should", or requirement wording unless those words are already part of the original phrase.
 - If the aspect is absent, return an empty list.
 - Do not invent missing aspects.
@@ -129,6 +131,8 @@ DECOMPOSE_SYSTEM_PROMPTS_BY_ASPECT = {
 
 
 DECOMPOSE_USER_PROMPT_TEMPLATE = """
+/no_think
+
 Aspect to extract:
 {aspect}
 

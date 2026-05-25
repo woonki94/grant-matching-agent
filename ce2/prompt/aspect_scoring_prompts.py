@@ -17,6 +17,8 @@ Score lower when the overlap is only generic or broad.
 
 SCORE_OUTPUT_SCHEMA = """
 Return exactly one JSON object and no markdown.
+Do not explain your reasoning.
+Do not output chain-of-thought or <think> blocks.
 
 Required schema:
 {
@@ -150,6 +152,8 @@ SCORE_SYSTEM_PROMPTS_BY_ASPECT = {
 
 
 SCORE_USER_PROMPT_TEMPLATE = """
+/no_think
+
 Aspect to score:
 {aspect}
 
