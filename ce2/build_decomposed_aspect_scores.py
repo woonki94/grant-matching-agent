@@ -39,6 +39,14 @@ from ce2.llm_runtime import (  # noqa: E402
     score_to_band,
     unload_llm,
 )
+from ce2.prompt.aspect_scoring_prompts import (  # noqa: E402
+    SCORE_SYSTEM_PROMPTS_BY_ASPECT,
+    SCORE_USER_PROMPT_TEMPLATE,
+)
+from ce2.prompt.decomposition_prompt import (  # noqa: E402
+    DECOMPOSE_SYSTEM_PROMPT,
+    DECOMPOSE_USER_PROMPT_TEMPLATE,
+)
 
 
 MODEL_ID_DEFAULT = "Qwen/Qwen3-14B"
@@ -64,86 +72,6 @@ TOP_P_DEFAULT = 0.9
 MAX_ATTEMPTS_DEFAULT = 2
 
 ASPECTS = ("domain", "method", "constraints")
-
-
-DECOMPOSE_SYSTEM_PROMPT = """
-You decompose short grant or faculty specialization keywords into three matching aspects.
-
-Definitions:
-- domain: the research/application topic, problem area, population, context, or field.
-- method: concrete methods, techniques, procedures, analytical approaches, workflows, models, or mechanisms.
-- constraints: specific requirements, capabilities, deliverables, data/tool/standard requirements, eligibility constraints, or required conditions.
-
-Rules:
-- Extract only information actually present or strongly implied by the text.
-- Use short noun phrases.
-- If an aspect is absent, return an empty list.
-- Do not invent missing methods or constraints.
-- Return exactly one JSON object and no markdown.
-
-Required schema:
-{
-  "domain": ["..."],
-  "method": ["..."],
-  "constraints": ["..."]
-}
-""".strip()
-
-
-DECOMPOSE_USER_PROMPT_TEMPLATE = """
-Specialization text:
-{text}
-""".strip()
-
-
-SCORE_SYSTEM_PROMPT = """
-You are a strict grant-to-faculty matching judge.
-
-You receive a grant specialization and a faculty specialization, each already decomposed into domain, method, and constraints.
-Score each aspect independently from 0.0 to 1.0.
-
-Aspect scoring:
-- domain_score: compare only topic/problem/context/domain overlap.
-- method_score: compare only method/technique/procedure/workflow overlap.
-- constraint_score: compare only required capabilities, deliverables, data/tool/standard requirements, qualifications, or concrete conditions.
-
-Calibration:
-- 0.00-0.10: no meaningful match.
-- 0.20-0.29: very weak match.
-- 0.30-0.49: partial but usable low-mid match.
-- 0.50-0.69: clear moderate match with missing pieces.
-- 0.70-0.84: strong match.
-- 0.85-1.00: near exact match.
-
-Important:
-- Do not let domain similarity inflate method or constraint scores.
-- Do not let generic method words inflate domain or constraint scores.
-- Constraint score should be high only when concrete requirements are actually satisfied.
-- If one side has an empty aspect list, that aspect score should usually be low unless the original text clearly implies it.
-- Return exactly one JSON object and no markdown.
-
-Required schema:
-{
-  "domain": {"score": <float>, "reason": "<short reason>"},
-  "method": {"score": <float>, "reason": "<short reason>"},
-  "constraints": {"score": <float>, "reason": "<short reason>"}
-}
-""".strip()
-
-
-SCORE_USER_PROMPT_TEMPLATE = """
-Grant specialization:
-{grant_text}
-
-Grant decomposition:
-{grant_decomposition_json}
-
-Faculty specialization:
-{fac_text}
-
-Faculty decomposition:
-{fac_decomposition_json}
-""".strip()
 
 
 @dataclass(frozen=True)
@@ -466,15 +394,12 @@ def _decompose_specs(
     return existing
 
 
-def _parse_aspect_score(obj: Optional[Dict[str, Any]], aspect: str) -> Tuple[float, str, bool]:
+def _parse_single_score(obj: Optional[Dict[str, Any]]) -> Tuple[float, str, bool]:
     if not isinstance(obj, dict):
         return 0.0, "", False
-    raw = obj.get(aspect)
-    if not isinstance(raw, dict):
+    if "score" not in obj:
         return 0.0, "", False
-    score = coerce_score(raw.get("score"))
-    reason = normalize_ws(raw.get("reason"))
-    return score, reason, True
+    return coerce_score(obj.get("score")), normalize_ws(obj.get("reason")), True
 
 
 def _score_pairs(
@@ -501,26 +426,29 @@ def _score_pairs(
         next_pending: List[Tuple[SpecItem, SpecItem, float, str]] = []
         for chunk in batched(pending, int(batch_size)):
             prompts: List[str] = []
-            valid_items: List[Tuple[SpecItem, SpecItem, float, str, Dict[str, Any], Dict[str, Any]]] = []
+            task_items: List[Tuple[str, str, SpecItem, SpecItem, float, str, Dict[str, Any], Dict[str, Any]]] = []
             for grant, fac, lexical_score, pair_source in chunk:
                 g_dec_row = decompositions.get(grant.item_id, {})
                 f_dec_row = decompositions.get(fac.item_id, {})
                 g_dec = g_dec_row.get("decomposition") if isinstance(g_dec_row, dict) else {}
                 f_dec = f_dec_row.get("decomposition") if isinstance(f_dec_row, dict) else {}
-                prompts.append(
-                    build_prompt(
-                        tokenizer,
-                        model_id=model_id,
-                        system_prompt=SCORE_SYSTEM_PROMPT,
-                        user_prompt=SCORE_USER_PROMPT_TEMPLATE.format(
-                            grant_text=grant.text,
-                            grant_decomposition_json=json.dumps(g_dec, ensure_ascii=False),
-                            fac_text=fac.text,
-                            fac_decomposition_json=json.dumps(f_dec, ensure_ascii=False),
-                        ),
-                    )
+                pair_id = f"{grant.item_id}::{fac.item_id}"
+                user_prompt = SCORE_USER_PROMPT_TEMPLATE.format(
+                    grant_text=grant.text,
+                    grant_decomposition_json=json.dumps(g_dec, ensure_ascii=False),
+                    fac_text=fac.text,
+                    fac_decomposition_json=json.dumps(f_dec, ensure_ascii=False),
                 )
-                valid_items.append((grant, fac, lexical_score, pair_source, g_dec_row, f_dec_row))
+                for aspect in ASPECTS:
+                    prompts.append(
+                        build_prompt(
+                            tokenizer,
+                            model_id=model_id,
+                            system_prompt=SCORE_SYSTEM_PROMPTS_BY_ASPECT[aspect],
+                            user_prompt=user_prompt,
+                        )
+                    )
+                    task_items.append((pair_id, aspect, grant, fac, lexical_score, pair_source, g_dec_row, f_dec_row))
             responses = generate_responses_batch(
                 llm_bundle=llm_bundle,
                 prompts=prompts,
@@ -529,18 +457,49 @@ def _score_pairs(
                 top_p=float(top_p),
             )
             rows: List[Dict[str, Any]] = []
-            for item, response in zip(valid_items, responses):
-                grant, fac, lexical_score, pair_source, g_dec_row, f_dec_row = item
+            grouped: Dict[str, Dict[str, Any]] = {}
+            for item, response in zip(task_items, responses):
+                pair_id, aspect, grant, fac, lexical_score, pair_source, g_dec_row, f_dec_row = item
                 parsed = extract_json_object(response)
-                domain_score, domain_reason, domain_ok = _parse_aspect_score(parsed, "domain")
-                method_score, method_reason, method_ok = _parse_aspect_score(parsed, "method")
-                constraint_score, constraint_reason, constraint_ok = _parse_aspect_score(parsed, "constraints")
-                parse_ok = bool(domain_ok and method_ok and constraint_ok)
+                score, reason, ok = _parse_single_score(parsed)
+                bucket = grouped.setdefault(
+                    pair_id,
+                    {
+                        "grant": grant,
+                        "fac": fac,
+                        "lexical_score": lexical_score,
+                        "pair_source": pair_source,
+                        "g_dec_row": g_dec_row,
+                        "f_dec_row": f_dec_row,
+                        "scores": {},
+                        "reasons": {},
+                        "raw_responses": {},
+                        "ok": {},
+                    },
+                )
+                bucket["scores"][aspect] = float(score)
+                bucket["reasons"][aspect] = reason
+                bucket["raw_responses"][aspect] = response
+                bucket["ok"][aspect] = bool(ok)
+
+            for pair_id, bucket in grouped.items():
+                grant = bucket["grant"]
+                fac = bucket["fac"]
+                lexical_score = bucket["lexical_score"]
+                pair_source = bucket["pair_source"]
+                g_dec_row = bucket["g_dec_row"]
+                f_dec_row = bucket["f_dec_row"]
+                score_map = bucket["scores"]
+                reason_map = bucket["reasons"]
+                ok_map = bucket["ok"]
+                parse_ok = all(bool(ok_map.get(aspect)) and aspect in score_map for aspect in ASPECTS)
                 if not parse_ok:
                     next_pending.append((grant, fac, lexical_score, pair_source))
                     continue
+                domain_score = float(score_map["domain"])
+                method_score = float(score_map["method"])
+                constraint_score = float(score_map["constraints"])
                 overall_score = float((domain_score + method_score + constraint_score) / 3.0)
-                pair_id = f"{grant.item_id}::{fac.item_id}"
                 row = {
                     "pair_id": pair_id,
                     "grant": {
@@ -568,16 +527,16 @@ def _score_pairs(
                         "overall": score_to_band(overall_score),
                     },
                     "reasons": {
-                        "domain": domain_reason,
-                        "method": method_reason,
-                        "constraints": constraint_reason,
+                        "domain": reason_map.get("domain", ""),
+                        "method": reason_map.get("method", ""),
+                        "constraints": reason_map.get("constraints", ""),
                     },
                     "lexical_prefilter_score": float(lexical_score),
                     "pair_source": pair_source,
                     "parse_ok": True,
                     "attempt": int(attempt + 1),
                     "model_id": model_id,
-                    "raw_response": response,
+                    "raw_responses": bucket["raw_responses"],
                 }
                 existing_pair_ids.add(pair_id)
                 rows.append(row)
