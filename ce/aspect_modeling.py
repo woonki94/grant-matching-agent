@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import json
 from pathlib import Path
 from types import SimpleNamespace
@@ -127,6 +128,27 @@ def _find_linear_classifier(model: nn.Module) -> Optional[nn.Linear]:
     return None
 
 
+def _find_classifier_attr_name(model: nn.Module) -> Optional[str]:
+    for attr in ("classifier", "score", "regressor"):
+        head = getattr(model, attr, None)
+        if isinstance(head, nn.Module):
+            return attr
+    return None
+
+
+def _slice_batch_kwargs(kwargs: Dict[str, Any], mask: torch.Tensor, batch_size: int) -> Dict[str, Any]:
+    out: Dict[str, Any] = {}
+    for key, value in kwargs.items():
+        if key == "labels":
+            continue
+        if torch.is_tensor(value) and value.dim() > 0 and int(value.shape[0]) == int(batch_size):
+            out[key] = value[mask]
+        else:
+            out[key] = value
+    out["return_dict"] = True
+    return out
+
+
 class AspectHeadSequenceClassifier(nn.Module):
     """Shared transformer encoder with separate scalar heads per training aspect."""
 
@@ -134,15 +156,26 @@ class AspectHeadSequenceClassifier(nn.Module):
         super().__init__()
         self.backbone = backbone
         self.config = getattr(backbone, "config", None)
-        hidden_size = _infer_hidden_size(backbone)
-        self.heads = nn.ModuleDict(
-            {
-                "domain": nn.Linear(hidden_size, 1),
-                "method": nn.Linear(hidden_size, 1),
-                "constraint": nn.Linear(hidden_size, 1),
-            }
-        )
-        self._init_from_backbone_classifier()
+        self.classifier_attr_name = _find_classifier_attr_name(backbone)
+        source_head = getattr(backbone, self.classifier_attr_name, None) if self.classifier_attr_name else None
+        if isinstance(source_head, nn.Module):
+            self.heads = nn.ModuleDict(
+                {
+                    "domain": copy.deepcopy(source_head),
+                    "method": copy.deepcopy(source_head),
+                    "constraint": copy.deepcopy(source_head),
+                }
+            )
+        else:
+            hidden_size = _infer_hidden_size(backbone)
+            self.heads = nn.ModuleDict(
+                {
+                    "domain": nn.Linear(hidden_size, 1),
+                    "method": nn.Linear(hidden_size, 1),
+                    "constraint": nn.Linear(hidden_size, 1),
+                }
+            )
+            self._init_from_backbone_classifier()
 
     def _init_from_backbone_classifier(self) -> None:
         source = _find_linear_classifier(self.backbone)
@@ -164,6 +197,56 @@ class AspectHeadSequenceClassifier(nn.Module):
     def forward(self, *args: Any, aspect_ids: Optional[torch.Tensor] = None, **kwargs: Any) -> Any:
         if args:
             raise TypeError("AspectHeadSequenceClassifier expects keyword inputs.")
+        if self.classifier_attr_name:
+            return self._forward_with_classifier_heads(aspect_ids=aspect_ids, **kwargs)
+        return self._forward_with_hidden_state_heads(aspect_ids=aspect_ids, **kwargs)
+
+    def _clean_aspect_ids(self, aspect_ids: Optional[torch.Tensor], *, batch_size: int, device: torch.device) -> torch.Tensor:
+        if aspect_ids is None:
+            return torch.zeros(batch_size, device=device, dtype=torch.long)
+        out = aspect_ids.to(device=device, dtype=torch.long).view(-1)
+        if int(out.numel()) != batch_size:
+            return torch.zeros(batch_size, device=device, dtype=torch.long)
+        return out
+
+    def _forward_with_classifier_heads(self, *, aspect_ids: Optional[torch.Tensor] = None, **kwargs: Any) -> Any:
+        input_ids = kwargs.get("input_ids")
+        if not torch.is_tensor(input_ids):
+            raise RuntimeError("Aspect-head routing requires tensor input_ids.")
+        batch_size = int(input_ids.shape[0])
+        aspect_ids = self._clean_aspect_ids(aspect_ids, batch_size=batch_size, device=input_ids.device)
+
+        original_head = getattr(self.backbone, self.classifier_attr_name)
+        logits: Optional[torch.Tensor] = None
+        handled = torch.zeros(batch_size, device=input_ids.device, dtype=torch.bool)
+        try:
+            for aspect_id, aspect_name in ((0, "domain"), (1, "domain"), (2, "method"), (3, "constraint")):
+                mask = aspect_ids == int(aspect_id)
+                if not bool(mask.any().item()):
+                    continue
+                setattr(self.backbone, self.classifier_attr_name, self.heads[aspect_name])
+                sub_kwargs = _slice_batch_kwargs(kwargs, mask, batch_size)
+                head_logits = self.backbone(**sub_kwargs).logits
+                if logits is None:
+                    logits = head_logits.new_empty((batch_size, int(head_logits.shape[-1])))
+                logits[mask] = head_logits.to(dtype=logits.dtype)
+                handled = handled | mask
+
+            if bool((~handled).any().item()):
+                setattr(self.backbone, self.classifier_attr_name, self.heads["domain"])
+                sub_kwargs = _slice_batch_kwargs(kwargs, ~handled, batch_size)
+                head_logits = self.backbone(**sub_kwargs).logits
+                if logits is None:
+                    logits = head_logits.new_empty((batch_size, int(head_logits.shape[-1])))
+                logits[~handled] = head_logits.to(dtype=logits.dtype)
+        finally:
+            setattr(self.backbone, self.classifier_attr_name, original_head)
+
+        if logits is None:
+            logits = input_ids.new_zeros((batch_size, 1), dtype=torch.float32)
+        return SimpleNamespace(logits=logits)
+
+    def _forward_with_hidden_state_heads(self, *, aspect_ids: Optional[torch.Tensor] = None, **kwargs: Any) -> Any:
         outputs = self._encoder_forward(**kwargs)
         pooled = getattr(outputs, "pooler_output", None)
         if pooled is None:
@@ -177,12 +260,7 @@ class AspectHeadSequenceClassifier(nn.Module):
             pooled = last_hidden[:, 0, :]
 
         batch_size = int(pooled.shape[0])
-        if aspect_ids is None:
-            aspect_ids = torch.zeros(batch_size, device=pooled.device, dtype=torch.long)
-        else:
-            aspect_ids = aspect_ids.to(device=pooled.device, dtype=torch.long).view(-1)
-            if int(aspect_ids.numel()) != batch_size:
-                aspect_ids = torch.zeros(batch_size, device=pooled.device, dtype=torch.long)
+        aspect_ids = self._clean_aspect_ids(aspect_ids, batch_size=batch_size, device=pooled.device)
 
         logits = pooled.new_empty((batch_size, 1))
         handled = torch.zeros(batch_size, device=pooled.device, dtype=torch.bool)
