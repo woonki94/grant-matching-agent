@@ -1,43 +1,54 @@
 from __future__ import annotations
 
 DECOMPOSE_SYSTEM_PROMPT = """
-You decompose short grant or faculty specialization keywords into three matching aspects.
+You decompose short grant or faculty specialization keywords into five matching aspects.
 
 Definitions:
-- domain: the broad research/application area, problem area, population, field, or target use case.
-- method: concrete techniques, algorithms, procedures, analytical approaches, workflows, models, mechanisms, or interventions.
-- constraints: explicit requirements or operating conditions that the work must satisfy, such as required data, tools, standards, deliverables, eligibility rules, performance conditions, deployment conditions, or environmental conditions.
+- domain: the broad research/application area, problem area, field, or target use case.
+- method: concrete techniques, algorithms, procedures, analytical approaches, workflows, models, mechanisms, interventions, or service components.
+- target: the population, entity, system, material, organism, dataset object, community, or context being served or studied.
+- deliverable: concrete output, service, product, tool, model, report, training, software, infrastructure, or program expected or produced.
+- application_context: the setting, deployment environment, operational context, sector, institution type, geography, or real-world use environment.
 
 Rules:
 - Extract only information actually present or strongly implied by the text.
 - Use short noun phrases, usually 2-8 words.
-- Prefer meaningful phrases over single words.
+- Prefer phrases over full sentences.
+- Do not add "must", "should", or requirement wording unless those words are already part of the original phrase.
 - Do not repeat the same phrase across multiple aspects unless it truly plays both roles.
 - If a phrase describes what the work is about, put it in domain.
-- If a phrase describes how the work is done, put it in method.
-- If a phrase describes a required condition, limitation, deliverable, eligibility rule, or operating setting, put it in constraints.
+- If a phrase describes how work is done, put it in method.
+- If a phrase describes who or what receives/is studied by the work, put it in target.
+- If a phrase describes what gets produced or delivered, put it in deliverable.
+- If a phrase describes where or under what operational setting the work happens, put it in application_context.
 - If an aspect is absent, return an empty list.
-- Do not invent missing methods or constraints.
+- Do not invent missing aspects.
 - Return exactly one JSON object and no markdown.
 
 Examples:
 
 Input:
-Learning-based planning and reasoning for tactical decision-making in dynamic adversarial environments.
+Family reunification and support services including case management, legal aid, and educational screening for returned children and youth.
 
 Output:
 {
   "domain": [
-    "tactical decision-making",
-    "adversarial environments"
+    "family reunification",
+    "support services"
   ],
   "method": [
-    "learning-based planning",
-    "automated reasoning"
+    "case management",
+    "legal aid",
+    "educational screening"
   ],
-  "constraints": [
-    "dynamic adversarial environments"
-  ]
+  "target": [
+    "returned children and youth"
+  ],
+  "deliverable": [
+    "family reunification services",
+    "support services"
+  ],
+  "application_context": []
 }
 
 Input:
@@ -52,7 +63,11 @@ Output:
   "method": [
     "transcriptomic analysis"
   ],
-  "constraints": []
+  "target": [
+    "host immune responses"
+  ],
+  "deliverable": [],
+  "application_context": []
 }
 
 Input:
@@ -67,16 +82,22 @@ Output:
     "software tool development",
     "reproducible analysis workflows"
   ],
-  "constraints": [
-    "open-source software deliverable"
-  ]
+  "target": [
+    "geospatial data"
+  ],
+  "deliverable": [
+    "open-source software tools"
+  ],
+  "application_context": []
 }
 
 Required schema:
 {
   "domain": ["..."],
   "method": ["..."],
-  "constraints": ["..."]
+  "target": ["..."],
+  "deliverable": ["..."],
+  "application_context": ["..."]
 }
 """.strip()
 

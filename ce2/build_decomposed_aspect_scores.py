@@ -53,9 +53,9 @@ MODEL_ID_DEFAULT = "Qwen/Qwen3-14B"
 GRANT_DB_DEFAULT = "ce/dataset/source/grant_keywords_spec_keywords_db.json"
 FAC_DB_DEFAULT = "ce/dataset/source/fac_specs_db.json"
 OUTPUT_DIR_DEFAULT = "ce2/dataset/distill"
-DECOMPOSITION_OUTPUT_DEFAULT = "ce2/dataset/distill/spec_decompositions.jsonl"
-SCORES_OUTPUT_DEFAULT = "ce2/dataset/distill/decomposed_aspect_pair_scores.jsonl"
-SUMMARY_OUTPUT_DEFAULT = "ce2/dataset/distill/decomposed_aspect_pair_scores_summary.json"
+DECOMPOSITION_OUTPUT_DEFAULT = "ce2/dataset/distill/spec_decompositions_5aspect.jsonl"
+SCORES_OUTPUT_DEFAULT = "ce2/dataset/distill/decomposed_5aspect_pair_scores.jsonl"
+SUMMARY_OUTPUT_DEFAULT = "ce2/dataset/distill/decomposed_5aspect_pair_scores_summary.json"
 
 SEED_DEFAULT = 42
 MAX_GRANT_SPECS_DEFAULT = 80
@@ -71,7 +71,7 @@ TEMPERATURE_DEFAULT = 0.0
 TOP_P_DEFAULT = 0.9
 MAX_ATTEMPTS_DEFAULT = 2
 
-ASPECTS = ("domain", "method", "constraints")
+ASPECTS = ("domain", "method", "target", "deliverable", "application_context")
 
 
 @dataclass(frozen=True)
@@ -154,7 +154,6 @@ def _load_grant_specs(path: Path, *, max_items: int, seed: int) -> List[SpecItem
     items: List[SpecItem] = []
     for grant in grants or []:
         grant_id = clean_text(grant.get("grant_id"))
-        grant_keywords = grant.get("grant_keywords") if isinstance(grant, dict) else []
         specs = grant.get("grant_spec_keywords") if isinstance(grant, dict) else []
         for idx, text in enumerate(specs or []):
             norm = normalize_ws(text)
@@ -168,7 +167,6 @@ def _load_grant_specs(path: Path, *, max_items: int, seed: int) -> List[SpecItem
                     meta={
                         "grant_id": grant_id,
                         "grant_spec_idx": int(idx),
-                        "grant_keywords": grant_keywords if isinstance(grant_keywords, list) else [],
                     },
                 )
             )
@@ -302,11 +300,13 @@ def _as_list(value: Any) -> List[str]:
 
 def _clean_decomposition(obj: Optional[Dict[str, Any]]) -> Dict[str, List[str]]:
     if not isinstance(obj, dict):
-        return {"domain": [], "method": [], "constraints": []}
+        return {aspect: [] for aspect in ASPECTS}
     return {
         "domain": _as_list(obj.get("domain")),
         "method": _as_list(obj.get("method")),
-        "constraints": _as_list(obj.get("constraints", obj.get("constraint"))),
+        "target": _as_list(obj.get("target")),
+        "deliverable": _as_list(obj.get("deliverable")),
+        "application_context": _as_list(obj.get("application_context", obj.get("context"))),
     }
 
 
@@ -381,7 +381,7 @@ def _decompose_specs(
                 "kind": item.kind,
                 "text": item.text,
                 "meta": item.meta,
-                "decomposition": {"domain": [], "method": [], "constraints": []},
+                "decomposition": {aspect: [] for aspect in ASPECTS},
                 "parse_ok": False,
                 "attempt": int(max(1, int(max_attempts))),
                 "model_id": model_id,
@@ -427,13 +427,15 @@ def _score_pairs(
         for chunk in batched(pending, int(batch_size)):
             prompts: List[str] = []
             task_items: List[Tuple[str, str, SpecItem, SpecItem, float, str, Dict[str, Any], Dict[str, Any]]] = []
-            for grant, fac, lexical_score, pair_source in chunk:
-                g_dec_row = decompositions.get(grant.item_id, {})
-                f_dec_row = decompositions.get(fac.item_id, {})
-                g_dec = g_dec_row.get("decomposition") if isinstance(g_dec_row, dict) else {}
-                f_dec = f_dec_row.get("decomposition") if isinstance(f_dec_row, dict) else {}
-                pair_id = f"{grant.item_id}::{fac.item_id}"
-                for aspect in ASPECTS:
+            # Group by aspect so consecutive prompts share the same system prompt.
+            # This improves vLLM prefix/cache locality without increasing batch size.
+            for aspect in ASPECTS:
+                for grant, fac, lexical_score, pair_source in chunk:
+                    g_dec_row = decompositions.get(grant.item_id, {})
+                    f_dec_row = decompositions.get(fac.item_id, {})
+                    g_dec = g_dec_row.get("decomposition") if isinstance(g_dec_row, dict) else {}
+                    f_dec = f_dec_row.get("decomposition") if isinstance(f_dec_row, dict) else {}
+                    pair_id = f"{grant.item_id}::{fac.item_id}"
                     user_prompt = SCORE_USER_PROMPT_TEMPLATE.format(
                         aspect=aspect,
                         grant_text=grant.text,
@@ -499,10 +501,8 @@ def _score_pairs(
                 if not parse_ok:
                     next_pending.append((grant, fac, lexical_score, pair_source))
                     continue
-                domain_score = float(score_map["domain"])
-                method_score = float(score_map["method"])
-                constraint_score = float(score_map["constraints"])
-                overall_score = float((domain_score + method_score + constraint_score) / 3.0)
+                aspect_scores = {aspect: float(score_map[aspect]) for aspect in ASPECTS}
+                overall_score = float(sum(aspect_scores.values()) / max(1, len(ASPECTS)))
                 row = {
                     "pair_id": pair_id,
                     "grant": {
@@ -518,22 +518,14 @@ def _score_pairs(
                         "decomposition": f_dec_row.get("decomposition", {}),
                     },
                     "scores": {
-                        "domain": domain_score,
-                        "method": method_score,
-                        "constraints": constraint_score,
+                        **aspect_scores,
                         "overall": overall_score,
                     },
                     "bands": {
-                        "domain": score_to_band(domain_score),
-                        "method": score_to_band(method_score),
-                        "constraints": score_to_band(constraint_score),
+                        **{aspect: score_to_band(score) for aspect, score in aspect_scores.items()},
                         "overall": score_to_band(overall_score),
                     },
-                    "reasons": {
-                        "domain": reason_map.get("domain", ""),
-                        "method": reason_map.get("method", ""),
-                        "constraints": reason_map.get("constraints", ""),
-                    },
+                    "reasons": {aspect: reason_map.get(aspect, "") for aspect in ASPECTS},
                     "lexical_prefilter_score": float(lexical_score),
                     "pair_source": pair_source,
                     "parse_ok": True,
@@ -603,7 +595,7 @@ def _build_summary(*, scores_path: Path, decomposition_path: Path, started_at: f
     decomps = list(_iter_jsonl(decomposition_path))
     score_values = {
         aspect: [float(row.get("scores", {}).get(aspect, 0.0)) for row in rows if isinstance(row.get("scores"), dict)]
-        for aspect in ("domain", "method", "constraints", "overall")
+        for aspect in (*ASPECTS, "overall")
     }
     return {
         "created_at": datetime.now(timezone.utc).isoformat(),
@@ -624,7 +616,7 @@ def _build_summary(*, scores_path: Path, decomposition_path: Path, started_at: f
 
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="CE2 pilot: decompose specs and score domain/method/constraint pair matches.")
+    p = argparse.ArgumentParser(description="CE2 pilot: decompose specs and score five aspect pair matches.")
     p.add_argument("--model-id", type=str, default=MODEL_ID_DEFAULT)
     p.add_argument("--grant-db", type=str, default=GRANT_DB_DEFAULT)
     p.add_argument("--fac-db", type=str, default=FAC_DB_DEFAULT)

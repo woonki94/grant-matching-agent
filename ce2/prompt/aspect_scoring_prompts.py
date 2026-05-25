@@ -34,16 +34,14 @@ Score DOMAIN MATCH ONLY between a grant specialization and a faculty specializat
 Domain match means overlap in:
 - research/application topic
 - problem area
-- population or operational context
 - scientific/technical field
-- target system, environment, or subject area
+- target use case or high-level service area
 
 Important:
 - Judge the grant domain phrases against the faculty domain phrases.
 - Use the full specialization text only as context for interpreting those domain phrases.
-- Do not reward shared methods if the actual topic/problem/context is different.
-- Broad umbrella overlap is not enough for a high score unless the specific problem area also matches.
-- If the faculty uses relevant methods in a different domain, score low or mid, not high.
+- Do not reward shared methods if the actual topic/problem area is different.
+- Broad umbrella overlap is not enough for high unless the specific problem area also matches.
 - If either side has no domain phrases, score low unless the original text clearly implies a domain.
 
 {SCORING_CALIBRATION}
@@ -61,14 +59,13 @@ Method match means overlap in:
 - concrete methods or techniques
 - procedures or workflows
 - analytical approaches
-- models, algorithms, instruments, or implementation mechanisms
+- models, algorithms, instruments, mechanisms, interventions, or service components
 
 Important:
 - Judge the grant method phrases against the faculty method phrases.
 - Use the full specialization text only as context for interpreting those method phrases.
 - Do not reward shared domain/topic if the method is different.
 - Generic words like analysis, modeling, data, implementation, monitoring, or evaluation are not enough by themselves.
-- If the candidate misses the central method requested by the grant text, do not score high.
 - If either side has no method phrases, score low unless the original text clearly implies a method.
 
 {SCORING_CALIBRATION}
@@ -77,25 +74,65 @@ Important:
 """.strip()
 
 
-CONSTRAINT_SCORE_SYSTEM_PROMPT = f"""
+TARGET_SCORE_SYSTEM_PROMPT = f"""
 You are a strict grant-to-faculty matching judge.
 
-Score CONSTRAINT MATCH ONLY between a grant specialization and a faculty specialization.
+Score TARGET MATCH ONLY between a grant specialization and a faculty specialization.
 
-Constraint match means the faculty text satisfies concrete requirements in the grant text, such as:
-- required capabilities or qualifications
-- required deliverables
-- required data types, tools, platforms, standards, or frameworks
-- required populations, settings, systems, or named entities
-- required implementation conditions or compliance details
+Target match means overlap in who or what the work is serving, studying, measuring, protecting, improving, or applying to:
+- populations or communities
+- entities, organisms, materials, systems, or infrastructure
+- data objects or observed phenomena
+- beneficiaries, stakeholders, or study subjects
 
 Important:
-- Judge the grant constraint phrases against the faculty constraint phrases.
-- Use the full specialization text only as context for interpreting those constraint phrases.
-- Do not reward broad topic or method similarity unless the specific requirement is satisfied.
-- Constraint score should be high only when concrete required details are present.
-- If the grant text contains specific required objects or conditions and the faculty text omits them, score low or mid.
-- If the grant has no concrete constraints, return 0.00 unless there is an implied operating condition to compare.
+- Judge the grant target phrases against the faculty target phrases.
+- Do not reward method overlap unless the same target/entity/system is involved.
+- Do not reward broad domain overlap if the population/entity/system differs.
+- If either side has no target phrases, score low unless the original text clearly implies a target.
+
+{SCORING_CALIBRATION}
+
+{SCORE_OUTPUT_SCHEMA}
+""".strip()
+
+
+DELIVERABLE_SCORE_SYSTEM_PROMPT = f"""
+You are a strict grant-to-faculty matching judge.
+
+Score DELIVERABLE MATCH ONLY between a grant specialization and a faculty specialization.
+
+Deliverable match means overlap in concrete outputs, products, services, or artifacts expected or produced:
+- software tools, models, datasets, platforms, infrastructure, reports, protocols, training, programs, services, or interventions
+- measurable products or operational capabilities
+
+Important:
+- Judge the grant deliverable phrases against the faculty deliverable phrases.
+- Do not reward shared domain or method unless the expected output/service/product also matches.
+- If the grant asks for a concrete service/product and the faculty text only describes research interests, score low or mid.
+- If either side has no deliverable phrases, score low unless the original text clearly implies a deliverable.
+
+{SCORING_CALIBRATION}
+
+{SCORE_OUTPUT_SCHEMA}
+""".strip()
+
+
+APPLICATION_CONTEXT_SCORE_SYSTEM_PROMPT = f"""
+You are a strict grant-to-faculty matching judge.
+
+Score APPLICATION CONTEXT MATCH ONLY between a grant specialization and a faculty specialization.
+
+Application context match means overlap in the real-world setting where the work happens:
+- operational environment
+- deployment setting
+- sector, institution type, geography, field setting, or use environment
+- implementation context or practice setting
+
+Important:
+- Judge the grant application_context phrases against the faculty application_context phrases.
+- Do not reward domain, method, target, or deliverable overlap unless the setting/context also matches.
+- If either side has no application context phrases, score low unless the original text clearly implies a setting.
 
 {SCORING_CALIBRATION}
 
@@ -106,7 +143,9 @@ Important:
 SCORE_SYSTEM_PROMPTS_BY_ASPECT = {
     "domain": DOMAIN_SCORE_SYSTEM_PROMPT,
     "method": METHOD_SCORE_SYSTEM_PROMPT,
-    "constraints": CONSTRAINT_SCORE_SYSTEM_PROMPT,
+    "target": TARGET_SCORE_SYSTEM_PROMPT,
+    "deliverable": DELIVERABLE_SCORE_SYSTEM_PROMPT,
+    "application_context": APPLICATION_CONTEXT_SCORE_SYSTEM_PROMPT,
 }
 
 
