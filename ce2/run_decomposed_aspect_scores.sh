@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # CE2 pilot:
-# 1) decompose grant/faculty specialization text into domain/method/constraints
+# 1) decompose grant/faculty specialization text into five aspects
 # 2) score selected grant-faculty pairs on each aspect
 # 3) save analyzable JSONL + summary
 
@@ -20,9 +20,9 @@ GRANT_DB="${GRANT_DB:-ce/dataset/source/grant_keywords_spec_keywords_db.json}"
 FAC_DB="${FAC_DB:-ce/dataset/source/fac_specs_db.json}"
 
 OUTPUT_DIR="${OUTPUT_DIR:-ce2/dataset/distill}"
-DECOMPOSITION_OUTPUT="${DECOMPOSITION_OUTPUT:-${OUTPUT_DIR}/spec_decompositions.jsonl}"
-SCORES_OUTPUT="${SCORES_OUTPUT:-${OUTPUT_DIR}/decomposed_aspect_pair_scores.jsonl}"
-SUMMARY_OUTPUT="${SUMMARY_OUTPUT:-${OUTPUT_DIR}/decomposed_aspect_pair_scores_summary.json}"
+DECOMPOSITION_OUTPUT="${DECOMPOSITION_OUTPUT:-${OUTPUT_DIR}/spec_decompositions_5aspect_splitprompt.jsonl}"
+SCORES_OUTPUT="${SCORES_OUTPUT:-${OUTPUT_DIR}/decomposed_5aspect_splitprompt_pair_scores.jsonl}"
+SUMMARY_OUTPUT="${SUMMARY_OUTPUT:-${OUTPUT_DIR}/decomposed_5aspect_splitprompt_pair_scores_summary.json}"
 
 SEED="${SEED:-42}"
 MAX_GRANT_SPECS="${MAX_GRANT_SPECS:-60}"
@@ -30,8 +30,8 @@ MAX_FAC_SPECS="${MAX_FAC_SPECS:-1000}"
 CANDIDATES_PER_GRANT_SPEC="${CANDIDATES_PER_GRANT_SPEC:-10}"
 RANDOM_CANDIDATES_PER_GRANT_SPEC="${RANDOM_CANDIDATES_PER_GRANT_SPEC:-3}"
 
-DECOMPOSE_BATCH_SIZE="${DECOMPOSE_BATCH_SIZE:-64}"
-SCORE_BATCH_SIZE="${SCORE_BATCH_SIZE:-64}"
+DECOMPOSE_BATCH_SIZE="${DECOMPOSE_BATCH_SIZE:-16}"
+SCORE_BATCH_SIZE="${SCORE_BATCH_SIZE:-24}"
 DECOMPOSE_MAX_NEW_TOKENS="${DECOMPOSE_MAX_NEW_TOKENS:-220}"
 SCORE_MAX_NEW_TOKENS="${SCORE_MAX_NEW_TOKENS:-300}"
 MAX_ATTEMPTS="${MAX_ATTEMPTS:-2}"

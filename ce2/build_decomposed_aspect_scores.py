@@ -44,7 +44,7 @@ from ce2.prompt.aspect_scoring_prompts import (  # noqa: E402
     SCORE_USER_PROMPT_TEMPLATE,
 )
 from ce2.prompt.decomposition_prompt import (  # noqa: E402
-    DECOMPOSE_SYSTEM_PROMPT,
+    DECOMPOSE_SYSTEM_PROMPTS_BY_ASPECT,
     DECOMPOSE_USER_PROMPT_TEMPLATE,
 )
 
@@ -53,17 +53,17 @@ MODEL_ID_DEFAULT = "Qwen/Qwen3-14B"
 GRANT_DB_DEFAULT = "ce/dataset/source/grant_keywords_spec_keywords_db.json"
 FAC_DB_DEFAULT = "ce/dataset/source/fac_specs_db.json"
 OUTPUT_DIR_DEFAULT = "ce2/dataset/distill"
-DECOMPOSITION_OUTPUT_DEFAULT = "ce2/dataset/distill/spec_decompositions_5aspect.jsonl"
-SCORES_OUTPUT_DEFAULT = "ce2/dataset/distill/decomposed_5aspect_pair_scores.jsonl"
-SUMMARY_OUTPUT_DEFAULT = "ce2/dataset/distill/decomposed_5aspect_pair_scores_summary.json"
+DECOMPOSITION_OUTPUT_DEFAULT = "ce2/dataset/distill/spec_decompositions_5aspect_splitprompt.jsonl"
+SCORES_OUTPUT_DEFAULT = "ce2/dataset/distill/decomposed_5aspect_splitprompt_pair_scores.jsonl"
+SUMMARY_OUTPUT_DEFAULT = "ce2/dataset/distill/decomposed_5aspect_splitprompt_pair_scores_summary.json"
 
 SEED_DEFAULT = 42
 MAX_GRANT_SPECS_DEFAULT = 80
 MAX_FAC_SPECS_DEFAULT = 2500
 CANDIDATES_PER_GRANT_SPEC_DEFAULT = 16
 RANDOM_CANDIDATES_PER_GRANT_SPEC_DEFAULT = 4
-DECOMPOSE_BATCH_SIZE_DEFAULT = 64
-SCORE_BATCH_SIZE_DEFAULT = 64
+DECOMPOSE_BATCH_SIZE_DEFAULT = 16
+SCORE_BATCH_SIZE_DEFAULT = 24
 DECOMPOSE_MAX_NEW_TOKENS_DEFAULT = 220
 SCORE_MAX_NEW_TOKENS_DEFAULT = 300
 MAX_MODEL_LEN_DEFAULT = 4096
@@ -298,16 +298,14 @@ def _as_list(value: Any) -> List[str]:
     return []
 
 
-def _clean_decomposition(obj: Optional[Dict[str, Any]]) -> Dict[str, List[str]]:
+def _parse_decomposition_items(obj: Optional[Dict[str, Any]], aspect: str) -> Tuple[List[str], bool]:
     if not isinstance(obj, dict):
-        return {aspect: [] for aspect in ASPECTS}
-    return {
-        "domain": _as_list(obj.get("domain")),
-        "method": _as_list(obj.get("method")),
-        "target": _as_list(obj.get("target")),
-        "deliverable": _as_list(obj.get("deliverable")),
-        "application_context": _as_list(obj.get("application_context", obj.get("context"))),
-    }
+        return [], False
+    if "items" in obj:
+        return _as_list(obj.get("items")), True
+    if aspect in obj:
+        return _as_list(obj.get(aspect)), True
+    return [], False
 
 
 def _decompose_specs(
@@ -331,15 +329,20 @@ def _decompose_specs(
             break
         next_pending: List[SpecItem] = []
         for chunk in batched(pending, int(batch_size)):
-            prompts = [
-                build_prompt(
-                    tokenizer,
-                    model_id=model_id,
-                    system_prompt=DECOMPOSE_SYSTEM_PROMPT,
-                    user_prompt=DECOMPOSE_USER_PROMPT_TEMPLATE.format(text=item.text),
-                )
-                for item in chunk
-            ]
+            prompts: List[str] = []
+            task_items: List[Tuple[str, str, SpecItem]] = []
+            # Group by aspect so vLLM sees long runs of the same system prompt.
+            for aspect in ASPECTS:
+                for item in chunk:
+                    prompts.append(
+                        build_prompt(
+                            tokenizer,
+                            model_id=model_id,
+                            system_prompt=DECOMPOSE_SYSTEM_PROMPTS_BY_ASPECT[aspect],
+                            user_prompt=DECOMPOSE_USER_PROMPT_TEMPLATE.format(aspect=aspect, text=item.text),
+                        )
+                    )
+                    task_items.append((item.item_id, aspect, item))
             responses = generate_responses_batch(
                 llm_bundle=llm_bundle,
                 prompts=prompts,
@@ -348,10 +351,29 @@ def _decompose_specs(
                 top_p=float(top_p),
             )
             rows: List[Dict[str, Any]] = []
-            for item, response in zip(chunk, responses):
+            grouped: Dict[str, Dict[str, Any]] = {}
+            for task, response in zip(task_items, responses):
+                item_id, aspect, item = task
                 parsed = extract_json_object(response)
-                decomp = _clean_decomposition(parsed)
-                parse_ok = isinstance(parsed, dict) and any(decomp[a] for a in ASPECTS)
+                items_out, ok = _parse_decomposition_items(parsed, aspect)
+                bucket = grouped.setdefault(
+                    item_id,
+                    {
+                        "item": item,
+                        "decomposition": {a: [] for a in ASPECTS},
+                        "ok": {},
+                        "raw_responses": {},
+                    },
+                )
+                bucket["decomposition"][aspect] = items_out
+                bucket["ok"][aspect] = bool(ok)
+                bucket["raw_responses"][aspect] = response
+
+            for item_id, bucket in grouped.items():
+                item = bucket["item"]
+                decomp = bucket["decomposition"]
+                ok_map = bucket["ok"]
+                parse_ok = all(bool(ok_map.get(aspect)) for aspect in ASPECTS) and any(decomp[a] for a in ASPECTS)
                 row = {
                     "item_id": item.item_id,
                     "kind": item.kind,
@@ -361,7 +383,7 @@ def _decompose_specs(
                     "parse_ok": bool(parse_ok),
                     "attempt": int(attempt + 1),
                     "model_id": model_id,
-                    "raw_response": response,
+                    "raw_responses": bucket["raw_responses"],
                 }
                 if parse_ok:
                     existing[item.item_id] = row
@@ -385,7 +407,7 @@ def _decompose_specs(
                 "parse_ok": False,
                 "attempt": int(max(1, int(max_attempts))),
                 "model_id": model_id,
-                "raw_response": "",
+                "raw_responses": {},
             }
             existing[item.item_id] = row
             rows.append(row)
