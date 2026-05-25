@@ -433,13 +433,16 @@ def _score_pairs(
                 g_dec = g_dec_row.get("decomposition") if isinstance(g_dec_row, dict) else {}
                 f_dec = f_dec_row.get("decomposition") if isinstance(f_dec_row, dict) else {}
                 pair_id = f"{grant.item_id}::{fac.item_id}"
-                user_prompt = SCORE_USER_PROMPT_TEMPLATE.format(
-                    grant_text=grant.text,
-                    grant_decomposition_json=json.dumps(g_dec, ensure_ascii=False),
-                    fac_text=fac.text,
-                    fac_decomposition_json=json.dumps(f_dec, ensure_ascii=False),
-                )
                 for aspect in ASPECTS:
+                    user_prompt = SCORE_USER_PROMPT_TEMPLATE.format(
+                        aspect=aspect,
+                        grant_text=grant.text,
+                        grant_aspect_items_json=json.dumps(g_dec.get(aspect, []), ensure_ascii=False),
+                        grant_decomposition_json=json.dumps(g_dec, ensure_ascii=False),
+                        fac_text=fac.text,
+                        fac_aspect_items_json=json.dumps(f_dec.get(aspect, []), ensure_ascii=False),
+                        fac_decomposition_json=json.dumps(f_dec, ensure_ascii=False),
+                    )
                     prompts.append(
                         build_prompt(
                             tokenizer,
