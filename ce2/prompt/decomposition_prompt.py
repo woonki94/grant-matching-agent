@@ -4,13 +4,14 @@ from __future__ import annotations
 DECOMPOSITION_BASE_RULES = """
 Rules:
 - Extract only information actually present or strongly implied by the text.
-- Use short noun phrases, usually 2-8 words.
+- Use short keyword phrases only.
 - Prefer phrases over full sentences.
 - Do not explain your reasoning.
 - Do not output chain-of-thought or <think> blocks.
-- Do not add "must", "should", or requirement wording unless those words are already part of the original phrase.
+- Do not add "must", "should", or requirement wording unless present in source.
 - If the aspect is absent, return an empty list.
 - Do not invent missing aspects.
+- Lowercase unless proper nouns.
 - Return exactly one JSON object and no markdown.
 
 Required schema:
@@ -25,6 +26,9 @@ You extract DOMAIN phrases from a short grant or faculty specialization keyword.
 
 Domain means the broad research/application area, problem area, field, or target use case.
 
+Length rule:
+- each domain item must be 1-3 words.
+
 Include phrases about:
 - research or application topic
 - problem area
@@ -33,9 +37,7 @@ Include phrases about:
 
 Do not include:
 - concrete methods or procedures
-- populations/entities unless they define the topic area
-- deliverables/products
-- deployment settings unless they define the domain
+- populations/entities unless they define the topic area itself
 
 {DECOMPOSITION_BASE_RULES}
 """.strip()
@@ -45,6 +47,9 @@ METHOD_DECOMPOSE_SYSTEM_PROMPT = f"""
 You extract METHOD phrases from a short grant or faculty specialization keyword.
 
 Method means concrete techniques, algorithms, procedures, analytical approaches, workflows, models, mechanisms, interventions, or service components.
+
+Length rule:
+- each method item must be 1-4 words.
 
 Include phrases about:
 - concrete methods or techniques
@@ -57,8 +62,7 @@ Include phrases about:
 Do not include:
 - broad topic/domain phrases
 - populations/entities unless they are part of a method phrase
-- deliverables/products unless they describe how work is done
-- settings or application environments
+- settings or application environments unless central to the method phrase
 
 {DECOMPOSITION_BASE_RULES}
 """.strip()
@@ -68,6 +72,10 @@ TARGET_DECOMPOSE_SYSTEM_PROMPT = f"""
 You extract TARGET phrases from a short grant or faculty specialization keyword.
 
 Target means the population, entity, system, material, organism, dataset object, community, or context being served or studied.
+
+Length rule:
+- each target item must be 1-4 words.
+- if target is unclear or implicit only, return [].
 
 Include phrases about:
 - populations, communities, beneficiaries, stakeholders, or study subjects
@@ -84,53 +92,10 @@ Do not include:
 """.strip()
 
 
-DELIVERABLE_DECOMPOSE_SYSTEM_PROMPT = f"""
-You extract DELIVERABLE phrases from a short grant or faculty specialization keyword.
-
-Deliverable means a concrete output, service, product, tool, model, report, training, software, infrastructure, or program expected or produced.
-
-Include phrases about:
-- software tools, datasets, models, reports, protocols, platforms, systems, infrastructure, or programs
-- services, interventions, training, assistance, or operational capabilities delivered
-- concrete outputs expected by a grant or produced by faculty work
-
-Do not include:
-- methods unless the method itself is the delivered service/component
-- broad domain phrases
-- targets unless they are part of the deliverable phrase
-- application settings
-
-{DECOMPOSITION_BASE_RULES}
-""".strip()
-
-
-APPLICATION_CONTEXT_DECOMPOSE_SYSTEM_PROMPT = f"""
-You extract APPLICATION CONTEXT phrases from a short grant or faculty specialization keyword.
-
-Application context means the setting, deployment environment, operational context, sector, institution type, geography, or real-world use environment.
-
-Include phrases about:
-- operational or deployment settings
-- sectors, institution types, geographies, field settings, or use environments
-- implementation or practice contexts
-- environmental, clinical, educational, industrial, community, or policy settings
-
-Do not include:
-- the target entity alone unless it describes a setting
-- methods or deliverables
-- broad domain phrases unless they clearly name an application setting
-- if no clear setting/deployment context is present, return an empty list
-
-{DECOMPOSITION_BASE_RULES}
-""".strip()
-
-
 DECOMPOSE_SYSTEM_PROMPTS_BY_ASPECT = {
     "domain": DOMAIN_DECOMPOSE_SYSTEM_PROMPT,
     "method": METHOD_DECOMPOSE_SYSTEM_PROMPT,
     "target": TARGET_DECOMPOSE_SYSTEM_PROMPT,
-    "deliverable": DELIVERABLE_DECOMPOSE_SYSTEM_PROMPT,
-    "application_context": APPLICATION_CONTEXT_DECOMPOSE_SYSTEM_PROMPT,
 }
 
 

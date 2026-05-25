@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # CE2 pilot:
-# 1) decompose grant/faculty specialization text into five aspects
+# 1) decompose grant/faculty specialization text into short-form 3 aspects
 # 2) score selected grant-faculty pairs on each aspect
 # 3) save analyzable JSONL + summary
 
@@ -21,9 +21,9 @@ FAC_DB="${FAC_DB:-ce/dataset/source/fac_specs_db.json}"
 
 RUN_ID="${RUN_ID:-$(date +%Y%m%d_%H%M%S)}"
 OUTPUT_DIR="${OUTPUT_DIR:-ce2/dataset/distill/runs}"
-DECOMPOSITION_OUTPUT="${DECOMPOSITION_OUTPUT:-${OUTPUT_DIR}/spec_decompositions_5aspect_splitprompt_${RUN_ID}.jsonl}"
-SCORES_OUTPUT="${SCORES_OUTPUT:-${OUTPUT_DIR}/decomposed_5aspect_splitprompt_pair_scores_${RUN_ID}.jsonl}"
-SUMMARY_OUTPUT="${SUMMARY_OUTPUT:-${OUTPUT_DIR}/decomposed_5aspect_splitprompt_pair_scores_summary_${RUN_ID}.json}"
+DECOMPOSITION_OUTPUT="${DECOMPOSITION_OUTPUT:-${OUTPUT_DIR}/spec_decompositions_3aspect_shortform_${RUN_ID}.jsonl}"
+SCORES_OUTPUT="${SCORES_OUTPUT:-${OUTPUT_DIR}/decomposed_3aspect_shortform_pair_scores_${RUN_ID}.jsonl}"
+SUMMARY_OUTPUT="${SUMMARY_OUTPUT:-${OUTPUT_DIR}/decomposed_3aspect_shortform_pair_scores_summary_${RUN_ID}.json}"
 
 SEED="${SEED:-42}"
 MAX_GRANT_SPECS="${MAX_GRANT_SPECS:-60}"

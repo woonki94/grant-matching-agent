@@ -53,9 +53,9 @@ MODEL_ID_DEFAULT = "Qwen/Qwen3-14B"
 GRANT_DB_DEFAULT = "ce/dataset/source/grant_keywords_spec_keywords_db.json"
 FAC_DB_DEFAULT = "ce/dataset/source/fac_specs_db.json"
 OUTPUT_DIR_DEFAULT = "ce2/dataset/distill"
-DECOMPOSITION_OUTPUT_DEFAULT = "ce2/dataset/distill/spec_decompositions_5aspect_splitprompt.jsonl"
-SCORES_OUTPUT_DEFAULT = "ce2/dataset/distill/decomposed_5aspect_splitprompt_pair_scores.jsonl"
-SUMMARY_OUTPUT_DEFAULT = "ce2/dataset/distill/decomposed_5aspect_splitprompt_pair_scores_summary.json"
+DECOMPOSITION_OUTPUT_DEFAULT = "ce2/dataset/distill/spec_decompositions_3aspect_shortform.jsonl"
+SCORES_OUTPUT_DEFAULT = "ce2/dataset/distill/decomposed_3aspect_shortform_pair_scores.jsonl"
+SUMMARY_OUTPUT_DEFAULT = "ce2/dataset/distill/decomposed_3aspect_shortform_pair_scores_summary.json"
 
 SEED_DEFAULT = 42
 MAX_GRANT_SPECS_DEFAULT = 80
@@ -71,7 +71,19 @@ TEMPERATURE_DEFAULT = 0.0
 TOP_P_DEFAULT = 0.9
 MAX_ATTEMPTS_DEFAULT = 2
 
-ASPECTS = ("domain", "method", "target", "deliverable", "application_context")
+ASPECTS = ("domain", "method", "target")
+
+ASPECT_WORD_LIMITS = {
+    "domain": 3,
+    "method": 4,
+    "target": 4,
+}
+
+ASPECT_MAX_ITEMS = {
+    "domain": 4,
+    "method": 4,
+    "target": 4,
+}
 
 
 @dataclass(frozen=True)
@@ -174,7 +186,7 @@ def _row_needs_redecompose(row: Dict[str, Any]) -> bool:
     if not isinstance(decomp, dict):
         return True
     # Force refresh when cached row is from an old schema
-    # (e.g., domain/method/constraints) instead of current 5-aspect schema.
+    # (e.g., domain/method/constraints or prior 5-aspect versions).
     if any(aspect not in decomp for aspect in ASPECTS):
         return True
     has_any = False
@@ -364,23 +376,6 @@ _METHOD_CUE_RE = re.compile(
     r")\b"
 )
 
-_CONTEXT_CUE_RE = re.compile(
-    r"\b("
-    r"consortium|institution\w*|university|college|school|classroom|community|"
-    r"clinic\w*|hospital\w*|laborator\w*|field|online|digital|platform|"
-    r"program|service|initiative|industry|policy|government|public|private|"
-    r"rural|urban|regional|state|country|international|environmental|clinical|educational"
-    r")\b"
-)
-
-_DELIVERABLE_CUE_RE = re.compile(
-    r"\b("
-    r"tool\w*|dataset\w*|model\w*|report\w*|protocol\w*|platform\w*|"
-    r"textbook\w*|resource\w*|content|software|infrastructure|program|service\w*|"
-    r"intervention\w*|training|guideline\w*"
-    r")\b"
-)
-
 
 def _dedupe_phrases(values: Sequence[str]) -> List[str]:
     seen: set[str] = set()
@@ -409,6 +404,73 @@ def _strip_capability_prefix(phrase: str) -> str:
     return normalize_ws(p)
 
 
+_SHORT_FILLER_WORDS = {
+    "a",
+    "an",
+    "the",
+    "of",
+    "for",
+    "with",
+    "to",
+    "in",
+    "on",
+    "and",
+    "or",
+    "by",
+    "via",
+    "through",
+    "including",
+    "involving",
+}
+
+_TRAILING_DROP_WORDS = {
+    "and",
+    "or",
+    "for",
+    "with",
+    "to",
+    "in",
+    "on",
+    "via",
+    "through",
+    "including",
+    "involving",
+}
+
+
+def _limit_words(phrase: str, *, max_words: int) -> str:
+    text = normalize_ws(phrase)
+    if not text:
+        return ""
+    words = text.split()
+    compact = [w for w in words if w.lower() not in _SHORT_FILLER_WORDS]
+    if compact:
+        words = compact
+    while words and words[-1].lower() in _TRAILING_DROP_WORDS:
+        words = words[:-1]
+    if len(words) <= int(max_words):
+        return " ".join(words)
+    return " ".join(words[: int(max_words)])
+
+
+def _normalize_aspect_items(aspect: str, values: Sequence[str]) -> List[str]:
+    max_words = int(ASPECT_WORD_LIMITS.get(aspect, 4))
+    max_items = int(ASPECT_MAX_ITEMS.get(aspect, 4))
+    out: List[str] = []
+    for raw in values:
+        phrase = normalize_ws(raw)
+        if not phrase:
+            continue
+        phrase = re.sub(r"^[\-\u2022\*\d\.\)\(]+\s*", "", phrase)
+        if aspect == "method":
+            phrase = _strip_capability_prefix(phrase)
+        phrase = _limit_words(phrase, max_words=max_words)
+        if not phrase:
+            continue
+        out.append(phrase)
+    return _dedupe_phrases(out)[:max_items]
+
+
 def _extract_method_fallbacks(text: str) -> List[str]:
     parts = re.split(r",|;", normalize_ws(text), flags=re.IGNORECASE)
     out: List[str] = []
@@ -419,35 +481,29 @@ def _extract_method_fallbacks(text: str) -> List[str]:
         if not _METHOD_CUE_RE.search(phrase.lower()):
             continue
         words = phrase.split()
-        if len(words) < 2:
+        if len(words) < 1:
             continue
-        out.append(phrase)
-    return _dedupe_phrases(out)
+        out.append(_limit_words(phrase, max_words=int(ASPECT_WORD_LIMITS["method"])))
+    return _normalize_aspect_items("method", out)
 
 
 def _clean_decomposition(text: str, decomp: Dict[str, List[str]]) -> Dict[str, List[str]]:
-    cleaned: Dict[str, List[str]] = {aspect: _dedupe_phrases(decomp.get(aspect, [])) for aspect in ASPECTS}
+    cleaned: Dict[str, List[str]] = {
+        aspect: _normalize_aspect_items(aspect, decomp.get(aspect, []))
+        for aspect in ASPECTS
+    }
 
     cleaned["method"] = [p for p in cleaned["method"] if _METHOD_CUE_RE.search(p.lower())]
     if not cleaned["method"]:
         cleaned["method"] = _extract_method_fallbacks(text)
 
-    cleaned["application_context"] = [
-        p for p in cleaned["application_context"] if _CONTEXT_CUE_RE.search(p.lower())
-    ]
-
-    cleaned["deliverable"] = [p for p in cleaned["deliverable"] if _DELIVERABLE_CUE_RE.search(p.lower())]
-
-    # Reduce cross-aspect duplication that hurts separability.
+    # Reduce cross-aspect duplication for cleaner training signals.
     method_keys = {p.casefold() for p in cleaned["method"]}
-    deliverable_keys = {p.casefold() for p in cleaned["deliverable"]}
-
     cleaned["target"] = [p for p in cleaned["target"] if p.casefold() not in method_keys]
     cleaned["domain"] = [p for p in cleaned["domain"] if p.casefold() not in method_keys]
-    cleaned["target"] = [p for p in cleaned["target"] if p.casefold() not in deliverable_keys]
 
     for aspect in ASPECTS:
-        cleaned[aspect] = _dedupe_phrases(cleaned[aspect])
+        cleaned[aspect] = _normalize_aspect_items(aspect, cleaned[aspect])
     return cleaned
 
 
@@ -794,7 +850,7 @@ def _build_summary(*, scores_path: Path, decomposition_path: Path, started_at: f
 
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="CE2 pilot: decompose specs and score five aspect pair matches.")
+    p = argparse.ArgumentParser(description="CE2 pilot: decompose specs and score short-form domain/method/target matches.")
     p.add_argument("--model-id", type=str, default=MODEL_ID_DEFAULT)
     p.add_argument("--grant-db", type=str, default=GRANT_DB_DEFAULT)
     p.add_argument("--fac-db", type=str, default=FAC_DB_DEFAULT)
