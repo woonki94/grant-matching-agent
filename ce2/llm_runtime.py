@@ -203,7 +203,8 @@ def generate_responses_batch(
     top_p: float,
 ) -> List[str]:
     backend = clean_text(llm_bundle.get("backend"))
-    if backend == "vllm":
+
+    def _generate_vllm(batch_prompts: Sequence[str]) -> List[str]:
         from vllm import SamplingParams
 
         params = SamplingParams(
@@ -211,18 +212,18 @@ def generate_responses_batch(
             temperature=float(max(0.0, temperature)),
             top_p=float(max(0.01, min(1.0, top_p))),
         )
-        outputs = llm_bundle["client"].generate(list(prompts), params)
+        outputs = llm_bundle["client"].generate(list(batch_prompts), params)
         texts: List[str] = []
         for out in outputs:
             texts.append(clean_text(out.outputs[0].text) if getattr(out, "outputs", None) else "")
         return texts
 
-    if backend == "hf":
+    def _generate_hf(batch_prompts: Sequence[str]) -> List[str]:
         import torch
 
         tokenizer = llm_bundle["tokenizer"]
         model = llm_bundle["client"]
-        enc = tokenizer(list(prompts), return_tensors="pt", padding=True, truncation=True)
+        enc = tokenizer(list(batch_prompts), return_tensors="pt", padding=True, truncation=True)
         device = next(model.parameters()).device
         enc = {k: v.to(device) for k, v in enc.items()}
         do_sample = float(temperature) > 0.0
@@ -245,4 +246,24 @@ def generate_responses_batch(
             texts.append(clean_text(tokenizer.decode(out_ids[i][prefix_len:], skip_special_tokens=True)))
         return texts
 
-    raise RuntimeError(f"Unsupported LLM backend: {backend}")
+    if backend == "vllm":
+        texts = _generate_vllm(prompts)
+    elif backend == "hf":
+        texts = _generate_hf(prompts)
+    else:
+        raise RuntimeError(f"Unsupported LLM backend: {backend}")
+
+    # Some vLLM/HF batched generations may return empty strings for a subset.
+    # Retry empty outputs one-by-one to recover without increasing batch memory.
+    missing = [i for i, txt in enumerate(texts) if not clean_text(txt)]
+    if missing:
+        retry_prompts = [prompts[i] for i in missing]
+        if backend == "vllm":
+            retry_texts = _generate_vllm(retry_prompts)
+        else:
+            retry_texts = _generate_hf(retry_prompts)
+        for idx, rtxt in zip(missing, retry_texts):
+            if clean_text(rtxt):
+                texts[idx] = rtxt
+
+    return texts

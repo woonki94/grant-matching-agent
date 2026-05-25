@@ -148,6 +148,23 @@ def _load_scored_pair_keys(path: Path) -> set[str]:
     return keys
 
 
+def _row_needs_redecompose(row: Dict[str, Any]) -> bool:
+    if not isinstance(row, dict):
+        return True
+    if not bool(row.get("parse_ok")):
+        return True
+    decomp = row.get("decomposition")
+    if not isinstance(decomp, dict):
+        return True
+    has_any = False
+    for aspect in ASPECTS:
+        value = decomp.get(aspect)
+        if isinstance(value, list) and any(normalize_ws(x) for x in value):
+            has_any = True
+            break
+    return not has_any
+
+
 def _load_grant_specs(path: Path, *, max_items: int, seed: int) -> List[SpecItem]:
     db = _read_json(path)
     grants = db.get("grants") if isinstance(db, dict) else []
@@ -373,7 +390,12 @@ def _decompose_specs(
                 item = bucket["item"]
                 decomp = bucket["decomposition"]
                 ok_map = bucket["ok"]
-                parse_ok = all(bool(ok_map.get(aspect)) for aspect in ASPECTS) and any(decomp[a] for a in ASPECTS)
+                parsed_aspects = [aspect for aspect in ASPECTS if bool(ok_map.get(aspect))]
+                nonempty_aspects = [aspect for aspect in ASPECTS if len(decomp.get(aspect, [])) > 0]
+                parse_ok = (
+                    len(parsed_aspects) >= max(1, len(ASPECTS) - 1)
+                    and len(nonempty_aspects) >= 1
+                )
                 row = {
                     "item_id": item.item_id,
                     "kind": item.kind,
@@ -381,15 +403,23 @@ def _decompose_specs(
                     "meta": item.meta,
                     "decomposition": decomp,
                     "parse_ok": bool(parse_ok),
+                    "decomposition_parse": {
+                        "parsed_aspects_count": int(len(parsed_aspects)),
+                        "nonempty_aspects_count": int(len(nonempty_aspects)),
+                        "parsed_aspects": parsed_aspects,
+                        "nonempty_aspects": nonempty_aspects,
+                    },
                     "attempt": int(attempt + 1),
                     "model_id": model_id,
                     "raw_responses": bucket["raw_responses"],
                 }
-                if parse_ok:
+                # Accept partial-but-usable decompositions to avoid losing most rows
+                # when one aspect response is malformed/truncated.
+                if len(parsed_aspects) == 0:
+                    next_pending.append(item)
+                else:
                     existing[item.item_id] = row
                     rows.append(row)
-                else:
-                    next_pending.append(item)
             _append_jsonl(output_path, rows)
         pending = next_pending
         if pending:
@@ -662,6 +692,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--gpu-memory-utilization", type=float, default=0.90)
     p.add_argument("--tensor-parallel-size", type=int, default=1)
     p.add_argument("--overwrite", action="store_true", help="Remove existing ce2 decomposition/score outputs before running.")
+    p.add_argument(
+        "--refresh-failed-decompositions",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Re-run decomposition for cached rows that are parse-failed or all-empty.",
+    )
     p.add_argument("--decompose-only", action="store_true")
     p.add_argument("--score-only", action="store_true")
     return p.parse_args()
@@ -714,6 +750,19 @@ def main() -> int:
             tensor_parallel_size=args.tensor_parallel_size,
         )
         decompositions = _load_jsonl_by_key(decomposition_path, "item_id")
+        if args.refresh_failed_decompositions:
+            before = len(decompositions)
+            decompositions = {
+                item_id: row
+                for item_id, row in decompositions.items()
+                if not _row_needs_redecompose(row)
+            }
+            refreshed = before - len(decompositions)
+            if refreshed > 0:
+                print(
+                    f"decompose_refresh_failed_or_empty={refreshed} "
+                    f"decompose_cached_kept={len(decompositions)}"
+                )
         if not args.score_only:
             decompositions = _decompose_specs(
                 llm_bundle=bundle,

@@ -43,6 +43,7 @@ GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.90}"
 TENSOR_PARALLEL_SIZE="${TENSOR_PARALLEL_SIZE:-1}"
 
 OVERWRITE="${OVERWRITE:-false}"
+REFRESH_FAILED_DECOMPOSITIONS="${REFRESH_FAILED_DECOMPOSITIONS:-true}"
 DECOMPOSE_ONLY="${DECOMPOSE_ONLY:-false}"
 SCORE_ONLY="${SCORE_ONLY:-false}"
 
@@ -82,6 +83,11 @@ CMD=(
 
 if [[ "${OVERWRITE}" == "true" ]]; then
   CMD+=(--overwrite)
+fi
+if [[ "${REFRESH_FAILED_DECOMPOSITIONS}" == "true" ]]; then
+  CMD+=(--refresh-failed-decompositions)
+else
+  CMD+=(--no-refresh-failed-decompositions)
 fi
 if [[ "${DECOMPOSE_ONLY}" == "true" ]]; then
   CMD+=(--decompose-only)
