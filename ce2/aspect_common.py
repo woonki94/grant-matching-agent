@@ -3,7 +3,6 @@ from __future__ import annotations
 import json
 import math
 import random
-import re
 import time
 from collections import Counter
 from dataclasses import dataclass
@@ -15,12 +14,13 @@ from ce2.llm_runtime import clean_text, normalize_ws, score_to_band
 
 
 MODEL_ID_DEFAULT = "Qwen/Qwen3-14B"
-GRANT_DB_DEFAULT = "ce/dataset/source/grant_keywords_spec_keywords_db.json"
-FAC_DB_DEFAULT = "ce/dataset/source/fac_specs_db.json"
+GRANT_DB_DEFAULT = "ce2/dataset/source/grant_keywords_spec_keywords_db.json"
+FAC_DB_DEFAULT = "ce2/dataset/source/fac_specs_db.json"
 OUTPUT_DIR_DEFAULT = "ce2/dataset/distill"
 DECOMPOSITION_OUTPUT_DEFAULT = "ce2/dataset/distill/spec_decompositions_3aspect_shortform.jsonl"
 SCORES_OUTPUT_DEFAULT = "ce2/dataset/distill/decomposed_3aspect_shortform_pair_scores.jsonl"
 SUMMARY_OUTPUT_DEFAULT = "ce2/dataset/distill/decomposed_3aspect_shortform_pair_scores_summary.json"
+STS_CACHE_PATH_DEFAULT = "ce2/dataset/source/spec_facspec_sts_cache.jsonl"
 
 SEED_DEFAULT = 42
 MAX_GRANT_SPECS_DEFAULT = 80
@@ -43,6 +43,7 @@ ASPECT_PREFILTER_LOW_PER_ASPECT_DEFAULT = 2
 ASPECT_PREFILTER_HIGH_POOL_SIZE_DEFAULT = 24
 ASPECT_PREFILTER_MID_RANK_START_DEFAULT = 24
 ASPECT_PREFILTER_MID_RANK_END_DEFAULT = 220
+STS_CACHE_LOW_TAIL_POOL_DEFAULT = 400
 
 
 @dataclass(frozen=True)
@@ -208,68 +209,59 @@ def load_fac_specs(path: Path, *, max_items: int, seed: int) -> List[SpecItem]:
     return items
 
 
-_STOPWORDS = {
-    "a",
-    "an",
-    "and",
-    "are",
-    "as",
-    "at",
-    "be",
-    "by",
-    "for",
-    "from",
-    "in",
-    "including",
-    "into",
-    "of",
-    "on",
-    "or",
-    "that",
-    "the",
-    "to",
-    "using",
-    "with",
-}
-
-
-def _tokens(text: str) -> List[str]:
-    return [t for t in re.findall(r"[a-z0-9][a-z0-9\-]{2,}", clean_text(text).lower()) if t not in _STOPWORDS]
-
-
-def _weighted_overlap_score(query_tokens: Sequence[str], doc_tokens: Sequence[str], idf: Dict[str, float]) -> float:
-    q = set(query_tokens)
-    d = set(doc_tokens)
-    if not q or not d:
-        return 0.0
-    inter = q & d
-    if not inter:
-        return 0.0
-    inter_w = sum(idf.get(t, 1.0) for t in inter)
-    denom = math.sqrt(sum(idf.get(t, 1.0) ** 2 for t in q)) * math.sqrt(sum(idf.get(t, 1.0) ** 2 for t in d))
-    return float(inter_w / max(denom, 1e-9))
-
-def _aspect_text_for_item(
-    item: SpecItem,
-    *,
-    aspect: str,
-    decompositions: Dict[str, Dict[str, Any]],
-) -> str:
-    row = decompositions.get(item.item_id, {})
-    decomp = row.get("decomposition") if isinstance(row, dict) else {}
-    values = decomp.get(aspect) if isinstance(decomp, dict) else []
-    if isinstance(values, list):
-        phrases = [normalize_ws(v) for v in values if normalize_ws(v)]
-        if phrases:
-            return " ".join(phrases)
-    return item.text
+def load_sts_cache(path: Path) -> Dict[str, List[Tuple[str, float]]]:
+    if not path.exists():
+        raise FileNotFoundError(f"STS cache not found: {path}")
+    out: Dict[str, List[Tuple[str, float]]] = {}
+    with path.open("r", encoding="utf-8") as f:
+        for raw in f:
+            line = clean_text(raw)
+            if not line:
+                continue
+            try:
+                row = json.loads(line)
+            except Exception:
+                continue
+            if not isinstance(row, dict):
+                continue
+            grant_id = clean_text(row.get("grant_id"))
+            try:
+                spec_idx = int(row.get("spec_idx"))
+            except Exception:
+                continue
+            grant_item_id = f"grant:{grant_id}:{spec_idx}"
+            cands = row.get("candidates")
+            if not isinstance(cands, list):
+                continue
+            parsed: List[Tuple[str, float]] = []
+            for c in cands:
+                if not isinstance(c, dict):
+                    continue
+                fac_id = c.get("fac_id")
+                fac_spec_id = c.get("fac_spec_id")
+                fac_spec_idx = c.get("fac_spec_idx")
+                if fac_id is None or fac_spec_id is None or fac_spec_idx is None:
+                    continue
+                fac_item_id = f"fac:{fac_id}:{fac_spec_id}:{fac_spec_idx}"
+                score_val = c.get("sts_score", c.get("cosine_score", 0.0))
+                try:
+                    score = float(score_val)
+                except Exception:
+                    score = 0.0
+                parsed.append((fac_item_id, score))
+            if parsed:
+                parsed.sort(key=lambda x: x[1], reverse=True)
+                out[grant_item_id] = parsed
+    if not out:
+        raise RuntimeError(f"STS cache loaded but empty or malformed: {path}")
+    return out
 
 
 def select_pairs_aspect_prefilter(
     grant_specs: Sequence[SpecItem],
     fac_specs: Sequence[SpecItem],
     *,
-    decompositions: Dict[str, Dict[str, Any]],
+    sts_cache: Dict[str, List[Tuple[str, float]]],
     seed: int,
     high_per_aspect: int = ASPECT_PREFILTER_HIGH_PER_ASPECT_DEFAULT,
     mid_per_aspect: int = ASPECT_PREFILTER_MID_PER_ASPECT_DEFAULT,
@@ -279,8 +271,9 @@ def select_pairs_aspect_prefilter(
     mid_rank_end: int = ASPECT_PREFILTER_MID_RANK_END_DEFAULT,
 ) -> List[Tuple[SpecItem, SpecItem, float, str]]:
     rng = random.Random(int(seed) + 911)
-    n_fac = len(fac_specs)
+    fac_by_id = {f.item_id: f for f in fac_specs}
     selected: Dict[str, Dict[str, Any]] = {}
+    print(f"prefilter_method=sts_cache grants_in_cache={len(sts_cache)}")
 
     def _add_pair(grant: SpecItem, fac: SpecItem, score: float, source: str) -> None:
         pair_id = f"{grant.item_id}::{fac.item_id}"
@@ -297,70 +290,42 @@ def select_pairs_aspect_prefilter(
         bucket["sources"].add(source)
 
     for aspect_idx, aspect in enumerate(ASPECTS):
-        grant_aspect_texts = [
-            _aspect_text_for_item(g, aspect=aspect, decompositions=decompositions)
-            for g in grant_specs
-        ]
-        fac_aspect_texts = [
-            _aspect_text_for_item(f, aspect=aspect, decompositions=decompositions)
-            for f in fac_specs
-        ]
-        grant_tokens = [_tokens(t) for t in grant_aspect_texts]
-        fac_tokens = [_tokens(t) for t in fac_aspect_texts]
+        aspect_rng = random.Random(int(seed) + 911 + (aspect_idx + 1) * 7919)
+        mid_start = max(0, int(mid_rank_start))
+        mid_end = max(mid_start, int(mid_rank_end))
+        low_tail = max(32, int(STS_CACHE_LOW_TAIL_POOL_DEFAULT))
 
-        df: Counter[str] = Counter()
-        for toks in (*grant_tokens, *fac_tokens):
-            df.update(set(toks))
-        n_docs = max(1, len(grant_tokens) + len(fac_tokens))
-        idf = {tok: math.log((1.0 + n_docs) / (1.0 + cnt)) + 1.0 for tok, cnt in df.items()}
+        for grant in grant_specs:
+            ranked = sts_cache.get(grant.item_id, [])
+            ranked = [(fid, s) for fid, s in ranked if fid in fac_by_id]
+            ranked_ids = [fid for fid, _ in ranked]
+            if not ranked_ids:
+                continue
+            score_by_id = {fid: float(s) for fid, s in ranked}
 
-        posting: Dict[str, List[int]] = {}
-        for fac_idx, toks in enumerate(fac_tokens):
-            for tok in set(toks):
-                posting.setdefault(tok, []).append(fac_idx)
-
-        for grant_idx, grant in enumerate(grant_specs):
-            gtoks = grant_tokens[grant_idx]
-            candidate_idx: set[int] = set()
-            for tok in set(gtoks):
-                for idx in posting.get(tok, []):
-                    candidate_idx.add(idx)
-
-            scored: List[Tuple[float, int]] = []
-            for idx in candidate_idx:
-                score = _weighted_overlap_score(gtoks, fac_tokens[idx], idf)
-                scored.append((float(score), idx))
-            scored.sort(key=lambda x: x[0], reverse=True)
-
-            high_pool = [idx for _, idx in scored[: max(0, int(high_pool_size))]]
+            high_pool = ranked_ids[: max(0, int(high_pool_size))]
             high_k = min(max(0, int(high_per_aspect)), len(high_pool))
-            high_pick = rng.sample(high_pool, high_k) if high_k > 0 else []
+            high_pick = aspect_rng.sample(high_pool, high_k) if high_k > 0 else []
 
-            mid_start = max(0, int(mid_rank_start))
-            mid_end = max(mid_start, int(mid_rank_end))
-            mid_pool = [idx for _, idx in scored[mid_start:mid_end]]
+            mid_pool = ranked_ids[mid_start:mid_end]
             mid_k = min(max(0, int(mid_per_aspect)), len(mid_pool))
-            mid_pick = rng.sample(mid_pool, mid_k) if mid_k > 0 else []
+            mid_pick = aspect_rng.sample(mid_pool, mid_k) if mid_k > 0 else []
 
-            tail_from_scored = [idx for _, idx in scored[mid_end:]]
-            zero_pool = [idx for idx in range(n_fac) if idx not in candidate_idx]
-            low_pool = zero_pool if zero_pool else tail_from_scored
+            low_pool = ranked_ids[max(mid_end, len(ranked_ids) - low_tail) :]
             if not low_pool:
-                low_pool = list(range(n_fac))
+                low_pool = ranked_ids
             low_k = min(max(0, int(low_per_aspect)), len(low_pool))
-            low_pick = rng.sample(low_pool, low_k) if low_k > 0 else []
+            low_pick = aspect_rng.sample(low_pool, low_k) if low_k > 0 else []
 
-            score_lookup = {idx: s for s, idx in scored}
-
-            for idx in high_pick:
-                fac = fac_specs[idx]
-                _add_pair(grant, fac, score_lookup.get(idx, 0.0), f"apf_{aspect}_high")
-            for idx in mid_pick:
-                fac = fac_specs[idx]
-                _add_pair(grant, fac, score_lookup.get(idx, 0.0), f"apf_{aspect}_mid")
-            for idx in low_pick:
-                fac = fac_specs[idx]
-                _add_pair(grant, fac, score_lookup.get(idx, 0.0), f"apf_{aspect}_low")
+            for fac_id in high_pick:
+                fac = fac_by_id[fac_id]
+                _add_pair(grant, fac, score_by_id.get(fac_id, 0.0), f"apf_{aspect}_high")
+            for fac_id in mid_pick:
+                fac = fac_by_id[fac_id]
+                _add_pair(grant, fac, score_by_id.get(fac_id, 0.0), f"apf_{aspect}_mid")
+            for fac_id in low_pick:
+                fac = fac_by_id[fac_id]
+                _add_pair(grant, fac, score_by_id.get(fac_id, 0.0), f"apf_{aspect}_low")
 
     pairs: List[Tuple[SpecItem, SpecItem, float, str]] = []
     for item in selected.values():

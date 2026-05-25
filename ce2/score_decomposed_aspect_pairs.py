@@ -23,12 +23,14 @@ if str(PROJECT_ROOT) not in sys.path:
 from ce2.aspect_common import (
     FAC_DB_DEFAULT,
     GRANT_DB_DEFAULT,
+    STS_CACHE_PATH_DEFAULT,
     ASPECT_PREFILTER_HIGH_PER_ASPECT_DEFAULT,
     ASPECT_PREFILTER_MID_PER_ASPECT_DEFAULT,
     ASPECT_PREFILTER_LOW_PER_ASPECT_DEFAULT,
     ASPECT_PREFILTER_HIGH_POOL_SIZE_DEFAULT,
     ASPECT_PREFILTER_MID_RANK_START_DEFAULT,
     ASPECT_PREFILTER_MID_RANK_END_DEFAULT,
+    load_sts_cache,
     MAX_ATTEMPTS_DEFAULT,
     MAX_FAC_SPECS_DEFAULT,
     MAX_GRANT_SPECS_DEFAULT,
@@ -68,6 +70,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--fac-db", type=str, default=FAC_DB_DEFAULT)
     p.add_argument("--output-dir", type=str, default=OUTPUT_DIR_DEFAULT)
     p.add_argument("--decomposition-output", type=str, default=DECOMPOSITION_OUTPUT_DEFAULT)
+    p.add_argument("--sts-cache", type=str, default=STS_CACHE_PATH_DEFAULT)
     p.add_argument("--scores-output", type=str, default=SCORES_OUTPUT_DEFAULT)
     p.add_argument("--summary-output", type=str, default=SUMMARY_OUTPUT_DEFAULT)
     p.add_argument("--seed", type=int, default=SEED_DEFAULT)
@@ -90,6 +93,7 @@ def main() -> int:
     args = parse_args()
     output_dir = resolve_path(PROJECT_ROOT, args.output_dir)
     decomposition_path = resolve_path(PROJECT_ROOT, args.decomposition_output)
+    sts_cache_path = resolve_path(PROJECT_ROOT, args.sts_cache)
     scores_path = resolve_path(PROJECT_ROOT, args.scores_output)
     summary_path = resolve_path(PROJECT_ROOT, args.summary_output)
     if not decomposition_path.exists():
@@ -104,10 +108,11 @@ def main() -> int:
     grant_specs = load_grant_specs(resolve_path(PROJECT_ROOT, args.grant_db), max_items=args.max_grant_specs, seed=args.seed)
     fac_specs = load_fac_specs(resolve_path(PROJECT_ROOT, args.fac_db), max_items=args.max_fac_specs, seed=args.seed)
     decompositions = load_jsonl_by_key(decomposition_path, "item_id")
+    sts_cache = load_sts_cache(sts_cache_path)
     pairs = select_pairs_aspect_prefilter(
         grant_specs,
         fac_specs,
-        decompositions=decompositions,
+        sts_cache=sts_cache,
         seed=args.seed,
     )
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -117,6 +122,7 @@ def main() -> int:
         "grant_db": str(resolve_path(PROJECT_ROOT, args.grant_db)),
         "fac_db": str(resolve_path(PROJECT_ROOT, args.fac_db)),
         "decomposition_output": str(decomposition_path),
+        "sts_cache": str(sts_cache_path),
         "scores_output": str(scores_path),
         "summary_output": str(summary_path),
         "seed": int(args.seed),
@@ -125,6 +131,7 @@ def main() -> int:
         "grant_specs_loaded": len(grant_specs),
         "fac_specs_loaded": len(fac_specs),
         "decompositions_loaded": len(decompositions),
+        "sts_cache_grants": len(sts_cache),
         "candidate_pairs": len(pairs),
         "pair_selection": "aspect_prefilter_balanced",
         "prefilter_high_per_aspect": int(ASPECT_PREFILTER_HIGH_PER_ASPECT_DEFAULT),
@@ -133,6 +140,7 @@ def main() -> int:
         "prefilter_high_pool_size": int(ASPECT_PREFILTER_HIGH_POOL_SIZE_DEFAULT),
         "prefilter_mid_rank_start": int(ASPECT_PREFILTER_MID_RANK_START_DEFAULT),
         "prefilter_mid_rank_end": int(ASPECT_PREFILTER_MID_RANK_END_DEFAULT),
+        "prefilter_method": "sts_cache",
         "use_tqdm": True,
     }
     print(json.dumps(config, ensure_ascii=False))
