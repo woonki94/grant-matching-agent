@@ -230,6 +230,9 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--fac-db", type=str, default=FAC_DB_CE2_DEFAULT)
     p.add_argument("--decomposition-output", type=str, default=DECOMPOSITION_OUTPUT_DEFAULT)
     p.add_argument("--output", type=str, default=PREFILTER_CE_OUTPUT_DEFAULT)
+    p.add_argument("--output-domain", type=str, default="")
+    p.add_argument("--output-method", type=str, default="")
+    p.add_argument("--output-target", type=str, default="")
     p.add_argument("--manifest", type=str, default=PREFILTER_CE_MANIFEST_DEFAULT)
     p.add_argument("--seed", type=int, default=SEED_DEFAULT)
     p.add_argument("--max-grant-specs", type=int, default=MAX_GRANT_SPECS_DEFAULT)
@@ -240,12 +243,43 @@ def _build_parser() -> argparse.ArgumentParser:
     return p
 
 
+def _derive_aspect_output_paths(
+    *,
+    output_base_path: Path,
+    output_domain: str,
+    output_method: str,
+    output_target: str,
+) -> Dict[str, Path]:
+    base_name = output_base_path.name
+    base_stem = output_base_path.stem if output_base_path.suffix else base_name
+    base_dir = output_base_path.parent
+    default_paths = {
+        "domain": (base_dir / f"{base_stem}_domain.jsonl").resolve(),
+        "method": (base_dir / f"{base_stem}_method.jsonl").resolve(),
+        "target": (base_dir / f"{base_stem}_target.jsonl").resolve(),
+    }
+    out = dict(default_paths)
+    if clean_text(output_domain):
+        out["domain"] = resolve_path(PROJECT_ROOT, output_domain)
+    if clean_text(output_method):
+        out["method"] = resolve_path(PROJECT_ROOT, output_method)
+    if clean_text(output_target):
+        out["target"] = resolve_path(PROJECT_ROOT, output_target)
+    return out
+
+
 def main() -> int:
     args = _build_parser().parse_args()
     started = time.time()
 
     decomposition_path = resolve_path(PROJECT_ROOT, args.decomposition_output)
-    output_path = resolve_path(PROJECT_ROOT, args.output)
+    output_base_path = resolve_path(PROJECT_ROOT, args.output)
+    aspect_output_paths = _derive_aspect_output_paths(
+        output_base_path=output_base_path,
+        output_domain=args.output_domain,
+        output_method=args.output_method,
+        output_target=args.output_target,
+    )
     manifest_path = resolve_path(PROJECT_ROOT, args.manifest)
 
     if not decomposition_path.exists():
@@ -304,22 +338,25 @@ def main() -> int:
             for f in fac_specs
         ]
 
-    output_path.parent.mkdir(parents=True, exist_ok=True)
+    for path in aspect_output_paths.values():
+        path.parent.mkdir(parents=True, exist_ok=True)
     manifest_path.parent.mkdir(parents=True, exist_ok=True)
 
     bar = _try_tqdm(total=len(grant_specs))
     rows_written = 0
     per_aspect_candidate_counts = {aspect: 0 for aspect in ASPECTS}
 
-    with output_path.open("w", encoding="utf-8") as out_f:
+    with (
+        aspect_output_paths["domain"].open("w", encoding="utf-8") as out_domain,
+        aspect_output_paths["method"].open("w", encoding="utf-8") as out_method,
+        aspect_output_paths["target"].open("w", encoding="utf-8") as out_target,
+    ):
+        writers = {
+            "domain": out_domain,
+            "method": out_method,
+            "target": out_target,
+        }
         for grant in grant_specs:
-            row: Dict[str, Any] = {
-                "grant_item_id": grant.item_id,
-                "grant_id": grant.meta.get("grant_id"),
-                "grant_spec_idx": grant.meta.get("grant_spec_idx"),
-                "grant_text": grant.text,
-                "aspects": {},
-            }
             for aspect in ASPECTS:
                 query_text = _aspect_text_for_item(grant, aspect=aspect, decompositions=decompositions)
                 logits = _score_query_against_docs(
@@ -339,12 +376,17 @@ def main() -> int:
                     )
                 )
                 per_aspect_candidate_counts[aspect] += int(len(candidates))
-                row["aspects"][aspect] = {
+                row: Dict[str, Any] = {
+                    "grant_item_id": grant.item_id,
+                    "grant_id": grant.meta.get("grant_id"),
+                    "grant_spec_idx": grant.meta.get("grant_spec_idx"),
+                    "grant_text": grant.text,
+                    "aspect": aspect,
                     "query_text": query_text,
                     "candidates": candidates,
                 }
+                writers[aspect].write(json.dumps(row, ensure_ascii=False) + "\n")
 
-            out_f.write(json.dumps(row, ensure_ascii=False) + "\n")
             rows_written += 1
             if bar is not None:
                 bar.update(1)
@@ -369,7 +411,7 @@ def main() -> int:
         "grant_db": str(grant_db) if "grant_db" in locals() and grant_db is not None else "",
         "fac_db": str(fac_db) if "fac_db" in locals() and fac_db is not None else "",
         "decomposition_output": str(decomposition_path),
-        "output": str(output_path),
+        "outputs": {k: str(v) for k, v in aspect_output_paths.items()},
         "aspects": list(ASPECTS),
         "seed": int(args.seed),
         "max_grant_specs": int(args.max_grant_specs),
@@ -388,7 +430,9 @@ def main() -> int:
     }
     manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
-    print(f"output={output_path}")
+    print(f"output_domain={aspect_output_paths['domain']}")
+    print(f"output_method={aspect_output_paths['method']}")
+    print(f"output_target={aspect_output_paths['target']}")
     print(f"manifest={manifest_path}")
     print(f"device={device}")
     print(f"rows_written={rows_written}")
