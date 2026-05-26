@@ -20,9 +20,10 @@ PROJECT_ROOT = _find_project_root()
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from ce2.aspect_common import (
+from ce2.data_preparation.utils import (  # noqa: E402
     DECOMPOSE_BATCH_SIZE_DEFAULT,
     DECOMPOSE_MAX_NEW_TOKENS_DEFAULT,
+    DECOMPOSITION_DIR_DEFAULT,
     DECOMPOSITION_OUTPUT_DEFAULT,
     FAC_DB_DEFAULT,
     GRANT_DB_DEFAULT,
@@ -31,18 +32,17 @@ from ce2.aspect_common import (
     MAX_GRANT_SPECS_DEFAULT,
     MAX_MODEL_LEN_DEFAULT,
     MODEL_ID_DEFAULT,
-    OUTPUT_DIR_DEFAULT,
     SEED_DEFAULT,
     TEMPERATURE_DEFAULT,
     TOP_P_DEFAULT,
+    decompose_specs,
     load_fac_specs,
     load_grant_specs,
     load_jsonl_by_key,
     refresh_decomposition_cache,
     resolve_path,
 )
-from ce2.aspect_decomposition_utils import decompose_specs
-from ce2.llm_runtime import load_llm, unload_llm
+from ce2.data_preparation.llm_runtime import load_llm, unload_llm  # noqa: E402
 
 
 def _unlink_if_exists(path: Path) -> None:
@@ -55,7 +55,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--model-id", type=str, default=MODEL_ID_DEFAULT)
     p.add_argument("--grant-db", type=str, default=GRANT_DB_DEFAULT)
     p.add_argument("--fac-db", type=str, default=FAC_DB_DEFAULT)
-    p.add_argument("--output-dir", type=str, default=OUTPUT_DIR_DEFAULT)
+    p.add_argument("--output-dir", type=str, default=DECOMPOSITION_DIR_DEFAULT)
     p.add_argument("--decomposition-output", type=str, default=DECOMPOSITION_OUTPUT_DEFAULT)
     p.add_argument("--seed", type=int, default=SEED_DEFAULT)
     p.add_argument("--max-grant-specs", type=int, default=MAX_GRANT_SPECS_DEFAULT)

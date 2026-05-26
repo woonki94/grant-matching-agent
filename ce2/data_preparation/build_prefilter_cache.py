@@ -2,13 +2,11 @@ from __future__ import annotations
 
 import argparse
 import json
-import math
-import random
 import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Sequence
+from typing import Any, Dict, List
 
 
 def _find_project_root() -> Path:
@@ -23,31 +21,36 @@ PROJECT_ROOT = _find_project_root()
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from ce2.aspect_common import (  # noqa: E402
+from ce2.data_preparation.utils import (  # noqa: E402
     ASPECTS,
     DECOMPOSITION_OUTPUT_DEFAULT,
-    FAC_DB_DEFAULT as FAC_DB_FALLBACK_DEFAULT,
-    GRANT_DB_DEFAULT as GRANT_DB_FALLBACK_DEFAULT,
+    FAC_DB_DEFAULT,
+    GRANT_DB_DEFAULT,
     MAX_FAC_SPECS_DEFAULT,
     MAX_GRANT_SPECS_DEFAULT,
+    PREFILTER_CACHE_BATCH_SIZE_DEFAULT,
+    PREFILTER_CACHE_MANIFEST_DEFAULT,
+    PREFILTER_CACHE_MAX_LENGTH_DEFAULT,
+    PREFILTER_CACHE_MODEL_ID_DEFAULT,
+    PREFILTER_CACHE_OUTPUT_DEFAULT,
+    PREFILTER_CACHE_TOP_K_PER_ASPECT_DEFAULT,
     SEED_DEFAULT,
-    SpecItem,
+    iter_topk_candidates,
     load_fac_specs,
     load_grant_specs,
     load_jsonl_by_key,
+    load_specs_from_decompositions,
+    prefilter_cache_paths,
     resolve_path,
+    score_query_against_docs,
+    _aspect_text_for_item,
+    _pick_device,
 )
-from ce2.llm_runtime import clean_text, normalize_ws  # noqa: E402
+from ce2.data_preparation.llm_runtime import clean_text  # noqa: E402
 
 
-PREFILTER_CE_MODEL_ID_DEFAULT = "dleemiller/ModernCE-base-sts"
 GRANT_DB_CE2_DEFAULT = "ce2/dataset/source/grant_keywords_spec_keywords_db.json"
 FAC_DB_CE2_DEFAULT = "ce2/dataset/source/fac_specs_db.json"
-PREFILTER_CE_OUTPUT_DEFAULT = "ce2/dataset/distill/aspect_prefilter_ce_cache.jsonl"
-PREFILTER_CE_MANIFEST_DEFAULT = "ce2/dataset/distill/aspect_prefilter_ce_cache.manifest.json"
-PREFILTER_CE_BATCH_SIZE_DEFAULT = 64
-PREFILTER_CE_MAX_LENGTH_DEFAULT = 256
-PREFILTER_CE_TOP_K_PER_ASPECT_DEFAULT = 256
 
 
 def _safe_int(value: Any, *, default: int, minimum: int, maximum: int) -> int:
@@ -66,180 +69,32 @@ def _try_tqdm(total: int) -> Any:
     try:
         from tqdm.auto import tqdm
 
-        return tqdm(total=total, desc="Aspect CE prefilter", unit="grant", dynamic_ncols=True)
+        return tqdm(total=total, desc="CE prefilter", unit="grant", dynamic_ncols=True)
     except Exception:
         return None
-
-
-def _pick_device() -> Any:
-    import torch
-
-    if torch.cuda.is_available():
-        return torch.device("cuda")
-    if torch.backends.mps.is_available():
-        return torch.device("mps")
-    return torch.device("cpu")
-
-
-def _to_device(batch: Dict[str, Any], device: Any) -> Dict[str, Any]:
-    return {k: v.to(device) for k, v in batch.items()}
-
-
-def _aspect_text_for_item(
-    item: SpecItem,
-    *,
-    aspect: str,
-    decompositions: Dict[str, Dict[str, Any]],
-) -> str:
-    row = decompositions.get(item.item_id, {})
-    decomp = row.get("decomposition") if isinstance(row, dict) else {}
-    values = decomp.get(aspect) if isinstance(decomp, dict) else []
-    if isinstance(values, list):
-        phrases = [normalize_ws(v) for v in values if normalize_ws(v)]
-        if phrases:
-            return " ".join(phrases)
-    return normalize_ws(item.text)
-
-
-def _kind_from_row(item_id: str, row_kind: Any) -> str:
-    kind = clean_text(row_kind).lower()
-    if kind in {"grant", "faculty"}:
-        return kind
-    if item_id.startswith("grant:"):
-        return "grant"
-    if item_id.startswith("fac:"):
-        return "faculty"
-    return kind or "unknown"
-
-
-def _load_specs_from_decompositions(
-    *,
-    decompositions: Dict[str, Dict[str, Any]],
-    max_grant_specs: int,
-    max_fac_specs: int,
-    seed: int,
-) -> tuple[List[SpecItem], List[SpecItem]]:
-    grant_specs: List[SpecItem] = []
-    fac_specs: List[SpecItem] = []
-
-    for item_id, row in decompositions.items():
-        if not isinstance(row, dict):
-            continue
-        iid = clean_text(item_id) or clean_text(row.get("item_id"))
-        if not iid:
-            continue
-        kind = _kind_from_row(iid, row.get("kind"))
-        text = normalize_ws(row.get("text"))
-        if not text:
-            continue
-        meta = row.get("meta") if isinstance(row.get("meta"), dict) else {}
-        item = SpecItem(item_id=iid, kind=kind, text=text, meta=meta)
-        if kind == "grant":
-            grant_specs.append(item)
-        elif kind == "faculty":
-            fac_specs.append(item)
-
-    rng = random.Random(int(seed))
-    rng.shuffle(grant_specs)
-    rng = random.Random(int(seed) + 13)
-    rng.shuffle(fac_specs)
-
-    if int(max_grant_specs) > 0:
-        grant_specs = grant_specs[: int(max_grant_specs)]
-    if int(max_fac_specs) > 0:
-        fac_specs = fac_specs[: int(max_fac_specs)]
-    return grant_specs, fac_specs
-
-
-def _sigmoid(x: float) -> float:
-    if x >= 0:
-        z = math.exp(-x)
-        return 1.0 / (1.0 + z)
-    z = math.exp(x)
-    return z / (1.0 + z)
-
-
-def _score_query_against_docs(
-    *,
-    model: Any,
-    tokenizer: Any,
-    query_text: str,
-    docs: Sequence[str],
-    device: Any,
-    batch_size: int,
-    max_length: int,
-) -> List[float]:
-    import torch
-
-    scores: List[float] = []
-    step = max(1, int(batch_size))
-    with torch.no_grad():
-        for i in range(0, len(docs), step):
-            docs_batch = list(docs[i : i + step])
-            q_batch = [query_text] * len(docs_batch)
-            enc = tokenizer(
-                q_batch,
-                docs_batch,
-                max_length=int(max_length),
-                truncation=True,
-                padding=True,
-                return_tensors="pt",
-            )
-            enc = _to_device(enc, device)
-            logits = model(**enc).logits
-            if logits.ndim == 2 and logits.shape[-1] > 1:
-                vals = logits[:, -1]
-            else:
-                vals = logits.squeeze(-1)
-            scores.extend(float(x) for x in vals.detach().cpu().tolist())
-    return scores
-
-
-def _iter_topk_candidates(
-    *,
-    fac_specs: Sequence[SpecItem],
-    logits: Sequence[float],
-    top_k: int,
-) -> Iterable[Dict[str, Any]]:
-    ranked = sorted(range(len(logits)), key=lambda i: float(logits[i]), reverse=True)
-    keep = ranked[: max(0, int(top_k))] if int(top_k) > 0 else ranked
-    for rank, idx in enumerate(keep, start=1):
-        fac = fac_specs[idx]
-        logit = float(logits[idx])
-        yield {
-            "rank": int(rank),
-            "fac_item_id": fac.item_id,
-            "fac_id": fac.meta.get("fac_id"),
-            "fac_spec_id": fac.meta.get("fac_spec_id"),
-            "fac_spec_idx": fac.meta.get("fac_spec_idx"),
-            "section": clean_text(fac.meta.get("section")),
-            "ce_logit": float(logit),
-            "ce_score": float(_sigmoid(logit)),
-        }
 
 
 def _build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         description=(
-            "Build per-aspect prefilter cache using true cross-encoder pair scoring "
-            "(AutoModelForSequenceClassification logits)."
+            "Build the CE2 prefilter cache using cross-encoder pair logits."
         )
     )
-    p.add_argument("--model-id", type=str, default=PREFILTER_CE_MODEL_ID_DEFAULT)
+    p.add_argument("--model-id", type=str, default=PREFILTER_CACHE_MODEL_ID_DEFAULT)
     p.add_argument("--grant-db", type=str, default=GRANT_DB_CE2_DEFAULT)
     p.add_argument("--fac-db", type=str, default=FAC_DB_CE2_DEFAULT)
     p.add_argument("--decomposition-output", type=str, default=DECOMPOSITION_OUTPUT_DEFAULT)
-    p.add_argument("--output", type=str, default=PREFILTER_CE_OUTPUT_DEFAULT)
+    p.add_argument("--output", type=str, default=PREFILTER_CACHE_OUTPUT_DEFAULT)
     p.add_argument("--output-domain", type=str, default="")
     p.add_argument("--output-method", type=str, default="")
     p.add_argument("--output-target", type=str, default="")
-    p.add_argument("--manifest", type=str, default=PREFILTER_CE_MANIFEST_DEFAULT)
+    p.add_argument("--manifest", type=str, default=PREFILTER_CACHE_MANIFEST_DEFAULT)
     p.add_argument("--seed", type=int, default=SEED_DEFAULT)
     p.add_argument("--max-grant-specs", type=int, default=MAX_GRANT_SPECS_DEFAULT)
     p.add_argument("--max-fac-specs", type=int, default=MAX_FAC_SPECS_DEFAULT)
-    p.add_argument("--top-k-per-aspect", type=int, default=PREFILTER_CE_TOP_K_PER_ASPECT_DEFAULT)
-    p.add_argument("--batch-size", type=int, default=PREFILTER_CE_BATCH_SIZE_DEFAULT)
-    p.add_argument("--max-length", type=int, default=PREFILTER_CE_MAX_LENGTH_DEFAULT)
+    p.add_argument("--top-k-per-aspect", type=int, default=PREFILTER_CACHE_TOP_K_PER_ASPECT_DEFAULT)
+    p.add_argument("--batch-size", type=int, default=PREFILTER_CACHE_BATCH_SIZE_DEFAULT)
+    p.add_argument("--max-length", type=int, default=PREFILTER_CACHE_MAX_LENGTH_DEFAULT)
     return p
 
 
@@ -250,15 +105,7 @@ def _derive_aspect_output_paths(
     output_method: str,
     output_target: str,
 ) -> Dict[str, Path]:
-    base_name = output_base_path.name
-    base_stem = output_base_path.stem if output_base_path.suffix else base_name
-    base_dir = output_base_path.parent
-    default_paths = {
-        "domain": (base_dir / f"{base_stem}_domain.jsonl").resolve(),
-        "method": (base_dir / f"{base_stem}_method.jsonl").resolve(),
-        "target": (base_dir / f"{base_stem}_target.jsonl").resolve(),
-    }
-    out = dict(default_paths)
+    out = prefilter_cache_paths(output_base_path)
     if clean_text(output_domain):
         out["domain"] = resolve_path(PROJECT_ROOT, output_domain)
     if clean_text(output_method):
@@ -290,7 +137,7 @@ def main() -> int:
     max_length = _safe_int(args.max_length, default=256, minimum=32, maximum=4096)
 
     decompositions = load_jsonl_by_key(decomposition_path, "item_id")
-    grant_specs, fac_specs = _load_specs_from_decompositions(
+    grant_specs, fac_specs = load_specs_from_decompositions(
         decompositions=decompositions,
         max_grant_specs=int(args.max_grant_specs),
         max_fac_specs=int(args.max_fac_specs),
@@ -302,9 +149,9 @@ def main() -> int:
         grant_db = resolve_path(PROJECT_ROOT, args.grant_db)
         fac_db = resolve_path(PROJECT_ROOT, args.fac_db)
         if clean_text(args.grant_db) == GRANT_DB_CE2_DEFAULT and not grant_db.exists():
-            grant_db = resolve_path(PROJECT_ROOT, GRANT_DB_FALLBACK_DEFAULT)
+            grant_db = resolve_path(PROJECT_ROOT, GRANT_DB_DEFAULT)
         if clean_text(args.fac_db) == FAC_DB_CE2_DEFAULT and not fac_db.exists():
-            fac_db = resolve_path(PROJECT_ROOT, FAC_DB_FALLBACK_DEFAULT)
+            fac_db = resolve_path(PROJECT_ROOT, FAC_DB_DEFAULT)
         if grant_db.exists() and fac_db.exists():
             grant_specs = load_grant_specs(grant_db, max_items=int(args.max_grant_specs), seed=int(args.seed))
             fac_specs = load_fac_specs(fac_db, max_items=int(args.max_fac_specs), seed=int(args.seed))
@@ -325,7 +172,7 @@ def main() -> int:
         raise RuntimeError("Missing dependencies: install torch and transformers.") from e
 
     device = _pick_device()
-    model_ref = clean_text(args.model_id) or PREFILTER_CE_MODEL_ID_DEFAULT
+    model_ref = clean_text(args.model_id) or PREFILTER_CACHE_MODEL_ID_DEFAULT
     tokenizer = AutoTokenizer.from_pretrained(model_ref, trust_remote_code=True)
     model = AutoModelForSequenceClassification.from_pretrained(model_ref, trust_remote_code=True)
     model.to(device)
@@ -359,7 +206,7 @@ def main() -> int:
         for grant in grant_specs:
             for aspect in ASPECTS:
                 query_text = _aspect_text_for_item(grant, aspect=aspect, decompositions=decompositions)
-                logits = _score_query_against_docs(
+                logits = score_query_against_docs(
                     model=model,
                     tokenizer=tokenizer,
                     query_text=query_text,
@@ -369,7 +216,7 @@ def main() -> int:
                     max_length=max_length,
                 )
                 candidates = list(
-                    _iter_topk_candidates(
+                    iter_topk_candidates(
                         fac_specs=fac_specs,
                         logits=logits,
                         top_k=top_k_per_aspect,
@@ -404,7 +251,7 @@ def main() -> int:
     elapsed = max(1e-6, time.time() - started)
     manifest = {
         "created_at_utc": datetime.now(timezone.utc).isoformat(),
-        "source": "aspect_true_cross_encoder",
+        "source": "true_cross_encoder",
         "spec_source": spec_source,
         "model_id": model_ref,
         "device": str(device),
