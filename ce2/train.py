@@ -238,6 +238,74 @@ def _load_split_rows(split_dir: Path, split: str, aspects: Sequence[str]) -> Lis
     return rows
 
 
+def _load_pairwise_split_rows(
+    split_dir: Path,
+    split: str,
+    aspects: Sequence[str],
+    *,
+    min_margin: float,
+    max_margin: float,
+    margin_scale: float,
+) -> List[PairExample]:
+    selected = set(aspects)
+    rows: List[PairExample] = []
+    for fallback_aspect in aspects:
+        path = split_dir / f"{fallback_aspect}_pairwise_{split}.jsonl"
+        if not path.exists():
+            continue
+        for obj in _iter_jsonl(path):
+            aspect = _normalize_ws(obj.get("aspect") or fallback_aspect).lower()
+            if aspect not in selected:
+                continue
+            query_text = _normalize_ws(obj.get("query_text"))
+            pos_text = _normalize_ws(obj.get("pos_text"))
+            neg_text = _normalize_ws(obj.get("neg_text"))
+            query_id = _normalize_ws(obj.get("query_id"))
+            pos_doc_id = _normalize_ws(obj.get("pos_doc_id"))
+            neg_doc_id = _normalize_ws(obj.get("neg_doc_id"))
+            if not query_text or not pos_text or not neg_text or not query_id or not pos_doc_id or not neg_doc_id:
+                continue
+
+            pos_score = _clamp01(obj.get("teacher_pos_score"))
+            neg_score = _clamp01(obj.get("teacher_neg_score"))
+            try:
+                raw_margin = float(obj.get("teacher_margin") or (pos_score - neg_score))
+            except Exception:
+                raw_margin = float(pos_score - neg_score)
+            if not math.isfinite(raw_margin) or raw_margin <= 0.0:
+                continue
+            loss_margin = max(float(min_margin), min(float(max_margin), raw_margin * float(margin_scale)))
+            source = "pairwise_file"
+            pair_type = _normalize_ws(obj.get("pair_type"))
+            if pair_type:
+                source = f"{source}:{pair_type}"
+
+            pos = Example(
+                aspect=aspect,
+                query_id=query_id,
+                doc_id=pos_doc_id,
+                pair_id=_normalize_ws(obj.get("pos_pair_id")) or f"{query_id}::{pos_doc_id}",
+                query_text=query_text,
+                doc_text=pos_text,
+                score=pos_score,
+                band=_normalize_ws(obj.get("pos_band")).lower(),
+                source=source,
+            )
+            neg = Example(
+                aspect=aspect,
+                query_id=query_id,
+                doc_id=neg_doc_id,
+                pair_id=_normalize_ws(obj.get("neg_pair_id")) or f"{query_id}::{neg_doc_id}",
+                query_text=query_text,
+                doc_text=neg_text,
+                score=neg_score,
+                band=_normalize_ws(obj.get("neg_band")).lower(),
+                source=source,
+            )
+            rows.append(PairExample(pos=pos, neg=neg, margin=loss_margin, weight=max(0.05, raw_margin)))
+    return rows
+
+
 def _group_by_query(rows: Sequence[Example]) -> List[List[Example]]:
     groups: Dict[Tuple[str, str], List[Example]] = {}
     for row in rows:
@@ -452,6 +520,13 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--list-batch-size", type=int, default=4, help="Number of query groups per Stage 2 batch.")
     p.add_argument("--eval-batch-size", type=int, default=16)
     p.add_argument("--grad-accum-steps", type=int, default=1)
+    p.add_argument(
+        "--pairwise-source",
+        type=str,
+        default="auto",
+        choices=["auto", "files", "derive"],
+        help="Use split-generated pairwise files, derive pairs from split rows, or auto-select files when present.",
+    )
     p.add_argument("--pairs-per-query", type=int, default=16)
     p.add_argument("--min-pair-delta", type=float, default=0.15)
     p.add_argument("--min-pair-margin", type=float, default=0.05)
@@ -496,24 +571,50 @@ def main() -> int:
     if not train_rows:
         raise RuntimeError(f"No train rows found in {split_dir}")
 
-    train_pairs = _make_pairs(
-        train_rows,
-        seed=int(args.seed),
-        pairs_per_query=int(args.pairs_per_query),
-        min_score_delta=float(args.min_pair_delta),
-        min_margin=float(args.min_pair_margin),
-        max_margin=float(args.max_pair_margin),
-        margin_scale=float(args.pair_margin_scale),
-    )
-    val_pairs = _make_pairs(
-        val_rows,
-        seed=int(args.seed) + 7,
-        pairs_per_query=int(args.pairs_per_query),
-        min_score_delta=float(args.min_pair_delta),
-        min_margin=float(args.min_pair_margin),
-        max_margin=float(args.max_pair_margin),
-        margin_scale=float(args.pair_margin_scale),
-    )
+    pair_source = "derived_on_the_fly"
+    train_pairs: List[PairExample] = []
+    val_pairs: List[PairExample] = []
+    if str(args.pairwise_source) in {"auto", "files"}:
+        train_pairs = _load_pairwise_split_rows(
+            split_dir,
+            "train",
+            aspects,
+            min_margin=float(args.min_pair_margin),
+            max_margin=float(args.max_pair_margin),
+            margin_scale=float(args.pair_margin_scale),
+        )
+        val_pairs = _load_pairwise_split_rows(
+            split_dir,
+            "val",
+            aspects,
+            min_margin=float(args.min_pair_margin),
+            max_margin=float(args.max_pair_margin),
+            margin_scale=float(args.pair_margin_scale),
+        )
+        if train_pairs:
+            pair_source = "split_pairwise_files"
+        elif str(args.pairwise_source) == "files":
+            raise RuntimeError(f"No split-generated pairwise train rows found in {split_dir}")
+
+    if not train_pairs and str(args.pairwise_source) != "files":
+        train_pairs = _make_pairs(
+            train_rows,
+            seed=int(args.seed),
+            pairs_per_query=int(args.pairs_per_query),
+            min_score_delta=float(args.min_pair_delta),
+            min_margin=float(args.min_pair_margin),
+            max_margin=float(args.max_pair_margin),
+            margin_scale=float(args.pair_margin_scale),
+        )
+        val_pairs = _make_pairs(
+            val_rows,
+            seed=int(args.seed) + 7,
+            pairs_per_query=int(args.pairs_per_query),
+            min_score_delta=float(args.min_pair_delta),
+            min_margin=float(args.min_pair_margin),
+            max_margin=float(args.max_pair_margin),
+            margin_scale=float(args.pair_margin_scale),
+        )
     train_groups = _group_by_query(train_rows)
     val_groups = _group_by_query(val_rows)
     test_groups = _group_by_query(test_rows)
@@ -595,6 +696,8 @@ def main() -> int:
         "test_rows": len(test_rows),
         "train_pairs": len(train_pairs),
         "val_pairs": len(val_pairs),
+        "pair_source": pair_source,
+        "pairwise_source_requested": _clean_text(args.pairwise_source),
         "train_groups": len(train_groups),
         "val_groups": len(val_groups),
         "test_groups": len(test_groups),

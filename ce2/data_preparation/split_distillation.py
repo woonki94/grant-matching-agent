@@ -183,6 +183,101 @@ def _write_rows(path: Path, rows: Sequence[Dict[str, Any]]) -> int:
     return len(rows)
 
 
+def _derive_pairwise_rows(
+    rows: Sequence[Dict[str, Any]],
+    *,
+    pos_k: int,
+    hard_k: int,
+    weak_k: int,
+    cap: int,
+    min_margin: float,
+) -> List[Dict[str, Any]]:
+    groups: Dict[str, List[Dict[str, Any]]] = {}
+    for row in rows:
+        query_id = _normalize_ws(row.get("query_id"))
+        doc_id = _normalize_ws(row.get("doc_id"))
+        if not query_id or not doc_id:
+            continue
+        groups.setdefault(query_id, []).append(row)
+
+    out: List[Dict[str, Any]] = []
+    p_k = max(1, int(pos_k))
+    h_k = max(0, int(hard_k))
+    w_k = max(1, int(weak_k))
+    max_pairs = max(1, int(cap))
+    margin_floor = max(0.0, float(min_margin))
+
+    for query_id in sorted(groups):
+        candidates = sorted(
+            groups[query_id],
+            key=lambda r: (-float(r.get("score") or 0.0), _normalize_ws(r.get("doc_id"))),
+        )
+        if len(candidates) < 2:
+            continue
+
+        pos = candidates[: min(p_k, len(candidates))]
+        hard = candidates[min(len(candidates), len(pos)) : min(len(candidates), len(pos) + h_k)]
+        weak = candidates[-min(w_k, len(candidates)) :]
+
+        seen_pairs: set[Tuple[str, str]] = set()
+        row_count = 0
+
+        def add_pair(pos_row: Dict[str, Any], neg_row: Dict[str, Any], pair_type: str) -> None:
+            nonlocal row_count
+            if row_count >= max_pairs:
+                return
+            pos_doc = _normalize_ws(pos_row.get("doc_id"))
+            neg_doc = _normalize_ws(neg_row.get("doc_id"))
+            if not pos_doc or not neg_doc or pos_doc == neg_doc:
+                return
+            key = (pos_doc, neg_doc)
+            if key in seen_pairs:
+                return
+            pos_score = float(pos_row.get("score") or 0.0)
+            neg_score = float(neg_row.get("score") or 0.0)
+            margin = float(pos_score - neg_score)
+            if margin <= 0.0 or margin < margin_floor:
+                return
+            seen_pairs.add(key)
+            row_count += 1
+            out.append(
+                {
+                    "aspect": _normalize_ws(pos_row.get("aspect")),
+                    "split": _normalize_ws(pos_row.get("split")),
+                    "query_id": query_id,
+                    "query_text": _normalize_ws(pos_row.get("query_text")),
+                    "pos_doc_id": pos_doc,
+                    "neg_doc_id": neg_doc,
+                    "pos_pair_id": _normalize_ws(pos_row.get("pair_id")),
+                    "neg_pair_id": _normalize_ws(neg_row.get("pair_id")),
+                    "pos_text": _normalize_ws(pos_row.get("doc_text")),
+                    "neg_text": _normalize_ws(neg_row.get("doc_text")),
+                    "teacher_pos_score": pos_score,
+                    "teacher_neg_score": neg_score,
+                    "teacher_margin": margin,
+                    "pos_band": _normalize_ws(pos_row.get("band")).lower(),
+                    "neg_band": _normalize_ws(neg_row.get("band")).lower(),
+                    "pair_type": pair_type,
+                }
+            )
+
+        for pos_row in pos:
+            for neg_row in weak:
+                add_pair(pos_row, neg_row, "derived_strong_vs_weak")
+                if row_count >= max_pairs:
+                    break
+            if row_count >= max_pairs:
+                break
+            for neg_row in hard:
+                add_pair(pos_row, neg_row, "derived_strong_vs_hard")
+                if row_count >= max_pairs:
+                    break
+            if row_count >= max_pairs:
+                break
+
+    return out
+
+
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Export CE2 distillation rows into aspect-specific train/val/test JSONL files.")
     p.add_argument("--distillation-input", type=str, default=DISTILLATION_OUTPUT_DEFAULT)
@@ -192,6 +287,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--val-ratio", type=float, default=0.10)
     p.add_argument("--test-ratio", type=float, default=0.10)
     p.add_argument("--include-augmentation", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--write-pairwise", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--pair-pos-k", type=int, default=4)
+    p.add_argument("--pair-hard-k", type=int, default=4)
+    p.add_argument("--pair-weak-k", type=int, default=4)
+    p.add_argument("--pair-cap-per-query", type=int, default=64)
+    p.add_argument("--pair-min-margin", type=float, default=0.0)
     p.add_argument("--overwrite", action="store_true")
     return p.parse_args()
 
@@ -215,6 +316,12 @@ def main() -> int:
         for aspect in ASPECTS
         for split in ("train", "val", "test")
     ]
+    if bool(args.write_pairwise):
+        outputs.extend(
+            output_dir / f"{aspect}_pairwise_{split}.jsonl"
+            for aspect in ASPECTS
+            for split in ("train", "val", "test")
+        )
     outputs.append(manifest_path)
     if not bool(args.overwrite):
         existing = [str(path) for path in outputs if path.exists()]
@@ -230,6 +337,7 @@ def main() -> int:
     )
 
     counts: Dict[str, Dict[str, int]] = {aspect: {"train": 0, "val": 0, "test": 0} for aspect in ASPECTS}
+    pair_counts: Dict[str, Dict[str, int]] = {aspect: {"train": 0, "val": 0, "test": 0} for aspect in ASPECTS}
     for aspect in ASPECTS:
         for split in ("train", "val", "test"):
             rows = [
@@ -240,6 +348,16 @@ def main() -> int:
             for row in rows:
                 row["split"] = split
             counts[aspect][split] = _write_rows(output_dir / f"{aspect}_{split}.jsonl", rows)
+            if bool(args.write_pairwise):
+                pair_rows = _derive_pairwise_rows(
+                    rows,
+                    pos_k=int(args.pair_pos_k),
+                    hard_k=int(args.pair_hard_k),
+                    weak_k=int(args.pair_weak_k),
+                    cap=int(args.pair_cap_per_query),
+                    min_margin=float(args.pair_min_margin),
+                )
+                pair_counts[aspect][split] = _write_rows(output_dir / f"{aspect}_pairwise_{split}.jsonl", pair_rows)
 
     manifest = {
         "created_at_utc": datetime.now(timezone.utc).isoformat(),
@@ -251,6 +369,15 @@ def main() -> int:
         "test_ratio": float(args.test_ratio),
         "query_split_counts": split_counts,
         "row_counts": counts,
+        "pairwise_enabled": bool(args.write_pairwise),
+        "pairwise_config": {
+            "pos_k": int(args.pair_pos_k),
+            "hard_k": int(args.pair_hard_k),
+            "weak_k": int(args.pair_weak_k),
+            "cap_per_query": int(args.pair_cap_per_query),
+            "min_margin": float(args.pair_min_margin),
+        },
+        "pairwise_row_counts": pair_counts,
         "total_aspect_rows": int(len(aspect_rows)),
     }
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -260,6 +387,7 @@ def main() -> int:
     print(f"manifest={manifest_path}")
     print(f"query_split_counts={json.dumps(split_counts, ensure_ascii=False)}")
     print(f"row_counts={json.dumps(counts, ensure_ascii=False)}")
+    print(f"pairwise_row_counts={json.dumps(pair_counts, ensure_ascii=False)}")
     return 0
 
 

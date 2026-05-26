@@ -66,6 +66,12 @@ AUGMENT_TARGET_LOW="${AUGMENT_TARGET_LOW:-0}"
 
 SPLIT_VAL_RATIO="${SPLIT_VAL_RATIO:-0.10}"
 SPLIT_TEST_RATIO="${SPLIT_TEST_RATIO:-0.10}"
+SPLIT_WRITE_PAIRWISE="${SPLIT_WRITE_PAIRWISE:-true}"
+SPLIT_PAIR_POS_K="${SPLIT_PAIR_POS_K:-4}"
+SPLIT_PAIR_HARD_K="${SPLIT_PAIR_HARD_K:-4}"
+SPLIT_PAIR_WEAK_K="${SPLIT_PAIR_WEAK_K:-4}"
+SPLIT_PAIR_CAP_PER_QUERY="${SPLIT_PAIR_CAP_PER_QUERY:-64}"
+SPLIT_PAIR_MIN_MARGIN="${SPLIT_PAIR_MIN_MARGIN:-0.0}"
 
 RUN_TRAIN="${RUN_TRAIN:-true}"
 TRAIN_MODEL_ID="${TRAIN_MODEL_ID:-dleemiller/ModernCE-base-sts}"
@@ -82,6 +88,7 @@ TRAIN_PAIR_BATCH_SIZE="${TRAIN_PAIR_BATCH_SIZE:-16}"
 TRAIN_LIST_BATCH_SIZE="${TRAIN_LIST_BATCH_SIZE:-4}"
 TRAIN_EVAL_BATCH_SIZE="${TRAIN_EVAL_BATCH_SIZE:-16}"
 TRAIN_GRAD_ACCUM_STEPS="${TRAIN_GRAD_ACCUM_STEPS:-1}"
+TRAIN_PAIRWISE_SOURCE="${TRAIN_PAIRWISE_SOURCE:-auto}"
 TRAIN_PAIRS_PER_QUERY="${TRAIN_PAIRS_PER_QUERY:-16}"
 TRAIN_MIN_PAIR_DELTA="${TRAIN_MIN_PAIR_DELTA:-0.15}"
 TRAIN_MIN_PAIR_MARGIN="${TRAIN_MIN_PAIR_MARGIN:-0.05}"
@@ -139,6 +146,8 @@ log "run_eval=${RUN_EVAL}"
 log "eval_model_dir=${EVAL_MODEL_DIR}"
 log "eval_output_json=${EVAL_OUTPUT_JSON}"
 log "eval_predictions_output=${EVAL_PREDICTIONS_OUTPUT}"
+log "split_pairwise=${SPLIT_WRITE_PAIRWISE}"
+log "train_pairwise_source=${TRAIN_PAIRWISE_SOURCE}"
 log "target_per_aspect=high:${TARGET_HIGH_PER_ASPECT},mid:${TARGET_MID_PER_ASPECT},low:${TARGET_LOW_PER_ASPECT}"
 log "prefilter_multiplier=high:${PREFILTER_MULTIPLIER_HIGH},mid:${PREFILTER_MULTIPLIER_MID},low:${PREFILTER_MULTIPLIER_LOW}"
 
@@ -216,7 +225,17 @@ SPLIT_CMD=(
   --seed "${SEED}"
   --val-ratio "${SPLIT_VAL_RATIO}"
   --test-ratio "${SPLIT_TEST_RATIO}"
+  --pair-pos-k "${SPLIT_PAIR_POS_K}"
+  --pair-hard-k "${SPLIT_PAIR_HARD_K}"
+  --pair-weak-k "${SPLIT_PAIR_WEAK_K}"
+  --pair-cap-per-query "${SPLIT_PAIR_CAP_PER_QUERY}"
+  --pair-min-margin "${SPLIT_PAIR_MIN_MARGIN}"
 )
+if [[ "${SPLIT_WRITE_PAIRWISE}" == "true" ]]; then
+  SPLIT_CMD+=(--write-pairwise)
+else
+  SPLIT_CMD+=(--no-write-pairwise)
+fi
 if [[ "${OVERWRITE}" == "true" ]]; then
   SPLIT_CMD+=(--overwrite)
 fi
@@ -243,6 +262,7 @@ if [[ "${RUN_TRAIN}" == "true" ]]; then
     --list-batch-size "${TRAIN_LIST_BATCH_SIZE}"
     --eval-batch-size "${TRAIN_EVAL_BATCH_SIZE}"
     --grad-accum-steps "${TRAIN_GRAD_ACCUM_STEPS}"
+    --pairwise-source "${TRAIN_PAIRWISE_SOURCE}"
     --pairs-per-query "${TRAIN_PAIRS_PER_QUERY}"
     --min-pair-delta "${TRAIN_MIN_PAIR_DELTA}"
     --min-pair-margin "${TRAIN_MIN_PAIR_MARGIN}"
