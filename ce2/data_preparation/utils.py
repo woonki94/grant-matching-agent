@@ -49,7 +49,7 @@ MAX_FAC_SPECS_DEFAULT = 2500
 DECOMPOSE_BATCH_SIZE_DEFAULT = 16
 DISTILL_BATCH_SIZE_DEFAULT = 24
 DECOMPOSE_MAX_NEW_TOKENS_DEFAULT = 512
-DISTILL_MAX_NEW_TOKENS_DEFAULT = 300
+DISTILL_MAX_NEW_TOKENS_DEFAULT = 32
 MAX_MODEL_LEN_DEFAULT = 4096
 TEMPERATURE_DEFAULT = 0.0
 TOP_P_DEFAULT = 0.9
@@ -1261,12 +1261,12 @@ def decompose_specs(
     return existing
 
 
-def _parse_single_score(obj: Optional[Dict[str, Any]]) -> Tuple[float, str, bool]:
+def _parse_single_score(obj: Optional[Dict[str, Any]]) -> Tuple[float, bool]:
     if not isinstance(obj, dict):
-        return 0.0, "", False
+        return 0.0, False
     if "score" not in obj:
-        return 0.0, "", False
-    return coerce_score(obj.get("score")), normalize_ws(obj.get("reason")), True
+        return 0.0, False
+    return coerce_score(obj.get("score")), True
 
 
 def _source_aspects(pair_source: str) -> List[str]:
@@ -1436,7 +1436,7 @@ def distill_pairs(
             for item, response in zip(task_items, responses):
                 pair_id, aspect, grant, fac, lexical_score, pair_source, g_dec_row, f_dec_row = item
                 parsed = extract_json_object(response)
-                score, reason, ok = _parse_single_score(parsed)
+                score, ok = _parse_single_score(parsed)
                 bucket = grouped.setdefault(
                     pair_id,
                     {
@@ -1447,13 +1447,11 @@ def distill_pairs(
                         "g_dec_row": g_dec_row,
                         "f_dec_row": f_dec_row,
                         "scores": {},
-                        "reasons": {},
                         "raw_responses": {},
                         "ok": {},
                     },
                 )
                 bucket["scores"][aspect] = float(score)
-                bucket["reasons"][aspect] = reason
                 bucket["raw_responses"][aspect] = response
                 bucket["ok"][aspect] = bool(ok)
 
@@ -1465,7 +1463,6 @@ def distill_pairs(
                 g_dec_row = bucket["g_dec_row"]
                 f_dec_row = bucket["f_dec_row"]
                 score_map = bucket["scores"]
-                reason_map = bucket["reasons"]
                 ok_map = bucket["ok"]
                 parse_ok = all(bool(ok_map.get(aspect)) and aspect in score_map for aspect in ASPECTS)
                 if not parse_ok:
@@ -1492,7 +1489,6 @@ def distill_pairs(
                         **{aspect: score_to_band(score) for aspect, score in aspect_scores.items()},
                         "overall": score_to_band(overall_score),
                     },
-                    "reasons": {aspect: reason_map.get(aspect, "") for aspect in ASPECTS},
                     "lexical_prefilter_score": float(lexical_score),
                     "pair_source": pair_source,
                     "parse_ok": True,

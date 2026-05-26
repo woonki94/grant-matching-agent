@@ -22,8 +22,7 @@ Do not output chain-of-thought or <think> blocks.
 
 Required schema:
 {
-  "score": <float in [0,1]>,
-  "reason": "<short reason mentioning the decisive overlap or gap>"
+  "score": <float in [0,1]>
 }
 """.strip()
 

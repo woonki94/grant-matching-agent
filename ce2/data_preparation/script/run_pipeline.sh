@@ -5,7 +5,7 @@ set -euo pipefail
 # 1) decompose grant/faculty specialization text into short-form 3 aspects
 # 2) build a stable CE prefilter cache over decomposed aspect text
 # 3) run LLM distillation over selected grant-faculty pairs
-# 4) save analyzable JSONL + summary
+# 4) export aspect-specific train/val/test split files
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
@@ -23,11 +23,13 @@ FAC_DB="${FAC_DB:-ce/dataset/source/fac_specs_db.json}"
 SOURCE_DIR="${SOURCE_DIR:-ce2/dataset/source}"
 DECOMPOSITION_DIR="${DECOMPOSITION_DIR:-ce2/dataset/decomposed}"
 DISTILL_DIR="${DISTILL_DIR:-ce2/dataset/distill}"
+SPLIT_DIR="${SPLIT_DIR:-ce2/dataset/splits}"
 DECOMPOSITION_OUTPUT="${DECOMPOSITION_OUTPUT:-${DECOMPOSITION_DIR}/spec_decompositions_3aspect_shortform.jsonl}"
 PREFILTER_CACHE_OUTPUT="${PREFILTER_CACHE_OUTPUT:-${SOURCE_DIR}/prefilter_cache.jsonl}"
 PREFILTER_CACHE_MANIFEST="${PREFILTER_CACHE_MANIFEST:-${SOURCE_DIR}/prefilter_cache.manifest.json}"
 DISTILLATION_OUTPUT="${DISTILLATION_OUTPUT:-${DISTILL_DIR}/llm_distillation.jsonl}"
 SUMMARY_OUTPUT="${SUMMARY_OUTPUT:-${DISTILL_DIR}/llm_distillation_summary.json}"
+AUGMENTATION_OUTPUT="${AUGMENTATION_OUTPUT:-${DISTILL_DIR}/augmentation.jsonl}"
 
 SEED="${SEED:-42}"
 MAX_GRANT_SPECS="${MAX_GRANT_SPECS:-0}"
@@ -37,7 +39,7 @@ DECOMPOSE_BATCH_SIZE="${DECOMPOSE_BATCH_SIZE:-16}"
 DISTILL_BATCH_SIZE="${DISTILL_BATCH_SIZE:-24}"
 PREFILTER_CACHE_BATCH_SIZE="${PREFILTER_CACHE_BATCH_SIZE:-64}"
 DECOMPOSE_MAX_NEW_TOKENS="${DECOMPOSE_MAX_NEW_TOKENS:-512}"
-DISTILL_MAX_NEW_TOKENS="${DISTILL_MAX_NEW_TOKENS:-300}"
+DISTILL_MAX_NEW_TOKENS="${DISTILL_MAX_NEW_TOKENS:-32}"
 PREFILTER_CACHE_MAX_LENGTH="${PREFILTER_CACHE_MAX_LENGTH:-256}"
 PREFILTER_CACHE_TOP_K_PER_ASPECT="${PREFILTER_CACHE_TOP_K_PER_ASPECT:-256}"
 TARGET_HIGH_PER_ASPECT="${TARGET_HIGH_PER_ASPECT:-2}"
@@ -62,8 +64,12 @@ OVERWRITE="${OVERWRITE:-true}"
 REFRESH_FAILED_DECOMPOSITIONS="${REFRESH_FAILED_DECOMPOSITIONS:-true}"
 REFRESH_ALL_DECOMPOSITIONS="${REFRESH_ALL_DECOMPOSITIONS:-true}"
 BUILD_PREFILTER_CACHE="${BUILD_PREFILTER_CACHE:-true}"
+RUN_SPLIT="${RUN_SPLIT:-true}"
 DECOMPOSE_ONLY="${DECOMPOSE_ONLY:-false}"
 DISTILL_ONLY="${DISTILL_ONLY:-false}"
+SPLIT_ONLY="${SPLIT_ONLY:-false}"
+SPLIT_VAL_RATIO="${SPLIT_VAL_RATIO:-0.10}"
+SPLIT_TEST_RATIO="${SPLIT_TEST_RATIO:-0.10}"
 
 log "CE2 data-preparation pipeline"
 log "model_id=${MODEL_ID}"
@@ -73,28 +79,40 @@ log "max_grant_specs=${MAX_GRANT_SPECS} max_fac_specs=${MAX_FAC_SPECS}"
 log "source_dir=${SOURCE_DIR}"
 log "decomposition_dir=${DECOMPOSITION_DIR}"
 log "distill_dir=${DISTILL_DIR}"
+log "split_dir=${SPLIT_DIR}"
 log "decomposition_output=${DECOMPOSITION_OUTPUT}"
 log "prefilter_source=${PREFILTER_SOURCE}"
 log "prefilter_cache_output=${PREFILTER_CACHE_OUTPUT}"
 log "prefilter_cache_manifest=${PREFILTER_CACHE_MANIFEST}"
 log "distillation_output=${DISTILLATION_OUTPUT}"
 log "summary_output=${SUMMARY_OUTPUT}"
+log "augmentation_output=${AUGMENTATION_OUTPUT}"
 log "target_per_aspect=high:${TARGET_HIGH_PER_ASPECT},mid:${TARGET_MID_PER_ASPECT},low:${TARGET_LOW_PER_ASPECT}"
 log "prefilter_multiplier=high:${PREFILTER_MULTIPLIER_HIGH},mid:${PREFILTER_MULTIPLIER_MID},low:${PREFILTER_MULTIPLIER_LOW}"
 log "prefilter_thresholds=high:${PREFILTER_HIGH_THRESHOLD},low:${PREFILTER_LOW_THRESHOLD}"
-log "overwrite=${OVERWRITE} refresh_failed_decompositions=${REFRESH_FAILED_DECOMPOSITIONS} refresh_all_decompositions=${REFRESH_ALL_DECOMPOSITIONS} build_prefilter_cache=${BUILD_PREFILTER_CACHE} decompose_only=${DECOMPOSE_ONLY} distill_only=${DISTILL_ONLY}"
+log "overwrite=${OVERWRITE} refresh_failed_decompositions=${REFRESH_FAILED_DECOMPOSITIONS} refresh_all_decompositions=${REFRESH_ALL_DECOMPOSITIONS} build_prefilter_cache=${BUILD_PREFILTER_CACHE} run_split=${RUN_SPLIT} decompose_only=${DECOMPOSE_ONLY} distill_only=${DISTILL_ONLY} split_only=${SPLIT_ONLY}"
 
 run_decompose=true
 run_cache=true
 run_distill=true
+run_split=true
 if [[ "${DECOMPOSE_ONLY}" == "true" && "${DISTILL_ONLY}" != "true" ]]; then
   run_cache=false
   run_distill=false
+  run_split=false
 elif [[ "${DISTILL_ONLY}" == "true" && "${DECOMPOSE_ONLY}" != "true" ]]; then
   run_decompose=false
+  run_split=false
+elif [[ "${SPLIT_ONLY}" == "true" ]]; then
+  run_decompose=false
+  run_cache=false
+  run_distill=false
 fi
 if [[ "${PREFILTER_SOURCE}" != "ce-cache" || "${BUILD_PREFILTER_CACHE}" != "true" ]]; then
   run_cache=false
+fi
+if [[ "${RUN_SPLIT}" != "true" ]]; then
+  run_split=false
 fi
 
 if [[ "${run_decompose}" == "true" ]]; then
@@ -191,5 +209,22 @@ if [[ "${run_distill}" == "true" ]]; then
   fi
   log "Running (distill): ${DISTILL_CMD[*]}"
   "${DISTILL_CMD[@]}"
+fi
+
+if [[ "${run_split}" == "true" ]]; then
+  SPLIT_CMD=(
+    "${PYTHON_BIN}" ce2/data_preparation/split_distillation.py
+    --distillation-input "${DISTILLATION_OUTPUT}"
+    --augmentation-input "${AUGMENTATION_OUTPUT}"
+    --output-dir "${SPLIT_DIR}"
+    --seed "${SEED}"
+    --val-ratio "${SPLIT_VAL_RATIO}"
+    --test-ratio "${SPLIT_TEST_RATIO}"
+  )
+  if [[ "${OVERWRITE}" == "true" ]]; then
+    SPLIT_CMD+=(--overwrite)
+  fi
+  log "Running (split): ${SPLIT_CMD[*]}"
+  "${SPLIT_CMD[@]}"
 fi
 log "Done."

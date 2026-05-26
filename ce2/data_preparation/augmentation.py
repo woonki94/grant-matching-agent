@@ -62,6 +62,7 @@ AUGMENT_SUMMARY_DEFAULT = "ce2/dataset/distill/augmentation_summary.json"
 AUGMENT_TARGET_POLICY_DEFAULT = "median"
 AUGMENT_MAX_ADD_PER_BAND_DEFAULT = 300
 AUGMENT_GEN_BATCH_SIZE_DEFAULT = 24
+AUGMENT_GEN_MAX_NEW_TOKENS_DEFAULT = 512
 AUGMENT_MAX_TRIES_PER_MISSING_DEFAULT = 8
 TEMPERATURE_DEFAULT = 0.0
 TOP_P_DEFAULT = 0.9
@@ -364,15 +365,12 @@ def _distill_candidate_pairs(
     for (idx, aspect), response in zip(task_meta, responses):
         parsed = extract_json_object(response)
         score = 0.0
-        reason = ""
         ok = False
         if isinstance(parsed, dict) and "score" in parsed:
             score = coerce_score(parsed.get("score"))
-            reason = normalize_ws(parsed.get("reason"))
             ok = True
-        bucket = grouped.setdefault(idx, {"scores": {}, "reasons": {}, "raw": {}, "ok": {}})
+        bucket = grouped.setdefault(idx, {"scores": {}, "raw": {}, "ok": {}})
         bucket["scores"][aspect] = float(score)
-        bucket["reasons"][aspect] = reason
         bucket["raw"][aspect] = response
         bucket["ok"][aspect] = bool(ok)
 
@@ -402,7 +400,6 @@ def _distill_candidate_pairs(
             },
             "scores": {**aspect_scores, "overall": overall},
             "bands": {**{a: score_to_band(v) for a, v in aspect_scores.items()}, "overall": score_to_band(overall)},
-            "reasons": {a: bucket.get("reasons", {}).get(a, "") for a in ASPECTS},
             "lexical_prefilter_score": 0.0,
             "pair_source": f"augmented_{cand.target_aspect}_{cand.target_band}",
             "parse_ok": True,
@@ -438,6 +435,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--target-low", type=int, default=0)
     p.add_argument("--max-add-per-band", type=int, default=AUGMENT_MAX_ADD_PER_BAND_DEFAULT)
     p.add_argument("--gen-batch-size", type=int, default=AUGMENT_GEN_BATCH_SIZE_DEFAULT)
+    p.add_argument("--gen-max-new-tokens", type=int, default=AUGMENT_GEN_MAX_NEW_TOKENS_DEFAULT)
     p.add_argument("--max-tries-per-missing", type=int, default=AUGMENT_MAX_TRIES_PER_MISSING_DEFAULT)
     p.add_argument("--distill-batch-size", type=int, default=DISTILL_BATCH_SIZE_DEFAULT)
     p.add_argument("--distill-max-new-tokens", type=int, default=DISTILL_MAX_NEW_TOKENS_DEFAULT)
@@ -571,7 +569,7 @@ def main() -> int:
                         llm_bundle=bundle,
                         model_id=effective_model_id,
                         jobs=jobs,
-                        max_new_tokens=int(args.distill_max_new_tokens),
+                        max_new_tokens=int(args.gen_max_new_tokens),
                         temperature=float(args.temperature),
                         top_p=float(args.top_p),
                         synthetic_counter_start=synthetic_counter,

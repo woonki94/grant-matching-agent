@@ -158,13 +158,18 @@ def load_llm(
         model.eval()
         return {"backend": "hf", "model_id": model_id, "tokenizer": tokenizer, "client": model}
 
-    llm = LLM(
-        model_id,
-        tensor_parallel_size=int(tensor_parallel_size),
-        max_model_len=int(max_model_len),
-        gpu_memory_utilization=float(gpu_memory_utilization),
-        trust_remote_code=True,
-    )
+    llm_kwargs: Dict[str, Any] = {
+        "tensor_parallel_size": int(tensor_parallel_size),
+        "max_model_len": int(max_model_len),
+        "gpu_memory_utilization": float(gpu_memory_utilization),
+        "trust_remote_code": True,
+        "disable_log_stats": True,
+    }
+    try:
+        llm = LLM(model_id, **llm_kwargs)
+    except TypeError:
+        llm_kwargs.pop("disable_log_stats", None)
+        llm = LLM(model_id, **llm_kwargs)
     return {"backend": "vllm", "model_id": model_id, "tokenizer": llm.get_tokenizer(), "client": llm}
 
 
@@ -212,7 +217,11 @@ def generate_responses_batch(
             temperature=float(max(0.0, temperature)),
             top_p=float(max(0.01, min(1.0, top_p))),
         )
-        outputs = llm_bundle["client"].generate(list(batch_prompts), params)
+        generate_kwargs: Dict[str, Any] = {"use_tqdm": False}
+        try:
+            outputs = llm_bundle["client"].generate(list(batch_prompts), params, **generate_kwargs)
+        except TypeError:
+            outputs = llm_bundle["client"].generate(list(batch_prompts), params)
         texts: List[str] = []
         for out in outputs:
             texts.append(clean_text(out.outputs[0].text) if getattr(out, "outputs", None) else "")
