@@ -5,7 +5,8 @@ set -euo pipefail
 # 1) distill real cache-selected pairs
 # 2) augment missing aspect-band clusters
 # 3) export aspect-specific train/val/test split files
-# 4) evaluate an existing finetuned CE2 model on the split files
+# 4) train a CE2 cross-encoder
+# 5) evaluate the trained CE2 model on the split files
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
@@ -26,6 +27,7 @@ SOURCE_DIR="${SOURCE_DIR:-ce2/dataset/source}"
 DECOMPOSITION_DIR="${DECOMPOSITION_DIR:-ce2/dataset/decomposed}"
 DISTILL_DIR="${DISTILL_DIR:-ce2/dataset/distill}"
 SPLIT_DIR="${SPLIT_DIR:-ce2/dataset/splits}"
+MODEL_DIR="${MODEL_DIR:-ce2/models/basic_distill}"
 EVAL_DIR="${EVAL_DIR:-ce2/eval/results}"
 
 DECOMPOSITION_OUTPUT="${DECOMPOSITION_OUTPUT:-${DECOMPOSITION_DIR}/spec_decompositions_3aspect_shortform.jsonl}"
@@ -34,7 +36,7 @@ DISTILLATION_OUTPUT="${DISTILLATION_OUTPUT:-${DISTILL_DIR}/llm_distillation.json
 DISTILLATION_SUMMARY_OUTPUT="${DISTILLATION_SUMMARY_OUTPUT:-${DISTILL_DIR}/llm_distillation_summary.json}"
 AUGMENTATION_OUTPUT="${AUGMENTATION_OUTPUT:-${DISTILL_DIR}/augmentation.jsonl}"
 AUGMENTATION_SUMMARY_OUTPUT="${AUGMENTATION_SUMMARY_OUTPUT:-${DISTILL_DIR}/augmentation_summary.json}"
-EVAL_MODEL_DIR="${EVAL_MODEL_DIR:-ce2/models/basic_distill/best}"
+EVAL_MODEL_DIR="${EVAL_MODEL_DIR:-${MODEL_DIR}/best}"
 EVAL_OUTPUT_JSON="${EVAL_OUTPUT_JSON:-${EVAL_DIR}/evaluation.json}"
 EVAL_PREDICTIONS_OUTPUT="${EVAL_PREDICTIONS_OUTPUT:-${EVAL_DIR}/predictions.jsonl}"
 
@@ -42,18 +44,18 @@ SEED="${SEED:-42}"
 MAX_GRANT_SPECS="${MAX_GRANT_SPECS:-0}"
 MAX_FAC_SPECS="${MAX_FAC_SPECS:-0}"
 
-TARGET_HIGH_PER_ASPECT="${TARGET_HIGH_PER_ASPECT:-2}"
-TARGET_MID_PER_ASPECT="${TARGET_MID_PER_ASPECT:-2}"
-TARGET_LOW_PER_ASPECT="${TARGET_LOW_PER_ASPECT:-2}"
-PREFILTER_MULTIPLIER_HIGH="${PREFILTER_MULTIPLIER_HIGH:-8}"
-PREFILTER_MULTIPLIER_MID="${PREFILTER_MULTIPLIER_MID:-8}"
-PREFILTER_MULTIPLIER_LOW="${PREFILTER_MULTIPLIER_LOW:-4}"
+TARGET_HIGH_PER_ASPECT="${TARGET_HIGH_PER_ASPECT:-4}"
+TARGET_MID_PER_ASPECT="${TARGET_MID_PER_ASPECT:-8}"
+TARGET_LOW_PER_ASPECT="${TARGET_LOW_PER_ASPECT:-4}"
+PREFILTER_MULTIPLIER_HIGH="${PREFILTER_MULTIPLIER_HIGH:-20}"
+PREFILTER_MULTIPLIER_MID="${PREFILTER_MULTIPLIER_MID:-4}"
+PREFILTER_MULTIPLIER_LOW="${PREFILTER_MULTIPLIER_LOW:-2}"
 PREFILTER_HIGH_THRESHOLD="${PREFILTER_HIGH_THRESHOLD:-0.70}"
 PREFILTER_LOW_THRESHOLD="${PREFILTER_LOW_THRESHOLD:-0.30}"
 
-DISTILL_BATCH_SIZE="${DISTILL_BATCH_SIZE:-24}"
-DISTILL_MAX_NEW_TOKENS="${DISTILL_MAX_NEW_TOKENS:-32}"
-AUGMENT_GEN_BATCH_SIZE="${AUGMENT_GEN_BATCH_SIZE:-24}"
+DISTILL_BATCH_SIZE="${DISTILL_BATCH_SIZE:-512}"
+DISTILL_MAX_NEW_TOKENS="${DISTILL_MAX_NEW_TOKENS:-16}"
+AUGMENT_GEN_BATCH_SIZE="${AUGMENT_GEN_BATCH_SIZE:-128}"
 AUGMENT_GEN_MAX_NEW_TOKENS="${AUGMENT_GEN_MAX_NEW_TOKENS:-512}"
 AUGMENT_MAX_TRIES_PER_MISSING="${AUGMENT_MAX_TRIES_PER_MISSING:-8}"
 AUGMENT_MAX_ADD_PER_BAND="${AUGMENT_MAX_ADD_PER_BAND:-300}"
@@ -64,6 +66,37 @@ AUGMENT_TARGET_LOW="${AUGMENT_TARGET_LOW:-0}"
 
 SPLIT_VAL_RATIO="${SPLIT_VAL_RATIO:-0.10}"
 SPLIT_TEST_RATIO="${SPLIT_TEST_RATIO:-0.10}"
+
+RUN_TRAIN="${RUN_TRAIN:-true}"
+TRAIN_MODEL_ID="${TRAIN_MODEL_ID:-dleemiller/ModernCE-base-sts}"
+TRAIN_ASPECTS="${TRAIN_ASPECTS:-domain,method,target}"
+TRAIN_MAX_LENGTH="${TRAIN_MAX_LENGTH:-256}"
+TRAIN_STAGE1_EPOCHS="${TRAIN_STAGE1_EPOCHS:-1}"
+TRAIN_STAGE2_EPOCHS="${TRAIN_STAGE2_EPOCHS:-3}"
+TRAIN_STAGE1_LR="${TRAIN_STAGE1_LR:-2e-5}"
+TRAIN_STAGE2_LR="${TRAIN_STAGE2_LR:-2e-5}"
+TRAIN_WEIGHT_DECAY="${TRAIN_WEIGHT_DECAY:-0.01}"
+TRAIN_WARMUP_RATIO="${TRAIN_WARMUP_RATIO:-0.06}"
+TRAIN_MAX_GRAD_NORM="${TRAIN_MAX_GRAD_NORM:-1.0}"
+TRAIN_PAIR_BATCH_SIZE="${TRAIN_PAIR_BATCH_SIZE:-16}"
+TRAIN_LIST_BATCH_SIZE="${TRAIN_LIST_BATCH_SIZE:-4}"
+TRAIN_EVAL_BATCH_SIZE="${TRAIN_EVAL_BATCH_SIZE:-16}"
+TRAIN_GRAD_ACCUM_STEPS="${TRAIN_GRAD_ACCUM_STEPS:-1}"
+TRAIN_PAIRS_PER_QUERY="${TRAIN_PAIRS_PER_QUERY:-16}"
+TRAIN_MIN_PAIR_DELTA="${TRAIN_MIN_PAIR_DELTA:-0.15}"
+TRAIN_MIN_PAIR_MARGIN="${TRAIN_MIN_PAIR_MARGIN:-0.05}"
+TRAIN_MAX_PAIR_MARGIN="${TRAIN_MAX_PAIR_MARGIN:-0.75}"
+TRAIN_PAIR_MARGIN_SCALE="${TRAIN_PAIR_MARGIN_SCALE:-1.0}"
+TRAIN_TEACHER_TEMPERATURE="${TRAIN_TEACHER_TEMPERATURE:-1.0}"
+TRAIN_LOSS_KL_WEIGHT="${TRAIN_LOSS_KL_WEIGHT:-1.0}"
+TRAIN_LOSS_PAIR_WEIGHT="${TRAIN_LOSS_PAIR_WEIGHT:-0.5}"
+TRAIN_LOSS_MSE_WEIGHT="${TRAIN_LOSS_MSE_WEIGHT:-0.05}"
+TRAIN_USE_BF16="${TRAIN_USE_BF16:-false}"
+TRAIN_WANDB_PROJECT="${TRAIN_WANDB_PROJECT:-ce2_distill}"
+TRAIN_WANDB_ENTITY="${TRAIN_WANDB_ENTITY:-}"
+TRAIN_WANDB_RUN_NAME="${TRAIN_WANDB_RUN_NAME:-}"
+TRAIN_WANDB_MODE="${TRAIN_WANDB_MODE:-online}"
+TRAIN_WANDB_TAGS="${TRAIN_WANDB_TAGS:-ce2,basic_distill}"
 
 RUN_EVAL="${RUN_EVAL:-true}"
 EVAL_SPLIT="${EVAL_SPLIT:-test}"
@@ -89,7 +122,7 @@ GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.90}"
 TENSOR_PARALLEL_SIZE="${TENSOR_PARALLEL_SIZE:-1}"
 OVERWRITE="${OVERWRITE:-true}"
 
-log "CE2 distill -> augment -> split"
+log "CE2 distill -> augment -> split -> train -> eval"
 log "distill_model_id=${DISTILL_MODEL_ID}"
 log "augment_model_id=${AUGMENT_MODEL_ID}"
 log "decomposition_output=${DECOMPOSITION_OUTPUT}"
@@ -97,6 +130,11 @@ log "prefilter_cache_output=${PREFILTER_CACHE_OUTPUT}"
 log "distillation_output=${DISTILLATION_OUTPUT}"
 log "augmentation_output=${AUGMENTATION_OUTPUT}"
 log "split_dir=${SPLIT_DIR}"
+log "run_train=${RUN_TRAIN}"
+log "train_model_id=${TRAIN_MODEL_ID}"
+log "model_dir=${MODEL_DIR}"
+log "train_wandb_project=${TRAIN_WANDB_PROJECT}"
+log "train_wandb_mode=${TRAIN_WANDB_MODE}"
 log "run_eval=${RUN_EVAL}"
 log "eval_model_dir=${EVAL_MODEL_DIR}"
 log "eval_output_json=${EVAL_OUTPUT_JSON}"
@@ -184,6 +222,52 @@ if [[ "${OVERWRITE}" == "true" ]]; then
 fi
 log "Running (split): ${SPLIT_CMD[*]}"
 "${SPLIT_CMD[@]}"
+
+if [[ "${RUN_TRAIN}" == "true" ]]; then
+  TRAIN_CMD=(
+    "${PYTHON_BIN}" ce2/train.py
+    --model-id "${TRAIN_MODEL_ID}"
+    --split-dir "${SPLIT_DIR}"
+    --output-dir "${MODEL_DIR}"
+    --aspects "${TRAIN_ASPECTS}"
+    --max-length "${TRAIN_MAX_LENGTH}"
+    --seed "${SEED}"
+    --stage1-epochs "${TRAIN_STAGE1_EPOCHS}"
+    --stage2-epochs "${TRAIN_STAGE2_EPOCHS}"
+    --stage1-learning-rate "${TRAIN_STAGE1_LR}"
+    --stage2-learning-rate "${TRAIN_STAGE2_LR}"
+    --weight-decay "${TRAIN_WEIGHT_DECAY}"
+    --warmup-ratio "${TRAIN_WARMUP_RATIO}"
+    --max-grad-norm "${TRAIN_MAX_GRAD_NORM}"
+    --pair-batch-size "${TRAIN_PAIR_BATCH_SIZE}"
+    --list-batch-size "${TRAIN_LIST_BATCH_SIZE}"
+    --eval-batch-size "${TRAIN_EVAL_BATCH_SIZE}"
+    --grad-accum-steps "${TRAIN_GRAD_ACCUM_STEPS}"
+    --pairs-per-query "${TRAIN_PAIRS_PER_QUERY}"
+    --min-pair-delta "${TRAIN_MIN_PAIR_DELTA}"
+    --min-pair-margin "${TRAIN_MIN_PAIR_MARGIN}"
+    --max-pair-margin "${TRAIN_MAX_PAIR_MARGIN}"
+    --pair-margin-scale "${TRAIN_PAIR_MARGIN_SCALE}"
+    --teacher-temperature "${TRAIN_TEACHER_TEMPERATURE}"
+    --loss-kl-weight "${TRAIN_LOSS_KL_WEIGHT}"
+    --loss-pair-weight "${TRAIN_LOSS_PAIR_WEIGHT}"
+    --loss-mse-weight "${TRAIN_LOSS_MSE_WEIGHT}"
+    --wandb-project "${TRAIN_WANDB_PROJECT}"
+    --wandb-run-name "${TRAIN_WANDB_RUN_NAME}"
+    --wandb-mode "${TRAIN_WANDB_MODE}"
+    --wandb-tags "${TRAIN_WANDB_TAGS}"
+  )
+  if [[ -n "${TRAIN_WANDB_ENTITY}" ]]; then
+    TRAIN_CMD+=(--wandb-entity "${TRAIN_WANDB_ENTITY}")
+  fi
+  if [[ "${TRAIN_USE_BF16}" == "true" ]]; then
+    TRAIN_CMD+=(--use-bf16)
+  fi
+  log "Running (train): ${TRAIN_CMD[*]}"
+  "${TRAIN_CMD[@]}"
+else
+  log "Skipping train because RUN_TRAIN=${RUN_TRAIN}"
+fi
 
 if [[ "${RUN_EVAL}" == "true" ]]; then
   if [[ ! -d "${EVAL_MODEL_DIR}" ]]; then

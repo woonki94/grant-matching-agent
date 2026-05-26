@@ -42,6 +42,8 @@ from ce2.data_preparation.utils import ASPECTS, resolve_path  # noqa: E402
 MODEL_ID_DEFAULT = "dleemiller/ModernCE-base-sts"
 SPLIT_DIR_DEFAULT = "ce2/dataset/splits"
 OUTPUT_DIR_DEFAULT = "ce2/models/basic_distill"
+WANDB_PROJECT_DEFAULT = "ce2_distill"
+WANDB_MODE_DEFAULT = "disabled"
 ASPECT_PREFIX = {
     "domain": "[DOMAIN]",
     "method": "[METHOD]",
@@ -411,6 +413,21 @@ def _save_model_dir(model: nn.Module, tokenizer: Any, path: Path) -> None:
     tokenizer.save_pretrained(path)
 
 
+def _flatten_metrics(prefix: str, obj: Dict[str, Any]) -> Dict[str, float]:
+    out: Dict[str, float] = {}
+    for key, value in obj.items():
+        name = f"{prefix}/{key}" if prefix else str(key)
+        if isinstance(value, dict):
+            out.update(_flatten_metrics(name, value))
+            continue
+        if isinstance(value, bool):
+            out[name] = float(1 if value else 0)
+            continue
+        if isinstance(value, (int, float)) and math.isfinite(float(value)):
+            out[name] = float(value)
+    return out
+
+
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
         description=(
@@ -446,6 +463,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--loss-mse-weight", type=float, default=0.05)
     p.add_argument("--use-bf16", action="store_true")
     p.add_argument("--no-tqdm", action="store_true")
+    p.add_argument("--wandb-project", type=str, default=WANDB_PROJECT_DEFAULT)
+    p.add_argument("--wandb-entity", type=str, default="")
+    p.add_argument("--wandb-run-name", type=str, default="")
+    p.add_argument("--wandb-mode", type=str, default=WANDB_MODE_DEFAULT, choices=["online", "offline", "disabled"])
+    p.add_argument("--wandb-tags", type=str, default="", help="Comma-separated W&B tags.")
     return p.parse_args()
 
 
@@ -578,163 +600,266 @@ def main() -> int:
         "test_groups": len(test_groups),
         "stage1_epochs": int(args.stage1_epochs),
         "stage2_epochs": int(args.stage2_epochs),
+        "stage1_learning_rate": float(args.stage1_learning_rate),
+        "stage2_learning_rate": float(args.stage2_learning_rate),
+        "weight_decay": float(args.weight_decay),
+        "warmup_ratio": float(args.warmup_ratio),
+        "max_length": int(args.max_length),
+        "pair_batch_size": int(args.pair_batch_size),
+        "list_batch_size": int(args.list_batch_size),
+        "eval_batch_size": int(args.eval_batch_size),
+        "grad_accum_steps": int(args.grad_accum_steps),
+        "pairs_per_query": int(args.pairs_per_query),
+        "min_pair_delta": float(args.min_pair_delta),
+        "teacher_temperature": float(args.teacher_temperature),
+        "use_bf16": bool(use_amp),
         "loss_weights": {
             "kl": float(args.loss_kl_weight),
             "pair": float(args.loss_pair_weight),
             "mse": float(args.loss_mse_weight),
+        },
+        "wandb": {
+            "project": _clean_text(args.wandb_project),
+            "entity": _clean_text(args.wandb_entity),
+            "run_name": _clean_text(args.wandb_run_name),
+            "mode": _clean_text(args.wandb_mode),
+            "tags": [_clean_text(x) for x in str(args.wandb_tags).split(",") if _clean_text(x)],
         },
     }
     _save_json(output_dir / "run_config.json", run_config)
     print(json.dumps(run_config, ensure_ascii=False, indent=2))
 
     history: List[Dict[str, Any]] = []
-
-    if train_pair_loader is not None and int(args.stage1_epochs) > 0:
-        total_steps = len(train_pair_loader) * int(args.stage1_epochs)
-        total_updates = max(1, math.ceil(total_steps / grad_accum_steps))
-        warmup_steps = int(round(float(args.warmup_ratio) * total_updates))
-        optimizer = AdamW(model.parameters(), lr=float(args.stage1_learning_rate), weight_decay=float(args.weight_decay))
-        scheduler = get_linear_schedule_with_warmup(optimizer, warmup_steps, total_updates)
-        for epoch in range(1, int(args.stage1_epochs) + 1):
-            model.train()
-            losses: List[float] = []
-            optimizer.zero_grad(set_to_none=True)
-            iterator: Iterable[Dict[str, Any]] = train_pair_loader
-            if use_tqdm:
-                iterator = tqdm(train_pair_loader, desc=f"Stage1 {epoch}/{int(args.stage1_epochs)}", leave=True)
-            for step, batch in enumerate(iterator, start=1):
-                enc = _move_encoder_to_device(batch["enc"], device)
-                margins = batch["margins"].to(device)
-                weights = batch["weights"].to(device)
-                amp_ctx = torch.autocast(device_type="cuda", dtype=amp_dtype) if use_amp else nullcontext()
-                with amp_ctx:
-                    logits = _model_logits(model, enc)
-                    pos_logits, neg_logits = _split_pair_logits(logits, int(margins.shape[0]))
-                    loss = _pairwise_margin_loss(pos_logits, neg_logits, margins, weights)
-                    scaled = loss / float(grad_accum_steps)
-                scaled.backward()
-                losses.append(float(loss.detach().cpu().item()))
-                if step % grad_accum_steps == 0 or step == len(train_pair_loader):
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), float(args.max_grad_norm))
-                    optimizer.step()
-                    scheduler.step()
-                    optimizer.zero_grad(set_to_none=True)
-            metrics = _evaluate_pairwise(model=model, loader=val_pair_loader, device=device)
-            epoch_metrics = {
-                "stage": 1,
-                "epoch": epoch,
-                "train_pair_loss": float(sum(losses) / max(1, len(losses))),
-                "val_pair_loss": metrics["pair_loss"],
-                "val_pair_acc": metrics["pair_acc"],
-            }
-            history.append(epoch_metrics)
-            print(json.dumps(epoch_metrics, ensure_ascii=False))
-        _save_model_dir(model, tokenizer, output_dir / "stage1_final")
+    wandb_run = None
+    wandb_mode = _clean_text(args.wandb_mode).lower()
+    if wandb_mode != "disabled":
+        try:
+            import wandb  # type: ignore
+        except Exception as exc:
+            raise RuntimeError(
+                "W&B logging is enabled but `wandb` is not installed. "
+                "Install it or run with --wandb-mode disabled."
+            ) from exc
+        run_name = _clean_text(args.wandb_run_name) or f"ce2-basic-distill-{int(time.time())}"
+        wandb_kwargs: Dict[str, Any] = {
+            "project": _clean_text(args.wandb_project) or WANDB_PROJECT_DEFAULT,
+            "name": run_name,
+            "config": run_config,
+            "mode": wandb_mode,
+            "dir": str(output_dir),
+        }
+        tags = [_clean_text(x) for x in str(args.wandb_tags).split(",") if _clean_text(x)]
+        if tags:
+            wandb_kwargs["tags"] = tags
+        if _clean_text(args.wandb_entity):
+            wandb_kwargs["entity"] = _clean_text(args.wandb_entity)
+        wandb_run = wandb.init(**wandb_kwargs)
+        wandb_run.summary["train_rows"] = int(len(train_rows))
+        wandb_run.summary["val_rows"] = int(len(val_rows))
+        wandb_run.summary["test_rows"] = int(len(test_rows))
+        wandb_run.summary["train_pairs"] = int(len(train_pairs))
+        wandb_run.summary["train_groups"] = int(len(train_groups))
 
     best_metric = float("inf")
     best_epoch = 0
-    if train_list_loader is not None and int(args.stage2_epochs) > 0:
-        pair_cycle = _cycle(train_pair_loader) if train_pair_loader is not None else None
-        total_steps = len(train_list_loader) * int(args.stage2_epochs)
-        total_updates = max(1, math.ceil(total_steps / grad_accum_steps))
-        warmup_steps = int(round(float(args.warmup_ratio) * total_updates))
-        optimizer = AdamW(model.parameters(), lr=float(args.stage2_learning_rate), weight_decay=float(args.weight_decay))
-        scheduler = get_linear_schedule_with_warmup(optimizer, warmup_steps, total_updates)
-        for epoch in range(1, int(args.stage2_epochs) + 1):
-            model.train()
-            loss_totals = {"total": 0.0, "kl": 0.0, "pair": 0.0, "mse": 0.0}
-            step_count = 0
-            optimizer.zero_grad(set_to_none=True)
-            iterator2: Iterable[Dict[str, Any]] = train_list_loader
-            if use_tqdm:
-                iterator2 = tqdm(train_list_loader, desc=f"Stage2 {epoch}/{int(args.stage2_epochs)}", leave=True)
-            for step, list_batch in enumerate(iterator2, start=1):
-                step_count += 1
-                enc = _move_encoder_to_device(list_batch["enc"], device)
-                scores = list_batch["scores"].to(device)
-                pair_loss = torch.zeros((), device=device)
-                amp_ctx = torch.autocast(device_type="cuda", dtype=amp_dtype) if use_amp else nullcontext()
-                with amp_ctx:
-                    logits = _model_logits(model, enc)
-                    kl_loss, mse_loss = _listwise_kl_and_mse(
-                        logits_flat=logits,
-                        scores_flat=scores,
-                        list_sizes=list_batch["list_sizes"],
-                        temperature=float(args.teacher_temperature),
-                    )
-                    if pair_cycle is not None:
-                        pair_batch = next(pair_cycle)
-                        pair_enc = _move_encoder_to_device(pair_batch["enc"], device)
-                        margins = pair_batch["margins"].to(device)
-                        weights = pair_batch["weights"].to(device)
-                        pair_logits = _model_logits(model, pair_enc)
-                        pos_logits, neg_logits = _split_pair_logits(pair_logits, int(margins.shape[0]))
-                        pair_loss = _pairwise_margin_loss(pos_logits, neg_logits, margins, weights)
-                    total_loss = (
-                        float(args.loss_kl_weight) * kl_loss
-                        + float(args.loss_pair_weight) * pair_loss
-                        + float(args.loss_mse_weight) * mse_loss
-                    )
-                    scaled_total = total_loss / float(grad_accum_steps)
-                scaled_total.backward()
-                if step % grad_accum_steps == 0 or step == len(train_list_loader):
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), float(args.max_grad_norm))
-                    optimizer.step()
-                    scheduler.step()
-                    optimizer.zero_grad(set_to_none=True)
-                loss_totals["total"] += float(total_loss.detach().cpu().item())
-                loss_totals["kl"] += float(kl_loss.detach().cpu().item())
-                loss_totals["pair"] += float(pair_loss.detach().cpu().item())
-                loss_totals["mse"] += float(mse_loss.detach().cpu().item())
+    try:
+        if train_pair_loader is not None and int(args.stage1_epochs) > 0:
+            total_steps = len(train_pair_loader) * int(args.stage1_epochs)
+            total_updates = max(1, math.ceil(total_steps / grad_accum_steps))
+            warmup_steps = int(round(float(args.warmup_ratio) * total_updates))
+            optimizer = AdamW(model.parameters(), lr=float(args.stage1_learning_rate), weight_decay=float(args.weight_decay))
+            scheduler = get_linear_schedule_with_warmup(optimizer, warmup_steps, total_updates)
+            for epoch in range(1, int(args.stage1_epochs) + 1):
+                model.train()
+                losses: List[float] = []
+                optimizer.zero_grad(set_to_none=True)
+                iterator: Iterable[Dict[str, Any]] = train_pair_loader
+                if use_tqdm:
+                    iterator = tqdm(train_pair_loader, desc=f"Stage1 {epoch}/{int(args.stage1_epochs)}", leave=True)
+                for step, batch in enumerate(iterator, start=1):
+                    enc = _move_encoder_to_device(batch["enc"], device)
+                    margins = batch["margins"].to(device)
+                    weights = batch["weights"].to(device)
+                    amp_ctx = torch.autocast(device_type="cuda", dtype=amp_dtype) if use_amp else nullcontext()
+                    with amp_ctx:
+                        logits = _model_logits(model, enc)
+                        pos_logits, neg_logits = _split_pair_logits(logits, int(margins.shape[0]))
+                        loss = _pairwise_margin_loss(pos_logits, neg_logits, margins, weights)
+                        scaled = loss / float(grad_accum_steps)
+                    scaled.backward()
+                    losses.append(float(loss.detach().cpu().item()))
+                    if step % grad_accum_steps == 0 or step == len(train_pair_loader):
+                        torch.nn.utils.clip_grad_norm_(model.parameters(), float(args.max_grad_norm))
+                        optimizer.step()
+                        scheduler.step()
+                        optimizer.zero_grad(set_to_none=True)
 
-            val_list_metrics = _evaluate_listwise(
-                model=model,
-                loader=val_list_loader,
-                device=device,
-                temperature=float(args.teacher_temperature),
+                metrics = _evaluate_pairwise(model=model, loader=val_pair_loader, device=device)
+                epoch_metrics = {
+                    "stage": 1,
+                    "epoch": epoch,
+                    "train_pair_loss": float(sum(losses) / max(1, len(losses))),
+                    "val_pair_loss": metrics["pair_loss"],
+                    "val_pair_acc": metrics["pair_acc"],
+                    "learning_rate": float(optimizer.param_groups[0]["lr"]),
+                }
+                history.append(epoch_metrics)
+                print(json.dumps(epoch_metrics, ensure_ascii=False))
+                if wandb_run is not None:
+                    wandb_run.log(
+                        {
+                            "stage": 1,
+                            "epoch": int(epoch),
+                            "train/pair_loss": float(epoch_metrics["train_pair_loss"]),
+                            "val/pair_loss": float(epoch_metrics["val_pair_loss"]),
+                            "val/pair_acc": float(epoch_metrics["val_pair_acc"]),
+                            "lr": float(epoch_metrics["learning_rate"]),
+                        },
+                        step=int(epoch),
+                    )
+            _save_model_dir(model, tokenizer, output_dir / "stage1_final")
+
+        if train_list_loader is not None and int(args.stage2_epochs) > 0:
+            pair_cycle = _cycle(train_pair_loader) if train_pair_loader is not None else None
+            total_steps = len(train_list_loader) * int(args.stage2_epochs)
+            total_updates = max(1, math.ceil(total_steps / grad_accum_steps))
+            warmup_steps = int(round(float(args.warmup_ratio) * total_updates))
+            optimizer = AdamW(model.parameters(), lr=float(args.stage2_learning_rate), weight_decay=float(args.weight_decay))
+            scheduler = get_linear_schedule_with_warmup(optimizer, warmup_steps, total_updates)
+            for epoch in range(1, int(args.stage2_epochs) + 1):
+                model.train()
+                loss_totals = {"total": 0.0, "kl": 0.0, "pair": 0.0, "mse": 0.0}
+                step_count = 0
+                optimizer.zero_grad(set_to_none=True)
+                iterator2: Iterable[Dict[str, Any]] = train_list_loader
+                if use_tqdm:
+                    iterator2 = tqdm(train_list_loader, desc=f"Stage2 {epoch}/{int(args.stage2_epochs)}", leave=True)
+                for step, list_batch in enumerate(iterator2, start=1):
+                    step_count += 1
+                    enc = _move_encoder_to_device(list_batch["enc"], device)
+                    scores = list_batch["scores"].to(device)
+                    pair_loss = torch.zeros((), device=device)
+                    amp_ctx = torch.autocast(device_type="cuda", dtype=amp_dtype) if use_amp else nullcontext()
+                    with amp_ctx:
+                        logits = _model_logits(model, enc)
+                        kl_loss, mse_loss = _listwise_kl_and_mse(
+                            logits_flat=logits,
+                            scores_flat=scores,
+                            list_sizes=list_batch["list_sizes"],
+                            temperature=float(args.teacher_temperature),
+                        )
+                        if pair_cycle is not None:
+                            pair_batch = next(pair_cycle)
+                            pair_enc = _move_encoder_to_device(pair_batch["enc"], device)
+                            margins = pair_batch["margins"].to(device)
+                            weights = pair_batch["weights"].to(device)
+                            pair_logits = _model_logits(model, pair_enc)
+                            pos_logits, neg_logits = _split_pair_logits(pair_logits, int(margins.shape[0]))
+                            pair_loss = _pairwise_margin_loss(pos_logits, neg_logits, margins, weights)
+                        total_loss = (
+                            float(args.loss_kl_weight) * kl_loss
+                            + float(args.loss_pair_weight) * pair_loss
+                            + float(args.loss_mse_weight) * mse_loss
+                        )
+                        scaled_total = total_loss / float(grad_accum_steps)
+                    scaled_total.backward()
+                    if step % grad_accum_steps == 0 or step == len(train_list_loader):
+                        torch.nn.utils.clip_grad_norm_(model.parameters(), float(args.max_grad_norm))
+                        optimizer.step()
+                        scheduler.step()
+                        optimizer.zero_grad(set_to_none=True)
+                    loss_totals["total"] += float(total_loss.detach().cpu().item())
+                    loss_totals["kl"] += float(kl_loss.detach().cpu().item())
+                    loss_totals["pair"] += float(pair_loss.detach().cpu().item())
+                    loss_totals["mse"] += float(mse_loss.detach().cpu().item())
+
+                val_list_metrics = _evaluate_listwise(
+                    model=model,
+                    loader=val_list_loader,
+                    device=device,
+                    temperature=float(args.teacher_temperature),
+                )
+                val_pair_metrics = _evaluate_pairwise(model=model, loader=val_pair_loader, device=device)
+                monitor = float(val_list_metrics["kl"] + float(args.loss_mse_weight) * val_list_metrics["mse"])
+                epoch_metrics = {
+                    "stage": 2,
+                    "epoch": epoch,
+                    "train_total_loss": loss_totals["total"] / max(1, step_count),
+                    "train_kl_loss": loss_totals["kl"] / max(1, step_count),
+                    "train_pair_loss": loss_totals["pair"] / max(1, step_count),
+                    "train_mse_loss": loss_totals["mse"] / max(1, step_count),
+                    "val_kl_loss": val_list_metrics["kl"],
+                    "val_mse_loss": val_list_metrics["mse"],
+                    "val_pair_loss": val_pair_metrics["pair_loss"],
+                    "val_pair_acc": val_pair_metrics["pair_acc"],
+                    "monitor": monitor,
+                    "learning_rate": float(optimizer.param_groups[0]["lr"]),
+                }
+                history.append(epoch_metrics)
+                print(json.dumps(epoch_metrics, ensure_ascii=False))
+                epoch_dir = output_dir / f"stage2_epoch_{epoch}"
+                _save_model_dir(model, tokenizer, epoch_dir)
+                _save_json(epoch_dir / "metrics.json", epoch_metrics)
+                improved = monitor <= best_metric
+                if improved:
+                    best_metric = monitor
+                    best_epoch = epoch
+                    _save_model_dir(model, tokenizer, output_dir / "best")
+                if wandb_run is not None:
+                    wandb_run.log(
+                        {
+                            "stage": 2,
+                            "epoch": int(epoch),
+                            "train/total_loss": float(epoch_metrics["train_total_loss"]),
+                            "train/kl_loss": float(epoch_metrics["train_kl_loss"]),
+                            "train/pair_loss": float(epoch_metrics["train_pair_loss"]),
+                            "train/mse_loss": float(epoch_metrics["train_mse_loss"]),
+                            "val/kl_loss": float(epoch_metrics["val_kl_loss"]),
+                            "val/mse_loss": float(epoch_metrics["val_mse_loss"]),
+                            "val/pair_loss": float(epoch_metrics["val_pair_loss"]),
+                            "val/pair_acc": float(epoch_metrics["val_pair_acc"]),
+                            "val/monitor": float(epoch_metrics["monitor"]),
+                            "best/monitor": float(best_metric),
+                            "best/epoch": float(best_epoch),
+                            "checkpoint/improved": float(1 if improved else 0),
+                            "lr": float(epoch_metrics["learning_rate"]),
+                        },
+                        step=int(args.stage1_epochs) + int(epoch),
+                    )
+
+        test_metrics = _evaluate_listwise(
+            model=model,
+            loader=test_list_loader,
+            device=device,
+            temperature=float(args.teacher_temperature),
+        )
+        _save_model_dir(model, tokenizer, output_dir / "final")
+        summary = {
+            "best_stage2_epoch": best_epoch,
+            "best_monitor": best_metric if math.isfinite(best_metric) else None,
+            "test": test_metrics,
+            "history": history,
+            "final_dir": str(output_dir / "final"),
+            "best_dir": str(output_dir / "best"),
+        }
+        _save_json(output_dir / "train_summary.json", summary)
+        if wandb_run is not None:
+            wandb_run.summary["best_stage2_epoch"] = int(best_epoch)
+            if math.isfinite(best_metric):
+                wandb_run.summary["best_monitor"] = float(best_metric)
+            for key, value in _flatten_metrics("test", test_metrics).items():
+                wandb_run.summary[key] = value
+            wandb_run.log(
+                _flatten_metrics("test", test_metrics),
+                step=int(args.stage1_epochs) + int(args.stage2_epochs) + 1,
             )
-            val_pair_metrics = _evaluate_pairwise(model=model, loader=val_pair_loader, device=device)
-            monitor = float(val_list_metrics["kl"] + float(args.loss_mse_weight) * val_list_metrics["mse"])
-            epoch_metrics = {
-                "stage": 2,
-                "epoch": epoch,
-                "train_total_loss": loss_totals["total"] / max(1, step_count),
-                "train_kl_loss": loss_totals["kl"] / max(1, step_count),
-                "train_pair_loss": loss_totals["pair"] / max(1, step_count),
-                "train_mse_loss": loss_totals["mse"] / max(1, step_count),
-                "val_kl_loss": val_list_metrics["kl"],
-                "val_mse_loss": val_list_metrics["mse"],
-                "val_pair_loss": val_pair_metrics["pair_loss"],
-                "val_pair_acc": val_pair_metrics["pair_acc"],
-                "monitor": monitor,
-            }
-            history.append(epoch_metrics)
-            print(json.dumps(epoch_metrics, ensure_ascii=False))
-            epoch_dir = output_dir / f"stage2_epoch_{epoch}"
-            _save_model_dir(model, tokenizer, epoch_dir)
-            _save_json(epoch_dir / "metrics.json", epoch_metrics)
-            if monitor <= best_metric:
-                best_metric = monitor
-                best_epoch = epoch
-                _save_model_dir(model, tokenizer, output_dir / "best")
-
-    test_metrics = _evaluate_listwise(
-        model=model,
-        loader=test_list_loader,
-        device=device,
-        temperature=float(args.teacher_temperature),
-    )
-    _save_model_dir(model, tokenizer, output_dir / "final")
-    summary = {
-        "best_stage2_epoch": best_epoch,
-        "best_monitor": best_metric if math.isfinite(best_metric) else None,
-        "test": test_metrics,
-        "history": history,
-        "final_dir": str(output_dir / "final"),
-        "best_dir": str(output_dir / "best"),
-    }
-    _save_json(output_dir / "train_summary.json", summary)
-    print(json.dumps(summary, ensure_ascii=False, indent=2))
+        print(json.dumps(summary, ensure_ascii=False, indent=2))
+    finally:
+        if wandb_run is not None:
+            try:
+                wandb_run.finish()
+            except Exception:
+                pass
     return 0
 
 
