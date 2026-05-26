@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import sys
 import time
 from pathlib import Path
@@ -21,13 +22,10 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from ce2.data_preparation.utils import (  # noqa: E402
-    ASPECT_PREFILTER_HIGH_PER_ASPECT_DEFAULT,
-    ASPECT_PREFILTER_HIGH_POOL_SIZE_DEFAULT,
-    ASPECT_PREFILTER_LOW_PER_ASPECT_DEFAULT,
-    ASPECT_PREFILTER_MID_PER_ASPECT_DEFAULT,
-    ASPECT_PREFILTER_MID_RANK_END_DEFAULT,
-    ASPECT_PREFILTER_MID_RANK_START_DEFAULT,
     DECOMPOSITION_OUTPUT_DEFAULT,
+    DISTILL_TARGET_HIGH_PER_ASPECT_DEFAULT,
+    DISTILL_TARGET_LOW_PER_ASPECT_DEFAULT,
+    DISTILL_TARGET_MID_PER_ASPECT_DEFAULT,
     DISTILL_DIR_DEFAULT,
     FAC_DB_DEFAULT,
     GRANT_DB_DEFAULT,
@@ -38,6 +36,11 @@ from ce2.data_preparation.utils import (  # noqa: E402
     MAX_GRANT_SPECS_DEFAULT,
     MAX_MODEL_LEN_DEFAULT,
     MODEL_ID_DEFAULT,
+    PREFILTER_HIGH_THRESHOLD_DEFAULT,
+    PREFILTER_LOW_THRESHOLD_DEFAULT,
+    PREFILTER_MULTIPLIER_HIGH_DEFAULT,
+    PREFILTER_MULTIPLIER_LOW_DEFAULT,
+    PREFILTER_MULTIPLIER_MID_DEFAULT,
     PREFILTER_CACHE_OUTPUT_DEFAULT,
     DISTILLATION_OUTPUT_DEFAULT,
     SEED_DEFAULT,
@@ -78,6 +81,14 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--seed", type=int, default=SEED_DEFAULT)
     p.add_argument("--max-grant-specs", type=int, default=MAX_GRANT_SPECS_DEFAULT)
     p.add_argument("--max-fac-specs", type=int, default=MAX_FAC_SPECS_DEFAULT)
+    p.add_argument("--target-high-per-aspect", type=int, default=DISTILL_TARGET_HIGH_PER_ASPECT_DEFAULT)
+    p.add_argument("--target-mid-per-aspect", type=int, default=DISTILL_TARGET_MID_PER_ASPECT_DEFAULT)
+    p.add_argument("--target-low-per-aspect", type=int, default=DISTILL_TARGET_LOW_PER_ASPECT_DEFAULT)
+    p.add_argument("--prefilter-multiplier-high", type=float, default=PREFILTER_MULTIPLIER_HIGH_DEFAULT)
+    p.add_argument("--prefilter-multiplier-mid", type=float, default=PREFILTER_MULTIPLIER_MID_DEFAULT)
+    p.add_argument("--prefilter-multiplier-low", type=float, default=PREFILTER_MULTIPLIER_LOW_DEFAULT)
+    p.add_argument("--prefilter-high-threshold", type=float, default=PREFILTER_HIGH_THRESHOLD_DEFAULT)
+    p.add_argument("--prefilter-low-threshold", type=float, default=PREFILTER_LOW_THRESHOLD_DEFAULT)
     p.add_argument("--distill-batch-size", type=int, default=DISTILL_BATCH_SIZE_DEFAULT)
     p.add_argument("--distill-max-new-tokens", type=int, default=DISTILL_MAX_NEW_TOKENS_DEFAULT)
     p.add_argument("--temperature", type=float, default=TEMPERATURE_DEFAULT)
@@ -110,20 +121,34 @@ def main() -> int:
     grant_specs = load_grant_specs(resolve_path(PROJECT_ROOT, args.grant_db), max_items=args.max_grant_specs, seed=args.seed)
     fac_specs = load_fac_specs(resolve_path(PROJECT_ROOT, args.fac_db), max_items=args.max_fac_specs, seed=args.seed)
     decompositions = load_jsonl_by_key(decomposition_path, "item_id")
+    target_high = max(0, int(args.target_high_per_aspect))
+    target_mid = max(0, int(args.target_mid_per_aspect))
+    target_low = max(0, int(args.target_low_per_aspect))
+    prefilter_high = int(math.ceil(target_high * max(0.0, float(args.prefilter_multiplier_high))))
+    prefilter_mid = int(math.ceil(target_mid * max(0.0, float(args.prefilter_multiplier_mid))))
+    prefilter_low = int(math.ceil(target_low * max(0.0, float(args.prefilter_multiplier_low))))
     if args.prefilter_source == "ce-cache":
         pairs = select_pairs_from_prefilter_cache(
             grant_specs,
             fac_specs,
             cache_base_path=prefilter_cache_path,
             seed=args.seed,
+            high_per_aspect=prefilter_high,
+            mid_per_aspect=prefilter_mid,
+            low_per_aspect=prefilter_low,
+            high_threshold=float(args.prefilter_high_threshold),
+            low_threshold=float(args.prefilter_low_threshold),
         )
-        pair_selection = "prefilter_cache_balanced"
+        pair_selection = "prefilter_cache_threshold_windows"
     else:
         pairs = select_pairs_with_sts_prefilter(
             grant_specs,
             fac_specs,
             decompositions=decompositions,
             seed=args.seed,
+            high_per_aspect=prefilter_high,
+            mid_per_aspect=prefilter_mid,
+            low_per_aspect=prefilter_low,
         )
         pair_selection = "sts_prefilter_balanced"
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -145,12 +170,17 @@ def main() -> int:
         "decompositions_loaded": len(decompositions),
         "candidate_pairs": len(pairs),
         "pair_selection": pair_selection,
-        "prefilter_high_per_aspect": int(ASPECT_PREFILTER_HIGH_PER_ASPECT_DEFAULT),
-        "prefilter_mid_per_aspect": int(ASPECT_PREFILTER_MID_PER_ASPECT_DEFAULT),
-        "prefilter_low_per_aspect": int(ASPECT_PREFILTER_LOW_PER_ASPECT_DEFAULT),
-        "prefilter_high_pool_size": int(ASPECT_PREFILTER_HIGH_POOL_SIZE_DEFAULT),
-        "prefilter_mid_rank_start": int(ASPECT_PREFILTER_MID_RANK_START_DEFAULT),
-        "prefilter_mid_rank_end": int(ASPECT_PREFILTER_MID_RANK_END_DEFAULT),
+        "target_high_per_aspect": int(target_high),
+        "target_mid_per_aspect": int(target_mid),
+        "target_low_per_aspect": int(target_low),
+        "prefilter_high_per_aspect": int(prefilter_high),
+        "prefilter_mid_per_aspect": int(prefilter_mid),
+        "prefilter_low_per_aspect": int(prefilter_low),
+        "prefilter_multiplier_high": float(args.prefilter_multiplier_high),
+        "prefilter_multiplier_mid": float(args.prefilter_multiplier_mid),
+        "prefilter_multiplier_low": float(args.prefilter_multiplier_low),
+        "prefilter_high_threshold": float(args.prefilter_high_threshold),
+        "prefilter_low_threshold": float(args.prefilter_low_threshold),
         "prefilter_sts_model_id": STS_PREFILTER_MODEL_ID_DEFAULT,
         "use_tqdm": True,
     }
@@ -177,6 +207,9 @@ def main() -> int:
             temperature=args.temperature,
             top_p=args.top_p,
             max_attempts=args.max_attempts,
+            target_high_per_aspect=target_high,
+            target_mid_per_aspect=target_mid,
+            target_low_per_aspect=target_low,
         )
     finally:
         unload_llm(bundle)

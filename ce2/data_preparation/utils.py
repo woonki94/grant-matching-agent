@@ -58,6 +58,14 @@ MAX_ATTEMPTS_DEFAULT = 2
 ASPECTS = ("domain", "method", "target")
 ASPECT_WORD_LIMITS = {"domain": 3, "method": 4, "target": 4}
 ASPECT_MAX_ITEMS = {"domain": 4, "method": 4, "target": 4}
+DISTILL_TARGET_HIGH_PER_ASPECT_DEFAULT = 2
+DISTILL_TARGET_MID_PER_ASPECT_DEFAULT = 2
+DISTILL_TARGET_LOW_PER_ASPECT_DEFAULT = 2
+PREFILTER_MULTIPLIER_HIGH_DEFAULT = 8.0
+PREFILTER_MULTIPLIER_MID_DEFAULT = 8.0
+PREFILTER_MULTIPLIER_LOW_DEFAULT = 4.0
+PREFILTER_HIGH_THRESHOLD_DEFAULT = 0.70
+PREFILTER_LOW_THRESHOLD_DEFAULT = 0.30
 ASPECT_PREFILTER_HIGH_PER_ASPECT_DEFAULT = 2
 ASPECT_PREFILTER_MID_PER_ASPECT_DEFAULT = 2
 ASPECT_PREFILTER_LOW_PER_ASPECT_DEFAULT = 2
@@ -572,11 +580,9 @@ def select_pairs_from_prefilter_cache(
     high_per_aspect: int = ASPECT_PREFILTER_HIGH_PER_ASPECT_DEFAULT,
     mid_per_aspect: int = ASPECT_PREFILTER_MID_PER_ASPECT_DEFAULT,
     low_per_aspect: int = ASPECT_PREFILTER_LOW_PER_ASPECT_DEFAULT,
-    high_pool_size: int = ASPECT_PREFILTER_HIGH_POOL_SIZE_DEFAULT,
-    mid_rank_start: int = ASPECT_PREFILTER_MID_RANK_START_DEFAULT,
-    mid_rank_end: int = ASPECT_PREFILTER_MID_RANK_END_DEFAULT,
+    high_threshold: float = PREFILTER_HIGH_THRESHOLD_DEFAULT,
+    low_threshold: float = PREFILTER_LOW_THRESHOLD_DEFAULT,
 ) -> List[Tuple[SpecItem, SpecItem, float, str]]:
-    rng = random.Random(int(seed) + 911)
     grant_by_id = {g.item_id: g for g in grant_specs}
     fac_by_id = {f.item_id: f for f in fac_specs}
     cache_paths = prefilter_cache_paths(cache_base_path)
@@ -601,6 +607,74 @@ def select_pairs_from_prefilter_cache(
             return float(value)
         except Exception:
             return float(default)
+
+    def _candidate_score(cand: Dict[str, Any]) -> float:
+        if cand.get("ce_score") is not None:
+            return _safe_float(cand.get("ce_score"), 0.0)
+        if cand.get("score") is not None:
+            return _safe_float(cand.get("score"), 0.0)
+        return float(_sigmoid(_safe_float(cand.get("ce_logit"), 0.0)))
+
+    def _dedupe_ranked(items: Iterable[Tuple[int, SpecItem, float]]) -> List[Tuple[int, SpecItem, float]]:
+        out: List[Tuple[int, SpecItem, float]] = []
+        seen: set[str] = set()
+        for item in items:
+            fac_id = item[1].item_id
+            if fac_id in seen:
+                continue
+            seen.add(fac_id)
+            out.append(item)
+        return out
+
+    def _window_right(items: Sequence[Tuple[int, SpecItem, float]], start: int, count: int) -> List[Tuple[int, SpecItem, float]]:
+        if not items or int(count) <= 0:
+            return []
+        s = min(max(0, int(start)), len(items) - 1)
+        return list(items[s : min(len(items), s + int(count))])
+
+    def _window_left(items: Sequence[Tuple[int, SpecItem, float]], end: int, count: int) -> List[Tuple[int, SpecItem, float]]:
+        if not items or int(count) <= 0:
+            return []
+        e = min(max(0, int(end)), len(items) - 1)
+        s = max(0, e - int(count) + 1)
+        return list(items[s : e + 1])
+
+    def _center_window(items: Sequence[Tuple[int, SpecItem, float]], count: int) -> List[Tuple[int, SpecItem, float]]:
+        if not items or int(count) <= 0:
+            return []
+        k = min(int(count), len(items))
+        center = len(items) // 2
+        start = max(0, center - (k // 2))
+        end = min(len(items), start + k)
+        start = max(0, end - k)
+        return list(items[start:end])
+
+    def _pick_mid_candidates(ranked: Sequence[Tuple[int, SpecItem, float]], count: int) -> List[Tuple[int, SpecItem, float]]:
+        if not ranked or int(count) <= 0:
+            return []
+        k = min(int(count), len(ranked))
+        right_count = (k + 1) // 2
+        left_count = k - right_count
+
+        first_under_high = next(
+            (i for i, (_, _, score) in enumerate(ranked) if float(score) < float(high_threshold)),
+            len(ranked) // 2,
+        )
+        last_over_low = next(
+            (i for i in range(len(ranked) - 1, -1, -1) if float(ranked[i][2]) > float(low_threshold)),
+            len(ranked) // 2,
+        )
+        picks = _dedupe_ranked(
+            [
+                *_window_right(ranked, first_under_high, right_count),
+                *_window_left(ranked, last_over_low, left_count),
+            ]
+        )
+        if len(picks) < k:
+            picks = _dedupe_ranked([*picks, *_center_window(ranked, k - len(picks))])
+        if len(picks) < k:
+            picks = _dedupe_ranked([*picks, *ranked])
+        return picks[:k]
 
     def _add_pair(grant: SpecItem, fac: SpecItem, score: float, source: str) -> None:
         pair_id = f"{grant.item_id}::{fac.item_id}"
@@ -633,29 +707,19 @@ def select_pairs_from_prefilter_cache(
                 if fac is None:
                     continue
                 rank = _safe_int(cand.get("rank"), idx)
-                score = _safe_float(cand.get("ce_score"), _safe_float(cand.get("ce_logit"), 0.0))
+                score = _candidate_score(cand)
                 ranked.append((rank, fac, score))
 
             if not ranked:
                 continue
             ranked.sort(key=lambda x: (x[0], -float(x[2]), x[1].item_id))
 
-            high_pool = ranked[: max(0, int(high_pool_size))]
-            high_k = min(max(0, int(high_per_aspect)), len(high_pool))
-            high_pick = rng.sample(high_pool, high_k) if high_k > 0 else []
-
-            mid_start = max(0, int(mid_rank_start))
-            mid_end = max(mid_start, int(mid_rank_end))
-            mid_pool = ranked[mid_start:mid_end]
-            mid_k = min(max(0, int(mid_per_aspect)), len(mid_pool))
-            mid_pick = rng.sample(mid_pool, mid_k) if mid_k > 0 else []
-
-            low_start = max(mid_end, len(ranked) - max(32, int(STS_PREFILTER_LOW_TAIL_POOL_DEFAULT)))
-            low_pool = ranked[low_start:]
-            if not low_pool:
-                low_pool = ranked[mid_end:] if mid_end < len(ranked) else ranked
-            low_k = min(max(0, int(low_per_aspect)), len(low_pool))
-            low_pick = rng.sample(low_pool, low_k) if low_k > 0 else []
+            high_k = min(max(0, int(high_per_aspect)), len(ranked))
+            mid_k = min(max(0, int(mid_per_aspect)), len(ranked))
+            low_k = min(max(0, int(low_per_aspect)), len(ranked))
+            high_pick = ranked[:high_k]
+            mid_pick = _pick_mid_candidates(ranked, mid_k)
+            low_pick = ranked[len(ranked) - low_k :] if low_k > 0 else []
 
             for _, fac, score in high_pick:
                 _add_pair(grant, fac, score, f"cecache_{aspect}_high")
@@ -1205,6 +1269,86 @@ def _parse_single_score(obj: Optional[Dict[str, Any]]) -> Tuple[float, str, bool
     return coerce_score(obj.get("score")), normalize_ws(obj.get("reason")), True
 
 
+def _source_aspects(pair_source: str) -> List[str]:
+    aspects: List[str] = []
+    for raw in normalize_ws(pair_source).split("|"):
+        parts = raw.split("_")
+        if len(parts) >= 3 and parts[0] in {"cecache", "apf"} and parts[1] in ASPECTS:
+            aspects.append(parts[1])
+    out: List[str] = []
+    seen: set[str] = set()
+    for aspect in aspects:
+        if aspect in seen:
+            continue
+        seen.add(aspect)
+        out.append(aspect)
+    return out
+
+
+def _quota_targets(
+    *,
+    high: int,
+    mid: int,
+    low: int,
+) -> Dict[str, int]:
+    return {
+        "high": max(0, int(high)),
+        "mid": max(0, int(mid)),
+        "low": max(0, int(low)),
+    }
+
+
+def _select_distilled_row(
+    *,
+    row: Dict[str, Any],
+    pair_source: str,
+    counts: Dict[Tuple[str, str, str], int],
+    targets: Dict[str, int],
+) -> Tuple[bool, List[Dict[str, Any]]]:
+    if not any(int(v) > 0 for v in targets.values()):
+        return True, []
+
+    grant = row.get("grant") if isinstance(row.get("grant"), dict) else {}
+    grant_item_id = normalize_ws(grant.get("item_id"))
+    if not grant_item_id:
+        return False, []
+
+    bands = row.get("bands") if isinstance(row.get("bands"), dict) else {}
+    source_aspects = _source_aspects(pair_source) or list(ASPECTS)
+    selected_clusters: List[Dict[str, Any]] = []
+    for aspect in source_aspects:
+        band = normalize_ws(bands.get(aspect)).lower()
+        if band not in targets:
+            continue
+        target = int(targets.get(band, 0))
+        if target <= 0:
+            continue
+        key = (grant_item_id, aspect, band)
+        current = int(counts.get(key, 0))
+        if current >= target:
+            continue
+        selected_clusters.append(
+            {
+                "grant_item_id": grant_item_id,
+                "aspect": aspect,
+                "band": band,
+                "slot": current + 1,
+                "target": target,
+            }
+        )
+
+    if not selected_clusters:
+        return False, []
+    for cluster in selected_clusters:
+        key = (
+            normalize_ws(cluster.get("grant_item_id")),
+            normalize_ws(cluster.get("aspect")),
+            normalize_ws(cluster.get("band")),
+        )
+        counts[key] = int(counts.get(key, 0) + 1)
+    return True, selected_clusters
+
+
 def distill_pairs(
     *,
     llm_bundle: Dict[str, Any],
@@ -1218,11 +1362,20 @@ def distill_pairs(
     temperature: float,
     top_p: float,
     max_attempts: int,
+    target_high_per_aspect: int = DISTILL_TARGET_HIGH_PER_ASPECT_DEFAULT,
+    target_mid_per_aspect: int = DISTILL_TARGET_MID_PER_ASPECT_DEFAULT,
+    target_low_per_aspect: int = DISTILL_TARGET_LOW_PER_ASPECT_DEFAULT,
 ) -> List[Dict[str, Any]]:
     tokenizer = llm_bundle["tokenizer"]
     pending = [p for p in pairs if f"{p[0].item_id}::{p[1].item_id}" not in existing_pair_ids]
     print(f"distill_existing={len(existing_pair_ids)} distill_pending={len(pending)}")
     written_rows: List[Dict[str, Any]] = []
+    selected_counts: Dict[Tuple[str, str, str], int] = {}
+    target_counts = _quota_targets(
+        high=target_high_per_aspect,
+        mid=target_mid_per_aspect,
+        low=target_low_per_aspect,
+    )
     for attempt in range(max(1, int(max_attempts))):
         if not pending:
             break
@@ -1347,6 +1500,16 @@ def distill_pairs(
                     "model_id": model_id,
                     "raw_responses": bucket["raw_responses"],
                 }
+                keep_row, selected_clusters = _select_distilled_row(
+                    row=row,
+                    pair_source=pair_source,
+                    counts=selected_counts,
+                    targets=target_counts,
+                )
+                if not keep_row:
+                    existing_pair_ids.add(pair_id)
+                    continue
+                row["distill_selected_clusters"] = selected_clusters
                 existing_pair_ids.add(pair_id)
                 rows.append(row)
                 written_rows.append(row)
