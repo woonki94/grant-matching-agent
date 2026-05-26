@@ -5,6 +5,7 @@ set -euo pipefail
 # 1) distill real cache-selected pairs
 # 2) augment missing aspect-band clusters
 # 3) export aspect-specific train/val/test split files
+# 4) evaluate an existing finetuned CE2 model on the split files
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
@@ -25,6 +26,7 @@ SOURCE_DIR="${SOURCE_DIR:-ce2/dataset/source}"
 DECOMPOSITION_DIR="${DECOMPOSITION_DIR:-ce2/dataset/decomposed}"
 DISTILL_DIR="${DISTILL_DIR:-ce2/dataset/distill}"
 SPLIT_DIR="${SPLIT_DIR:-ce2/dataset/splits}"
+EVAL_DIR="${EVAL_DIR:-ce2/eval/results}"
 
 DECOMPOSITION_OUTPUT="${DECOMPOSITION_OUTPUT:-${DECOMPOSITION_DIR}/spec_decompositions_3aspect_shortform.jsonl}"
 PREFILTER_CACHE_OUTPUT="${PREFILTER_CACHE_OUTPUT:-${SOURCE_DIR}/prefilter_cache.jsonl}"
@@ -32,6 +34,9 @@ DISTILLATION_OUTPUT="${DISTILLATION_OUTPUT:-${DISTILL_DIR}/llm_distillation.json
 DISTILLATION_SUMMARY_OUTPUT="${DISTILLATION_SUMMARY_OUTPUT:-${DISTILL_DIR}/llm_distillation_summary.json}"
 AUGMENTATION_OUTPUT="${AUGMENTATION_OUTPUT:-${DISTILL_DIR}/augmentation.jsonl}"
 AUGMENTATION_SUMMARY_OUTPUT="${AUGMENTATION_SUMMARY_OUTPUT:-${DISTILL_DIR}/augmentation_summary.json}"
+EVAL_MODEL_DIR="${EVAL_MODEL_DIR:-ce2/models/basic_distill/best}"
+EVAL_OUTPUT_JSON="${EVAL_OUTPUT_JSON:-${EVAL_DIR}/evaluation.json}"
+EVAL_PREDICTIONS_OUTPUT="${EVAL_PREDICTIONS_OUTPUT:-${EVAL_DIR}/predictions.jsonl}"
 
 SEED="${SEED:-42}"
 MAX_GRANT_SPECS="${MAX_GRANT_SPECS:-0}"
@@ -60,6 +65,22 @@ AUGMENT_TARGET_LOW="${AUGMENT_TARGET_LOW:-0}"
 SPLIT_VAL_RATIO="${SPLIT_VAL_RATIO:-0.10}"
 SPLIT_TEST_RATIO="${SPLIT_TEST_RATIO:-0.10}"
 
+RUN_EVAL="${RUN_EVAL:-true}"
+EVAL_SPLIT="${EVAL_SPLIT:-test}"
+EVAL_ASPECTS="${EVAL_ASPECTS:-domain,method,target}"
+EVAL_BATCH_SIZE="${EVAL_BATCH_SIZE:-64}"
+EVAL_MAX_LENGTH="${EVAL_MAX_LENGTH:-256}"
+EVAL_TOP_K="${EVAL_TOP_K:-10}"
+EVAL_REL_THRESHOLD="${EVAL_REL_THRESHOLD:-0.70}"
+EVAL_PAIR_EPS="${EVAL_PAIR_EPS:-0.05}"
+EVAL_OOB_HIGH_WEIGHT="${EVAL_OOB_HIGH_WEIGHT:-2.0}"
+EVAL_OOB_MID_WEIGHT="${EVAL_OOB_MID_WEIGHT:-1.0}"
+EVAL_OOB_LOW_WEIGHT="${EVAL_OOB_LOW_WEIGHT:-1.0}"
+EVAL_OOB_MID_LOW_WEIGHT="${EVAL_OOB_MID_LOW_WEIGHT:-1.0}"
+EVAL_OOB_MID_HIGH_WEIGHT="${EVAL_OOB_MID_HIGH_WEIGHT:-1.0}"
+EVAL_SPLIT_MID_OOB="${EVAL_SPLIT_MID_OOB:-false}"
+EVAL_WRITE_PREDICTIONS="${EVAL_WRITE_PREDICTIONS:-true}"
+
 MAX_ATTEMPTS="${MAX_ATTEMPTS:-2}"
 TEMPERATURE="${TEMPERATURE:-0.0}"
 TOP_P="${TOP_P:-0.9}"
@@ -76,6 +97,10 @@ log "prefilter_cache_output=${PREFILTER_CACHE_OUTPUT}"
 log "distillation_output=${DISTILLATION_OUTPUT}"
 log "augmentation_output=${AUGMENTATION_OUTPUT}"
 log "split_dir=${SPLIT_DIR}"
+log "run_eval=${RUN_EVAL}"
+log "eval_model_dir=${EVAL_MODEL_DIR}"
+log "eval_output_json=${EVAL_OUTPUT_JSON}"
+log "eval_predictions_output=${EVAL_PREDICTIONS_OUTPUT}"
 log "target_per_aspect=high:${TARGET_HIGH_PER_ASPECT},mid:${TARGET_MID_PER_ASPECT},low:${TARGET_LOW_PER_ASPECT}"
 log "prefilter_multiplier=high:${PREFILTER_MULTIPLIER_HIGH},mid:${PREFILTER_MULTIPLIER_MID},low:${PREFILTER_MULTIPLIER_LOW}"
 
@@ -159,5 +184,46 @@ if [[ "${OVERWRITE}" == "true" ]]; then
 fi
 log "Running (split): ${SPLIT_CMD[*]}"
 "${SPLIT_CMD[@]}"
+
+if [[ "${RUN_EVAL}" == "true" ]]; then
+  if [[ ! -d "${EVAL_MODEL_DIR}" ]]; then
+    log "Eval model directory not found: ${EVAL_MODEL_DIR}"
+    log "Train a model first, set EVAL_MODEL_DIR to an existing checkpoint, or run with RUN_EVAL=false."
+    exit 1
+  fi
+  EVAL_CMD=(
+    "${PYTHON_BIN}" ce2/eval/evaluate_model.py
+    --model-dir "${EVAL_MODEL_DIR}"
+    --split-dir "${SPLIT_DIR}"
+    --split "${EVAL_SPLIT}"
+    --aspects "${EVAL_ASPECTS}"
+    --output-json "${EVAL_OUTPUT_JSON}"
+    --predictions-output "${EVAL_PREDICTIONS_OUTPUT}"
+    --batch-size "${EVAL_BATCH_SIZE}"
+    --max-length "${EVAL_MAX_LENGTH}"
+    --high-threshold "${PREFILTER_HIGH_THRESHOLD}"
+    --mid-threshold "${PREFILTER_LOW_THRESHOLD}"
+    --top-k "${EVAL_TOP_K}"
+    --rel-threshold "${EVAL_REL_THRESHOLD}"
+    --pair-eps "${EVAL_PAIR_EPS}"
+    --oob-high-weight "${EVAL_OOB_HIGH_WEIGHT}"
+    --oob-mid-weight "${EVAL_OOB_MID_WEIGHT}"
+    --oob-low-weight "${EVAL_OOB_LOW_WEIGHT}"
+    --oob-mid-low-weight "${EVAL_OOB_MID_LOW_WEIGHT}"
+    --oob-mid-high-weight "${EVAL_OOB_MID_HIGH_WEIGHT}"
+  )
+  if [[ "${EVAL_SPLIT_MID_OOB}" == "true" ]]; then
+    EVAL_CMD+=(--split-mid-oob)
+  else
+    EVAL_CMD+=(--no-split-mid-oob)
+  fi
+  if [[ "${EVAL_WRITE_PREDICTIONS}" != "true" ]]; then
+    EVAL_CMD+=(--no-predictions)
+  fi
+  log "Running (eval): ${EVAL_CMD[*]}"
+  "${EVAL_CMD[@]}"
+else
+  log "Skipping eval because RUN_EVAL=${RUN_EVAL}"
+fi
 
 log "Done."

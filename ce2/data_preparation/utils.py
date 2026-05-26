@@ -482,9 +482,12 @@ def select_pairs_with_sts_prefilter(
 
     def _add_pair(grant: SpecItem, fac: SpecItem, score: float, source: str) -> None:
         pair_id = f"{grant.item_id}::{fac.item_id}"
-        bucket = selected.get(pair_id)
+        aspects = _source_aspects(source)
+        aspect_key = aspects[0] if aspects else "unknown"
+        selected_id = f"{pair_id}::{aspect_key}"
+        bucket = selected.get(selected_id)
         if bucket is None:
-            selected[pair_id] = {
+            selected[selected_id] = {
                 "grant": grant,
                 "fac": fac,
                 "score": float(score),
@@ -678,9 +681,12 @@ def select_pairs_from_prefilter_cache(
 
     def _add_pair(grant: SpecItem, fac: SpecItem, score: float, source: str) -> None:
         pair_id = f"{grant.item_id}::{fac.item_id}"
-        bucket = selected.get(pair_id)
+        aspects = _source_aspects(source)
+        aspect_key = aspects[0] if aspects else "unknown"
+        selected_id = f"{pair_id}::{aspect_key}"
+        bucket = selected.get(selected_id)
         if bucket is None:
-            selected[pair_id] = {
+            selected[selected_id] = {
                 "grant": grant,
                 "fac": fac,
                 "score": float(score),
@@ -787,10 +793,16 @@ def _score_stats(values: Sequence[float]) -> Dict[str, Any]:
 def build_summary(*, distillation_path: Path, decomposition_path: Path, started_at: float, config: Dict[str, Any]) -> Dict[str, Any]:
     rows = list(iter_jsonl(distillation_path))
     decomps = list(iter_jsonl(decomposition_path))
-    score_values = {
-        aspect: [float(row.get("scores", {}).get(aspect, 0.0)) for row in rows if isinstance(row.get("scores"), dict)]
-        for aspect in (*ASPECTS, "overall")
-    }
+    score_values: Dict[str, List[float]] = {aspect: [] for aspect in ASPECTS}
+    for row in rows:
+        row_aspect = normalize_ws(row.get("aspect")).lower()
+        if row_aspect in ASPECTS and row.get("score") is not None:
+            score_values[row_aspect].append(coerce_score(row.get("score")))
+            continue
+        scores = row.get("scores") if isinstance(row.get("scores"), dict) else {}
+        for aspect in ASPECTS:
+            if aspect in scores:
+                score_values[aspect].append(coerce_score(scores.get(aspect)))
     return {
         "created_at": datetime.now(timezone.utc).isoformat(),
         "elapsed_sec": time.time() - started_at,
@@ -1314,10 +1326,11 @@ def _select_distilled_row(
         return False, []
 
     bands = row.get("bands") if isinstance(row.get("bands"), dict) else {}
-    source_aspects = _source_aspects(pair_source) or list(ASPECTS)
+    row_aspect = normalize_ws(row.get("aspect")).lower()
+    source_aspects = [row_aspect] if row_aspect in ASPECTS else (_source_aspects(pair_source) or list(ASPECTS))
     selected_clusters: List[Dict[str, Any]] = []
     for aspect in source_aspects:
-        band = normalize_ws(bands.get(aspect)).lower()
+        band = normalize_ws(row.get("band")).lower() if row_aspect == aspect else normalize_ws(bands.get(aspect)).lower()
         if band not in targets:
             continue
         target = int(targets.get(band, 0))
@@ -1367,7 +1380,11 @@ def distill_pairs(
     target_low_per_aspect: int = DISTILL_TARGET_LOW_PER_ASPECT_DEFAULT,
 ) -> List[Dict[str, Any]]:
     tokenizer = llm_bundle["tokenizer"]
-    pending = [p for p in pairs if f"{p[0].item_id}::{p[1].item_id}" not in existing_pair_ids]
+    def _pair_aspect_key(grant: SpecItem, fac: SpecItem, pair_source: str) -> str:
+        aspect = (_source_aspects(pair_source) or ["unknown"])[0]
+        return f"{grant.item_id}::{fac.item_id}::{aspect}"
+
+    pending = [p for p in pairs if _pair_aspect_key(p[0], p[1], p[3]) not in existing_pair_ids]
     print(f"distill_existing={len(existing_pair_ids)} distill_pending={len(pending)}")
     written_rows: List[Dict[str, Any]] = []
     selected_counts: Dict[Tuple[str, str, str], int] = {}
@@ -1397,13 +1414,16 @@ def distill_pairs(
         for chunk in chunk_iter:
             prompts: List[str] = []
             task_items: List[Tuple[str, str, SpecItem, SpecItem, float, str, Dict[str, Any], Dict[str, Any]]] = []
-            for aspect in ASPECTS:
-                for grant, fac, lexical_score, pair_source in chunk:
-                    g_dec_row = decompositions.get(grant.item_id, {})
-                    f_dec_row = decompositions.get(fac.item_id, {})
-                    g_dec = g_dec_row.get("decomposition") if isinstance(g_dec_row, dict) else {}
-                    f_dec = f_dec_row.get("decomposition") if isinstance(f_dec_row, dict) else {}
-                    pair_id = f"{grant.item_id}::{fac.item_id}"
+            for grant, fac, lexical_score, pair_source in chunk:
+                source_aspects = _source_aspects(pair_source)
+                if not source_aspects:
+                    source_aspects = list(ASPECTS)
+                g_dec_row = decompositions.get(grant.item_id, {})
+                f_dec_row = decompositions.get(fac.item_id, {})
+                g_dec = g_dec_row.get("decomposition") if isinstance(g_dec_row, dict) else {}
+                f_dec = f_dec_row.get("decomposition") if isinstance(f_dec_row, dict) else {}
+                for aspect in source_aspects:
+                    pair_id = f"{grant.item_id}::{fac.item_id}::{aspect}"
                     user_prompt = SCORE_USER_PROMPT_TEMPLATE.format(
                         aspect=aspect,
                         grant_text=grant.text,
@@ -1432,46 +1452,19 @@ def distill_pairs(
             )
 
             rows: List[Dict[str, Any]] = []
-            grouped: Dict[str, Dict[str, Any]] = {}
             for item, response in zip(task_items, responses):
                 pair_id, aspect, grant, fac, lexical_score, pair_source, g_dec_row, f_dec_row = item
                 parsed = extract_json_object(response)
                 score, ok = _parse_single_score(parsed)
-                bucket = grouped.setdefault(
-                    pair_id,
-                    {
-                        "grant": grant,
-                        "fac": fac,
-                        "lexical_score": lexical_score,
-                        "pair_source": pair_source,
-                        "g_dec_row": g_dec_row,
-                        "f_dec_row": f_dec_row,
-                        "scores": {},
-                        "raw_responses": {},
-                        "ok": {},
-                    },
-                )
-                bucket["scores"][aspect] = float(score)
-                bucket["raw_responses"][aspect] = response
-                bucket["ok"][aspect] = bool(ok)
-
-            for pair_id, bucket in grouped.items():
-                grant = bucket["grant"]
-                fac = bucket["fac"]
-                lexical_score = bucket["lexical_score"]
-                pair_source = bucket["pair_source"]
-                g_dec_row = bucket["g_dec_row"]
-                f_dec_row = bucket["f_dec_row"]
-                score_map = bucket["scores"]
-                ok_map = bucket["ok"]
-                parse_ok = all(bool(ok_map.get(aspect)) and aspect in score_map for aspect in ASPECTS)
-                if not parse_ok:
+                if not ok:
                     next_pending.append((grant, fac, lexical_score, pair_source))
                     continue
-                aspect_scores = {aspect: float(score_map[aspect]) for aspect in ASPECTS}
-                overall_score = float(sum(aspect_scores.values()) / max(1, len(ASPECTS)))
+                band = score_to_band(float(score))
                 row = {
                     "pair_id": pair_id,
+                    "aspect": aspect,
+                    "score": float(score),
+                    "band": band,
                     "grant": {
                         "item_id": grant.item_id,
                         "text": grant.text,
@@ -1484,17 +1477,15 @@ def distill_pairs(
                         "meta": fac.meta,
                         "decomposition": f_dec_row.get("decomposition", {}),
                     },
-                    "scores": {**aspect_scores, "overall": overall_score},
-                    "bands": {
-                        **{aspect: score_to_band(score) for aspect, score in aspect_scores.items()},
-                        "overall": score_to_band(overall_score),
-                    },
+                    "scores": {aspect: float(score)},
+                    "bands": {aspect: band},
                     "lexical_prefilter_score": float(lexical_score),
                     "pair_source": pair_source,
                     "parse_ok": True,
                     "attempt": int(attempt + 1),
                     "model_id": model_id,
-                    "raw_responses": bucket["raw_responses"],
+                    "raw_response": response,
+                    "raw_responses": {aspect: response},
                 }
                 keep_row, selected_clusters = _select_distilled_row(
                     row=row,

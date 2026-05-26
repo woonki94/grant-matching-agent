@@ -141,6 +141,11 @@ def _count_bands(distilled_rows: Sequence[Dict[str, Any]]) -> Dict[str, Dict[str
     for row in distilled_rows:
         if not bool(row.get("parse_ok")):
             continue
+        row_aspect = normalize_ws(row.get("aspect")).lower()
+        row_band = normalize_ws(row.get("band")).lower()
+        if row_aspect in ASPECTS and row_band in BANDS:
+            counts[row_aspect][row_band] += 1
+            continue
         bands = row.get("bands") if isinstance(row.get("bands"), dict) else {}
         for aspect in ASPECTS:
             b = normalize_ws(bands.get(aspect)).lower()
@@ -333,25 +338,25 @@ def _distill_candidate_pairs(
     for idx, cand in enumerate(candidates):
         g_dec = cand.grant_dec_row.get("decomposition", {})
         f_dec = cand.fac_dec_row.get("decomposition", {})
-        for aspect in ASPECTS:
-            user_prompt = SCORE_USER_PROMPT_TEMPLATE.format(
-                aspect=aspect,
-                grant_text=cand.grant.text,
-                grant_aspect_items_json=json.dumps(g_dec.get(aspect, []), ensure_ascii=False),
-                grant_decomposition_json=json.dumps(g_dec, ensure_ascii=False),
-                fac_text=cand.faculty.text,
-                fac_aspect_items_json=json.dumps(f_dec.get(aspect, []), ensure_ascii=False),
-                fac_decomposition_json=json.dumps(f_dec, ensure_ascii=False),
+        aspect = cand.target_aspect
+        user_prompt = SCORE_USER_PROMPT_TEMPLATE.format(
+            aspect=aspect,
+            grant_text=cand.grant.text,
+            grant_aspect_items_json=json.dumps(g_dec.get(aspect, []), ensure_ascii=False),
+            grant_decomposition_json=json.dumps(g_dec, ensure_ascii=False),
+            fac_text=cand.faculty.text,
+            fac_aspect_items_json=json.dumps(f_dec.get(aspect, []), ensure_ascii=False),
+            fac_decomposition_json=json.dumps(f_dec, ensure_ascii=False),
+        )
+        prompts.append(
+            build_prompt(
+                tokenizer,
+                model_id=model_id,
+                system_prompt=SCORE_SYSTEM_PROMPTS_BY_ASPECT[aspect],
+                user_prompt=user_prompt,
             )
-            prompts.append(
-                build_prompt(
-                    tokenizer,
-                    model_id=model_id,
-                    system_prompt=SCORE_SYSTEM_PROMPTS_BY_ASPECT[aspect],
-                    user_prompt=user_prompt,
-                )
-            )
-            task_meta.append((idx, aspect))
+        )
+        task_meta.append((idx, aspect))
 
     responses = generate_responses_batch(
         llm_bundle=llm_bundle,
@@ -379,13 +384,17 @@ def _distill_candidate_pairs(
         bucket = grouped.get(idx, {})
         score_map = bucket.get("scores", {})
         ok_map = bucket.get("ok", {})
-        parse_ok = all(bool(ok_map.get(a)) and a in score_map for a in ASPECTS)
+        aspect = cand.target_aspect
+        parse_ok = bool(ok_map.get(aspect)) and aspect in score_map
         if not parse_ok:
             continue
-        aspect_scores = {a: float(score_map[a]) for a in ASPECTS}
-        overall = float(sum(aspect_scores.values()) / max(1, len(ASPECTS)))
+        score = float(score_map[aspect])
+        band = score_to_band(score)
         row = {
-            "pair_id": f"{cand.grant.item_id}::{cand.faculty.item_id}",
+            "pair_id": f"{cand.grant.item_id}::{cand.faculty.item_id}::{aspect}",
+            "aspect": aspect,
+            "score": score,
+            "band": band,
             "grant": {
                 "item_id": cand.grant.item_id,
                 "text": cand.grant.text,
@@ -398,14 +407,15 @@ def _distill_candidate_pairs(
                 "meta": cand.faculty.meta,
                 "decomposition": cand.fac_dec_row.get("decomposition", {}),
             },
-            "scores": {**aspect_scores, "overall": overall},
-            "bands": {**{a: score_to_band(v) for a, v in aspect_scores.items()}, "overall": score_to_band(overall)},
+            "scores": {aspect: score},
+            "bands": {aspect: band},
             "lexical_prefilter_score": 0.0,
             "pair_source": f"augmented_{cand.target_aspect}_{cand.target_band}",
             "parse_ok": True,
             "attempt": 1,
             "model_id": model_id,
-            "raw_responses": bucket.get("raw", {}),
+            "raw_response": (bucket.get("raw", {}) or {}).get(aspect, ""),
+            "raw_responses": {aspect: (bucket.get("raw", {}) or {}).get(aspect, "")},
             "is_augmented": True,
             "augment_target_aspect": cand.target_aspect,
             "augment_target_band": cand.target_band,
@@ -600,8 +610,11 @@ def main() -> int:
                         pair_id = normalize_ws(row.get("pair_id"))
                         if not pair_id or pair_id in existing_pair_ids:
                             continue
-                        row_bands = row.get("bands") if isinstance(row.get("bands"), dict) else {}
-                        if normalize_ws(row_bands.get(aspect)).lower() != band:
+                        row_band = normalize_ws(row.get("band")).lower()
+                        if not row_band:
+                            row_bands = row.get("bands") if isinstance(row.get("bands"), dict) else {}
+                            row_band = normalize_ws(row_bands.get(aspect)).lower()
+                        if row_band != band:
                             continue
 
                         grant_item_id = normalize_ws((row.get("grant") or {}).get("item_id"))

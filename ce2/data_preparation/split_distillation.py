@@ -102,6 +102,10 @@ def _query_id(row: Dict[str, Any]) -> str:
 
 
 def _selected_aspects(row: Dict[str, Any]) -> List[str]:
+    row_aspect = _normalize_ws(row.get("aspect"))
+    if row_aspect in ASPECTS:
+        return [row_aspect]
+
     clusters = row.get("distill_selected_clusters")
     if isinstance(clusters, list):
         aspects = []
@@ -132,10 +136,14 @@ def _to_aspect_rows(row: Dict[str, Any], *, source_file: str) -> List[Dict[str, 
     out: List[Dict[str, Any]] = []
 
     for aspect in _selected_aspects(row):
-        if aspect not in scores:
+        if row.get("aspect") == aspect and row.get("score") is not None:
+            score = float(row.get("score") or 0.0)
+            band = _normalize_ws(row.get("band")).lower()
+        elif aspect in scores:
+            score = float(scores.get(aspect) or 0.0)
+            band = _normalize_ws(bands.get(aspect)).lower()
+        else:
             continue
-        score = float(scores.get(aspect) or 0.0)
-        band = _normalize_ws(bands.get(aspect)).lower()
         out.append(
             {
                 "aspect": aspect,
