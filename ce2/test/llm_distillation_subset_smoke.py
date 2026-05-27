@@ -47,6 +47,8 @@ DECOMPOSITION_OUTPUT_DEFAULT = "ce2/test/output/spec_decompositions_subset.jsonl
 DISTILLATION_OUTPUT_DEFAULT = "ce2/test/output/llm_distillation_subset.jsonl"
 SUMMARY_OUTPUT_DEFAULT = "ce2/test/output/llm_distillation_subset_summary.json"
 PREVIEW_OUTPUT_DEFAULT = "ce2/test/output/llm_distillation_subset_preview.txt"
+SUBSET_GRANT_DB_DEFAULT = "ce2/test/output/grant_keywords_spec_keywords_db_subset.json"
+SUBSET_FAC_DB_DEFAULT = "ce2/test/output/fac_specs_db_subset.json"
 SAFE_TEST_OUTPUT_ROOT = "ce2/test/output"
 
 
@@ -193,8 +195,8 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("--python-bin", type=str, default=sys.executable or "python")
     p.add_argument("--model-id", type=str, default=MODEL_ID_DEFAULT)
-    p.add_argument("--grant-db", type=str, default=GRANT_DB_DEFAULT)
-    p.add_argument("--fac-db", type=str, default=FAC_DB_DEFAULT)
+    p.add_argument("--grant-db", type=str, default=SUBSET_GRANT_DB_DEFAULT)
+    p.add_argument("--fac-db", type=str, default=SUBSET_FAC_DB_DEFAULT)
     p.add_argument("--decomposition-output", type=str, default=DECOMPOSITION_OUTPUT_DEFAULT)
     p.add_argument("--prefilter-source", type=str, choices=("auto", "ce-cache", "sts"), default="auto")
     p.add_argument("--prefilter-cache", type=str, default=PREFILTER_CACHE_OUTPUT_DEFAULT)
@@ -237,6 +239,8 @@ def main() -> int:
     args = _build_parser().parse_args()
 
     decomposition_output = resolve_path(PROJECT_ROOT, args.decomposition_output)
+    grant_db = resolve_path(PROJECT_ROOT, args.grant_db)
+    fac_db = resolve_path(PROJECT_ROOT, args.fac_db)
     prefilter_cache = resolve_path(PROJECT_ROOT, args.prefilter_cache)
     distillation_output = resolve_path(PROJECT_ROOT, args.distillation_output)
     summary_output = resolve_path(PROJECT_ROOT, args.summary_output)
@@ -248,6 +252,13 @@ def main() -> int:
         raise FileNotFoundError(
             f"Missing decomposition file: {decomposition_output}\n"
             "Run ce2/test/decomposition_subset_smoke.py first, or pass --decomposition-output."
+        )
+    if not grant_db.exists() or not fac_db.exists():
+        raise FileNotFoundError(
+            "Missing subset grant/fac DB for distillation smoke test.\n"
+            f"grant_db={grant_db}\n"
+            f"fac_db={fac_db}\n"
+            "Run ce2/test/run_decomposition_subset.sh first, or pass --grant-db/--fac-db explicitly."
         )
     _assert_safe_output_path(
         distillation_output,
@@ -281,9 +292,9 @@ def main() -> int:
         "--model-id",
         str(args.model_id),
         "--grant-db",
-        str(args.grant_db),
+        str(grant_db),
         "--fac-db",
-        str(args.fac_db),
+        str(fac_db),
         "--output-dir",
         str(out_dir),
         "--decomposition-output",

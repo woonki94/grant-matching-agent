@@ -57,6 +57,7 @@ from ce2.data_preparation.utils import (  # noqa: E402
     distill_pairs,
     select_pairs_from_prefilter_cache,
     select_pairs_with_sts_prefilter,
+    validate_decomposition_coverage,
     write_json,
 )
 from ce2.data_preparation.llm_runtime import load_llm, unload_llm  # noqa: E402
@@ -121,6 +122,16 @@ def main() -> int:
     grant_specs = load_grant_specs(resolve_path(PROJECT_ROOT, args.grant_db), max_items=args.max_grant_specs, seed=args.seed)
     fac_specs = load_fac_specs(resolve_path(PROJECT_ROOT, args.fac_db), max_items=args.max_fac_specs, seed=args.seed)
     decompositions = load_jsonl_by_key(decomposition_path, "item_id")
+    validate_decomposition_coverage(
+        items=grant_specs,
+        decompositions=decompositions,
+        label="grant specs loaded for distillation",
+    )
+    validate_decomposition_coverage(
+        items=fac_specs,
+        decompositions=decompositions,
+        label="faculty specs loaded for distillation",
+    )
     target_high = max(0, int(args.target_high_per_aspect))
     target_mid = max(0, int(args.target_mid_per_aspect))
     target_low = max(0, int(args.target_low_per_aspect))

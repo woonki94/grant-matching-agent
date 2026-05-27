@@ -7,8 +7,8 @@ cd "${PROJECT_ROOT}"
 
 PYTHON_BIN="${PYTHON_BIN:-python}"
 MODEL_ID="${MODEL_ID:-Qwen/Qwen3-14B}"
-GRANT_DB="${GRANT_DB:-ce/dataset/source/grant_keywords_spec_keywords_db.json}"
-FAC_DB="${FAC_DB:-ce/dataset/source/fac_specs_db.json}"
+GRANT_DB="${GRANT_DB:-ce2/test/output/grant_keywords_spec_keywords_db_subset.json}"
+FAC_DB="${FAC_DB:-ce2/test/output/fac_specs_db_subset.json}"
 DECOMPOSITION_OUTPUT="${DECOMPOSITION_OUTPUT:-ce2/test/output/spec_decompositions_subset.jsonl}"
 PREFILTER_SOURCE="${PREFILTER_SOURCE:-auto}"   # auto | ce-cache | sts
 PREFILTER_CACHE="${PREFILTER_CACHE:-ce2/dataset/source/prefilter_cache.jsonl}"

@@ -966,6 +966,34 @@ def _cached_decomposition_matches_item(row: Dict[str, Any], item: SpecItem) -> b
     )
 
 
+def validate_decomposition_coverage(
+    *,
+    items: Sequence[SpecItem],
+    decompositions: Dict[str, Dict[str, Any]],
+    label: str,
+    max_examples: int = 5,
+) -> None:
+    bad: List[str] = []
+    for item in items:
+        row = decompositions.get(item.item_id)
+        if row is None:
+            reason = "missing"
+        elif not _cached_decomposition_matches_item(row, item):
+            reason = "stale_or_mismatched_text"
+        else:
+            continue
+        if len(bad) < max(1, int(max_examples)):
+            bad.append(f"{reason}: {item.item_id} text={item.text[:120]}")
+    if bad:
+        raise RuntimeError(
+            f"Decomposition coverage check failed for {label}: "
+            f"found missing or stale decomposition rows. Examples:\n"
+            + "\n".join(bad)
+            + "\nRegenerate decomposition for the same grant/fac DB inputs, "
+            "or pass the subset DBs that match the decomposition output."
+        )
+
+
 def decompose_specs(
     *,
     llm_bundle: Dict[str, Any],
