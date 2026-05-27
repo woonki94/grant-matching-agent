@@ -33,7 +33,8 @@ MAX_ATTEMPTS="${MAX_ATTEMPTS:-2}"
 MAX_MODEL_LEN="${MAX_MODEL_LEN:-4096}"
 GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.90}"
 TENSOR_PARALLEL_SIZE="${TENSOR_PARALLEL_SIZE:-1}"
-OVERWRITE="${OVERWRITE:-true}"
+OVERWRITE="${OVERWRITE:-false}"
+ALLOW_NON_TEST_OUTPUT="${ALLOW_NON_TEST_OUTPUT:-false}"
 PREVIEW_OUTPUT="${PREVIEW_OUTPUT:-ce2/test/output/llm_distillation_subset_preview.txt}"
 PREVIEW_COUNT="${PREVIEW_COUNT:-36}"
 
@@ -71,6 +72,11 @@ CMD=(
   --preview-output "${PREVIEW_OUTPUT}"
   --preview-count "${PREVIEW_COUNT}"
 )
+if bool_true "${ALLOW_NON_TEST_OUTPUT}"; then
+  CMD+=(--allow-non-test-output)
+else
+  CMD+=(--no-allow-non-test-output)
+fi
 
 if bool_true "${OVERWRITE}"; then
   CMD+=(--overwrite)

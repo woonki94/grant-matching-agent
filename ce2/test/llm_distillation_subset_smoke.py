@@ -47,6 +47,7 @@ DECOMPOSITION_OUTPUT_DEFAULT = "ce2/test/output/spec_decompositions_subset.jsonl
 DISTILLATION_OUTPUT_DEFAULT = "ce2/test/output/llm_distillation_subset.jsonl"
 SUMMARY_OUTPUT_DEFAULT = "ce2/test/output/llm_distillation_subset_summary.json"
 PREVIEW_OUTPUT_DEFAULT = "ce2/test/output/llm_distillation_subset_preview.txt"
+SAFE_TEST_OUTPUT_ROOT = "ce2/test/output"
 
 
 def _clean_text(value: Any) -> str:
@@ -83,6 +84,26 @@ def _iter_jsonl(path: Path) -> Iterable[Dict[str, Any]]:
                 raise RuntimeError(f"Invalid JSON at {path}:{line_no}: {type(exc).__name__}: {exc}") from exc
             if isinstance(obj, dict):
                 yield obj
+
+
+def _is_relative_to(path: Path, root: Path) -> bool:
+    try:
+        path.resolve().relative_to(root.resolve())
+        return True
+    except Exception:
+        return False
+
+
+def _assert_safe_output_path(path: Path, *, safe_root: Path, allow_non_test_output: bool) -> None:
+    if bool(allow_non_test_output):
+        return
+    if not _is_relative_to(path, safe_root):
+        raise RuntimeError(
+            f"Refusing to write outside test output root.\n"
+            f"path={path}\n"
+            f"allowed_root={safe_root}\n"
+            "Set --allow-non-test-output to bypass intentionally."
+        )
 
 
 def _truncate(text: str, limit: int) -> str:
@@ -198,9 +219,15 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--max-model-len", type=int, default=MAX_MODEL_LEN_DEFAULT)
     p.add_argument("--gpu-memory-utilization", type=float, default=0.90)
     p.add_argument("--tensor-parallel-size", type=int, default=1)
-    p.add_argument("--overwrite", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--overwrite", action=argparse.BooleanOptionalAction, default=False)
     p.add_argument("--preview-output", type=str, default=PREVIEW_OUTPUT_DEFAULT)
     p.add_argument("--preview-count", type=int, default=36)
+    p.add_argument(
+        "--allow-non-test-output",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Allow writing outputs outside ce2/test/output (disabled by default for safety).",
+    )
     return p
 
 
@@ -212,12 +239,28 @@ def main() -> int:
     distillation_output = resolve_path(PROJECT_ROOT, args.distillation_output)
     summary_output = resolve_path(PROJECT_ROOT, args.summary_output)
     preview_output = resolve_path(PROJECT_ROOT, args.preview_output)
+    safe_root = resolve_path(PROJECT_ROOT, SAFE_TEST_OUTPUT_ROOT)
 
     if not decomposition_output.exists():
         raise FileNotFoundError(
             f"Missing decomposition file: {decomposition_output}\n"
             "Run ce2/test/decomposition_subset_smoke.py first, or pass --decomposition-output."
         )
+    _assert_safe_output_path(
+        distillation_output,
+        safe_root=safe_root,
+        allow_non_test_output=bool(args.allow_non_test_output),
+    )
+    _assert_safe_output_path(
+        summary_output,
+        safe_root=safe_root,
+        allow_non_test_output=bool(args.allow_non_test_output),
+    )
+    _assert_safe_output_path(
+        preview_output,
+        safe_root=safe_root,
+        allow_non_test_output=bool(args.allow_non_test_output),
+    )
 
     resolved_prefilter, prefilter_reason = _resolve_prefilter_source(
         requested=str(args.prefilter_source),

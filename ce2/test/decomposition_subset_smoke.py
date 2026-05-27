@@ -37,6 +37,7 @@ from ce2.data_preparation.utils import (  # noqa: E402
 
 DECOMPOSITION_OUTPUT_DEFAULT = "ce2/test/output/spec_decompositions_subset.jsonl"
 PREVIEW_OUTPUT_DEFAULT = "ce2/test/output/spec_decompositions_subset_preview.txt"
+SAFE_TEST_OUTPUT_ROOT = "ce2/test/output"
 
 
 def _clean_text(value: Any) -> str:
@@ -59,6 +60,26 @@ def _iter_jsonl(path: Path) -> Iterable[Dict[str, Any]]:
                 raise RuntimeError(f"Invalid JSON at {path}:{line_no}: {type(exc).__name__}: {exc}") from exc
             if isinstance(obj, dict):
                 yield obj
+
+
+def _is_relative_to(path: Path, root: Path) -> bool:
+    try:
+        path.resolve().relative_to(root.resolve())
+        return True
+    except Exception:
+        return False
+
+
+def _assert_safe_output_path(path: Path, *, safe_root: Path, allow_non_test_output: bool) -> None:
+    if bool(allow_non_test_output):
+        return
+    if not _is_relative_to(path, safe_root):
+        raise RuntimeError(
+            f"Refusing to write outside test output root.\n"
+            f"path={path}\n"
+            f"allowed_root={safe_root}\n"
+            "Set --allow-non-test-output to bypass intentionally."
+        )
 
 
 def _truncate(text: str, limit: int) -> str:
@@ -151,13 +172,19 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--max-model-len", type=int, default=MAX_MODEL_LEN_DEFAULT)
     p.add_argument("--gpu-memory-utilization", type=float, default=0.90)
     p.add_argument("--tensor-parallel-size", type=int, default=1)
-    p.add_argument("--overwrite", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--overwrite", action=argparse.BooleanOptionalAction, default=False)
     p.add_argument("--refresh-failed-decompositions", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--refresh-all-decompositions", action=argparse.BooleanOptionalAction, default=False)
     p.add_argument("--decomposition-output", type=str, default=DECOMPOSITION_OUTPUT_DEFAULT)
     p.add_argument("--preview-output", type=str, default=PREVIEW_OUTPUT_DEFAULT)
     p.add_argument("--preview-count", type=int, default=12)
     p.add_argument("--preview-kind", type=str, choices=("all", "grant", "faculty"), default="all")
+    p.add_argument(
+        "--allow-non-test-output",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Allow writing outputs outside ce2/test/output (disabled by default for safety).",
+    )
     return p
 
 
@@ -166,6 +193,17 @@ def main() -> int:
 
     decomposition_output = resolve_path(PROJECT_ROOT, args.decomposition_output)
     preview_output = resolve_path(PROJECT_ROOT, args.preview_output)
+    safe_root = resolve_path(PROJECT_ROOT, SAFE_TEST_OUTPUT_ROOT)
+    _assert_safe_output_path(
+        decomposition_output,
+        safe_root=safe_root,
+        allow_non_test_output=bool(args.allow_non_test_output),
+    )
+    _assert_safe_output_path(
+        preview_output,
+        safe_root=safe_root,
+        allow_non_test_output=bool(args.allow_non_test_output),
+    )
     output_dir = decomposition_output.parent
     output_dir.mkdir(parents=True, exist_ok=True)
 
