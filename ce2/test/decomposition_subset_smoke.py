@@ -505,22 +505,16 @@ def _build_prefilter_debug_subset_dbs(
     fac_by_id = {f.item_id: f for f in fac_specs_all}
     cache_paths = prefilter_cache_paths(prefilter_cache)
 
-    pair_rows: List[Tuple[str, str, str]] = []
-    audit_rows: List[Dict[str, Any]] = []
-    seen_grants: Set[str] = set()
-    max_grants = max(1, int(max_grant_specs))
-
+    candidates_by_aspect: Dict[str, Dict[str, List[Tuple[int, str, float, Dict[str, Any]]]]] = {}
     for aspect in debug_aspects:
         cache_path = cache_paths[aspect]
         if not cache_path.exists():
             raise FileNotFoundError(f"Missing prefilter debug cache for {aspect}: {cache_path}")
 
+        aspect_rows: Dict[str, List[Tuple[int, str, float, Dict[str, Any]]]] = {}
         for row in _iter_jsonl(cache_path):
-            if len(seen_grants) >= max_grants:
-                break
             grant_item_id = _normalize_ws(row.get("grant_item_id"))
-            grant = grant_by_id.get(grant_item_id)
-            if grant is None or grant_item_id in seen_grants:
+            if grant_item_id not in grant_by_id:
                 continue
             raw_candidates = row.get("candidates")
             if not isinstance(raw_candidates, list):
@@ -535,9 +529,25 @@ def _build_prefilter_debug_subset_dbs(
                     continue
                 rank = _safe_int(cand.get("rank"), idx)
                 ranked.append((rank, fac_item_id, _candidate_score(cand), cand))
-            if len(ranked) < 3:
-                continue
+            if len(ranked) >= 3:
+                aspect_rows[grant_item_id] = ranked
+        candidates_by_aspect[aspect] = aspect_rows
 
+    pair_rows: List[Tuple[str, str, str]] = []
+    audit_rows: List[Dict[str, Any]] = []
+    selected_grants: List[str] = []
+    max_grants = max(1, int(max_grant_specs))
+
+    for grant in grant_specs_all:
+        grant_item_id = str(grant.item_id)
+        if len(selected_grants) >= max_grants:
+            break
+        if any(grant_item_id not in candidates_by_aspect.get(aspect, {}) for aspect in debug_aspects):
+            continue
+        selected_grants.append(grant_item_id)
+
+        for aspect in debug_aspects:
+            ranked = candidates_by_aspect[aspect][grant_item_id]
             used_fac_ids: Set[str] = set()
             picks: List[Tuple[str, Tuple[int, str, float, Dict[str, Any]]]] = []
             for band in ("high", "mid", "low"):
@@ -549,7 +559,6 @@ def _build_prefilter_debug_subset_dbs(
             if len(picks) < 3:
                 continue
 
-            seen_grants.add(grant_item_id)
             for band, (rank, fac_item_id, score, cand) in picks:
                 fac = fac_by_id[fac_item_id]
                 cluster = f"{aspect}:{band}"
@@ -568,10 +577,19 @@ def _build_prefilter_debug_subset_dbs(
                     }
                 )
 
-    if len(seen_grants) < max_grants:
+    if len(selected_grants) < max_grants:
         raise RuntimeError(
-            f"Prefilter-debug found only {len(seen_grants)} grants with high/mid/low picks; "
+            f"Prefilter-debug found only {len(selected_grants)} grants with high/mid/low picks "
+            f"for every selected aspect; "
             f"requested {max_grants}. Check cache coverage or use fewer --max-grant-specs."
+        )
+
+    expected_pairs = len(selected_grants) * len(debug_aspects) * 3
+    if len(audit_rows) != expected_pairs:
+        raise RuntimeError(
+            f"Prefilter-debug expected {expected_pairs} audit rows "
+            f"({len(selected_grants)} grants x {len(debug_aspects)} aspects x 3 bands), "
+            f"but produced {len(audit_rows)}."
         )
 
     debug_selection_output.parent.mkdir(parents=True, exist_ok=True)
@@ -587,7 +605,8 @@ def _build_prefilter_debug_subset_dbs(
         pair_rows=pair_rows,
         stats={
             "debug_aspects": list(debug_aspects),
-            "debug_grants": int(len(seen_grants)),
+            "debug_grants": int(len(selected_grants)),
+            "debug_expected_pairs": int(expected_pairs),
             "debug_pairs": int(len(pair_rows)),
             "debug_selection_output": str(debug_selection_output),
         },
@@ -610,8 +629,8 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--prefilter-debug-aspects",
         type=str,
-        default="domain",
-        help="Comma-separated aspects for prefilter-debug mode. Use domain for 10 grants x 3 bands = 30 faculty specs.",
+        default="all",
+        help="Comma-separated aspects for prefilter-debug mode. Default all gives 10 grants x 3 aspects x 3 bands = 90 picks.",
     )
     p.add_argument("--prefilter-debug-selection-output", type=str, default=PREFILTER_DEBUG_SELECTION_OUTPUT_DEFAULT)
     p.add_argument("--prefilter-high-per-aspect", type=int, default=4)

@@ -11,7 +11,7 @@ GRANT_DB="${GRANT_DB:-ce/dataset/source/grant_keywords_spec_keywords_db.json}"
 FAC_DB="${FAC_DB:-ce/dataset/source/fac_specs_db.json}"
 SUBSET_MODE="${SUBSET_MODE:-prefilter-debug}"   # auto | prefilter-debug | prefilter | random
 PREFILTER_CACHE="${PREFILTER_CACHE:-ce2/dataset/source/prefilter_cache.jsonl}"
-PREFILTER_DEBUG_ASPECTS="${PREFILTER_DEBUG_ASPECTS:-domain}"  # domain gives 10 grants x high/mid/low = 30 fac specs
+PREFILTER_DEBUG_ASPECTS="${PREFILTER_DEBUG_ASPECTS:-all}"  # all gives 10 grants x 3 aspects x high/mid/low = 90 picks
 PREFILTER_DEBUG_SELECTION_OUTPUT="${PREFILTER_DEBUG_SELECTION_OUTPUT:-ce2/test/output/prefilter_debug_selection.jsonl}"
 PREFILTER_HIGH_PER_ASPECT="${PREFILTER_HIGH_PER_ASPECT:-4}"
 PREFILTER_MID_PER_ASPECT="${PREFILTER_MID_PER_ASPECT:-4}"
