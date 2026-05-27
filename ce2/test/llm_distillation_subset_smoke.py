@@ -222,6 +222,8 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--overwrite", action=argparse.BooleanOptionalAction, default=False)
     p.add_argument("--preview-output", type=str, default=PREVIEW_OUTPUT_DEFAULT)
     p.add_argument("--preview-count", type=int, default=36)
+    p.add_argument("--write-preview", action=argparse.BooleanOptionalAction, default=False)
+    p.add_argument("--write-summary", action=argparse.BooleanOptionalAction, default=False)
     p.add_argument(
         "--allow-non-test-output",
         action=argparse.BooleanOptionalAction,
@@ -238,6 +240,7 @@ def main() -> int:
     prefilter_cache = resolve_path(PROJECT_ROOT, args.prefilter_cache)
     distillation_output = resolve_path(PROJECT_ROOT, args.distillation_output)
     summary_output = resolve_path(PROJECT_ROOT, args.summary_output)
+    summary_tmp_output = summary_output.parent / f"{summary_output.stem}.tmp.json"
     preview_output = resolve_path(PROJECT_ROOT, args.preview_output)
     safe_root = resolve_path(PROJECT_ROOT, SAFE_TEST_OUTPUT_ROOT)
 
@@ -252,15 +255,16 @@ def main() -> int:
         allow_non_test_output=bool(args.allow_non_test_output),
     )
     _assert_safe_output_path(
-        summary_output,
+        summary_output if bool(args.write_summary) else summary_tmp_output,
         safe_root=safe_root,
         allow_non_test_output=bool(args.allow_non_test_output),
     )
-    _assert_safe_output_path(
-        preview_output,
-        safe_root=safe_root,
-        allow_non_test_output=bool(args.allow_non_test_output),
-    )
+    if bool(args.write_preview):
+        _assert_safe_output_path(
+            preview_output,
+            safe_root=safe_root,
+            allow_non_test_output=bool(args.allow_non_test_output),
+        )
 
     resolved_prefilter, prefilter_reason = _resolve_prefilter_source(
         requested=str(args.prefilter_source),
@@ -270,6 +274,7 @@ def main() -> int:
     out_dir = distillation_output.parent
     out_dir.mkdir(parents=True, exist_ok=True)
 
+    summary_output_run = summary_output if bool(args.write_summary) else summary_tmp_output
     cmd = [
         str(args.python_bin),
         "ce2/data_preparation/llm_distillation.py",
@@ -290,7 +295,7 @@ def main() -> int:
         "--distillation-output",
         str(distillation_output),
         "--summary-output",
-        str(summary_output),
+        str(summary_output_run),
         "--seed",
         str(int(args.seed)),
         "--max-grant-specs",
@@ -337,13 +342,19 @@ def main() -> int:
     print(f"running_cmd={' '.join(cmd)}")
     subprocess.run(cmd, cwd=str(PROJECT_ROOT), check=True)
 
+    if (not bool(args.write_summary)) and summary_output_run.exists():
+        summary_output_run.unlink()
+
     rows = [row for row in _iter_jsonl(distillation_output)]
-    _write_preview(rows=rows, preview_path=preview_output, preview_count=max(1, int(args.preview_count)))
+    if bool(args.write_preview):
+        _write_preview(rows=rows, preview_path=preview_output, preview_count=max(1, int(args.preview_count)))
 
     print(f"decomposition_output={decomposition_output}")
     print(f"distillation_output={distillation_output}")
-    print(f"summary_output={summary_output}")
-    print(f"preview_output={preview_output}")
+    if bool(args.write_summary):
+        print(f"summary_output={summary_output}")
+    if bool(args.write_preview):
+        print(f"preview_output={preview_output}")
     print(f"rows_total={len(rows)}")
     print(f"aspect_counts={json.dumps(_aspect_counts(rows), ensure_ascii=False)}")
     print(f"band_counts={json.dumps(_band_counts(rows), ensure_ascii=False)}")

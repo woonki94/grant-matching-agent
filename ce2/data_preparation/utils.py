@@ -56,7 +56,7 @@ TOP_P_DEFAULT = 0.9
 MAX_ATTEMPTS_DEFAULT = 2
 
 ASPECTS = ("domain", "method", "target")
-ASPECT_WORD_LIMITS = {"domain": 3, "method": 4, "target": 4}
+ASPECT_WORD_LIMITS = {"domain": 6, "method": 8, "target": 6}
 ASPECT_MAX_ITEMS = {"domain": 4, "method": 4, "target": 4}
 DISTILL_TARGET_HIGH_PER_ASPECT_DEFAULT = 2
 DISTILL_TARGET_MID_PER_ASPECT_DEFAULT = 2
@@ -839,24 +839,6 @@ def _parse_decomposition_items(obj: Optional[Dict[str, Any]], aspect: str) -> Tu
     return [], False
 
 
-_METHOD_CUE_RE = re.compile(
-    r"\b("
-    r"manag(?:e|es|ed|ing|ment)?|"
-    r"identif(?:y|ies|ied|ying|ication)?|"
-    r"evaluat(?:e|es|ed|ing|ion)?|"
-    r"measur(?:e|es|ed|ing|ement)?|"
-    r"assess(?:ment|e|es|ed|ing)?|"
-    r"screen(?:ing|ed|s)?|survey(?:ing|ed|s)?|"
-    r"model(?:ing|led|s)?|analy(?:sis|ze|zes|zed|zing|tical)?|"
-    r"map(?:ping|ped|s)?|monitor(?:ing|ed|s)?|"
-    r"implement(?:ation|ing|ed|s)?|"
-    r"develop(?:ing|ed|s)?|design(?:ing|ed|s)?|"
-    r"creat(?:e|es|ed|ing|ion)?|distribut(?:e|es|ed|ing|ion)?|"
-    r"train(?:ing|ed|s)?|optimiz(?:e|es|ed|ing|ation)?|simulate(?:d|s|ing)?|validate(?:d|s|ing)?|"
-    r"case management|legal aid|workflow|protocol|algorithm|method\w*|technique\w*"
-    r")\b"
-)
-
 _TRAILING_DROP_WORDS = {
     "and",
     "or",
@@ -888,41 +870,6 @@ _METHOD_SINGLETON_WHITELIST = {
     "development",
     "training",
 }
-
-_NEAR_DUP_STOPWORDS = {
-    "a",
-    "an",
-    "the",
-    "of",
-    "for",
-    "with",
-    "to",
-    "in",
-    "on",
-    "and",
-    "or",
-    "by",
-    "via",
-    "through",
-}
-
-_TARGET_LIKE_RE = re.compile(
-    r"\b("
-    r"patient\w*|famil\w*|youth|children|child|student\w*|participant\w*|"
-    r"institution\w*|university|college|school|institute\w*|entity|entities|"
-    r"community|communities|clinic\w*|hospital\w*|agency|agencies|"
-    r"service\w*|program\w*|initiative\w*|platform\w*|resource\w*|textbook\w*|"
-    r"dataset\w*|tool\w*|fish|species|system\w*|infrastructure"
-    r")\b"
-)
-
-_DELIVERABLE_LIKE_RE = re.compile(
-    r"\b("
-    r"textbook\w*|resource\w*|platform\w*|dataset\w*|tool\w*|software|"
-    r"report\w*|protocol\w*|model\w*|content|materials?"
-    r")\b"
-)
-
 
 def _dedupe_phrases(values: Sequence[str]) -> List[str]:
     seen: set[str] = set()
@@ -974,11 +921,7 @@ def _normalize_aspect_items(aspect: str, values: Sequence[str]) -> List[str]:
         phrase = re.sub(r"^[\-\u2022\*\d\.\)\(]+\s*", "", phrase)
         if aspect == "method":
             phrase = _strip_capability_prefix(phrase)
-            words = phrase.split()
-            if len(words) > max_words and words and words[0].lower().endswith("ing"):
-                phrase = " ".join([words[0], *words[-(max_words - 1) :]])
-            else:
-                phrase = _limit_words(phrase, max_words=max_words)
+            phrase = _limit_words(phrase, max_words=max_words)
         else:
             phrase = _limit_words(phrase, max_words=max_words)
         if not phrase:
@@ -991,156 +934,8 @@ def _normalize_aspect_items(aspect: str, values: Sequence[str]) -> List[str]:
     return _dedupe_phrases(out)[:max_items]
 
 
-def _token_set_loose(phrase: str) -> set[str]:
-    toks = []
-    for t in re.findall(r"[A-Za-z0-9][A-Za-z0-9\-]*", normalize_ws(phrase).lower()):
-        if t in _NEAR_DUP_STOPWORDS:
-            continue
-        toks.append(t)
-    return set(toks)
-
-
-def _is_near_duplicate(a: str, b: str) -> bool:
-    aa = a.casefold()
-    bb = b.casefold()
-    if aa == bb:
-        return True
-    ta = _token_set_loose(a)
-    tb = _token_set_loose(b)
-    if not ta or not tb:
-        return False
-    inter = len(ta & tb)
-    uni = len(ta | tb)
-    if uni == 0:
-        return False
-    j = inter / uni
-    if j >= 0.80:
-        return True
-    return ta.issubset(tb) or tb.issubset(ta)
-
-
-def _extract_method_fallbacks(text: str) -> List[str]:
-    parts = re.split(r",|;", normalize_ws(text), flags=re.IGNORECASE)
-    out: List[str] = []
-    for part in parts:
-        phrase = _strip_capability_prefix(part)
-        if not phrase:
-            continue
-        if not _METHOD_CUE_RE.search(phrase.lower()):
-            continue
-        words = phrase.split()
-        if len(words) < 1:
-            continue
-        out.append(_limit_words(phrase, max_words=int(ASPECT_WORD_LIMITS["method"])))
-    return _normalize_aspect_items("method", out)
-
-
-def _extract_domain_fallbacks(text: str) -> List[str]:
-    base = _strip_capability_prefix(text)
-    if not base:
-        return []
-    preferred = base
-    m = re.search(r"\b(?:for|in|on)\b\s+(.+)$", base, flags=re.IGNORECASE)
-    if m:
-        preferred = normalize_ws(m.group(1))
-    preferred = re.split(r",|;|\bwith\b|\busing\b|\bvia\b|\bthrough\b", preferred, maxsplit=1, flags=re.IGNORECASE)[0]
-    preferred = _strip_capability_prefix(preferred)
-    preferred = re.sub(
-        r"^(manag(?:e|es|ed|ing)|identif(?:y|ies|ied|ying)|evaluat(?:e|es|ed|ing)|"
-        r"measur(?:e|es|ed|ing)|implement(?:ation|ing|ed|s)|design(?:ing|ed|s)|"
-        r"develop(?:ing|ed|s)|creat(?:e|es|ed|ing)|distribut(?:e|es|ed|ing))\s+",
-        "",
-        preferred,
-        flags=re.IGNORECASE,
-    )
-    cleaned = _normalize_aspect_items("domain", [preferred])
-    if cleaned:
-        return cleaned
-    return _normalize_aspect_items("domain", [_limit_words(base, max_words=int(ASPECT_WORD_LIMITS["domain"]))])
-
-
-def _extract_target_fallbacks(text: str) -> List[str]:
-    base = _strip_capability_prefix(text)
-    if not base:
-        return []
-    candidates: List[str] = []
-    for m in re.finditer(
-        r"\b(?:for|involving|among|serving|targeting|toward|towards|within)\b\s+([^,;]+)",
-        base,
-        flags=re.IGNORECASE,
-    ):
-        seg = normalize_ws(m.group(1))
-        if not seg:
-            continue
-        parts = re.split(r"\band\b|,|;", seg, flags=re.IGNORECASE)
-        candidates.extend(normalize_ws(p) for p in parts if normalize_ws(p))
-    targetish: List[str] = []
-    for c in candidates:
-        if _TARGET_LIKE_RE.search(c.lower()):
-            targetish.append(c)
-    if targetish:
-        return _normalize_aspect_items("target", targetish)
-    return _normalize_aspect_items("target", candidates)
-
-
-def _ensure_dense_decomposition(text: str, decomp: Dict[str, List[str]]) -> Dict[str, List[str]]:
-    out = {aspect: list(decomp.get(aspect, [])) for aspect in ASPECTS}
-    if not out.get("domain"):
-        out["domain"] = _extract_domain_fallbacks(text)
-    if not out.get("method"):
-        out["method"] = _extract_method_fallbacks(text)
-    if not out.get("target"):
-        out["target"] = _extract_target_fallbacks(text)
-    if not out["domain"] and out["target"]:
-        out["domain"] = _normalize_aspect_items("domain", [out["target"][0]])
-    if not out["target"] and out["domain"]:
-        out["target"] = _normalize_aspect_items("target", [out["domain"][0]])
-    if not out["method"]:
-        seed = out["domain"][0] if out["domain"] else (out["target"][0] if out["target"] else "")
-        if not seed:
-            seed = _limit_words(_strip_capability_prefix(text), max_words=int(ASPECT_WORD_LIMITS["method"]))
-        out["method"] = _normalize_aspect_items("method", [seed])
-        if not out["method"]:
-            out["method"] = _normalize_aspect_items("method", [f"{seed} method"])
-    return {aspect: _normalize_aspect_items(aspect, out.get(aspect, [])) for aspect in ASPECTS}
-
-
 def _clean_decomposition(text: str, decomp: Dict[str, List[str]]) -> Dict[str, List[str]]:
-    cleaned: Dict[str, List[str]] = {aspect: _normalize_aspect_items(aspect, decomp.get(aspect, [])) for aspect in ASPECTS}
-    original_domain = list(cleaned.get("domain", []))
-    cleaned["method"] = [p for p in cleaned["method"] if _METHOD_CUE_RE.search(p.lower())]
-    if not cleaned["method"]:
-        cleaned["method"] = _extract_method_fallbacks(text)
-
-    method_keys = {p.casefold() for p in cleaned["method"]}
-    cleaned["target"] = [p for p in cleaned["target"] if p.casefold() not in method_keys]
-    cleaned["domain"] = [p for p in cleaned["domain"] if p.casefold() not in method_keys]
-    cleaned["domain"] = [p for p in cleaned["domain"] if not _METHOD_CUE_RE.search(p.lower())]
-
-    target_vals = list(cleaned["target"])
-    cleaned["domain"] = [d for d in cleaned["domain"] if not any(_is_near_duplicate(d, t) for t in target_vals)]
-    if target_vals:
-        cleaned["domain"] = [d for d in cleaned["domain"] if not _TARGET_LIKE_RE.search(d.lower())]
-    cleaned["domain"] = [d for d in cleaned["domain"] if not _DELIVERABLE_LIKE_RE.search(d.lower())]
-
-    if not cleaned["domain"]:
-        for d in original_domain:
-            dl = d.lower()
-            if _METHOD_CUE_RE.search(dl):
-                continue
-            if _DELIVERABLE_LIKE_RE.search(dl):
-                continue
-            cleaned["domain"] = [d]
-            break
-
-    if len(cleaned["target"]) > 1 and cleaned["domain"]:
-        pruned_target = [t for t in cleaned["target"] if not any(_is_near_duplicate(t, d) for d in cleaned["domain"])]
-        if pruned_target:
-            cleaned["target"] = pruned_target
-    cleaned = _ensure_dense_decomposition(text, cleaned)
-    for aspect in ASPECTS:
-        cleaned[aspect] = _normalize_aspect_items(aspect, cleaned[aspect])
-    return cleaned
+    return {aspect: _normalize_aspect_items(aspect, decomp.get(aspect, [])) for aspect in ASPECTS}
 
 
 def decompose_specs(
@@ -1254,7 +1049,7 @@ def decompose_specs(
     if pending:
         rows = []
         for item in pending:
-            decomp = _ensure_dense_decomposition(item.text, {aspect: [] for aspect in ASPECTS})
+            decomp = {aspect: [] for aspect in ASPECTS}
             row = {
                 "item_id": item.item_id,
                 "kind": item.kind,

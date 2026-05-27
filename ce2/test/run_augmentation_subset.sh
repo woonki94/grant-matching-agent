@@ -31,6 +31,8 @@ OVERWRITE="${OVERWRITE:-false}"
 ALLOW_NON_TEST_OUTPUT="${ALLOW_NON_TEST_OUTPUT:-false}"
 PREVIEW_OUTPUT="${PREVIEW_OUTPUT:-ce2/test/output/augmentation_subset_preview.txt}"
 PREVIEW_COUNT="${PREVIEW_COUNT:-30}"
+WRITE_PREVIEW="${WRITE_PREVIEW:-false}"
+WRITE_SUMMARY="${WRITE_SUMMARY:-false}"
 
 bool_true() { [[ "${1:-}" == "true" ]]; }
 
@@ -71,7 +73,22 @@ if bool_true "${OVERWRITE}"; then
 else
   CMD+=(--no-overwrite)
 fi
+if bool_true "${WRITE_PREVIEW}"; then
+  CMD+=(--write-preview)
+else
+  CMD+=(--no-write-preview)
+fi
+if bool_true "${WRITE_SUMMARY}"; then
+  CMD+=(--write-summary)
+else
+  CMD+=(--no-write-summary)
+fi
 
 echo "Running: ${CMD[*]}"
 "${CMD[@]}"
-echo "Preview: ${PREVIEW_OUTPUT}"
+if bool_true "${WRITE_SUMMARY}"; then
+  echo "Summary: ${SUMMARY_OUTPUT}"
+fi
+if bool_true "${WRITE_PREVIEW}"; then
+  echo "Preview: ${PREVIEW_OUTPUT}"
+fi

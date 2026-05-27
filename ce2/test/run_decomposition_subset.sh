@@ -37,6 +37,7 @@ SUBSET_GRANT_DB_OUTPUT="${SUBSET_GRANT_DB_OUTPUT:-ce2/test/output/grant_keywords
 SUBSET_FAC_DB_OUTPUT="${SUBSET_FAC_DB_OUTPUT:-ce2/test/output/fac_specs_db_subset.json}"
 PREVIEW_COUNT="${PREVIEW_COUNT:-12}"
 PREVIEW_KIND="${PREVIEW_KIND:-all}"  # all | grant | faculty
+WRITE_PREVIEW="${WRITE_PREVIEW:-false}"
 
 bool_true() { [[ "${1:-}" == "true" ]]; }
 
@@ -81,6 +82,11 @@ if bool_true "${OVERWRITE}"; then
 else
   CMD+=(--no-overwrite)
 fi
+if bool_true "${WRITE_PREVIEW}"; then
+  CMD+=(--write-preview)
+else
+  CMD+=(--no-write-preview)
+fi
 if bool_true "${REFRESH_FAILED_DECOMPOSITIONS}"; then
   CMD+=(--refresh-failed-decompositions)
 else
@@ -94,4 +100,6 @@ fi
 
 echo "Running: ${CMD[*]}"
 "${CMD[@]}"
-echo "Preview: ${PREVIEW_OUTPUT}"
+if bool_true "${WRITE_PREVIEW}"; then
+  echo "Preview: ${PREVIEW_OUTPUT}"
+fi

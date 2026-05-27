@@ -417,6 +417,7 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--preview-output", type=str, default=PREVIEW_OUTPUT_DEFAULT)
     p.add_argument("--preview-count", type=int, default=12)
     p.add_argument("--preview-kind", type=str, choices=("all", "grant", "faculty"), default="all")
+    p.add_argument("--write-preview", action=argparse.BooleanOptionalAction, default=False)
     p.add_argument("--subset-grant-db-output", type=str, default=SUBSET_GRANT_DB_OUTPUT_DEFAULT)
     p.add_argument("--subset-fac-db-output", type=str, default=SUBSET_FAC_DB_OUTPUT_DEFAULT)
     p.add_argument(
@@ -448,7 +449,7 @@ def main() -> int:
         preview_output,
         safe_root=safe_root,
         allow_non_test_output=bool(args.allow_non_test_output),
-    )
+    ) if bool(args.write_preview) else None
     _assert_safe_output_path(
         subset_grant_db_output,
         safe_root=safe_root,
@@ -551,15 +552,17 @@ def main() -> int:
     subprocess.run(cmd, cwd=str(PROJECT_ROOT), check=True)
 
     rows = [row for row in _iter_jsonl(decomposition_output)]
-    _write_preview(
-        rows=rows,
-        preview_path=preview_output,
-        preview_count=max(1, int(args.preview_count)),
-        preview_kind=_normalize_ws(args.preview_kind).lower() or "all",
-    )
+    if bool(args.write_preview):
+        _write_preview(
+            rows=rows,
+            preview_path=preview_output,
+            preview_count=max(1, int(args.preview_count)),
+            preview_kind=_normalize_ws(args.preview_kind).lower() or "all",
+        )
 
     print(f"decomposition_output={decomposition_output}")
-    print(f"preview_output={preview_output}")
+    if bool(args.write_preview):
+        print(f"preview_output={preview_output}")
     print(f"rows_total={len(rows)}")
     return 0
 
