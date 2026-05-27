@@ -437,6 +437,19 @@ def _aspect_text_for_item(
     return item.text
 
 
+def _safe_decomposition(value: Any) -> Dict[str, List[str]]:
+    if not isinstance(value, dict):
+        return {aspect: [] for aspect in ASPECTS}
+    return {
+        aspect: _as_list(value.get(aspect))
+        for aspect in ASPECTS
+    }
+
+
+def _has_aspect_items(decomp: Dict[str, List[str]], aspect: str) -> bool:
+    return any(normalize_ws(x) for x in decomp.get(aspect, []))
+
+
 def select_pairs_with_sts_prefilter(
     grant_specs: Sequence[SpecItem],
     fac_specs: Sequence[SpecItem],
@@ -1215,9 +1228,11 @@ def distill_pairs(
                     source_aspects = list(ASPECTS)
                 g_dec_row = decompositions.get(grant.item_id, {})
                 f_dec_row = decompositions.get(fac.item_id, {})
-                g_dec = g_dec_row.get("decomposition") if isinstance(g_dec_row, dict) else {}
-                f_dec = f_dec_row.get("decomposition") if isinstance(f_dec_row, dict) else {}
+                g_dec = _safe_decomposition(g_dec_row.get("decomposition") if isinstance(g_dec_row, dict) else {})
+                f_dec = _safe_decomposition(f_dec_row.get("decomposition") if isinstance(f_dec_row, dict) else {})
                 for aspect in source_aspects:
+                    if not (_has_aspect_items(g_dec, aspect) or _has_aspect_items(f_dec, aspect)):
+                        continue
                     pair_id = f"{grant.item_id}::{fac.item_id}::{aspect}"
                     user_prompt = SCORE_USER_PROMPT_TEMPLATE.format(
                         aspect=aspect,
@@ -1237,6 +1252,11 @@ def distill_pairs(
                         )
                     )
                     task_items.append((pair_id, aspect, grant, fac, lexical_score, pair_source, g_dec_row, f_dec_row))
+
+            if not prompts:
+                if bar is not None:
+                    bar.set_postfix(written=int(written_this_attempt), retry_pending=int(len(next_pending)), refresh=False)
+                continue
 
             responses = generate_responses_batch(
                 llm_bundle=llm_bundle,
@@ -1264,13 +1284,13 @@ def distill_pairs(
                         "item_id": grant.item_id,
                         "text": grant.text,
                         "meta": grant.meta,
-                        "decomposition": g_dec_row.get("decomposition", {}),
+                        "decomposition": g_dec,
                     },
                     "faculty": {
                         "item_id": fac.item_id,
                         "text": fac.text,
                         "meta": fac.meta,
-                        "decomposition": f_dec_row.get("decomposition", {}),
+                        "decomposition": f_dec,
                     },
                     "scores": {aspect: float(score)},
                     "bands": {aspect: band},

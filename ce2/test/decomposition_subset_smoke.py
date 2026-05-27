@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import subprocess
 import sys
 from pathlib import Path
@@ -44,9 +45,11 @@ from ce2.data_preparation.utils import (  # noqa: E402
 
 DECOMPOSITION_OUTPUT_DEFAULT = "ce2/test/output/spec_decompositions_subset.jsonl"
 PREVIEW_OUTPUT_DEFAULT = "ce2/test/output/spec_decompositions_subset_preview.txt"
+PREFILTER_DEBUG_SELECTION_OUTPUT_DEFAULT = "ce2/test/output/prefilter_debug_selection.jsonl"
 SUBSET_GRANT_DB_OUTPUT_DEFAULT = "ce2/test/output/grant_keywords_spec_keywords_db_subset.json"
 SUBSET_FAC_DB_OUTPUT_DEFAULT = "ce2/test/output/fac_specs_db_subset.json"
 SAFE_TEST_OUTPUT_ROOT = "ce2/test/output"
+ASPECT_NAMES = ("domain", "method", "target")
 
 
 def _clean_text(value: Any) -> str:
@@ -98,10 +101,45 @@ def _truncate(text: str, limit: int) -> str:
     return raw[: max(0, int(limit) - 3)] + "..."
 
 
-def _resolve_subset_mode(*, requested: str, prefilter_cache: Path) -> tuple[str, str]:
+def _parse_debug_aspects(raw: Any) -> List[str]:
+    text = _normalize_ws(raw).lower()
+    if not text or text == "all":
+        return list(ASPECT_NAMES)
+    aspects: List[str] = []
+    for part in text.split(","):
+        aspect = _normalize_ws(part).lower()
+        if not aspect:
+            continue
+        if aspect not in ASPECT_NAMES:
+            raise ValueError(
+                f"Invalid prefilter debug aspect: {aspect}. "
+                f"Use one of {', '.join(ASPECT_NAMES)} or all."
+            )
+        if aspect not in aspects:
+            aspects.append(aspect)
+    if not aspects:
+        raise ValueError("No prefilter debug aspects selected.")
+    return aspects
+
+
+def _resolve_subset_mode(
+    *,
+    requested: str,
+    prefilter_cache: Path,
+    prefilter_debug_aspects: Sequence[str],
+) -> tuple[str, str]:
     mode = _normalize_ws(requested).lower()
     if mode == "random":
         return "random", "explicit_random"
+    if mode == "prefilter-debug":
+        paths = prefilter_cache_paths(prefilter_cache)
+        missing = [name for name in prefilter_debug_aspects if not paths.get(name, Path()).exists()]
+        if missing:
+            raise FileNotFoundError(
+                "Requested prefilter-debug subset mode, but selected cache files are missing: "
+                + ", ".join(missing)
+            )
+        return "prefilter-debug", "explicit_prefilter_debug"
     if mode == "prefilter":
         paths = prefilter_cache_paths(prefilter_cache)
         missing = [name for name, path in paths.items() if not path.exists()]
@@ -240,55 +278,21 @@ def _rank_facs_by_frequency(pair_rows: Sequence[Tuple[str, str, str]]) -> List[s
     return sorted(freq.keys(), key=lambda f: (-int(freq.get(f, 0)), f))
 
 
-def _build_prefilter_subset_dbs(
+def _write_subset_dbs_from_pair_rows(
     *,
     grant_db_path: Path,
     fac_db_path: Path,
     subset_grant_db_output: Path,
     subset_fac_db_output: Path,
-    prefilter_cache: Path,
-    seed: int,
-    max_grant_specs: int,
-    max_fac_specs: int,
-    high_per_aspect: int,
-    mid_per_aspect: int,
-    low_per_aspect: int,
-    high_threshold: float,
-    low_threshold: float,
+    pair_rows: Sequence[Tuple[str, str, str]],
+    stats: Dict[str, Any],
 ) -> Dict[str, Any]:
-    grant_specs_all = load_grant_specs(grant_db_path, max_items=0, seed=int(seed))
-    fac_specs_all = load_fac_specs(fac_db_path, max_items=0, seed=int(seed))
-    pairs = select_pairs_from_prefilter_cache(
-        grant_specs_all,
-        fac_specs_all,
-        cache_base_path=prefilter_cache,
-        seed=int(seed),
-        high_per_aspect=max(0, int(high_per_aspect)),
-        mid_per_aspect=max(0, int(mid_per_aspect)),
-        low_per_aspect=max(0, int(low_per_aspect)),
-        high_threshold=float(high_threshold),
-        low_threshold=float(low_threshold),
-    )
-    pair_rows: List[Tuple[str, str, str]] = []
-    for grant, fac, _score, source in pairs:
-        pair_rows.append((str(grant.item_id), str(fac.item_id), _source_cluster(str(source))))
-
-    if int(max_grant_specs) > 0 and pair_rows:
-        grant_ranked = _rank_grants_by_coverage(pair_rows)
-        keep_grants = set(grant_ranked[: int(max_grant_specs)])
-        pair_rows = [row for row in pair_rows if row[0] in keep_grants]
-
-    if int(max_fac_specs) > 0 and pair_rows:
-        fac_ranked = _rank_facs_by_frequency(pair_rows)
-        keep_facs = set(fac_ranked[: int(max_fac_specs)])
-        pair_rows = [row for row in pair_rows if row[1] in keep_facs]
-
     grant_item_ids = {g for g, _f, _c in pair_rows}
     fac_item_ids = {f for _g, f, _c in pair_rows}
     if not grant_item_ids or not fac_item_ids:
         raise RuntimeError(
             "Prefilter subset selection produced zero items. "
-            "Try increasing --max-grant-specs/--max-fac-specs or prefilter per-aspect counts."
+            "Try increasing --max-grant-specs/--max-fac-specs or checking the selected prefilter cache."
         )
 
     selected_grant_indices: Dict[str, Set[int]] = {}
@@ -358,7 +362,7 @@ def _build_prefilter_subset_dbs(
     if not grant_subset_rows or not fac_subset_rows:
         raise RuntimeError(
             "Prefilter subset DB build produced empty grant/fac rows. "
-            "Try increasing subset caps or prefilter per-aspect counts."
+            "Try increasing subset caps or checking item_id compatibility with the source DBs."
         )
 
     grant_out_obj = dict(grant_db_obj) if isinstance(grant_db_obj, dict) else {}
@@ -368,17 +372,226 @@ def _build_prefilter_subset_dbs(
     _write_json(subset_grant_db_output, grant_out_obj)
     _write_json(subset_fac_db_output, fac_out_obj)
 
-    return {
-        "candidate_pairs": int(len(pairs)),
-        "candidate_pairs_after_caps": int(len(pair_rows)),
-        "grant_item_ids": int(len(grant_item_ids)),
-        "fac_item_ids": int(len(fac_item_ids)),
-        "grant_rows": int(len(grant_subset_rows)),
-        "grant_specs_kept": int(grant_kept_specs),
-        "fac_rows": int(len(fac_subset_rows)),
-        "subset_grant_db": str(subset_grant_db_output),
-        "subset_fac_db": str(subset_fac_db_output),
-    }
+    out = dict(stats)
+    out.update(
+        {
+            "candidate_pairs_after_caps": int(len(pair_rows)),
+            "grant_item_ids": int(len(grant_item_ids)),
+            "fac_item_ids": int(len(fac_item_ids)),
+            "grant_rows": int(len(grant_subset_rows)),
+            "grant_specs_kept": int(grant_kept_specs),
+            "fac_rows": int(len(fac_subset_rows)),
+            "subset_grant_db": str(subset_grant_db_output),
+            "subset_fac_db": str(subset_fac_db_output),
+        }
+    )
+    return out
+
+
+def _build_prefilter_subset_dbs(
+    *,
+    grant_db_path: Path,
+    fac_db_path: Path,
+    subset_grant_db_output: Path,
+    subset_fac_db_output: Path,
+    prefilter_cache: Path,
+    seed: int,
+    max_grant_specs: int,
+    max_fac_specs: int,
+    high_per_aspect: int,
+    mid_per_aspect: int,
+    low_per_aspect: int,
+    high_threshold: float,
+    low_threshold: float,
+) -> Dict[str, Any]:
+    grant_specs_all = load_grant_specs(grant_db_path, max_items=0, seed=int(seed))
+    fac_specs_all = load_fac_specs(fac_db_path, max_items=0, seed=int(seed))
+    pairs = select_pairs_from_prefilter_cache(
+        grant_specs_all,
+        fac_specs_all,
+        cache_base_path=prefilter_cache,
+        seed=int(seed),
+        high_per_aspect=max(0, int(high_per_aspect)),
+        mid_per_aspect=max(0, int(mid_per_aspect)),
+        low_per_aspect=max(0, int(low_per_aspect)),
+        high_threshold=float(high_threshold),
+        low_threshold=float(low_threshold),
+    )
+    pair_rows: List[Tuple[str, str, str]] = []
+    for grant, fac, _score, source in pairs:
+        pair_rows.append((str(grant.item_id), str(fac.item_id), _source_cluster(str(source))))
+
+    if int(max_grant_specs) > 0 and pair_rows:
+        grant_ranked = _rank_grants_by_coverage(pair_rows)
+        keep_grants = set(grant_ranked[: int(max_grant_specs)])
+        pair_rows = [row for row in pair_rows if row[0] in keep_grants]
+
+    if int(max_fac_specs) > 0 and pair_rows:
+        fac_ranked = _rank_facs_by_frequency(pair_rows)
+        keep_facs = set(fac_ranked[: int(max_fac_specs)])
+        pair_rows = [row for row in pair_rows if row[1] in keep_facs]
+
+    return _write_subset_dbs_from_pair_rows(
+        grant_db_path=grant_db_path,
+        fac_db_path=fac_db_path,
+        subset_grant_db_output=subset_grant_db_output,
+        subset_fac_db_output=subset_fac_db_output,
+        pair_rows=pair_rows,
+        stats={"candidate_pairs": int(len(pairs))},
+    )
+
+
+def _safe_int(value: Any, default: int = 0) -> int:
+    try:
+        return int(value)
+    except Exception:
+        return int(default)
+
+
+def _safe_float(value: Any, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except Exception:
+        return float(default)
+
+
+def _sigmoid(value: float) -> float:
+    x = max(-60.0, min(60.0, float(value)))
+    return 1.0 / (1.0 + math.exp(-x))
+
+
+def _candidate_score(cand: Dict[str, Any]) -> float:
+    if cand.get("ce_score") is not None:
+        return _safe_float(cand.get("ce_score"), 0.0)
+    if cand.get("score") is not None:
+        return _safe_float(cand.get("score"), 0.0)
+    return float(_sigmoid(_safe_float(cand.get("ce_logit"), 0.0)))
+
+
+def _choose_candidate(
+    ranked: Sequence[Tuple[int, str, float, Dict[str, Any]]],
+    *,
+    band: str,
+    used_fac_ids: Set[str],
+) -> Tuple[int, str, float, Dict[str, Any]] | None:
+    available = [item for item in ranked if item[1] not in used_fac_ids]
+    pool = available if available else list(ranked)
+    if not pool:
+        return None
+    if band == "high":
+        return max(pool, key=lambda x: (float(x[2]), -int(x[0]), x[1]))
+    if band == "mid":
+        return min(pool, key=lambda x: (abs(float(x[2]) - 0.5), -float(x[2]), int(x[0]), x[1]))
+    if band == "low":
+        return min(pool, key=lambda x: (float(x[2]), int(x[0]), x[1]))
+    raise ValueError(f"Unknown prefilter debug band: {band}")
+
+
+def _build_prefilter_debug_subset_dbs(
+    *,
+    grant_db_path: Path,
+    fac_db_path: Path,
+    subset_grant_db_output: Path,
+    subset_fac_db_output: Path,
+    prefilter_cache: Path,
+    debug_selection_output: Path,
+    seed: int,
+    max_grant_specs: int,
+    debug_aspects: Sequence[str],
+) -> Dict[str, Any]:
+    grant_specs_all = load_grant_specs(grant_db_path, max_items=0, seed=int(seed))
+    fac_specs_all = load_fac_specs(fac_db_path, max_items=0, seed=int(seed))
+    grant_by_id = {g.item_id: g for g in grant_specs_all}
+    fac_by_id = {f.item_id: f for f in fac_specs_all}
+    cache_paths = prefilter_cache_paths(prefilter_cache)
+
+    pair_rows: List[Tuple[str, str, str]] = []
+    audit_rows: List[Dict[str, Any]] = []
+    seen_grants: Set[str] = set()
+    max_grants = max(1, int(max_grant_specs))
+
+    for aspect in debug_aspects:
+        cache_path = cache_paths[aspect]
+        if not cache_path.exists():
+            raise FileNotFoundError(f"Missing prefilter debug cache for {aspect}: {cache_path}")
+
+        for row in _iter_jsonl(cache_path):
+            if len(seen_grants) >= max_grants:
+                break
+            grant_item_id = _normalize_ws(row.get("grant_item_id"))
+            grant = grant_by_id.get(grant_item_id)
+            if grant is None or grant_item_id in seen_grants:
+                continue
+            raw_candidates = row.get("candidates")
+            if not isinstance(raw_candidates, list):
+                continue
+
+            ranked: List[Tuple[int, str, float, Dict[str, Any]]] = []
+            for idx, cand in enumerate(raw_candidates, start=1):
+                if not isinstance(cand, dict):
+                    continue
+                fac_item_id = _normalize_ws(cand.get("fac_item_id"))
+                if fac_item_id not in fac_by_id:
+                    continue
+                rank = _safe_int(cand.get("rank"), idx)
+                ranked.append((rank, fac_item_id, _candidate_score(cand), cand))
+            if len(ranked) < 3:
+                continue
+
+            used_fac_ids: Set[str] = set()
+            picks: List[Tuple[str, Tuple[int, str, float, Dict[str, Any]]]] = []
+            for band in ("high", "mid", "low"):
+                picked = _choose_candidate(ranked, band=band, used_fac_ids=used_fac_ids)
+                if picked is None:
+                    continue
+                used_fac_ids.add(picked[1])
+                picks.append((band, picked))
+            if len(picks) < 3:
+                continue
+
+            seen_grants.add(grant_item_id)
+            for band, (rank, fac_item_id, score, cand) in picks:
+                fac = fac_by_id[fac_item_id]
+                cluster = f"{aspect}:{band}"
+                pair_rows.append((grant_item_id, fac_item_id, cluster))
+                audit_rows.append(
+                    {
+                        "aspect": aspect,
+                        "band": band,
+                        "score": float(score),
+                        "rank": int(rank),
+                        "grant_item_id": grant_item_id,
+                        "grant_text": grant.text,
+                        "fac_item_id": fac_item_id,
+                        "fac_text": fac.text,
+                        "raw_candidate": cand,
+                    }
+                )
+
+    if len(seen_grants) < max_grants:
+        raise RuntimeError(
+            f"Prefilter-debug found only {len(seen_grants)} grants with high/mid/low picks; "
+            f"requested {max_grants}. Check cache coverage or use fewer --max-grant-specs."
+        )
+
+    debug_selection_output.parent.mkdir(parents=True, exist_ok=True)
+    with debug_selection_output.open("w", encoding="utf-8") as f:
+        for row in audit_rows:
+            f.write(json.dumps(row, ensure_ascii=False) + "\n")
+
+    return _write_subset_dbs_from_pair_rows(
+        grant_db_path=grant_db_path,
+        fac_db_path=fac_db_path,
+        subset_grant_db_output=subset_grant_db_output,
+        subset_fac_db_output=subset_fac_db_output,
+        pair_rows=pair_rows,
+        stats={
+            "debug_aspects": list(debug_aspects),
+            "debug_grants": int(len(seen_grants)),
+            "debug_pairs": int(len(pair_rows)),
+            "debug_selection_output": str(debug_selection_output),
+        },
+    )
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -392,15 +605,22 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--model-id", type=str, default=MODEL_ID_DEFAULT)
     p.add_argument("--grant-db", type=str, default=GRANT_DB_DEFAULT)
     p.add_argument("--fac-db", type=str, default=FAC_DB_DEFAULT)
-    p.add_argument("--subset-mode", type=str, choices=("auto", "prefilter", "random"), default="auto")
+    p.add_argument("--subset-mode", type=str, choices=("auto", "prefilter", "prefilter-debug", "random"), default="auto")
     p.add_argument("--prefilter-cache", type=str, default=PREFILTER_CACHE_OUTPUT_DEFAULT)
+    p.add_argument(
+        "--prefilter-debug-aspects",
+        type=str,
+        default="domain",
+        help="Comma-separated aspects for prefilter-debug mode. Use domain for 10 grants x 3 bands = 30 faculty specs.",
+    )
+    p.add_argument("--prefilter-debug-selection-output", type=str, default=PREFILTER_DEBUG_SELECTION_OUTPUT_DEFAULT)
     p.add_argument("--prefilter-high-per-aspect", type=int, default=4)
     p.add_argument("--prefilter-mid-per-aspect", type=int, default=4)
     p.add_argument("--prefilter-low-per-aspect", type=int, default=4)
     p.add_argument("--prefilter-high-threshold", type=float, default=PREFILTER_HIGH_THRESHOLD_DEFAULT)
     p.add_argument("--prefilter-low-threshold", type=float, default=PREFILTER_LOW_THRESHOLD_DEFAULT)
     p.add_argument("--seed", type=int, default=SEED_DEFAULT)
-    p.add_argument("--max-grant-specs", type=int, default=6)
+    p.add_argument("--max-grant-specs", type=int, default=10)
     p.add_argument("--max-fac-specs", type=int, default=24)
     p.add_argument("--decompose-batch-size", type=int, default=DECOMPOSE_BATCH_SIZE_DEFAULT)
     p.add_argument("--decompose-max-new-tokens", type=int, default=DECOMPOSE_MAX_NEW_TOKENS_DEFAULT)
@@ -437,8 +657,10 @@ def main() -> int:
     decomposition_output = resolve_path(PROJECT_ROOT, args.decomposition_output)
     preview_output = resolve_path(PROJECT_ROOT, args.preview_output)
     prefilter_cache = resolve_path(PROJECT_ROOT, args.prefilter_cache)
+    prefilter_debug_selection_output = resolve_path(PROJECT_ROOT, args.prefilter_debug_selection_output)
     subset_grant_db_output = resolve_path(PROJECT_ROOT, args.subset_grant_db_output)
     subset_fac_db_output = resolve_path(PROJECT_ROOT, args.subset_fac_db_output)
+    prefilter_debug_aspects = _parse_debug_aspects(args.prefilter_debug_aspects)
     safe_root = resolve_path(PROJECT_ROOT, SAFE_TEST_OUTPUT_ROOT)
     _assert_safe_output_path(
         decomposition_output,
@@ -450,6 +672,11 @@ def main() -> int:
         safe_root=safe_root,
         allow_non_test_output=bool(args.allow_non_test_output),
     ) if bool(args.write_preview) else None
+    _assert_safe_output_path(
+        prefilter_debug_selection_output,
+        safe_root=safe_root,
+        allow_non_test_output=bool(args.allow_non_test_output),
+    )
     _assert_safe_output_path(
         subset_grant_db_output,
         safe_root=safe_root,
@@ -466,6 +693,7 @@ def main() -> int:
     subset_mode, subset_reason = _resolve_subset_mode(
         requested=str(args.subset_mode),
         prefilter_cache=prefilter_cache,
+        prefilter_debug_aspects=prefilter_debug_aspects,
     )
 
     run_grant_db = grant_db_input
@@ -488,6 +716,22 @@ def main() -> int:
             low_per_aspect=max(0, int(args.prefilter_low_per_aspect)),
             high_threshold=float(args.prefilter_high_threshold),
             low_threshold=float(args.prefilter_low_threshold),
+        )
+        run_grant_db = subset_grant_db_output
+        run_fac_db = subset_fac_db_output
+        run_max_grant_specs = 0
+        run_max_fac_specs = 0
+    elif subset_mode == "prefilter-debug":
+        prefilter_stats = _build_prefilter_debug_subset_dbs(
+            grant_db_path=grant_db_input,
+            fac_db_path=fac_db_input,
+            subset_grant_db_output=subset_grant_db_output,
+            subset_fac_db_output=subset_fac_db_output,
+            prefilter_cache=prefilter_cache,
+            debug_selection_output=prefilter_debug_selection_output,
+            seed=int(args.seed),
+            max_grant_specs=max(1, int(args.max_grant_specs)),
+            debug_aspects=prefilter_debug_aspects,
         )
         run_grant_db = subset_grant_db_output
         run_fac_db = subset_fac_db_output

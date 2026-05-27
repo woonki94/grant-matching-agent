@@ -66,7 +66,7 @@ Include phrases about:
 - algorithms, models, instruments, measurements, mechanisms, or procedures
 - service components such as case management, legal aid, screening, counseling, training, or assessment
 - analytical or implementation workflows
-- action/process phrases such as managing, identifying, evaluating, measuring, designing, developing, creating, distributing, implementing, combining, characterizing, optimizing
+- action/procedure phrases such as managing, identifying, evaluating, measuring, designing, developing, creating, distributing, implementing, combining, characterizing, optimizing
 - techniques such as spectroscopy, characterization, statistics, integration, fabrication, synthesis, testing, simulation, modeling, analysis
 - "experience/expertise/skill in X" patterns: extract X as method phrase when X is a concrete process
 
@@ -77,6 +77,9 @@ Do not include:
 - generic single-word method labels when a more specific phrase is available
 - phenomena, materials, populations, or objects by themselves
 - a method item when the text only names a topic/problem and gives no procedure
+- goals, outcomes, requirements, or constraints unless the phrase also names a concrete procedure
+- prevention/reduction/improvement goals by themselves, such as preventing breakup, reducing risk, improving quality, or increasing participation
+- phrases led by "preventing", "reducing", "improving", "maximizing", "ensuring", or "maintaining" unless they describe how the work is done
 
 {DECOMPOSITION_BASE_RULES}
 """.strip()
