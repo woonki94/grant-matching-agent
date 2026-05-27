@@ -21,7 +21,12 @@ from ce2.data_preparation.llm_runtime import (
     normalize_ws,
     score_to_band,
 )
-from ce2.data_preparation.prompt.decomposition import DECOMPOSE_SYSTEM_PROMPTS_BY_ASPECT, DECOMPOSE_USER_PROMPT_TEMPLATE
+from ce2.data_preparation.prompt.decomposition import (
+    DECOMPOSE_DOMAIN_USER_PROMPT_TEMPLATE,
+    DECOMPOSE_METHOD_USER_PROMPT_TEMPLATE,
+    DECOMPOSE_SYSTEM_PROMPTS_BY_ASPECT,
+    DECOMPOSE_TARGET_USER_PROMPT_TEMPLATE,
+)
 from ce2.data_preparation.prompt.distillation import SCORE_SYSTEM_PROMPTS_BY_ASPECT, SCORE_USER_PROMPT_TEMPLATE
 
 try:
@@ -951,6 +956,16 @@ def _clean_decomposition(text: str, decomp: Dict[str, List[str]]) -> Dict[str, L
     return {aspect: _normalize_aspect_items(aspect, decomp.get(aspect, [])) for aspect in ASPECTS}
 
 
+def _cached_decomposition_matches_item(row: Dict[str, Any], item: SpecItem) -> bool:
+    if not isinstance(row, dict):
+        return False
+    return (
+        clean_text(row.get("item_id")) == clean_text(item.item_id)
+        and normalize_ws(row.get("text")) == normalize_ws(item.text)
+        and clean_text(row.get("kind")) == clean_text(item.kind)
+    )
+
+
 def decompose_specs(
     *,
     llm_bundle: Dict[str, Any],
@@ -965,8 +980,22 @@ def decompose_specs(
     max_attempts: int,
 ) -> Dict[str, Dict[str, Any]]:
     tokenizer = llm_bundle["tokenizer"]
-    pending = [item for item in items if item.item_id not in existing]
-    print(f"decompose_existing={len(existing)} decompose_pending={len(pending)}")
+    pending: List[SpecItem] = []
+    stale_cached = 0
+    for item in items:
+        cached = existing.get(item.item_id)
+        if cached is None:
+            pending.append(item)
+            continue
+        if not _cached_decomposition_matches_item(cached, item):
+            stale_cached += 1
+            existing.pop(item.item_id, None)
+            pending.append(item)
+    print(
+        f"decompose_existing={len(existing)} "
+        f"decompose_stale_cached={stale_cached} "
+        f"decompose_pending={len(pending)}"
+    )
     for attempt in range(max(1, int(max_attempts))):
         if not pending:
             break
@@ -986,39 +1015,62 @@ def decompose_specs(
             chunk_iter = bar
         written_this_attempt = 0
         for chunk in chunk_iter:
-            prompts: List[str] = []
-            task_items: List[Tuple[str, str, SpecItem]] = []
+            rows: List[Dict[str, Any]] = []
+            grouped: Dict[str, Dict[str, Any]] = {
+                item.item_id: {
+                    "item": item,
+                    "decomposition": {a: [] for a in ASPECTS},
+                    "ok": {},
+                    "raw_responses": {},
+                }
+                for item in chunk
+            }
+
             for aspect in ASPECTS:
+                prompts: List[str] = []
+                task_items: List[SpecItem] = []
                 for item in chunk:
+                    bucket = grouped[item.item_id]
+                    decomp_so_far = bucket["decomposition"]
+                    if aspect == "domain":
+                        user_prompt = DECOMPOSE_DOMAIN_USER_PROMPT_TEMPLATE.format(text=item.text)
+                    elif aspect == "method":
+                        user_prompt = DECOMPOSE_METHOD_USER_PROMPT_TEMPLATE.format(
+                            text=item.text,
+                            domain_items_json=json.dumps(decomp_so_far.get("domain", []), ensure_ascii=False),
+                        )
+                    elif aspect == "target":
+                        user_prompt = DECOMPOSE_TARGET_USER_PROMPT_TEMPLATE.format(
+                            text=item.text,
+                            domain_items_json=json.dumps(decomp_so_far.get("domain", []), ensure_ascii=False),
+                            method_items_json=json.dumps(decomp_so_far.get("method", []), ensure_ascii=False),
+                        )
+                    else:
+                        raise ValueError(f"Unsupported decomposition aspect: {aspect}")
                     prompts.append(
                         build_prompt(
                             tokenizer,
                             model_id=model_id,
                             system_prompt=DECOMPOSE_SYSTEM_PROMPTS_BY_ASPECT[aspect],
-                            user_prompt=DECOMPOSE_USER_PROMPT_TEMPLATE.format(aspect=aspect, text=item.text),
+                            user_prompt=user_prompt,
                         )
                     )
-                    task_items.append((item.item_id, aspect, item))
-            responses = generate_responses_batch(
-                llm_bundle=llm_bundle,
-                prompts=prompts,
-                max_new_tokens=int(max_new_tokens),
-                temperature=float(temperature),
-                top_p=float(top_p),
-            )
-            rows: List[Dict[str, Any]] = []
-            grouped: Dict[str, Dict[str, Any]] = {}
-            for task, response in zip(task_items, responses):
-                item_id, aspect, item = task
-                parsed = extract_json_object(response)
-                items_out, ok = _parse_decomposition_items(parsed, aspect)
-                bucket = grouped.setdefault(
-                    item_id,
-                    {"item": item, "decomposition": {a: [] for a in ASPECTS}, "ok": {}, "raw_responses": {}},
+                    task_items.append(item)
+
+                responses = generate_responses_batch(
+                    llm_bundle=llm_bundle,
+                    prompts=prompts,
+                    max_new_tokens=int(max_new_tokens),
+                    temperature=float(temperature),
+                    top_p=float(top_p),
                 )
-                bucket["decomposition"][aspect] = items_out
-                bucket["ok"][aspect] = bool(ok)
-                bucket["raw_responses"][aspect] = response
+                for item, response in zip(task_items, responses):
+                    parsed = extract_json_object(response)
+                    items_out, ok = _parse_decomposition_items(parsed, aspect)
+                    bucket = grouped[item.item_id]
+                    bucket["decomposition"][aspect] = _normalize_aspect_items(aspect, items_out)
+                    bucket["ok"][aspect] = bool(ok)
+                    bucket["raw_responses"][aspect] = response
 
             for item_id, bucket in grouped.items():
                 item = bucket["item"]

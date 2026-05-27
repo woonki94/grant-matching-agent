@@ -3,14 +3,15 @@ from __future__ import annotations
 
 DECOMPOSITION_BASE_RULES = """
 Rules:
-- Extract only information actually present or strongly implied by the text.
+- Extract information actually present, strongly implied, or safely inferable from the text.
 - Use short keyword phrases only.
 - Prefer phrases over full sentences.
 - Do not explain your reasoning.
 - Do not output chain-of-thought or <think> blocks.
 - Do not add "must", "should", or requirement wording unless present in source.
-- Return [] when this aspect is not explicitly present or clearly implied.
-- Empty is better than a fake or generic label.
+- Make a grounded best effort to produce nonempty aspect items when a reasonable interpretation exists.
+- Return [] only when filling the aspect would require inventing an ungrounded or misleading concept.
+- A broad but grounded inferred label is better than an empty aspect; an empty aspect is better than a fake label.
 - Do not invent concepts not grounded in the source text.
 - Lowercase unless proper nouns.
 - Each phrase should appear in only one aspect unless absolutely necessary.
@@ -125,4 +126,65 @@ Aspect to extract:
 
 Specialization text:
 {text}
+""".strip()
+
+
+DECOMPOSE_DOMAIN_USER_PROMPT_TEMPLATE = """
+/no_think
+
+Aspect to extract:
+domain
+
+Specialization text:
+{text}
+
+Extract the broad topic/problem/application area first. Later stages will use this domain context to avoid copying domain phrases into method or target.
+""".strip()
+
+
+DECOMPOSE_METHOD_USER_PROMPT_TEMPLATE = """
+/no_think
+
+Aspect to extract:
+method
+
+Specialization text:
+{text}
+
+Already extracted domain phrases:
+{domain_items_json}
+
+Extract METHOD phrases now.
+
+Domain means topic/problem/application area.
+Method means concrete technique, action, procedure, workflow, model, measurement, analysis, intervention, service component, or implementation approach.
+
+Do not copy domain phrases into method unless the phrase clearly names a concrete method.
+If the domain extraction looks imperfect, use it as context but do not follow it blindly.
+Prefer grounded action/process phrases over broad topic labels.
+""".strip()
+
+
+DECOMPOSE_TARGET_USER_PROMPT_TEMPLATE = """
+/no_think
+
+Aspect to extract:
+target
+
+Specialization text:
+{text}
+
+Already extracted domain phrases:
+{domain_items_json}
+
+Already extracted method phrases:
+{method_items_json}
+
+Extract TARGET phrases now.
+
+Target means the object, population, community, system, material, organism, data object, outcome, condition, or setting being studied, served, measured, optimized, protected, reduced, or improved.
+
+Do not copy domain or method phrases into target unless they truly identify the acted-on object.
+If the earlier extraction looks imperfect, use it as context but do not follow it blindly.
+Prefer grounded objects/populations/systems/outcomes over broad topic or procedure labels.
 """.strip()
