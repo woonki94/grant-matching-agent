@@ -6,6 +6,7 @@ PROJECT_ROOT="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
 cd "${PROJECT_ROOT}"
 
 PYTHON_BIN="${PYTHON_BIN:-python}"
+START_STAGE="${START_STAGE:-decompose}"
 
 LLM_MODEL_ID="${LLM_MODEL_ID:-Qwen/Qwen3-14B}"
 PREFILTER_MODEL_ID="${PREFILTER_MODEL_ID:-dleemiller/ModernCE-base-sts}"
@@ -29,7 +30,7 @@ DECOMPOSE_BATCH_SIZE="${DECOMPOSE_BATCH_SIZE:-512}"
 DECOMPOSE_MAX_NEW_TOKENS="${DECOMPOSE_MAX_NEW_TOKENS:-256}"
 AUGMENT_BATCH_SIZE="${AUGMENT_BATCH_SIZE:-512}"
 AUGMENT_MAX_NEW_TOKENS="${AUGMENT_MAX_NEW_TOKENS:-384}"
-PREFILTER_BATCH_SIZE="${PREFILTER_BATCH_SIZE:-256}"
+PREFILTER_BATCH_SIZE="${PREFILTER_BATCH_SIZE:-512}"
 PREFILTER_MAX_LENGTH="${PREFILTER_MAX_LENGTH:-256}"
 DISTILL_BATCH_SIZE="${DISTILL_BATCH_SIZE:-512}"
 DISTILL_MAX_NEW_TOKENS="${DISTILL_MAX_NEW_TOKENS:-32}"
@@ -74,6 +75,37 @@ REFRESH_ALL_DECOMPOSITIONS="${REFRESH_ALL_DECOMPOSITIONS:-false}"
 INCLUDE_AUG_AUG="${INCLUDE_AUG_AUG:-false}"
 
 bool_true() { [[ "${1:-}" == "true" ]]; }
+
+stage_index() {
+  case "${1:-}" in
+    decompose|decompose_originals) echo 10 ;;
+    augment) echo 20 ;;
+    decompose_augmented|augment_decompose) echo 30 ;;
+    combine) echo 40 ;;
+    prefilter|precache|cache) echo 50 ;;
+    distill) echo 60 ;;
+    split) echo 70 ;;
+    *)
+      echo "Unknown START_STAGE='${1}'. Valid: decompose, augment, decompose_augmented, combine, prefilter, distill, split." >&2
+      exit 2
+      ;;
+  esac
+}
+
+START_STAGE_INDEX="$(stage_index "${START_STAGE}")"
+
+run_stage_from() {
+  local stage_key="$1"
+  local name="$2"
+  shift 2
+  local idx
+  idx="$(stage_index "${stage_key}")"
+  if (( idx < START_STAGE_INDEX )); then
+    echo "Skipping CE3 full stage: ${name} because START_STAGE=${START_STAGE}"
+    return 0
+  fi
+  run_stage "${name}" "$@"
+}
 
 run_stage() {
   local name="$1"
@@ -233,16 +265,17 @@ SPLIT_CMD=(
   --pair-boundary-min-margin "${PAIR_BOUNDARY_MIN_MARGIN}"
 )
 
-run_stage "decompose originals" "${ORIGINAL_DECOMPOSE_CMD[@]}"
-run_stage "augment high-intent candidates" "${AUGMENT_CMD[@]}"
-run_stage "decompose augmented candidates" "${AUGMENTED_DECOMPOSE_CMD[@]}"
-run_stage "combine decompositions" "${COMBINE_CMD[@]}"
-run_stage "build prefilter cache" "${PREFILTER_CMD[@]}"
-run_stage "distill selected pairs" "${DISTILL_CMD[@]}"
-run_stage "split distillation dataset" "${SPLIT_CMD[@]}"
+run_stage_from "decompose" "decompose originals" "${ORIGINAL_DECOMPOSE_CMD[@]}"
+run_stage_from "augment" "augment high-intent candidates" "${AUGMENT_CMD[@]}"
+run_stage_from "decompose_augmented" "decompose augmented candidates" "${AUGMENTED_DECOMPOSE_CMD[@]}"
+run_stage_from "combine" "combine decompositions" "${COMBINE_CMD[@]}"
+run_stage_from "prefilter" "build prefilter cache" "${PREFILTER_CMD[@]}"
+run_stage_from "distill" "distill selected pairs" "${DISTILL_CMD[@]}"
+run_stage_from "split" "split distillation dataset" "${SPLIT_CMD[@]}"
 
 echo
 echo "CE3 full pipeline complete."
+echo "Start stage: ${START_STAGE}"
 echo "Combined decomposition: ${COMBINED_DECOMPOSITION_OUTPUT}"
 echo "Prefilter cache base: ${PREFILTER_CACHE_BASE}"
 echo "Distillation output: ${DISTILLATION_OUTPUT}"

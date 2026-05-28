@@ -14,6 +14,7 @@ EVAL_SCRIPT="${EVAL_SCRIPT:-ce3/script/run_eval.sh}"
 RUN_DATA_PREPARATION="${RUN_DATA_PREPARATION:-true}"
 RUN_TRAIN="${RUN_TRAIN:-true}"
 RUN_EVAL="${RUN_EVAL:-true}"
+START_STAGE="${START_STAGE:-decompose}"
 
 SPLIT_DIR="${SPLIT_DIR:-${SPLIT_OUTPUT_DIR:-ce3/dataset/splits}}"
 TRAIN_OUTPUT_DIR="${TRAIN_OUTPUT_DIR:-ce3/models/aspect_reranker}"
@@ -32,6 +33,7 @@ if [[ "${RUN_DATA_PREPARATION}" == "true" ]]; then
   run_stage "data preparation" \
     env \
       PYTHON_BIN="${PYTHON_BIN}" \
+      START_STAGE="${START_STAGE}" \
       SPLIT_OUTPUT_DIR="${SPLIT_DIR}" \
       bash "${DATA_PREPARATION_SCRIPT}"
 else
