@@ -24,6 +24,11 @@ from torch.optim import AdamW
 from torch.utils.data import DataLoader, Dataset
 from transformers import AutoTokenizer
 
+try:
+    from tqdm.auto import tqdm
+except Exception:
+    tqdm = None  # type: ignore[assignment]
+
 
 def _find_project_root() -> Path:
     here = Path(__file__).resolve()
@@ -705,7 +710,19 @@ def train_stage(
                 model.train()
             step_hist = {k: [] for k in hist}
 
-        for primary_batch in primary_loader:
+        train_iter = primary_loader
+        bar = None
+        if tqdm is not None:
+            total_batches = len(primary_loader) if hasattr(primary_loader, "__len__") else None
+            bar = tqdm(
+                primary_loader,
+                total=total_batches,
+                desc=f"CE3 stage{stage} epoch{epoch}",
+                unit="batch",
+                dynamic_ncols=True,
+            )
+            train_iter = bar
+        for primary_batch in train_iter:
             secondary_batch = next(secondary_iter)
             pair_batch = primary_batch if stage == 1 else secondary_batch
             list_batch = secondary_batch if stage == 1 else primary_batch
@@ -735,6 +752,14 @@ def train_stage(
                 global_step += 1
                 accum = 0
                 log_after_optimizer_step()
+            if bar is not None:
+                latest = mean_hist(step_hist if any(step_hist.values()) else hist)
+                bar.set_postfix(
+                    step=int(global_step),
+                    total=f"{latest.get('total', 0.0):.4f}",
+                    pair=f"{latest.get('pair', 0.0):.4f}",
+                    kl=f"{latest.get('kl', 0.0):.4f}",
+                )
         if accum > 0:
             if float(args.max_grad_norm) > 0.0:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), float(args.max_grad_norm))
@@ -742,6 +767,8 @@ def train_stage(
             optimizer.zero_grad(set_to_none=True)
             global_step += 1
             log_after_optimizer_step()
+        if bar is not None:
+            bar.close()
 
         metrics = evaluate(model, val_pair_loader, val_list_loader, device, args)
         ranking = float(metrics.get("ndcg@10", 0.0)) + float(metrics.get("mrr@10", 0.0)) + float(metrics.get("recall@50", 0.0))
