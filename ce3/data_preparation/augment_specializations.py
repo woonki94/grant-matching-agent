@@ -35,10 +35,6 @@ from ce3.data_preparation.llm_runtime import (  # noqa: E402
 from ce3.data_preparation.utils import (  # noqa: E402
     SpecItem,
     append_jsonl,
-    cached_row_matches_item,
-    load_faculty_specializations,
-    load_grant_specializations,
-    load_jsonl_by_key,
     resolve_path,
 )
 
@@ -49,14 +45,9 @@ except Exception:
 
 
 MODEL_ID_DEFAULT = "Qwen/Qwen3-14B"
-GRANT_DB_DEFAULT = "ce3/dataset/source/grant_keywords_spec_keywords_db.json"
-FAC_DB_DEFAULT = "ce3/dataset/source/fac_specs_db.json"
 DECOMPOSITION_OUTPUT_DEFAULT = "ce3/dataset/decomposed/spec_decompositions_topic_approach_objective.jsonl"
 OUTPUT_DIR_DEFAULT = "ce3/dataset/augmented"
 AUGMENTATION_OUTPUT_DEFAULT = "ce3/dataset/augmented/spec_augmentations_high.jsonl"
-SEED_DEFAULT = 42
-MAX_GRANT_SPECS_DEFAULT = 0
-MAX_FAC_SPECS_DEFAULT = 0
 AUGMENTATIONS_PER_ASPECT_DEFAULT = 4
 AUGMENT_BATCH_SIZE_DEFAULT = 12
 AUGMENT_MAX_NEW_TOKENS_DEFAULT = 384
@@ -226,29 +217,30 @@ def load_existing_source_keys(path: Path) -> set[str]:
     return out
 
 
-def validate_decomposition_coverage(
-    *,
-    items: Sequence[SpecItem],
-    decompositions: Dict[str, Dict[str, Any]],
-    label: str,
-) -> None:
-    bad: List[str] = []
-    for item in items:
-        row = decompositions.get(item.item_id)
-        if row is None:
-            reason = "missing"
-        elif not cached_row_matches_item(row, item):
-            reason = "stale_or_mismatched_text"
-        else:
-            continue
-        if len(bad) < 5:
-            bad.append(f"{reason}: {item.item_id} text={item.text[:140]}")
-    if bad:
-        raise RuntimeError(
-            f"Decomposition coverage failed for {label}. Examples:\n"
-            + "\n".join(bad)
-            + "\nRun CE3 decomposition on the same source DBs before augmentation."
-        )
+def load_items_from_decompositions(path: Path) -> tuple[List[SpecItem], Dict[str, Dict[str, Any]]]:
+    items: List[SpecItem] = []
+    decompositions: Dict[str, Dict[str, Any]] = {}
+    with path.open("r", encoding="utf-8") as f:
+        for raw in f:
+            try:
+                row = json.loads(raw)
+            except Exception:
+                continue
+            if not isinstance(row, dict):
+                continue
+            item_id = clean_text(row.get("item_id"))
+            kind = clean_text(row.get("kind"))
+            text = normalize_ws(row.get("text"))
+            if not item_id or not kind or not text:
+                continue
+            if kind not in {"grant", "faculty"}:
+                continue
+            if item_id in decompositions:
+                continue
+            meta = row.get("meta") if isinstance(row.get("meta"), dict) else {}
+            items.append(SpecItem(item_id=item_id, kind=kind, text=text, meta=dict(meta)))
+            decompositions[item_id] = row
+    return items, decompositions
 
 
 def _pending_requests(
@@ -410,14 +402,9 @@ def augment_specializations(
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="CE3 high-intent specialization augmentation runner.")
     p.add_argument("--model-id", type=str, default=MODEL_ID_DEFAULT)
-    p.add_argument("--grant-db", type=str, default=GRANT_DB_DEFAULT)
-    p.add_argument("--fac-db", type=str, default=FAC_DB_DEFAULT)
     p.add_argument("--decomposition-output", type=str, default=DECOMPOSITION_OUTPUT_DEFAULT)
     p.add_argument("--output-dir", type=str, default=OUTPUT_DIR_DEFAULT)
     p.add_argument("--augmentation-output", type=str, default=AUGMENTATION_OUTPUT_DEFAULT)
-    p.add_argument("--seed", type=int, default=SEED_DEFAULT)
-    p.add_argument("--max-grant-specs", type=int, default=MAX_GRANT_SPECS_DEFAULT)
-    p.add_argument("--max-fac-specs", type=int, default=MAX_FAC_SPECS_DEFAULT)
     p.add_argument("--augmentations-per-aspect", type=int, default=AUGMENTATIONS_PER_ASPECT_DEFAULT)
     p.add_argument("--augment-batch-size", type=int, default=AUGMENT_BATCH_SIZE_DEFAULT)
     p.add_argument("--augment-max-new-tokens", type=int, default=AUGMENT_MAX_NEW_TOKENS_DEFAULT)
@@ -434,8 +421,6 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     started = time.time()
     args = parse_args()
-    grant_db = resolve_path(args.grant_db)
-    fac_db = resolve_path(args.fac_db)
     decomposition_path = resolve_path(args.decomposition_output)
     output_dir = resolve_path(args.output_dir)
     output_path = resolve_path(args.augmentation_output)
@@ -444,12 +429,10 @@ def main() -> int:
     if args.overwrite:
         _unlink_if_exists(output_path)
 
-    grant_specs = load_grant_specializations(grant_db, max_items=args.max_grant_specs, seed=args.seed)
-    fac_specs = load_faculty_specializations(fac_db, max_items=args.max_fac_specs, seed=args.seed)
-    items = [*grant_specs, *fac_specs]
-    decompositions = load_jsonl_by_key(decomposition_path, "item_id")
-    validate_decomposition_coverage(items=grant_specs, decompositions=decompositions, label="grant specs")
-    validate_decomposition_coverage(items=fac_specs, decompositions=decompositions, label="faculty specs")
+    items, decompositions = load_items_from_decompositions(decomposition_path)
+    if not items:
+        raise RuntimeError(f"No original grant/faculty decomposition rows found in {decomposition_path}")
+    kind_counts = Counter(item.kind for item in items)
     output_dir.mkdir(parents=True, exist_ok=True)
 
     print(
@@ -457,14 +440,11 @@ def main() -> int:
             {
                 "stage": "ce3_augment_setup",
                 "model_id": args.model_id,
-                "grant_db": str(grant_db),
-                "fac_db": str(fac_db),
                 "decomposition_output": str(decomposition_path),
                 "augmentation_output": str(output_path),
                 "aspects": list(ASPECTS),
-                "seed": int(args.seed),
-                "grant_specs_loaded": int(len(grant_specs)),
-                "fac_specs_loaded": int(len(fac_specs)),
+                "grant_specs_loaded": int(kind_counts.get("grant", 0)),
+                "fac_specs_loaded": int(kind_counts.get("faculty", 0)),
                 "items_total": int(len(items)),
                 "augmentations_per_aspect": int(args.augmentations_per_aspect),
             },
