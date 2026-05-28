@@ -2,7 +2,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
+PROJECT_ROOT="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
 cd "${PROJECT_ROOT}"
 
 PYTHON_BIN="${PYTHON_BIN:-python}"
@@ -31,7 +31,7 @@ bool_true() { [[ "${1:-}" == "true" ]]; }
 
 if [[ ! -f "${DECOMPOSITION_OUTPUT}" ]]; then
   echo "Missing subset combined decomposition: ${DECOMPOSITION_OUTPUT}" >&2
-  echo "Run ce3/test/run_combine_decompositions_subset.sh first." >&2
+  echo "Run ce3/test/component/run_combine_decompositions_subset.sh first." >&2
   exit 1
 fi
 
@@ -39,7 +39,7 @@ for aspect in topic approach objective; do
   cache_path="${PREFILTER_CACHE_BASE%.jsonl}_${aspect}.jsonl"
   if [[ ! -f "${cache_path}" ]]; then
     echo "Missing subset prefilter cache: ${cache_path}" >&2
-    echo "Run ce3/test/run_prefilter_cache_subset.sh first." >&2
+    echo "Run ce3/test/component/run_prefilter_cache_subset.sh first." >&2
     exit 1
   fi
 done

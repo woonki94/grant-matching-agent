@@ -7,10 +7,10 @@ cd "${PROJECT_ROOT}"
 
 PYTHON_BIN="${PYTHON_BIN:-python}"
 MODEL_ID="${MODEL_ID:-Qwen/Qwen3-14B}"
-AUGMENTATION_INPUT="${AUGMENTATION_INPUT:-ce3/dataset/augmented/spec_augmentations_high.jsonl}"
-OUTPUT_DIR="${OUTPUT_DIR:-ce3/dataset/decomposed}"
-AUGMENTED_DECOMPOSITION_OUTPUT="${AUGMENTED_DECOMPOSITION_OUTPUT:-ce3/dataset/decomposed/spec_decompositions_augmented.jsonl}"
-DECOMPOSE_BATCH_SIZE="${DECOMPOSE_BATCH_SIZE:-16}"
+AUGMENTATION_INPUT="${AUGMENTATION_INPUT:-ce3/test/output/spec_augmentations_subset.jsonl}"
+OUTPUT_DIR="${OUTPUT_DIR:-ce3/test/output}"
+AUGMENTED_DECOMPOSITION_OUTPUT="${AUGMENTED_DECOMPOSITION_OUTPUT:-ce3/test/output/spec_decompositions_augmented_subset.jsonl}"
+DECOMPOSE_BATCH_SIZE="${DECOMPOSE_BATCH_SIZE:-8}"
 DECOMPOSE_MAX_NEW_TOKENS="${DECOMPOSE_MAX_NEW_TOKENS:-256}"
 TEMPERATURE="${TEMPERATURE:-0.0}"
 TOP_P="${TOP_P:-0.9}"
@@ -18,11 +18,17 @@ MAX_ATTEMPTS="${MAX_ATTEMPTS:-2}"
 MAX_MODEL_LEN="${MAX_MODEL_LEN:-4096}"
 GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.90}"
 TENSOR_PARALLEL_SIZE="${TENSOR_PARALLEL_SIZE:-1}"
-OVERWRITE="${OVERWRITE:-false}"
+OVERWRITE="${OVERWRITE:-true}"
 REFRESH_FAILED_DECOMPOSITIONS="${REFRESH_FAILED_DECOMPOSITIONS:-true}"
 REFRESH_ALL_DECOMPOSITIONS="${REFRESH_ALL_DECOMPOSITIONS:-false}"
 
 bool_true() { [[ "${1:-}" == "true" ]]; }
+
+if [[ ! -f "${AUGMENTATION_INPUT}" ]]; then
+  echo "Missing subset augmentation: ${AUGMENTATION_INPUT}" >&2
+  echo "Run ce3/test/component/run_augmentation_subset.sh first." >&2
+  exit 1
+fi
 
 CMD=(
   "${PYTHON_BIN}" ce3/data_preparation/decompose_augmented_specializations.py
@@ -56,3 +62,4 @@ fi
 
 echo "Running: ${CMD[*]}"
 "${CMD[@]}"
+echo "Subset augmented decomposition: ${AUGMENTED_DECOMPOSITION_OUTPUT}"

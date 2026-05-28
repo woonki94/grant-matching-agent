@@ -2,7 +2,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
+PROJECT_ROOT="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
 cd "${PROJECT_ROOT}"
 
 PYTHON_BIN="${PYTHON_BIN:-python}"
@@ -12,12 +12,12 @@ COMBINED_OUTPUT="${COMBINED_OUTPUT:-ce3/test/output/spec_decompositions_combined
 
 if [[ ! -f "${ORIGINAL_DECOMPOSITION}" ]]; then
   echo "Missing subset original decomposition: ${ORIGINAL_DECOMPOSITION}" >&2
-  echo "Run ce3/test/run_decomposition_subset.sh first." >&2
+  echo "Run ce3/test/component/run_decomposition_subset.sh first." >&2
   exit 1
 fi
 if [[ ! -f "${AUGMENTED_DECOMPOSITION}" ]]; then
   echo "Missing subset augmented decomposition: ${AUGMENTED_DECOMPOSITION}" >&2
-  echo "Run ce3/test/run_decompose_augmented_subset.sh first." >&2
+  echo "Run ce3/test/component/run_decompose_augmented_subset.sh first." >&2
   exit 1
 fi
 
