@@ -47,6 +47,49 @@ OUTPUT_DIR_DEFAULT = "ce3/models/aspect_reranker"
 PAIR_TYPE_WEIGHT_MAP_DEFAULT = "default=1.0,llm_disagreement=1.15,strong_vs_boundary=1.05,strong_vs_weak=0.95,strong_vs_hard=1.0"
 
 
+def _wandb_enabled(args: argparse.Namespace) -> bool:
+    return _clean_text(getattr(args, "wandb_mode", "")).lower() not in {"", "disabled", "off", "false", "none"}
+
+
+def _flatten_metrics(prefix: str, obj: Dict[str, Any]) -> Dict[str, float]:
+    out: Dict[str, float] = {}
+    for key, value in obj.items():
+        metric_key = f"{prefix}/{key}" if prefix else str(key)
+        if isinstance(value, dict):
+            out.update(_flatten_metrics(metric_key, value))
+            continue
+        if isinstance(value, bool):
+            out[metric_key] = float(value)
+            continue
+        if isinstance(value, (int, float)):
+            out[metric_key] = float(value)
+    return out
+
+
+def _init_wandb(args: argparse.Namespace, *, run_config: Dict[str, Any]) -> Any:
+    if not _wandb_enabled(args):
+        return None
+    try:
+        import wandb
+    except Exception as exc:
+        raise RuntimeError("W&B logging requested, but wandb is not installed in this environment.") from exc
+    tags = [_clean_text(x) for x in _clean_text(args.wandb_tags).split(",") if _clean_text(x)]
+    return wandb.init(
+        project=_clean_text(args.wandb_project) or "ce3_distill",
+        entity=_clean_text(args.wandb_entity) or None,
+        name=_clean_text(args.wandb_run_name) or None,
+        mode=_clean_text(args.wandb_mode) or "online",
+        tags=tags or None,
+        config=run_config,
+    )
+
+
+def _wandb_log(wandb_run: Any, payload: Dict[str, Any], *, step: Optional[int] = None) -> None:
+    if wandb_run is None:
+        return
+    wandb_run.log(_flatten_metrics("", payload), step=step)
+
+
 @dataclass(frozen=True)
 class PairExample:
     query_text: str
@@ -583,18 +626,74 @@ def train_stage(
     output_dir: Path,
     args: argparse.Namespace,
     global_step: int,
+    wandb_run: Any = None,
 ) -> Tuple[int, Dict[str, Any]]:
     secondary_iter = cycle_loader(secondary_loader)
     best_selection = float("-inf")
     best_meta: Dict[str, Any] = {}
     use_amp = device.type == "cuda" and bool(args.fp16)
     amp_ctx = torch.autocast(device_type="cuda", dtype=torch.float16) if use_amp else nullcontext()
+    train_log_every_steps = max(0, int(getattr(args, "train_log_every_steps", 1)))
+    eval_every_steps = max(0, int(getattr(args, "eval_every_steps", 100)))
 
     for epoch in range(1, int(args.stage1_epochs if stage == 1 else args.stage2_epochs) + 1):
         model.train()
         hist: Dict[str, List[float]] = {k: [] for k in ("total", "pair", "kl", "mse", "cluster", "calibration")}
+        step_hist: Dict[str, List[float]] = {k: [] for k in hist}
         optimizer.zero_grad(set_to_none=True)
         accum = 0
+
+        def mean_hist(values: Dict[str, List[float]]) -> Dict[str, float]:
+            return {k: float(sum(v) / max(1, len(v))) for k, v in values.items()}
+
+        def log_after_optimizer_step() -> None:
+            nonlocal step_hist
+            if train_log_every_steps > 0 and global_step % train_log_every_steps == 0:
+                _wandb_log(
+                    wandb_run,
+                    {
+                        "stage": float(stage),
+                        "epoch": float(epoch),
+                        "train": mean_hist(step_hist),
+                    },
+                    step=global_step,
+                )
+            if eval_every_steps > 0 and global_step % eval_every_steps == 0:
+                step_metrics = evaluate(model, val_pair_loader, val_list_loader, device, args)
+                step_ranking = (
+                    float(step_metrics.get("ndcg@10", 0.0))
+                    + float(step_metrics.get("mrr@10", 0.0))
+                    + float(step_metrics.get("recall@50", 0.0))
+                )
+                step_selection = step_ranking - float(step_metrics.get("oob_objective", 0.0))
+                print(
+                    json.dumps(
+                        {
+                            "stage": int(stage),
+                            "epoch": int(epoch),
+                            "global_step": int(global_step),
+                            "event": "step_eval",
+                            "selection_score": float(step_selection),
+                            "ranking_sum": float(step_ranking),
+                            "val": step_metrics,
+                        },
+                        ensure_ascii=False,
+                    )
+                )
+                _wandb_log(
+                    wandb_run,
+                    {
+                        "stage": float(stage),
+                        "epoch": float(epoch),
+                        "selection_score": float(step_selection),
+                        "ranking_sum": float(step_ranking),
+                        "val": step_metrics,
+                    },
+                    step=global_step,
+                )
+                model.train()
+            step_hist = {k: [] for k in hist}
+
         for primary_batch in primary_loader:
             secondary_batch = next(secondary_iter)
             pair_batch = primary_batch if stage == 1 else secondary_batch
@@ -611,6 +710,12 @@ def train_stage(
             hist["mse"].append(float(l_losses["mse"].detach().cpu().item()))
             hist["cluster"].append(float(l_losses["cluster"].detach().cpu().item()))
             hist["calibration"].append(float(l_losses["calibration"].detach().cpu().item()))
+            step_hist["total"].append(float(loss.detach().cpu().item() * float(args.grad_accum_steps)))
+            step_hist["pair"].append(float(p_loss.detach().cpu().item()))
+            step_hist["kl"].append(float(l_losses["kl"].detach().cpu().item()))
+            step_hist["mse"].append(float(l_losses["mse"].detach().cpu().item()))
+            step_hist["cluster"].append(float(l_losses["cluster"].detach().cpu().item()))
+            step_hist["calibration"].append(float(l_losses["calibration"].detach().cpu().item()))
             if accum >= int(args.grad_accum_steps):
                 if float(args.max_grad_norm) > 0.0:
                     torch.nn.utils.clip_grad_norm_(model.parameters(), float(args.max_grad_norm))
@@ -618,12 +723,14 @@ def train_stage(
                 optimizer.zero_grad(set_to_none=True)
                 global_step += 1
                 accum = 0
+                log_after_optimizer_step()
         if accum > 0:
             if float(args.max_grad_norm) > 0.0:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), float(args.max_grad_norm))
             optimizer.step()
             optimizer.zero_grad(set_to_none=True)
             global_step += 1
+            log_after_optimizer_step()
 
         metrics = evaluate(model, val_pair_loader, val_list_loader, device, args)
         ranking = float(metrics.get("ndcg@10", 0.0)) + float(metrics.get("mrr@10", 0.0)) + float(metrics.get("recall@50", 0.0))
@@ -638,6 +745,18 @@ def train_stage(
             "val": metrics,
         }
         print(json.dumps(meta, ensure_ascii=False))
+        _wandb_log(
+            wandb_run,
+            {
+                "stage": float(stage),
+                "epoch": float(epoch),
+                "selection_score": float(selection),
+                "ranking_sum": float(ranking),
+                "train": meta["train"],
+                "val": metrics,
+            },
+            step=global_step,
+        )
         save_checkpoint(model, tokenizer, output_dir / f"stage{stage}_epoch_{epoch}", meta)
         if selection > best_selection:
             best_selection = selection
@@ -686,9 +805,16 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--pair-type-weight-map", type=str, default=PAIR_TYPE_WEIGHT_MAP_DEFAULT)
     p.add_argument("--num-workers", type=int, default=0)
     p.add_argument("--max-grad-norm", type=float, default=1.0)
+    p.add_argument("--train-log-every-steps", type=int, default=1, help="Log train losses to W&B every N optimizer steps. 0 disables step train logs.")
+    p.add_argument("--eval-every-steps", type=int, default=100, help="Run validation and log val metrics every N optimizer steps. 0 disables step validation.")
     p.add_argument("--fp16", action="store_true")
     p.add_argument("--no-multihead", action="store_true")
     p.add_argument("--trust-remote-code", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--wandb-project", type=str, default="")
+    p.add_argument("--wandb-entity", type=str, default="")
+    p.add_argument("--wandb-run-name", type=str, default="")
+    p.add_argument("--wandb-mode", type=str, default="online", help="online, offline, dryrun, or disabled.")
+    p.add_argument("--wandb-tags", type=str, default="ce3,aspect-conditioned,multihead")
     return p.parse_args()
 
 
@@ -745,7 +871,7 @@ def main() -> int:
     pair_test_loader = DataLoader(PairDataset(test_pairs or val_pairs), batch_size=args.eval_batch_size, shuffle=False, collate_fn=pair_collator, **loader_kwargs)
     list_test_loader = DataLoader(ListDataset(test_list_rows or val_list_rows), batch_size=args.eval_batch_size, shuffle=False, collate_fn=list_collator, **loader_kwargs)
 
-    print(json.dumps({
+    setup_meta = {
         "stage": "ce3_train_setup",
         "model_id": args.model_id,
         "multihead": not bool(args.no_multihead),
@@ -758,55 +884,80 @@ def main() -> int:
         "test_pair_rows": len(test_pairs),
         "long_prefixes": True,
         "posthoc_calibration": False,
-    }, ensure_ascii=False))
+        "wandb_enabled": bool(_wandb_enabled(args)),
+    }
+    print(json.dumps(setup_meta, ensure_ascii=False))
+    wandb_run = _init_wandb(
+        args,
+        run_config={
+            **vars(args),
+            "train_list_rows": len(train_list_rows),
+            "train_pair_rows": len(train_pairs),
+            "val_list_rows": len(val_list_rows),
+            "val_pair_rows": len(val_pairs),
+            "test_list_rows": len(test_list_rows),
+            "test_pair_rows": len(test_pairs),
+            "multihead": not bool(args.no_multihead),
+            "long_prefixes": True,
+            "posthoc_calibration": False,
+        },
+    )
+    _wandb_log(wandb_run, {"setup": setup_meta}, step=0)
 
     global_step = 0
     best: Dict[str, Any] = {}
-    if int(args.stage1_epochs) > 0:
-        opt = AdamW(model.parameters(), lr=float(args.stage1_learning_rate or args.learning_rate), weight_decay=float(args.weight_decay))
-        global_step, best["stage1"] = train_stage(
-            stage=1,
-            model=model,
-            optimizer=opt,
-            tokenizer=tokenizer,
-            primary_loader=pair_train_loader,
-            secondary_loader=list_train_loader,
-            val_pair_loader=pair_val_loader,
-            val_list_loader=list_val_loader,
-            device=device,
-            output_dir=output_dir,
-            args=args,
-            global_step=global_step,
-        )
-    if int(args.stage2_epochs) > 0:
-        opt = AdamW(model.parameters(), lr=float(args.stage2_learning_rate or args.learning_rate), weight_decay=float(args.weight_decay))
-        global_step, best["stage2"] = train_stage(
-            stage=2,
-            model=model,
-            optimizer=opt,
-            tokenizer=tokenizer,
-            primary_loader=list_train_loader,
-            secondary_loader=pair_train_loader,
-            val_pair_loader=pair_val_loader,
-            val_list_loader=list_val_loader,
-            device=device,
-            output_dir=output_dir,
-            args=args,
-            global_step=global_step,
-        )
+    try:
+        if int(args.stage1_epochs) > 0:
+            opt = AdamW(model.parameters(), lr=float(args.stage1_learning_rate or args.learning_rate), weight_decay=float(args.weight_decay))
+            global_step, best["stage1"] = train_stage(
+                stage=1,
+                model=model,
+                optimizer=opt,
+                tokenizer=tokenizer,
+                primary_loader=pair_train_loader,
+                secondary_loader=list_train_loader,
+                val_pair_loader=pair_val_loader,
+                val_list_loader=list_val_loader,
+                device=device,
+                output_dir=output_dir,
+                args=args,
+                global_step=global_step,
+                wandb_run=wandb_run,
+            )
+        if int(args.stage2_epochs) > 0:
+            opt = AdamW(model.parameters(), lr=float(args.stage2_learning_rate or args.learning_rate), weight_decay=float(args.weight_decay))
+            global_step, best["stage2"] = train_stage(
+                stage=2,
+                model=model,
+                optimizer=opt,
+                tokenizer=tokenizer,
+                primary_loader=list_train_loader,
+                secondary_loader=pair_train_loader,
+                val_pair_loader=pair_val_loader,
+                val_list_loader=list_val_loader,
+                device=device,
+                output_dir=output_dir,
+                args=args,
+                global_step=global_step,
+                wandb_run=wandb_run,
+            )
 
-    test_metrics = evaluate(model, pair_test_loader, list_test_loader, device, args)
-    final_meta = {
-        "elapsed_sec": time.time() - started,
-        "global_step": int(global_step),
-        "best": best,
-        "test": test_metrics,
-        "args": vars(args),
-    }
-    save_checkpoint(model, tokenizer, output_dir / "final", final_meta)
-    (output_dir / "train_manifest.json").write_text(json.dumps(final_meta, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    print(json.dumps({"stage": "ce3_train_done", **final_meta}, ensure_ascii=False))
-    return 0
+        test_metrics = evaluate(model, pair_test_loader, list_test_loader, device, args)
+        _wandb_log(wandb_run, {"test": test_metrics}, step=global_step)
+        final_meta = {
+            "elapsed_sec": time.time() - started,
+            "global_step": int(global_step),
+            "best": best,
+            "test": test_metrics,
+            "args": vars(args),
+        }
+        save_checkpoint(model, tokenizer, output_dir / "final", final_meta)
+        (output_dir / "train_manifest.json").write_text(json.dumps(final_meta, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        print(json.dumps({"stage": "ce3_train_done", **final_meta}, ensure_ascii=False))
+        return 0
+    finally:
+        if wandb_run is not None:
+            wandb_run.finish()
 
 
 if __name__ == "__main__":
