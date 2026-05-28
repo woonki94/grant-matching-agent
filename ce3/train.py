@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 import shutil
 import sys
 import time
@@ -10,6 +11,11 @@ from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
+
+# ModernBERT may invoke torch.compile for embeddings. In this training setup the
+# aspect-head routing wrapper can make Dynamo tracing fail with fake CPU/CUDA
+# device propagation errors, so keep eager execution unless explicitly changed.
+os.environ.setdefault("TORCHDYNAMO_DISABLE", "1")
 
 import torch
 import torch.nn.functional as F
