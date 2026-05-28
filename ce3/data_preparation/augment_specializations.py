@@ -49,7 +49,7 @@ DECOMPOSITION_OUTPUT_DEFAULT = "ce3/dataset/decomposed/spec_decompositions_topic
 OUTPUT_DIR_DEFAULT = "ce3/dataset/augmented"
 AUGMENTATION_OUTPUT_DEFAULT = "ce3/dataset/augmented/spec_augmentations_high.jsonl"
 AUGMENTATIONS_PER_ASPECT_DEFAULT = 4
-AUGMENT_BATCH_SIZE_DEFAULT = 256
+AUGMENT_BATCH_SIZE_DEFAULT = 512
 AUGMENT_MAX_NEW_TOKENS_DEFAULT = 384
 MAX_ATTEMPTS_DEFAULT = 2
 MAX_MODEL_LEN_DEFAULT = 4096
@@ -77,34 +77,24 @@ ASPECT_DEFINITIONS = {
 
 CONTRAST_INSTRUCTIONS = {
     "topic": (
-        "Preserve the broad subject/context of the source, preferably using a paraphrase. "
-        "Change the work performed and change the target objects, beneficiaries, systems, "
-        "materials, datasets, outcomes, or use cases. Do not preserve the source approach. "
-        "Do not simply replace source entities with near-equivalent entities. For example, "
-        "do not replace universities with colleges, research institutes with laboratories, "
-        "or economic development entities with innovation hubs if those entities belong to "
-        "a non-target lens. If the source topic strongly implies the source objective, shift "
-        "the generated phrase toward analysis, terminology, policy language, communication, "
-        "education, governance, monitoring, or measurement instead of direct service delivery "
-        "or direct outcome achievement."
+        "Preserve only the broad subject/context. Do not preserve the source action pattern, "
+        "method, workflow, target objects, populations, systems, materials, outcomes, or use case. "
+        "Move the phrase into a different task type such as analysis, terminology, governance, "
+        "communication, education, monitoring, measurement, or policy review. "
+        "Do not simply replace source entities with near-equivalent entities."
     ),
 
     "approach": (
-        "Preserve the work performed, technique, capability, action pattern, workflow, model, "
-        "or analysis/design procedure. Change the topic/context and change the target objects, "
-        "beneficiaries, systems, materials, datasets, outcomes, or use cases. Do not preserve "
-        "source populations, systems, materials, diseases, disciplines, service areas, or outcome "
-        "goals unless they are necessary to express the approach. Avoid near-equivalent action "
-        "substitutions such as managing -> coordinating, designing -> planning, evaluating -> "
-        "assessing, or measuring -> tracking unless that action pattern is the requested high lens."
+        "Preserve only the action pattern, method, workflow, or capability. Move it into a clearly "
+        "different topic/context and clearly different target objects, populations, systems, materials, "
+        "outcomes, or use case. Do not preserve source domain words or source beneficiary/object words."
     ),
 
     "objective": (
-        "Preserve the target object, beneficiary, system, material, dataset, outcome, condition, "
-        "use case, deployment setting, requirement, or intended purpose. Change the topic/context "
-        "and change the work performed. If the objective strongly implies the source topic, preserve "
-        "the objective but shift the surrounding context and action as much as realistically possible. "
-        "Do not preserve the source method or approach unless unavoidable."
+        "Preserve only the target object, beneficiary, system, material, outcome, condition, use case, "
+        "deployment setting, requirement, or intended purpose. Change the action pattern and change the "
+        "surrounding topic/context as much as possible. Do not preserve source methods, workflows, or "
+        "field-specific framing unless unavoidable."
     ),
 }
 
@@ -112,39 +102,41 @@ CONTRAST_INSTRUCTIONS = {
 SYSTEM_PROMPT = """
 You generate synthetic specialization phrases for cross-encoder data augmentation.
 
-The synthetic phrase is not a label. It is only a candidate that will be scored later by a teacher model.
+The synthetic phrase is not a label. It will be rescored later by a teacher model.
 
 Goal:
-- Generate a realistic grant/faculty specialization phrase.
-- The generated phrase should strongly match the source on the requested high-match attention lens.
-- The other two lenses should be semantically low or at most weak/mid matches whenever possible.
-- If a non-target lens is naturally entangled with the requested high-match lens, keep that non-target lens only weakly or partially related rather than forcing an unnatural phrase.
+- The generated phrase should strongly match the source on the requested high-match lens.
+- The generated phrase should intentionally mismatch the other two lenses as much as realistically possible.
+- The phrase must still sound like a plausible grant/faculty specialization keyword.
 
 Attention lenses:
 - topic: the main subject, problem area, technical context, field, discipline, application area, or service area.
 - approach: the capability, method, technique, action, workflow, model, intervention, measurement, analysis procedure, design process, or work performed.
 - objective: the target object, beneficiary, system, material, dataset, outcome, condition, use case, deployment setting, requirement, or intended purpose.
 
-Rules:
-- Preserve the requested high-match lens clearly and specifically.
-- Preserve only the requested high-match lens. Do not preserve source details from the other two lenses unless unavoidable.
-- Prefer semantic paraphrases over copying source wording when a natural paraphrase exists.
-- Avoid reusing exact multi-word source phrases unless they are technical terms, population names, legally defined terms, or otherwise necessary for the requested high-match lens.
-- For the two non-target lenses, use different actions, different methods, different target objects, different populations, different systems, different materials, different datasets, different outcomes, and different use cases when possible.
-- Avoid near-equivalent substitutions in non-target lenses. Examples of near-equivalent substitutions to avoid:
-  - universities -> colleges
-  - research institutes -> laboratories
-  - economic development entities -> innovation hubs
-  - managing -> coordinating
-  - designing -> planning
-  - evaluating -> assessing
-  - measuring -> tracking
-  - treatment services -> care programs
-  - clinical interventions -> health interventions
-- Do not make a near-duplicate or simple paraphrase of the full source phrase.
+Strong contrast rules:
+- Preserve only the requested high-match lens.
+- For the two non-target lenses, actively avoid the source's actions, methods, workflows, targets, beneficiaries, systems, materials, outcomes, conditions, and use cases.
+- Do not use near-equivalent substitutions for non-target lens details.
+- Near-equivalent substitutions are not allowed in non-target lenses, such as:
+  - universities -> colleges / academic institutions
+  - research institutes -> laboratories / scientific centers
+  - economic development entities -> innovation hubs / regional growth organizations
+  - responsible officers -> program coordinators / compliance officers
+  - exchange visitor program -> international student program / academic mobility program
+  - managing -> coordinating / orchestrating
+  - designing -> planning / developing
+  - evaluating -> assessing / auditing
+  - measuring -> tracking / monitoring
+  - treatment services -> care programs / health interventions
+- If preserving the requested lens naturally preserves part of another lens, keep the non-target lens only weakly related and avoid copying its exact entities or action pattern.
+- Prefer a different domain, different beneficiary, different object, different material/system, and different outcome for non-target lenses.
+- Prefer semantic paraphrases over copying source wording for the target lens.
+- Avoid exact multi-word source phrases unless they are necessary technical terms or population names for the requested high-match lens.
+- Do not make a near-duplicate or full paraphrase of the source phrase.
 - Do not add names of real people, institutions, grants, companies, or private entities.
-- Do not invent overly broad filler such as "programs", "projects", "initiatives", "systems", "services", or "strategies" unless paired with a specific modifier.
-- Each output should be one concise standalone specialization phrase, not a full sentence and not an explanation.
+- Do not use broad filler like "programs", "projects", "initiatives", "systems", "services", or "strategies" unless paired with a specific modifier.
+- Each output should be one concise standalone specialization phrase, not an explanation.
 - Return exactly one JSON object and no markdown.
 
 Required schema:
@@ -172,19 +164,22 @@ Requested lens definition:
 Requested lens phrases to preserve semantically:
 {target_items_json}
 
-Avoid copying these exact phrases unless unavoidable:
+Avoid copying these exact source phrases:
 {avoid_exact_phrases_json}
 
 Contrast instruction:
 {contrast_instruction}
 
+Before generating, internally identify the two non-target lenses and avoid their source meanings.
+Do not output that reasoning.
+
 Generate {n} diverse synthetic specialization phrases.
 
-Each generated phrase should:
+Each generated phrase must:
 1. strongly match the source on {target_aspect};
-2. avoid preserving the other two lenses as much as realistically possible;
-3. remain realistic as a grant/faculty specialization keyword;
-4. avoid near-equivalent substitutions for non-target lens details.
+2. intentionally mismatch the other two lenses;
+3. avoid near-equivalent substitutions for non-target details;
+4. remain realistic as a grant/faculty specialization keyword.
 
 Return only valid JSON.
 """.strip()
