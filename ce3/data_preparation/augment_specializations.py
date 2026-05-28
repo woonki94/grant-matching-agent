@@ -68,8 +68,11 @@ ASPECT_DEFINITIONS = {
 
 CONTRAST_INSTRUCTIONS = {
     "topic": (
-        "Preserve only the broad subject/context. Change the work performed and change the target objects, "
-        "beneficiaries, systems, materials, or outcomes. Do not simply swap institutions for near-equivalent institutions."
+        "Preserve only the broad subject/context, preferably by paraphrasing it. Change the work performed and change "
+        "the target objects, beneficiaries, systems, materials, or outcomes. Do not simply swap institutions for "
+        "near-equivalent institutions. If the topic phrase also implies the source objective, shift the generated "
+        "phrase toward analysis, terminology, policy language, communication, education, governance, or measurement "
+        "instead of direct service delivery or outcome achievement."
     ),
     "approach": (
         "Preserve the work performed, technique, capability, or action pattern. Change the topic/context and change "
@@ -133,6 +136,9 @@ Requested lens definition:
 Requested lens phrases to preserve semantically:
 {target_items_json}
 
+Avoid copying these exact phrases unless unavoidable:
+{avoid_exact_phrases_json}
+
 Contrast instruction:
 {contrast_instruction}
 
@@ -160,6 +166,21 @@ def _safe_decomposition(row: Dict[str, Any]) -> Dict[str, List[str]]:
     if not isinstance(decomp, dict):
         return {aspect: [] for aspect in ASPECTS}
     return {aspect: _as_list(decomp.get(aspect)) for aspect in ASPECTS}
+
+
+def _avoid_exact_phrases(decomp: Dict[str, List[str]], aspect: str) -> List[str]:
+    out: List[str] = []
+    seen: set[str] = set()
+    for phrase in decomp.get(aspect, []):
+        norm = normalize_ws(phrase)
+        if len(norm.split()) < 2:
+            continue
+        key = norm.casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(norm)
+    return out
 
 
 def _parse_augmentations(obj: Optional[Dict[str, Any]], *, limit: int) -> tuple[List[str], bool]:
@@ -335,6 +356,7 @@ def augment_specializations(
             prompts: List[str] = []
             for item, aspect in chunk:
                 decomp = _safe_decomposition(decompositions.get(item.item_id, {}))
+                avoid_phrases = _avoid_exact_phrases(decomp, aspect)
                 prompts.append(
                     build_prompt(
                         tokenizer,
@@ -346,6 +368,7 @@ def augment_specializations(
                             target_aspect=aspect,
                             target_definition=ASPECT_DEFINITIONS[aspect],
                             target_items_json=json.dumps(decomp.get(aspect, []), ensure_ascii=False),
+                            avoid_exact_phrases_json=json.dumps(avoid_phrases, ensure_ascii=False),
                             contrast_instruction=CONTRAST_INSTRUCTIONS[aspect],
                             n=max(1, int(augmentations_per_aspect)),
                         ),
@@ -372,6 +395,7 @@ def augment_specializations(
                     continue
 
                 accepted_for_request = 0
+                avoid_phrases = _avoid_exact_phrases(decomp, aspect)
                 for text in texts:
                     slot = None
                     for candidate_slot in range(max(0, int(augmentations_per_aspect))):
@@ -396,6 +420,7 @@ def augment_specializations(
                             "intended_cluster": "high",
                             "slot": int(slot),
                             "contrast_aspects": [x for x in ASPECTS if x != aspect],
+                            "avoid_exact_phrases": avoid_phrases,
                         },
                         "source_decomposition": decomp,
                         "parse_ok": bool(parsed),
