@@ -37,10 +37,7 @@ from ce3.data_preparation.llm_runtime import (  # noqa: E402
 from ce3.data_preparation.utils import (  # noqa: E402
     SpecItem,
     append_jsonl,
-    cached_row_matches_item,
-    load_faculty_specializations,
-    load_grant_specializations,
-    load_jsonl_by_key,
+    load_items_from_decomposition_rows,
     resolve_path,
 )
 
@@ -51,15 +48,10 @@ except Exception:
 
 
 MODEL_ID_DEFAULT = "Qwen/Qwen3-14B"
-GRANT_DB_DEFAULT = "ce3/dataset/source/grant_keywords_spec_keywords_db.json"
-FAC_DB_DEFAULT = "ce3/dataset/source/fac_specs_db.json"
-DECOMPOSITION_OUTPUT_DEFAULT = "ce3/dataset/decomposed/spec_decompositions_topic_approach_objective.jsonl"
+DECOMPOSITION_OUTPUT_DEFAULT = "ce3/dataset/decomposed/spec_decompositions_combined.jsonl"
 OUTPUT_DIR_DEFAULT = "ce3/dataset/distill"
 DISTILLATION_OUTPUT_DEFAULT = "ce3/dataset/distill/llm_distillation.jsonl"
 PREFILTER_CACHE_BASE_DEFAULT = "ce3/dataset/source/prefilter_cache.jsonl"
-SEED_DEFAULT = 42
-MAX_GRANT_SPECS_DEFAULT = 0
-MAX_FAC_SPECS_DEFAULT = 0
 TARGET_HIGH_PER_GRANT_ASPECT_DEFAULT = 4
 TARGET_MID_PER_GRANT_ASPECT_DEFAULT = 8
 TARGET_LOW_PER_GRANT_ASPECT_DEFAULT = 4
@@ -353,31 +345,6 @@ def _parse_score(obj: Optional[Dict[str, Any]]) -> tuple[float, bool]:
     return coerce_score(obj.get("score")), True
 
 
-def validate_decomposition_coverage(
-    *,
-    items: Sequence[SpecItem],
-    decompositions: Dict[str, Dict[str, Any]],
-    label: str,
-) -> None:
-    bad: List[str] = []
-    for item in items:
-        row = decompositions.get(item.item_id)
-        if row is None:
-            reason = "missing"
-        elif not cached_row_matches_item(row, item):
-            reason = "stale_or_mismatched_text"
-        else:
-            continue
-        if len(bad) < 5:
-            bad.append(f"{reason}: {item.item_id} text={item.text[:140]}")
-    if bad:
-        raise RuntimeError(
-            f"Decomposition coverage failed for {label}. Examples:\n"
-            + "\n".join(bad)
-            + "\nRun CE3 decomposition on the same source DBs before distillation."
-        )
-
-
 def distill_pairs(
     *,
     llm_bundle: Dict[str, Any],
@@ -466,12 +433,14 @@ def distill_pairs(
                     "band": score_to_band(float(score)),
                     "grant": {
                         "item_id": cand.grant.item_id,
+                        "kind": cand.grant.kind,
                         "text": cand.grant.text,
                         "meta": cand.grant.meta,
                         "decomposition": g_dec,
                     },
                     "faculty": {
                         "item_id": cand.faculty.item_id,
+                        "kind": cand.faculty.kind,
                         "text": cand.faculty.text,
                         "meta": cand.faculty.meta,
                         "decomposition": f_dec,
@@ -507,15 +476,10 @@ def distill_pairs(
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="CE3 LLM distillation over decomposed specialization pairs.")
     p.add_argument("--model-id", type=str, default=MODEL_ID_DEFAULT)
-    p.add_argument("--grant-db", type=str, default=GRANT_DB_DEFAULT)
-    p.add_argument("--fac-db", type=str, default=FAC_DB_DEFAULT)
     p.add_argument("--decomposition-output", type=str, default=DECOMPOSITION_OUTPUT_DEFAULT)
     p.add_argument("--prefilter-cache-base", type=str, default=PREFILTER_CACHE_BASE_DEFAULT)
     p.add_argument("--output-dir", type=str, default=OUTPUT_DIR_DEFAULT)
     p.add_argument("--distillation-output", type=str, default=DISTILLATION_OUTPUT_DEFAULT)
-    p.add_argument("--seed", type=int, default=SEED_DEFAULT)
-    p.add_argument("--max-grant-specs", type=int, default=MAX_GRANT_SPECS_DEFAULT)
-    p.add_argument("--max-fac-specs", type=int, default=MAX_FAC_SPECS_DEFAULT)
     p.add_argument("--target-high-per-grant-aspect", type=int, default=TARGET_HIGH_PER_GRANT_ASPECT_DEFAULT)
     p.add_argument("--target-mid-per-grant-aspect", type=int, default=TARGET_MID_PER_GRANT_ASPECT_DEFAULT)
     p.add_argument("--target-low-per-grant-aspect", type=int, default=TARGET_LOW_PER_GRANT_ASPECT_DEFAULT)
@@ -537,8 +501,6 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     started = time.time()
     args = parse_args()
-    grant_db = resolve_path(args.grant_db)
-    fac_db = resolve_path(args.fac_db)
     decomposition_path = resolve_path(args.decomposition_output)
     prefilter_cache_base = resolve_path(args.prefilter_cache_base)
     output_dir = resolve_path(args.output_dir)
@@ -548,11 +510,11 @@ def main() -> int:
     if args.overwrite:
         _unlink_if_exists(output_path)
 
-    grant_specs = load_grant_specializations(grant_db, max_items=args.max_grant_specs, seed=args.seed)
-    fac_specs = load_faculty_specializations(fac_db, max_items=args.max_fac_specs, seed=args.seed)
-    decompositions = load_jsonl_by_key(decomposition_path, "item_id")
-    validate_decomposition_coverage(items=grant_specs, decompositions=decompositions, label="grant specs")
-    validate_decomposition_coverage(items=fac_specs, decompositions=decompositions, label="faculty specs")
+    grant_specs, fac_specs, decompositions = load_items_from_decomposition_rows(decomposition_path)
+    if not grant_specs or not fac_specs:
+        raise RuntimeError(
+            f"Combined decomposition must contain at least one grant-side and one faculty-side item: {decomposition_path}"
+        )
 
     fac_by_id = {item.item_id: item for item in fac_specs}
     pairs = select_candidate_pairs(
@@ -574,8 +536,6 @@ def main() -> int:
             {
                 "stage": "ce3_distill_setup",
                 "model_id": args.model_id,
-                "grant_db": str(grant_db),
-                "fac_db": str(fac_db),
                 "decomposition_output": str(decomposition_path),
                 "prefilter_cache_base": str(prefilter_cache_base),
                 "distillation_output": str(output_path),

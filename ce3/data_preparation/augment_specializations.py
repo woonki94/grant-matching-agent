@@ -66,6 +66,22 @@ ASPECT_DEFINITIONS = {
 }
 
 
+CONTRAST_INSTRUCTIONS = {
+    "topic": (
+        "Preserve only the broad subject/context. Change the work performed and change the target objects, "
+        "beneficiaries, systems, materials, or outcomes. Do not simply swap institutions for near-equivalent institutions."
+    ),
+    "approach": (
+        "Preserve the work performed, technique, capability, or action pattern. Change the topic/context and change "
+        "the target objects, beneficiaries, systems, materials, or outcomes."
+    ),
+    "objective": (
+        "Preserve the target object, beneficiary, system, material, outcome, condition, or use case. Change the "
+        "topic/context and change the work performed."
+    ),
+}
+
+
 SYSTEM_PROMPT = """
 You generate synthetic specialization phrases for cross-encoder data augmentation.
 
@@ -73,7 +89,7 @@ The synthetic phrase is not a label. It is only a candidate that will be scored 
 
 Goal:
 - Match the source specialization strongly on exactly one requested attention lens.
-- Make the other two lenses meaningfully different when possible, so the generated phrase creates useful contrast.
+- Make the other two lenses as semantically low as possible while keeping the phrase realistic.
 - Keep the phrase realistic as a grant/faculty specialization keyword.
 
 Attention lenses:
@@ -83,7 +99,12 @@ Attention lenses:
 
 Rules:
 - Preserve the requested high-match lens clearly and specifically.
-- Vary the non-target lenses. Do not make a near-duplicate of the source phrase.
+- Prefer semantic paraphrases over copying source wording when a natural paraphrase exists.
+- Avoid reusing exact multi-word source phrases unless they are technical terms, population names, or otherwise necessary for the requested high-match lens.
+- Preserve only the requested lens. Do not preserve source details from the other two lenses unless unavoidable.
+- The two non-target lenses should use different actions, different target objects/populations/systems, and different outcome details when possible.
+- Avoid near-equivalent substitutions in non-target lenses, such as universities -> colleges, research institutes -> laboratories, managing -> coordinating, or designing -> planning.
+- Do not make a near-duplicate of the source phrase.
 - Do not add names of real people, institutions, grants, or private entities.
 - Do not invent overly broad filler.
 - Each output should be one concise standalone specialization phrase, not a sentence with explanations.
@@ -112,9 +133,12 @@ Requested lens definition:
 Requested lens phrases to preserve semantically:
 {target_items_json}
 
+Contrast instruction:
+{contrast_instruction}
+
 Generate {n} diverse synthetic specialization phrases.
 
-The generated phrases should be high for {target_aspect} against the source, while the other two lenses should be different enough to create contrast.
+The generated phrases should be high for {target_aspect} against the source, while the other two lenses should be low whenever possible.
 """.strip()
 
 
@@ -322,6 +346,7 @@ def augment_specializations(
                             target_aspect=aspect,
                             target_definition=ASPECT_DEFINITIONS[aspect],
                             target_items_json=json.dumps(decomp.get(aspect, []), ensure_ascii=False),
+                            contrast_instruction=CONTRAST_INSTRUCTIONS[aspect],
                             n=max(1, int(augmentations_per_aspect)),
                         ),
                     )

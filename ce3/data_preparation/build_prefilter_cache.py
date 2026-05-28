@@ -24,10 +24,7 @@ if str(PROJECT_ROOT) not in sys.path:
 from ce3.data_preparation.llm_runtime import normalize_ws  # noqa: E402
 from ce3.data_preparation.utils import (  # noqa: E402
     SpecItem,
-    cached_row_matches_item,
-    load_faculty_specializations,
-    load_grant_specializations,
-    load_jsonl_by_key,
+    load_items_from_decomposition_rows,
     resolve_path,
 )
 
@@ -38,13 +35,8 @@ except Exception:
 
 
 MODEL_ID_DEFAULT = "dleemiller/ModernCE-base-sts"
-GRANT_DB_DEFAULT = "ce3/dataset/source/grant_keywords_spec_keywords_db.json"
-FAC_DB_DEFAULT = "ce3/dataset/source/fac_specs_db.json"
-DECOMPOSITION_OUTPUT_DEFAULT = "ce3/dataset/decomposed/spec_decompositions_topic_approach_objective.jsonl"
+DECOMPOSITION_OUTPUT_DEFAULT = "ce3/dataset/decomposed/spec_decompositions_combined.jsonl"
 OUTPUT_BASE_DEFAULT = "ce3/dataset/source/prefilter_cache.jsonl"
-SEED_DEFAULT = 42
-MAX_GRANT_SPECS_DEFAULT = 0
-MAX_FAC_SPECS_DEFAULT = 0
 BATCH_SIZE_DEFAULT = 64
 MAX_LENGTH_DEFAULT = 256
 ASPECTS = ("topic", "approach", "objective")
@@ -77,26 +69,6 @@ def _aspect_text(item: SpecItem, decompositions: Dict[str, Dict[str, Any]], aspe
     decomp = _safe_decomposition(decompositions.get(item.item_id, {}))
     text = " ".join(decomp.get(aspect, []))
     return normalize_ws(text)
-
-
-def _validate_coverage(items: Sequence[SpecItem], decompositions: Dict[str, Dict[str, Any]], *, label: str) -> None:
-    bad: List[str] = []
-    for item in items:
-        row = decompositions.get(item.item_id)
-        if row is None:
-            reason = "missing"
-        elif not cached_row_matches_item(row, item):
-            reason = "stale_or_mismatched_text"
-        else:
-            continue
-        if len(bad) < 5:
-            bad.append(f"{reason}: {item.item_id} text={item.text[:140]}")
-    if bad:
-        raise RuntimeError(
-            f"Decomposition coverage failed for {label}. Examples:\n"
-            + "\n".join(bad)
-            + "\nRun CE3 decomposition on the same source DBs before building prefilter cache."
-        )
 
 
 def _sigmoid(value: float) -> float:
@@ -179,6 +151,7 @@ def _build_all_candidates(
             {
                 "rank": int(rank),
                 "fac_item_id": fac.item_id,
+                "fac_kind": fac.kind,
                 "fac_text": fac.text,
                 "fac_meta": fac.meta,
                 "doc_text": fac_texts[idx],
@@ -197,6 +170,7 @@ def build_prefilter_cache(
     model_id: str,
     batch_size: int,
     max_length: int,
+    include_aug_aug: bool,
 ) -> Dict[str, Any]:
     model, tokenizer, device = _load_cross_encoder(model_id)
     output_paths = prefilter_cache_paths(output_base_path)
@@ -204,10 +178,6 @@ def build_prefilter_cache(
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text("", encoding="utf-8")
 
-    fac_texts_by_aspect = {
-        aspect: [_aspect_text(fac, decompositions, aspect) for fac in fac_specs]
-        for aspect in ASPECTS
-    }
     written = {aspect: 0 for aspect in ASPECTS}
     iterator: Iterable[tuple[str, SpecItem]] = (
         (aspect, grant)
@@ -225,23 +195,29 @@ def build_prefilter_cache(
     try:
         for aspect, grant in iterator:
             query_text = _aspect_text(grant, decompositions, aspect)
-            query_texts = [query_text] * len(fac_specs)
+            candidate_fac_specs = [
+                fac for fac in fac_specs
+                if bool(include_aug_aug) or not (grant.kind.endswith("_aug") and fac.kind.endswith("_aug"))
+            ]
+            candidate_fac_texts = [_aspect_text(fac, decompositions, aspect) for fac in candidate_fac_specs]
+            query_texts = [query_text] * len(candidate_fac_specs)
             scores = _score_pairs(
                 model=model,
                 tokenizer=tokenizer,
                 device=device,
                 query_texts=query_texts,
-                doc_texts=fac_texts_by_aspect[aspect],
+                doc_texts=candidate_fac_texts,
                 batch_size=batch_size,
                 max_length=max_length,
             )
             candidates = _build_all_candidates(
-                fac_specs=fac_specs,
-                fac_texts=fac_texts_by_aspect[aspect],
+                fac_specs=candidate_fac_specs,
+                fac_texts=candidate_fac_texts,
                 scores=scores,
             )
             row = {
                 "grant_item_id": grant.item_id,
+                "grant_kind": grant.kind,
                 "grant_text": grant.text,
                 "grant_meta": grant.meta,
                 "aspect": aspect,
@@ -264,48 +240,47 @@ def build_prefilter_cache(
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Build CE3 aspect prefilter cache with a cross-encoder STS model.")
     p.add_argument("--model-id", type=str, default=MODEL_ID_DEFAULT)
-    p.add_argument("--grant-db", type=str, default=GRANT_DB_DEFAULT)
-    p.add_argument("--fac-db", type=str, default=FAC_DB_DEFAULT)
     p.add_argument("--decomposition-output", type=str, default=DECOMPOSITION_OUTPUT_DEFAULT)
     p.add_argument("--output-base", type=str, default=OUTPUT_BASE_DEFAULT)
-    p.add_argument("--seed", type=int, default=SEED_DEFAULT)
-    p.add_argument("--max-grant-specs", type=int, default=MAX_GRANT_SPECS_DEFAULT)
-    p.add_argument("--max-fac-specs", type=int, default=MAX_FAC_SPECS_DEFAULT)
     p.add_argument("--batch-size", type=int, default=BATCH_SIZE_DEFAULT)
     p.add_argument("--max-length", type=int, default=MAX_LENGTH_DEFAULT)
+    p.add_argument("--include-aug-aug", action="store_true", help="Also score synthetic grant_aug vs synthetic fac_aug pairs.")
     return p.parse_args()
 
 
 def main() -> int:
     started = time.time()
     args = parse_args()
-    grant_db = resolve_path(args.grant_db)
-    fac_db = resolve_path(args.fac_db)
     decomposition_path = resolve_path(args.decomposition_output)
     output_base_path = resolve_path(args.output_base)
     if not decomposition_path.exists():
         raise FileNotFoundError(f"Missing decomposition output: {decomposition_path}")
 
-    grant_specs = load_grant_specializations(grant_db, max_items=args.max_grant_specs, seed=args.seed)
-    fac_specs = load_faculty_specializations(fac_db, max_items=args.max_fac_specs, seed=args.seed)
-    decompositions = load_jsonl_by_key(decomposition_path, "item_id")
-    _validate_coverage(grant_specs, decompositions, label="grant specs")
-    _validate_coverage(fac_specs, decompositions, label="faculty specs")
+    grant_specs, fac_specs, decompositions = load_items_from_decomposition_rows(decomposition_path)
+    if not grant_specs or not fac_specs:
+        raise RuntimeError(
+            f"Combined decomposition must contain at least one grant-side and one faculty-side item: {decomposition_path}"
+        )
+    expected_scores_per_aspect = sum(
+        1
+        for grant in grant_specs
+        for fac in fac_specs
+        if bool(args.include_aug_aug) or not (grant.kind.endswith("_aug") and fac.kind.endswith("_aug"))
+    )
 
     print(
         json.dumps(
             {
                 "stage": "ce3_prefilter_setup",
                 "model_id": args.model_id,
-                "grant_db": str(grant_db),
-                "fac_db": str(fac_db),
                 "decomposition_output": str(decomposition_path),
                 "output_base": str(output_base_path),
                 "aspects": list(ASPECTS),
                 "grant_specs_loaded": int(len(grant_specs)),
                 "fac_specs_loaded": int(len(fac_specs)),
-                "expected_scores_per_aspect": int(len(grant_specs) * len(fac_specs)),
-                "expected_scores_total": int(len(ASPECTS) * len(grant_specs) * len(fac_specs)),
+                "expected_scores_per_aspect": int(expected_scores_per_aspect),
+                "expected_scores_total": int(len(ASPECTS) * expected_scores_per_aspect),
+                "include_aug_aug": bool(args.include_aug_aug),
             },
             ensure_ascii=False,
         )
@@ -318,6 +293,7 @@ def main() -> int:
         model_id=args.model_id,
         batch_size=args.batch_size,
         max_length=args.max_length,
+        include_aug_aug=bool(args.include_aug_aug),
     )
     print(json.dumps(stats, ensure_ascii=False))
     print(f"elapsed_sec={time.time() - started:.2f}")

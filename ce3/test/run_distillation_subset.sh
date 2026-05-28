@@ -7,15 +7,10 @@ cd "${PROJECT_ROOT}"
 
 PYTHON_BIN="${PYTHON_BIN:-python}"
 MODEL_ID="${MODEL_ID:-Qwen/Qwen3-14B}"
-GRANT_DB="${GRANT_DB:-ce3/dataset/source/grant_keywords_spec_keywords_db.json}"
-FAC_DB="${FAC_DB:-ce3/dataset/source/fac_specs_db.json}"
-DECOMPOSITION_OUTPUT="${DECOMPOSITION_OUTPUT:-ce3/test/output/spec_decompositions_subset.jsonl}"
+DECOMPOSITION_OUTPUT="${DECOMPOSITION_OUTPUT:-ce3/test/output/spec_decompositions_combined_subset.jsonl}"
 PREFILTER_CACHE_BASE="${PREFILTER_CACHE_BASE:-ce3/test/output/prefilter_cache_subset.jsonl}"
 OUTPUT_DIR="${OUTPUT_DIR:-ce3/test/output}"
 DISTILLATION_OUTPUT="${DISTILLATION_OUTPUT:-ce3/test/output/llm_distillation_subset.jsonl}"
-SEED="${SEED:-42}"
-MAX_GRANT_SPECS="${MAX_GRANT_SPECS:-10}"
-MAX_FAC_SPECS="${MAX_FAC_SPECS:-10}"
 TARGET_HIGH_PER_GRANT_ASPECT="${TARGET_HIGH_PER_GRANT_ASPECT:-1}"
 TARGET_MID_PER_GRANT_ASPECT="${TARGET_MID_PER_GRANT_ASPECT:-2}"
 TARGET_LOW_PER_GRANT_ASPECT="${TARGET_LOW_PER_GRANT_ASPECT:-1}"
@@ -35,8 +30,8 @@ OVERWRITE="${OVERWRITE:-true}"
 bool_true() { [[ "${1:-}" == "true" ]]; }
 
 if [[ ! -f "${DECOMPOSITION_OUTPUT}" ]]; then
-  echo "Missing subset decomposition: ${DECOMPOSITION_OUTPUT}" >&2
-  echo "Run ce3/test/run_decomposition_subset.sh first." >&2
+  echo "Missing subset combined decomposition: ${DECOMPOSITION_OUTPUT}" >&2
+  echo "Run ce3/test/run_combine_decompositions_subset.sh first." >&2
   exit 1
 fi
 
@@ -52,15 +47,10 @@ done
 CMD=(
   "${PYTHON_BIN}" ce3/data_preparation/llm_distillation.py
   --model-id "${MODEL_ID}"
-  --grant-db "${GRANT_DB}"
-  --fac-db "${FAC_DB}"
   --decomposition-output "${DECOMPOSITION_OUTPUT}"
   --prefilter-cache-base "${PREFILTER_CACHE_BASE}"
   --output-dir "${OUTPUT_DIR}"
   --distillation-output "${DISTILLATION_OUTPUT}"
-  --seed "${SEED}"
-  --max-grant-specs "${MAX_GRANT_SPECS}"
-  --max-fac-specs "${MAX_FAC_SPECS}"
   --target-high-per-grant-aspect "${TARGET_HIGH_PER_GRANT_ASPECT}"
   --target-mid-per-grant-aspect "${TARGET_MID_PER_GRANT_ASPECT}"
   --target-low-per-grant-aspect "${TARGET_LOW_PER_GRANT_ASPECT}"

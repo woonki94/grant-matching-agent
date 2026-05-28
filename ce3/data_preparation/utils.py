@@ -61,6 +61,45 @@ def load_jsonl_by_key(path: Path, key: str) -> Dict[str, Dict[str, Any]]:
     return out
 
 
+def load_items_from_decomposition_rows(
+    path: Path,
+    *,
+    grant_kinds: Sequence[str] = ("grant", "grant_aug"),
+    faculty_kinds: Sequence[str] = ("faculty", "fac_aug"),
+) -> tuple[List[SpecItem], List[SpecItem], Dict[str, Dict[str, Any]]]:
+    grants: List[SpecItem] = []
+    faculty: List[SpecItem] = []
+    rows_by_id: Dict[str, Dict[str, Any]] = {}
+    grant_kind_set = set(grant_kinds)
+    faculty_kind_set = set(faculty_kinds)
+    if not path.exists():
+        return grants, faculty, rows_by_id
+    with path.open("r", encoding="utf-8") as f:
+        for raw in f:
+            line = clean_text(raw)
+            if not line:
+                continue
+            try:
+                row = json.loads(line)
+            except Exception:
+                continue
+            if not isinstance(row, dict):
+                continue
+            item_id = clean_text(row.get("item_id"))
+            kind = clean_text(row.get("kind"))
+            text = normalize_ws(row.get("text"))
+            if not item_id or not kind or not text or item_id in rows_by_id:
+                continue
+            meta = row.get("meta") if isinstance(row.get("meta"), dict) else {}
+            item = SpecItem(item_id=item_id, kind=kind, text=text, meta=dict(meta))
+            rows_by_id[item_id] = row
+            if kind in grant_kind_set:
+                grants.append(item)
+            elif kind in faculty_kind_set:
+                faculty.append(item)
+    return grants, faculty, rows_by_id
+
+
 def load_grant_specializations(path: Path, *, max_items: int, seed: int) -> List[SpecItem]:
     db = read_json(path)
     grants = db.get("grants") if isinstance(db, dict) else []
