@@ -335,6 +335,11 @@ def _to_device(obj: Any, device: torch.device) -> Any:
         return {k: _to_device(v, device) for k, v in obj.items()}
     if torch.is_tensor(obj):
         return obj.to(device, non_blocking=(device.type == "cuda"))
+    if hasattr(obj, "to"):
+        try:
+            return obj.to(device)
+        except Exception:
+            return obj
     return obj
 
 

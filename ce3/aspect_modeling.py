@@ -126,6 +126,23 @@ def _slice_batch_kwargs(kwargs: Dict[str, Any], mask: torch.Tensor, batch_size: 
     return out
 
 
+def _module_device(module: nn.Module) -> torch.device:
+    try:
+        return next(module.parameters()).device
+    except StopIteration:
+        return torch.device("cpu")
+
+
+def _move_tensor_kwargs(kwargs: Dict[str, Any], device: torch.device) -> Dict[str, Any]:
+    out: Dict[str, Any] = {}
+    for key, value in kwargs.items():
+        if torch.is_tensor(value):
+            out[key] = value.to(device)
+        else:
+            out[key] = value
+    return out
+
+
 class AspectHeadSequenceClassifier(nn.Module):
     """Shared cross-encoder backbone with one scalar head per CE3 aspect."""
 
@@ -156,6 +173,9 @@ class AspectHeadSequenceClassifier(nn.Module):
         if self.classifier_attr_name is None:
             raise RuntimeError("Missing classifier attribute for aspect-head routing.")
 
+        target_device = _module_device(self.backbone)
+        kwargs = _move_tensor_kwargs(kwargs, target_device)
+        input_ids = kwargs["input_ids"]
         batch_size = int(input_ids.shape[0])
         aspect_ids = self._clean_aspect_ids(aspect_ids, batch_size=batch_size, device=input_ids.device)
         original_head = getattr(self.backbone, self.classifier_attr_name)
