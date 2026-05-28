@@ -10,21 +10,15 @@ MODEL_ID="${MODEL_ID:-Qwen/Qwen3-14B}"
 GRANT_DB="${GRANT_DB:-ce3/dataset/source/grant_keywords_spec_keywords_db.json}"
 FAC_DB="${FAC_DB:-ce3/dataset/source/fac_specs_db.json}"
 DECOMPOSITION_OUTPUT="${DECOMPOSITION_OUTPUT:-ce3/test/output/spec_decompositions_subset.jsonl}"
-PREFILTER_CACHE_BASE="${PREFILTER_CACHE_BASE:-ce3/test/output/prefilter_cache_subset.jsonl}"
 OUTPUT_DIR="${OUTPUT_DIR:-ce3/test/output}"
-DISTILLATION_OUTPUT="${DISTILLATION_OUTPUT:-ce3/test/output/llm_distillation_subset.jsonl}"
+AUGMENTATION_OUTPUT="${AUGMENTATION_OUTPUT:-ce3/test/output/spec_augmentations_subset.jsonl}"
 SEED="${SEED:-42}"
 MAX_GRANT_SPECS="${MAX_GRANT_SPECS:-10}"
 MAX_FAC_SPECS="${MAX_FAC_SPECS:-10}"
-TARGET_HIGH_PER_GRANT_ASPECT="${TARGET_HIGH_PER_GRANT_ASPECT:-1}"
-TARGET_MID_PER_GRANT_ASPECT="${TARGET_MID_PER_GRANT_ASPECT:-2}"
-TARGET_LOW_PER_GRANT_ASPECT="${TARGET_LOW_PER_GRANT_ASPECT:-1}"
-PREFILTER_HIGH_MULTIPLIER="${PREFILTER_HIGH_MULTIPLIER:-4.0}"
-PREFILTER_MID_MULTIPLIER="${PREFILTER_MID_MULTIPLIER:-2.0}"
-PREFILTER_LOW_MULTIPLIER="${PREFILTER_LOW_MULTIPLIER:-1.25}"
-DISTILL_BATCH_SIZE="${DISTILL_BATCH_SIZE:-24}"
-DISTILL_MAX_NEW_TOKENS="${DISTILL_MAX_NEW_TOKENS:-32}"
-TEMPERATURE="${TEMPERATURE:-0.0}"
+AUGMENTATIONS_PER_ASPECT="${AUGMENTATIONS_PER_ASPECT:-1}"
+AUGMENT_BATCH_SIZE="${AUGMENT_BATCH_SIZE:-8}"
+AUGMENT_MAX_NEW_TOKENS="${AUGMENT_MAX_NEW_TOKENS:-256}"
+TEMPERATURE="${TEMPERATURE:-0.7}"
 TOP_P="${TOP_P:-0.9}"
 MAX_ATTEMPTS="${MAX_ATTEMPTS:-2}"
 MAX_MODEL_LEN="${MAX_MODEL_LEN:-4096}"
@@ -40,35 +34,20 @@ if [[ ! -f "${DECOMPOSITION_OUTPUT}" ]]; then
   exit 1
 fi
 
-for aspect in topic approach objective; do
-  cache_path="${PREFILTER_CACHE_BASE%.jsonl}_${aspect}.jsonl"
-  if [[ ! -f "${cache_path}" ]]; then
-    echo "Missing subset prefilter cache: ${cache_path}" >&2
-    echo "Run ce3/test/run_prefilter_cache_subset.sh first." >&2
-    exit 1
-  fi
-done
-
 CMD=(
-  "${PYTHON_BIN}" ce3/data_preparation/llm_distillation.py
+  "${PYTHON_BIN}" ce3/data_preparation/augment_specializations.py
   --model-id "${MODEL_ID}"
   --grant-db "${GRANT_DB}"
   --fac-db "${FAC_DB}"
   --decomposition-output "${DECOMPOSITION_OUTPUT}"
-  --prefilter-cache-base "${PREFILTER_CACHE_BASE}"
   --output-dir "${OUTPUT_DIR}"
-  --distillation-output "${DISTILLATION_OUTPUT}"
+  --augmentation-output "${AUGMENTATION_OUTPUT}"
   --seed "${SEED}"
   --max-grant-specs "${MAX_GRANT_SPECS}"
   --max-fac-specs "${MAX_FAC_SPECS}"
-  --target-high-per-grant-aspect "${TARGET_HIGH_PER_GRANT_ASPECT}"
-  --target-mid-per-grant-aspect "${TARGET_MID_PER_GRANT_ASPECT}"
-  --target-low-per-grant-aspect "${TARGET_LOW_PER_GRANT_ASPECT}"
-  --prefilter-high-multiplier "${PREFILTER_HIGH_MULTIPLIER}"
-  --prefilter-mid-multiplier "${PREFILTER_MID_MULTIPLIER}"
-  --prefilter-low-multiplier "${PREFILTER_LOW_MULTIPLIER}"
-  --distill-batch-size "${DISTILL_BATCH_SIZE}"
-  --distill-max-new-tokens "${DISTILL_MAX_NEW_TOKENS}"
+  --augmentations-per-aspect "${AUGMENTATIONS_PER_ASPECT}"
+  --augment-batch-size "${AUGMENT_BATCH_SIZE}"
+  --augment-max-new-tokens "${AUGMENT_MAX_NEW_TOKENS}"
   --temperature "${TEMPERATURE}"
   --top-p "${TOP_P}"
   --max-attempts "${MAX_ATTEMPTS}"
@@ -83,4 +62,4 @@ fi
 
 echo "Running: ${CMD[*]}"
 "${CMD[@]}"
-echo "Subset distillation: ${DISTILLATION_OUTPUT}"
+echo "Subset augmentation: ${AUGMENTATION_OUTPUT}"

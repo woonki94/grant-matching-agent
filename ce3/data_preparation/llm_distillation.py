@@ -2,13 +2,12 @@ from __future__ import annotations
 
 import argparse
 import json
-import re
 import sys
 import time
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence
 
 
 def _find_project_root() -> Path:
@@ -57,12 +56,16 @@ FAC_DB_DEFAULT = "ce3/dataset/source/fac_specs_db.json"
 DECOMPOSITION_OUTPUT_DEFAULT = "ce3/dataset/decomposed/spec_decompositions_topic_approach_objective.jsonl"
 OUTPUT_DIR_DEFAULT = "ce3/dataset/distill"
 DISTILLATION_OUTPUT_DEFAULT = "ce3/dataset/distill/llm_distillation.jsonl"
+PREFILTER_CACHE_BASE_DEFAULT = "ce3/dataset/source/prefilter_cache.jsonl"
 SEED_DEFAULT = 42
 MAX_GRANT_SPECS_DEFAULT = 0
 MAX_FAC_SPECS_DEFAULT = 0
-PREFILTER_HIGH_PER_ASPECT_DEFAULT = 3
-PREFILTER_MID_PER_ASPECT_DEFAULT = 3
-PREFILTER_LOW_PER_ASPECT_DEFAULT = 3
+TARGET_HIGH_PER_GRANT_ASPECT_DEFAULT = 4
+TARGET_MID_PER_GRANT_ASPECT_DEFAULT = 8
+TARGET_LOW_PER_GRANT_ASPECT_DEFAULT = 4
+PREFILTER_HIGH_MULTIPLIER_DEFAULT = 4.0
+PREFILTER_MID_MULTIPLIER_DEFAULT = 2.0
+PREFILTER_LOW_MULTIPLIER_DEFAULT = 1.25
 DISTILL_BATCH_SIZE_DEFAULT = 24
 DISTILL_MAX_NEW_TOKENS_DEFAULT = 32
 MAX_ATTEMPTS_DEFAULT = 2
@@ -144,7 +147,10 @@ class CandidatePair:
     faculty: SpecItem
     aspect: str
     prefilter_score: float
-    source_band: str
+    prefilter_rank: int
+    target_cluster: str
+    query_text: str
+    doc_text: str
 
 
 def _unlink_if_exists(path: Path) -> None:
@@ -167,87 +173,160 @@ def _safe_decomposition(row: Dict[str, Any]) -> Dict[str, List[str]]:
     return {aspect: _as_list(decomp.get(aspect)) for aspect in ASPECTS}
 
 
-def _aspect_text(item: SpecItem, decomp: Dict[str, List[str]], aspect: str, *, fallback_to_full_text: bool) -> str:
-    text = " ".join(x for x in decomp.get(aspect, []) if normalize_ws(x))
-    if text:
-        return normalize_ws(text)
-    return item.text if fallback_to_full_text else ""
+def prefilter_cache_paths(output_base_path: Path) -> Dict[str, Path]:
+    stem = output_base_path.stem if output_base_path.suffix else output_base_path.name
+    return {
+        aspect: (output_base_path.parent / f"{stem}_{aspect}.jsonl").resolve()
+        for aspect in ASPECTS
+    }
 
 
-TOKEN_RE = re.compile(r"[a-zA-Z0-9][a-zA-Z0-9_\-]*")
+def _positive_int(value: int) -> int:
+    return max(0, int(value))
 
 
-def _tokens(text: str) -> set[str]:
-    return {m.group(0).lower() for m in TOKEN_RE.finditer(normalize_ws(text))}
+def _overfetch_count(target: int, multiplier: float) -> int:
+    if int(target) <= 0:
+        return 0
+    import math
 
-
-def _lexical_score(query: str, doc: str) -> float:
-    q = _tokens(query)
-    d = _tokens(doc)
-    if not q or not d:
-        return 0.0
-    inter = len(q & d)
-    precision = inter / max(1, len(d))
-    recall = inter / max(1, len(q))
-    if precision + recall <= 0:
-        return 0.0
-    return float((2 * precision * recall) / (precision + recall))
+    return max(int(target), int(math.ceil(float(target) * max(1.0, float(multiplier)))))
 
 
 def _dedupe_candidates(candidates: Iterable[CandidatePair]) -> List[CandidatePair]:
-    best: Dict[Tuple[str, str, str], CandidatePair] = {}
+    best: Dict[tuple[str, str, str], CandidatePair] = {}
     for cand in candidates:
         key = (cand.grant.item_id, cand.faculty.item_id, cand.aspect)
         old = best.get(key)
-        if old is None or cand.prefilter_score > old.prefilter_score:
+        if old is None or _candidate_priority(cand) < _candidate_priority(old):
             best[key] = cand
-    return sorted(best.values(), key=lambda x: (x.grant.item_id, x.aspect, -x.prefilter_score, x.faculty.item_id))
+    return sorted(
+        best.values(),
+        key=lambda x: (x.grant.item_id, x.aspect, _cluster_sort_key(x.target_cluster), x.prefilter_rank, x.faculty.item_id),
+    )
+
+
+def _cluster_sort_key(cluster: str) -> int:
+    return {"high": 0, "mid": 1, "low": 2}.get(cluster, 9)
+
+
+def _candidate_priority(cand: CandidatePair) -> tuple[int, int, float, str]:
+    score_sort = -cand.prefilter_score if cand.target_cluster != "low" else cand.prefilter_score
+    return (_cluster_sort_key(cand.target_cluster), int(cand.prefilter_rank), float(score_sort), cand.faculty.item_id)
+
+
+def _select_from_ranked_candidates(
+    *,
+    candidates: Sequence[Dict[str, Any]],
+    target_high: int,
+    target_mid: int,
+    target_low: int,
+    high_multiplier: float,
+    mid_multiplier: float,
+    low_multiplier: float,
+) -> List[tuple[str, Dict[str, Any]]]:
+    valid = [
+        cand
+        for cand in candidates
+        if normalize_ws(cand.get("doc_text")) and clean_text(cand.get("fac_item_id"))
+    ]
+    selected: List[tuple[str, Dict[str, Any]]] = []
+    selected_fac_ids: set[str] = set()
+
+    def add(cluster: str, pool: Sequence[Dict[str, Any]], limit: int) -> None:
+        for cand in pool:
+            if len([x for x in selected if x[0] == cluster]) >= limit:
+                return
+            fac_id = clean_text(cand.get("fac_item_id"))
+            if not fac_id or fac_id in selected_fac_ids:
+                continue
+            selected.append((cluster, cand))
+            selected_fac_ids.add(fac_id)
+
+    high_n = _overfetch_count(target_high, high_multiplier)
+    mid_n = _overfetch_count(target_mid, mid_multiplier)
+    low_n = _overfetch_count(target_low, low_multiplier)
+
+    high_pool = sorted(valid, key=lambda x: (-float(x.get("ce_score", 0.0)), int(x.get("rank", 0)), clean_text(x.get("fac_item_id"))))
+    mid_pool = sorted(valid, key=lambda x: (abs(float(x.get("ce_score", 0.0)) - 0.5), -float(x.get("ce_score", 0.0)), int(x.get("rank", 0)), clean_text(x.get("fac_item_id"))))
+    low_pool = sorted(valid, key=lambda x: (float(x.get("ce_score", 0.0)), -int(x.get("rank", 0)), clean_text(x.get("fac_item_id"))))
+
+    add("high", high_pool, high_n)
+    add("mid", mid_pool, mid_n)
+    add("low", low_pool, low_n)
+    return selected
 
 
 def select_candidate_pairs(
     *,
     grant_specs: Sequence[SpecItem],
-    fac_specs: Sequence[SpecItem],
-    decompositions: Dict[str, Dict[str, Any]],
-    high_per_aspect: int,
-    mid_per_aspect: int,
-    low_per_aspect: int,
+    fac_by_id: Dict[str, SpecItem],
+    prefilter_cache_base: Path,
+    target_high: int,
+    target_mid: int,
+    target_low: int,
+    high_multiplier: float,
+    mid_multiplier: float,
+    low_multiplier: float,
 ) -> List[CandidatePair]:
+    grant_by_id = {item.item_id: item for item in grant_specs}
+    paths = prefilter_cache_paths(prefilter_cache_base)
+    missing = [str(path) for path in paths.values() if not path.exists()]
+    if missing:
+        raise FileNotFoundError(
+            "Missing prefilter cache files:\n"
+            + "\n".join(missing)
+            + "\nRun CE3 prefilter cache generation before distillation."
+        )
+
     selected: List[CandidatePair] = []
-    fac_decomps = {
-        fac.item_id: _safe_decomposition(decompositions.get(fac.item_id, {}))
-        for fac in fac_specs
-    }
-
-    for grant in grant_specs:
-        grant_dec = _safe_decomposition(decompositions.get(grant.item_id, {}))
-        for aspect in ASPECTS:
-            grant_aspect_text = _aspect_text(grant, grant_dec, aspect, fallback_to_full_text=False)
-            if not grant_aspect_text:
-                continue
-
-            ranked: List[Tuple[float, SpecItem]] = []
-            for fac in fac_specs:
-                fac_text = _aspect_text(fac, fac_decomps[fac.item_id], aspect, fallback_to_full_text=True)
-                ranked.append((_lexical_score(grant_aspect_text, fac_text), fac))
-            if not ranked:
-                continue
-
-            ranked.sort(key=lambda x: (-float(x[0]), x[1].item_id))
-            high_k = max(0, int(high_per_aspect))
-            mid_k = max(0, int(mid_per_aspect))
-            low_k = max(0, int(low_per_aspect))
-
-            for score, fac in ranked[:high_k]:
-                selected.append(CandidatePair(grant, fac, aspect, float(score), "high"))
-
-            mid_pool = sorted(ranked, key=lambda x: (abs(float(x[0]) - 0.5), -float(x[0]), x[1].item_id))
-            for score, fac in mid_pool[:mid_k]:
-                selected.append(CandidatePair(grant, fac, aspect, float(score), "mid"))
-
-            low_pool = sorted(ranked, key=lambda x: (float(x[0]), x[1].item_id))
-            for score, fac in low_pool[:low_k]:
-                selected.append(CandidatePair(grant, fac, aspect, float(score), "low"))
+    for aspect, path in paths.items():
+        with path.open("r", encoding="utf-8") as f:
+            for raw in f:
+                try:
+                    row = json.loads(raw)
+                except Exception:
+                    continue
+                grant_id = clean_text(row.get("grant_item_id"))
+                grant = grant_by_id.get(grant_id)
+                if grant is None:
+                    continue
+                query_text = normalize_ws(row.get("query_text"))
+                if not query_text:
+                    continue
+                row_aspect = clean_text(row.get("aspect")) or aspect
+                if row_aspect != aspect:
+                    continue
+                raw_candidates = row.get("candidates")
+                if not isinstance(raw_candidates, list):
+                    continue
+                clustered = _select_from_ranked_candidates(
+                    candidates=raw_candidates,
+                    target_high=_positive_int(target_high),
+                    target_mid=_positive_int(target_mid),
+                    target_low=_positive_int(target_low),
+                    high_multiplier=high_multiplier,
+                    mid_multiplier=mid_multiplier,
+                    low_multiplier=low_multiplier,
+                )
+                for cluster, raw_cand in clustered:
+                    fac_id = clean_text(raw_cand.get("fac_item_id"))
+                    fac = fac_by_id.get(fac_id)
+                    doc_text = normalize_ws(raw_cand.get("doc_text"))
+                    if fac is None or not doc_text:
+                        continue
+                    selected.append(
+                        CandidatePair(
+                            grant=grant,
+                            faculty=fac,
+                            aspect=aspect,
+                            prefilter_score=float(raw_cand.get("ce_score", 0.0)),
+                            prefilter_rank=int(raw_cand.get("rank", 0)),
+                            target_cluster=cluster,
+                            query_text=query_text,
+                            doc_text=doc_text,
+                        )
+                    )
 
     return _dedupe_candidates(selected)
 
@@ -397,8 +476,12 @@ def distill_pairs(
                         "meta": cand.faculty.meta,
                         "decomposition": f_dec,
                     },
-                    "lexical_prefilter_score": float(cand.prefilter_score),
-                    "pair_source": f"lexical_{cand.aspect}_{cand.source_band}",
+                    "ce_prefilter_score": float(cand.prefilter_score),
+                    "ce_prefilter_rank": int(cand.prefilter_rank),
+                    "target_cluster": cand.target_cluster,
+                    "prefilter_query_text": cand.query_text,
+                    "prefilter_doc_text": cand.doc_text,
+                    "pair_source": f"ce_prefilter_{cand.aspect}_{cand.target_cluster}",
                     "parse_ok": True,
                     "attempt": int(attempt + 1),
                     "model_id": model_id,
@@ -427,14 +510,18 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--grant-db", type=str, default=GRANT_DB_DEFAULT)
     p.add_argument("--fac-db", type=str, default=FAC_DB_DEFAULT)
     p.add_argument("--decomposition-output", type=str, default=DECOMPOSITION_OUTPUT_DEFAULT)
+    p.add_argument("--prefilter-cache-base", type=str, default=PREFILTER_CACHE_BASE_DEFAULT)
     p.add_argument("--output-dir", type=str, default=OUTPUT_DIR_DEFAULT)
     p.add_argument("--distillation-output", type=str, default=DISTILLATION_OUTPUT_DEFAULT)
     p.add_argument("--seed", type=int, default=SEED_DEFAULT)
     p.add_argument("--max-grant-specs", type=int, default=MAX_GRANT_SPECS_DEFAULT)
     p.add_argument("--max-fac-specs", type=int, default=MAX_FAC_SPECS_DEFAULT)
-    p.add_argument("--prefilter-high-per-aspect", type=int, default=PREFILTER_HIGH_PER_ASPECT_DEFAULT)
-    p.add_argument("--prefilter-mid-per-aspect", type=int, default=PREFILTER_MID_PER_ASPECT_DEFAULT)
-    p.add_argument("--prefilter-low-per-aspect", type=int, default=PREFILTER_LOW_PER_ASPECT_DEFAULT)
+    p.add_argument("--target-high-per-grant-aspect", type=int, default=TARGET_HIGH_PER_GRANT_ASPECT_DEFAULT)
+    p.add_argument("--target-mid-per-grant-aspect", type=int, default=TARGET_MID_PER_GRANT_ASPECT_DEFAULT)
+    p.add_argument("--target-low-per-grant-aspect", type=int, default=TARGET_LOW_PER_GRANT_ASPECT_DEFAULT)
+    p.add_argument("--prefilter-high-multiplier", type=float, default=PREFILTER_HIGH_MULTIPLIER_DEFAULT)
+    p.add_argument("--prefilter-mid-multiplier", type=float, default=PREFILTER_MID_MULTIPLIER_DEFAULT)
+    p.add_argument("--prefilter-low-multiplier", type=float, default=PREFILTER_LOW_MULTIPLIER_DEFAULT)
     p.add_argument("--distill-batch-size", type=int, default=DISTILL_BATCH_SIZE_DEFAULT)
     p.add_argument("--distill-max-new-tokens", type=int, default=DISTILL_MAX_NEW_TOKENS_DEFAULT)
     p.add_argument("--temperature", type=float, default=TEMPERATURE_DEFAULT)
@@ -453,6 +540,7 @@ def main() -> int:
     grant_db = resolve_path(args.grant_db)
     fac_db = resolve_path(args.fac_db)
     decomposition_path = resolve_path(args.decomposition_output)
+    prefilter_cache_base = resolve_path(args.prefilter_cache_base)
     output_dir = resolve_path(args.output_dir)
     output_path = resolve_path(args.distillation_output)
     if not decomposition_path.exists():
@@ -466,14 +554,20 @@ def main() -> int:
     validate_decomposition_coverage(items=grant_specs, decompositions=decompositions, label="grant specs")
     validate_decomposition_coverage(items=fac_specs, decompositions=decompositions, label="faculty specs")
 
+    fac_by_id = {item.item_id: item for item in fac_specs}
     pairs = select_candidate_pairs(
         grant_specs=grant_specs,
-        fac_specs=fac_specs,
-        decompositions=decompositions,
-        high_per_aspect=args.prefilter_high_per_aspect,
-        mid_per_aspect=args.prefilter_mid_per_aspect,
-        low_per_aspect=args.prefilter_low_per_aspect,
+        fac_by_id=fac_by_id,
+        prefilter_cache_base=prefilter_cache_base,
+        target_high=args.target_high_per_grant_aspect,
+        target_mid=args.target_mid_per_grant_aspect,
+        target_low=args.target_low_per_grant_aspect,
+        high_multiplier=args.prefilter_high_multiplier,
+        mid_multiplier=args.prefilter_mid_multiplier,
+        low_multiplier=args.prefilter_low_multiplier,
     )
+    candidate_aspect_counts = Counter(pair.aspect for pair in pairs)
+    candidate_cluster_counts = Counter(pair.target_cluster for pair in pairs)
     output_dir.mkdir(parents=True, exist_ok=True)
     print(
         json.dumps(
@@ -483,14 +577,20 @@ def main() -> int:
                 "grant_db": str(grant_db),
                 "fac_db": str(fac_db),
                 "decomposition_output": str(decomposition_path),
+                "prefilter_cache_base": str(prefilter_cache_base),
                 "distillation_output": str(output_path),
                 "aspects": list(ASPECTS),
                 "grant_specs_loaded": int(len(grant_specs)),
                 "fac_specs_loaded": int(len(fac_specs)),
                 "candidate_pairs": int(len(pairs)),
-                "prefilter_high_per_aspect": int(args.prefilter_high_per_aspect),
-                "prefilter_mid_per_aspect": int(args.prefilter_mid_per_aspect),
-                "prefilter_low_per_aspect": int(args.prefilter_low_per_aspect),
+                "candidate_aspect_counts": dict(candidate_aspect_counts),
+                "candidate_target_cluster_counts": dict(candidate_cluster_counts),
+                "target_high_per_grant_aspect": int(args.target_high_per_grant_aspect),
+                "target_mid_per_grant_aspect": int(args.target_mid_per_grant_aspect),
+                "target_low_per_grant_aspect": int(args.target_low_per_grant_aspect),
+                "prefilter_high_multiplier": float(args.prefilter_high_multiplier),
+                "prefilter_mid_multiplier": float(args.prefilter_mid_multiplier),
+                "prefilter_low_multiplier": float(args.prefilter_low_multiplier),
             },
             ensure_ascii=False,
         )
