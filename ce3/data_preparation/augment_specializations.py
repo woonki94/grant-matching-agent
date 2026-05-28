@@ -487,6 +487,7 @@ def augment_specializations(
                         model_id=model_id,
                         system_prompt=SYSTEM_PROMPT,
                         user_prompt=USER_PROMPT_TEMPLATE.format(
+                            few_shot_examples=FEW_SHOT_EXAMPLES,
                             source_text=item.text,
                             source_decomposition_json=json.dumps(decomp, ensure_ascii=False),
                             target_aspect=aspect,

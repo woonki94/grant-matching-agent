@@ -19,6 +19,7 @@ run_stage "decompose augmented candidates" bash ce3/test/component/run_decompose
 run_stage "combine decompositions" bash ce3/test/component/run_combine_decompositions_subset.sh
 run_stage "build prefilter cache" bash ce3/test/component/run_prefilter_cache_subset.sh
 run_stage "distill selected pairs" bash ce3/test/component/run_distillation_subset.sh
+run_stage "split distillation dataset" bash ce3/test/component/run_split_dataset_subset.sh
 
 echo
 echo "CE3 subset pipeline complete."

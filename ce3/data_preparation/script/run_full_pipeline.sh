@@ -19,6 +19,7 @@ AUGMENTED_DECOMPOSITION_OUTPUT="${AUGMENTED_DECOMPOSITION_OUTPUT:-ce3/dataset/de
 COMBINED_DECOMPOSITION_OUTPUT="${COMBINED_DECOMPOSITION_OUTPUT:-ce3/dataset/decomposed/spec_decompositions_combined.jsonl}"
 PREFILTER_CACHE_BASE="${PREFILTER_CACHE_BASE:-ce3/dataset/source/prefilter_cache.jsonl}"
 DISTILLATION_OUTPUT="${DISTILLATION_OUTPUT:-ce3/dataset/distill/llm_distillation.jsonl}"
+SPLIT_OUTPUT_DIR="${SPLIT_OUTPUT_DIR:-ce3/dataset/splits}"
 
 SEED="${SEED:-42}"
 MAX_GRANT_SPECS="${MAX_GRANT_SPECS:-0}"
@@ -40,6 +41,19 @@ TARGET_LOW_PER_GRANT_ASPECT="${TARGET_LOW_PER_GRANT_ASPECT:-3}"
 PREFILTER_HIGH_MULTIPLIER="${PREFILTER_HIGH_MULTIPLIER:-3.0}"
 PREFILTER_MID_MULTIPLIER="${PREFILTER_MID_MULTIPLIER:-2.0}"
 PREFILTER_LOW_MULTIPLIER="${PREFILTER_LOW_MULTIPLIER:-1.0}"
+VAL_RATIO="${VAL_RATIO:-0.10}"
+TEST_RATIO="${TEST_RATIO:-0.10}"
+PREFIX_MODE="${PREFIX_MODE:-bracket}"
+PAIR_GENERATION_MODE="${PAIR_GENERATION_MODE:-controlled}"
+PAIR_MIN_MARGIN="${PAIR_MIN_MARGIN:-0.01}"
+PAIR_PER_QUERY_CAP="${PAIR_PER_QUERY_CAP:-0}"
+PAIR_MAX_DISAGREEMENT_PER_QUERY="${PAIR_MAX_DISAGREEMENT_PER_QUERY:-6}"
+PAIR_MAX_BOUNDARY_PER_QUERY="${PAIR_MAX_BOUNDARY_PER_QUERY:-6}"
+PAIR_WEAK_MIN_PER_QUERY="${PAIR_WEAK_MIN_PER_QUERY:-10}"
+PAIR_DISAGREE_PREFILTER_MIN="${PAIR_DISAGREE_PREFILTER_MIN:-0.70}"
+PAIR_DISAGREE_TEACHER_MAX="${PAIR_DISAGREE_TEACHER_MAX:-0.30}"
+PAIR_DISAGREE_MIN_MARGIN="${PAIR_DISAGREE_MIN_MARGIN:-0.15}"
+PAIR_BOUNDARY_MIN_MARGIN="${PAIR_BOUNDARY_MIN_MARGIN:-0.05}"
 
 DECOMPOSE_TEMPERATURE="${DECOMPOSE_TEMPERATURE:-0.0}"
 AUGMENT_TEMPERATURE="${AUGMENT_TEMPERATURE:-0.7}"
@@ -196,15 +210,37 @@ if bool_true "${OVERWRITE_DISTILLATION}"; then
   DISTILL_CMD+=(--overwrite)
 fi
 
+SPLIT_CMD=(
+  "${PYTHON_BIN}" ce3/data_preparation/split_distillation_dataset.py
+  --distillation-input "${DISTILLATION_OUTPUT}"
+  --output-dir "${SPLIT_OUTPUT_DIR}"
+  --seed "${SEED}"
+  --val-ratio "${VAL_RATIO}"
+  --test-ratio "${TEST_RATIO}"
+  --prefix-mode "${PREFIX_MODE}"
+  --pair-generation-mode "${PAIR_GENERATION_MODE}"
+  --pair-min-margin "${PAIR_MIN_MARGIN}"
+  --pair-per-query-cap "${PAIR_PER_QUERY_CAP}"
+  --pair-max-disagreement-per-query "${PAIR_MAX_DISAGREEMENT_PER_QUERY}"
+  --pair-max-boundary-per-query "${PAIR_MAX_BOUNDARY_PER_QUERY}"
+  --pair-weak-min-per-query "${PAIR_WEAK_MIN_PER_QUERY}"
+  --pair-disagree-prefilter-min "${PAIR_DISAGREE_PREFILTER_MIN}"
+  --pair-disagree-teacher-max "${PAIR_DISAGREE_TEACHER_MAX}"
+  --pair-disagree-min-margin "${PAIR_DISAGREE_MIN_MARGIN}"
+  --pair-boundary-min-margin "${PAIR_BOUNDARY_MIN_MARGIN}"
+)
+
 run_stage "decompose originals" "${ORIGINAL_DECOMPOSE_CMD[@]}"
 run_stage "augment high-intent candidates" "${AUGMENT_CMD[@]}"
 run_stage "decompose augmented candidates" "${AUGMENTED_DECOMPOSE_CMD[@]}"
 run_stage "combine decompositions" "${COMBINE_CMD[@]}"
 run_stage "build prefilter cache" "${PREFILTER_CMD[@]}"
 run_stage "distill selected pairs" "${DISTILL_CMD[@]}"
+run_stage "split distillation dataset" "${SPLIT_CMD[@]}"
 
 echo
 echo "CE3 full pipeline complete."
 echo "Combined decomposition: ${COMBINED_DECOMPOSITION_OUTPUT}"
 echo "Prefilter cache base: ${PREFILTER_CACHE_BASE}"
 echo "Distillation output: ${DISTILLATION_OUTPUT}"
+echo "Split output directory: ${SPLIT_OUTPUT_DIR}"
