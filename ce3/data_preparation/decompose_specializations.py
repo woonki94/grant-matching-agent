@@ -77,9 +77,13 @@ The three lenses are:
 
 Rules:
 - Use only information present, strongly implied, or safely inferable from the phrase.
-- Make a grounded best effort to fill every lens when reasonable.
-- Return [] only when filling a lens would be fake or misleading.
+- Make a grounded best effort to fill every lens, but prefer [] over vague filler.
+- Each lens should add distinct retrieval value.
+- Return [] when a lens would only repeat another lens or require a vague/generic filler phrase.
 - Do not copy the same phrase into multiple lenses unless it truly plays multiple roles.
+- Avoid generic standalone terms such as "program", "project", "strategy", "initiative", "intervention", "services", or "management" unless paired with a specific modifier.
+- The objective lens should capture the target object, beneficiary, system, material, outcome, condition, use case, or intended purpose, not merely restate the approach.
+- If the objective is not explicit but the target object or beneficiary is clear, use that target object or beneficiary as the objective.
 - Prefer role-specific paraphrases over repeated source spans.
 - Keep items short keyword phrases, not sentences.
 - Lowercase unless proper nouns or technical capitalization is needed.
