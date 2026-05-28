@@ -28,6 +28,28 @@ LOSS_MSE_WEIGHT="${LOSS_MSE_WEIGHT:-0.2}"
 LOSS_CLUSTER_MARGIN_WEIGHT="${LOSS_CLUSTER_MARGIN_WEIGHT:-0.1}"
 LOSS_CALIBRATION_WEIGHT="${LOSS_CALIBRATION_WEIGHT:-0.1}"
 PAIR_TYPE_WEIGHT_MAP="${PAIR_TYPE_WEIGHT_MAP:-default=1.0,llm_disagreement=1.15,strong_vs_boundary=1.05,strong_vs_weak=0.95,strong_vs_hard=1.0}"
+STAGE1_PAIR_PRESET="${STAGE1_PAIR_PRESET:-balanced}"
+case "${STAGE1_PAIR_PRESET}" in
+  balanced)
+    STAGE1_PAIR_TYPES="${STAGE1_PAIR_TYPES:-llm_disagreement,strong_vs_hard,strong_vs_weak,strong_vs_boundary}"
+    STAGE1_PAIR_MIN_MARGIN="${STAGE1_PAIR_MIN_MARGIN:-0.10}"
+    STAGE1_PAIR_MAX_PER_QUERY="${STAGE1_PAIR_MAX_PER_QUERY:-16}"
+    ;;
+  strong)
+    STAGE1_PAIR_TYPES="${STAGE1_PAIR_TYPES:-llm_disagreement,strong_vs_hard}"
+    STAGE1_PAIR_MIN_MARGIN="${STAGE1_PAIR_MIN_MARGIN:-0.15}"
+    STAGE1_PAIR_MAX_PER_QUERY="${STAGE1_PAIR_MAX_PER_QUERY:-8}"
+    ;;
+  all)
+    STAGE1_PAIR_TYPES="${STAGE1_PAIR_TYPES:-}"
+    STAGE1_PAIR_MIN_MARGIN="${STAGE1_PAIR_MIN_MARGIN:-0.0}"
+    STAGE1_PAIR_MAX_PER_QUERY="${STAGE1_PAIR_MAX_PER_QUERY:-0}"
+    ;;
+  *)
+    echo "Unknown STAGE1_PAIR_PRESET='${STAGE1_PAIR_PRESET}'. Valid: balanced, strong, all." >&2
+    exit 2
+    ;;
+esac
 FP16="${FP16:-false}"
 WANDB_PROJECT="${WANDB_PROJECT:-ce3_distill}"
 WANDB_ENTITY="${WANDB_ENTITY:-}"
@@ -59,6 +81,10 @@ CMD=(
   --loss-cluster-margin-weight "${LOSS_CLUSTER_MARGIN_WEIGHT}"
   --loss-calibration-weight "${LOSS_CALIBRATION_WEIGHT}"
   --pair-type-weight-map "${PAIR_TYPE_WEIGHT_MAP}"
+  --stage1-pair-preset "${STAGE1_PAIR_PRESET}"
+  --stage1-pair-types "${STAGE1_PAIR_TYPES}"
+  --stage1-pair-min-margin "${STAGE1_PAIR_MIN_MARGIN}"
+  --stage1-pair-max-per-query "${STAGE1_PAIR_MAX_PER_QUERY}"
   --wandb-project "${WANDB_PROJECT}"
   --wandb-entity "${WANDB_ENTITY}"
   --wandb-run-name "${WANDB_RUN_NAME}"

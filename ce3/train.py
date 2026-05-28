@@ -56,6 +56,13 @@ MODEL_ID_DEFAULT = "dleemiller/ModernCE-base-sts"
 SPLIT_DIR_DEFAULT = "ce3/dataset/splits"
 OUTPUT_DIR_DEFAULT = "ce3/models/aspect_reranker"
 PAIR_TYPE_WEIGHT_MAP_DEFAULT = "default=1.0,llm_disagreement=1.15,strong_vs_boundary=1.05,strong_vs_weak=0.95,strong_vs_hard=1.0"
+STAGE1_PAIR_TYPES_DEFAULT = "llm_disagreement,strong_vs_hard,strong_vs_weak,strong_vs_boundary"
+STAGE1_PAIR_TYPE_PRIORITY = {
+    "llm_disagreement": 0,
+    "strong_vs_hard": 1,
+    "strong_vs_weak": 2,
+    "strong_vs_boundary": 3,
+}
 
 
 def _wandb_enabled(args: argparse.Namespace) -> bool:
@@ -191,6 +198,10 @@ def _parse_pair_type_weight_map(value: Any) -> Tuple[Dict[str, float], float]:
     return out, default
 
 
+def _parse_csv_set(value: Any) -> set[str]:
+    return {_clean_text(x).lower() for x in _clean_text(value).split(",") if _clean_text(x)}
+
+
 def _load_jsonl(path: Path) -> List[Dict[str, Any]]:
     rows: List[Dict[str, Any]] = []
     if not path.exists():
@@ -228,6 +239,47 @@ def load_pair_rows(path: Path) -> List[PairExample]:
             )
         )
     return out
+
+
+def filter_stage1_pairs(
+    pairs: Sequence[PairExample],
+    *,
+    pair_types: str,
+    min_margin: float,
+    max_per_query: int,
+) -> List[PairExample]:
+    allowed_types = _parse_csv_set(pair_types)
+    margin_floor = max(0.0, float(min_margin))
+    filtered = [
+        row for row in pairs
+        if (not allowed_types or row.pair_type.lower() in allowed_types)
+        and float(row.teacher_margin) >= margin_floor
+    ]
+    cap = int(max_per_query)
+    if cap <= 0:
+        return sorted(filtered, key=_stage1_pair_sort_key)
+
+    grouped: Dict[Tuple[str, str], List[PairExample]] = {}
+    for row in filtered:
+        grouped.setdefault((row.aspect, row.query_text), []).append(row)
+
+    out: List[PairExample] = []
+    for key in sorted(grouped):
+        rows = sorted(grouped[key], key=_stage1_pair_sort_key)
+        out.extend(rows[:cap])
+    return out
+
+
+def _stage1_pair_sort_key(row: PairExample) -> Tuple[int, float, float, float, str, str]:
+    priority = STAGE1_PAIR_TYPE_PRIORITY.get(row.pair_type.lower(), 99)
+    return (
+        priority,
+        -float(row.teacher_margin),
+        -float(row.teacher_pos_score),
+        float(row.teacher_neg_score),
+        row.pos_text,
+        row.neg_text,
+    )
 
 
 class PairCollator:
@@ -841,6 +893,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--margin-min", type=float, default=0.02)
     p.add_argument("--margin-max", type=float, default=0.60)
     p.add_argument("--pair-type-weight-map", type=str, default=PAIR_TYPE_WEIGHT_MAP_DEFAULT)
+    p.add_argument("--stage1-pair-preset", type=str, default="balanced", help="Run-script preset label for tracking only.")
+    p.add_argument("--stage1-pair-types", type=str, default=STAGE1_PAIR_TYPES_DEFAULT, help="Comma-separated pair types used in Stage 1. Empty keeps all.")
+    p.add_argument("--stage1-pair-min-margin", type=float, default=0.10)
+    p.add_argument("--stage1-pair-max-per-query", type=int, default=16, help="Max Stage 1 pairs per query/aspect. 0 keeps all filtered pairs.")
     p.add_argument("--num-workers", type=int, default=0)
     p.add_argument("--max-grad-norm", type=float, default=1.0)
     p.add_argument("--train-log-every-steps", type=int, default=1, help="Log train losses to W&B every N optimizer steps. 0 disables step train logs.")
@@ -882,8 +938,16 @@ def main() -> int:
     train_pairs = load_pair_rows(train_pair_path)
     val_pairs = load_pair_rows(val_pair_path)
     test_pairs = load_pair_rows(test_pair_path)
+    stage1_train_pairs = filter_stage1_pairs(
+        train_pairs,
+        pair_types=args.stage1_pair_types,
+        min_margin=float(args.stage1_pair_min_margin),
+        max_per_query=int(args.stage1_pair_max_per_query),
+    )
     if not train_list_rows or not train_pairs:
         raise RuntimeError("Training requires non-empty train listwise and pairwise split files.")
+    if int(args.stage1_epochs) > 0 and not stage1_train_pairs:
+        raise RuntimeError("Stage 1 pair filtering produced zero pairs. Loosen --stage1-pair-types or --stage1-pair-min-margin.")
     if not val_list_rows or not val_pairs:
         raise RuntimeError("Validation requires non-empty val listwise and pairwise split files.")
 
@@ -902,6 +966,7 @@ def main() -> int:
     list_collator = ListCollator(tokenizer, args.max_length, high_threshold=args.high_threshold, mid_threshold=args.mid_threshold)
     loader_kwargs = {"num_workers": max(0, int(args.num_workers)), "pin_memory": device.type == "cuda"}
 
+    pair_stage1_loader = DataLoader(PairDataset(stage1_train_pairs), batch_size=args.train_batch_size, shuffle=True, collate_fn=pair_collator, **loader_kwargs)
     pair_train_loader = DataLoader(PairDataset(train_pairs), batch_size=args.train_batch_size, shuffle=True, collate_fn=pair_collator, **loader_kwargs)
     list_train_loader = DataLoader(ListDataset(train_list_rows), batch_size=args.train_batch_size, shuffle=True, collate_fn=list_collator, **loader_kwargs)
     pair_val_loader = DataLoader(PairDataset(val_pairs), batch_size=args.eval_batch_size, shuffle=False, collate_fn=pair_collator, **loader_kwargs)
@@ -916,6 +981,7 @@ def main() -> int:
         "device": str(device),
         "train_list_rows": len(train_list_rows),
         "train_pair_rows": len(train_pairs),
+        "stage1_train_pair_rows": len(stage1_train_pairs),
         "val_list_rows": len(val_list_rows),
         "val_pair_rows": len(val_pairs),
         "test_list_rows": len(test_list_rows),
@@ -931,6 +997,7 @@ def main() -> int:
             **vars(args),
             "train_list_rows": len(train_list_rows),
             "train_pair_rows": len(train_pairs),
+            "stage1_train_pair_rows": len(stage1_train_pairs),
             "val_list_rows": len(val_list_rows),
             "val_pair_rows": len(val_pairs),
             "test_list_rows": len(test_list_rows),
@@ -952,7 +1019,7 @@ def main() -> int:
                 model=model,
                 optimizer=opt,
                 tokenizer=tokenizer,
-                primary_loader=pair_train_loader,
+                primary_loader=pair_stage1_loader,
                 secondary_loader=list_train_loader,
                 val_pair_loader=pair_val_loader,
                 val_list_loader=list_val_loader,
