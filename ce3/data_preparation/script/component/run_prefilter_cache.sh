@@ -7,7 +7,7 @@ cd "${PROJECT_ROOT}"
 
 PYTHON_BIN="${PYTHON_BIN:-python}"
 MODEL_ID="${MODEL_ID:-dleemiller/ModernCE-base-sts}"
-DECOMPOSITION_OUTPUT="${DECOMPOSITION_OUTPUT:-ce3/dataset/decomposed/spec_decompositions_combined.jsonl}"
+DECOMPOSITION_OUTPUT="${DECOMPOSITION_OUTPUT:-ce3/dataset/decomposed/spec_decompositions_topic_approach_objective.jsonl}"
 OUTPUT_BASE="${OUTPUT_BASE:-ce3/dataset/source/prefilter_cache.jsonl}"
 BATCH_SIZE="${BATCH_SIZE:-64}"
 MAX_LENGTH="${MAX_LENGTH:-256}"

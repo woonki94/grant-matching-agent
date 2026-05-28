@@ -7,7 +7,8 @@ cd "${PROJECT_ROOT}"
 
 PYTHON_BIN="${PYTHON_BIN:-python}"
 MODEL_ID="${MODEL_ID:-Qwen/Qwen3-14B}"
-DECOMPOSITION_OUTPUT="${DECOMPOSITION_OUTPUT:-ce3/dataset/decomposed/spec_decompositions_combined.jsonl}"
+DECOMPOSITION_OUTPUT="${DECOMPOSITION_OUTPUT:-ce3/dataset/decomposed/spec_decompositions_topic_approach_objective.jsonl}"
+AUGMENTED_DECOMPOSITION_OUTPUT="${AUGMENTED_DECOMPOSITION_OUTPUT:-}"
 PREFILTER_CACHE_BASE="${PREFILTER_CACHE_BASE:-ce3/dataset/source/prefilter_cache.jsonl}"
 OUTPUT_DIR="${OUTPUT_DIR:-ce3/dataset/distill}"
 DISTILLATION_OUTPUT="${DISTILLATION_OUTPUT:-ce3/dataset/distill/llm_distillation.jsonl}"
@@ -17,6 +18,7 @@ TARGET_LOW_PER_GRANT_ASPECT="${TARGET_LOW_PER_GRANT_ASPECT:-4}"
 PREFILTER_HIGH_MULTIPLIER="${PREFILTER_HIGH_MULTIPLIER:-4.0}"
 PREFILTER_MID_MULTIPLIER="${PREFILTER_MID_MULTIPLIER:-2.0}"
 PREFILTER_LOW_MULTIPLIER="${PREFILTER_LOW_MULTIPLIER:-1.25}"
+AUGMENTED_CANDIDATES_PER_SOURCE_ASPECT="${AUGMENTED_CANDIDATES_PER_SOURCE_ASPECT:-3}"
 DISTILL_BATCH_SIZE="${DISTILL_BATCH_SIZE:-24}"
 DISTILL_MAX_NEW_TOKENS="${DISTILL_MAX_NEW_TOKENS:-32}"
 TEMPERATURE="${TEMPERATURE:-0.0}"
@@ -42,6 +44,7 @@ CMD=(
   --prefilter-high-multiplier "${PREFILTER_HIGH_MULTIPLIER}"
   --prefilter-mid-multiplier "${PREFILTER_MID_MULTIPLIER}"
   --prefilter-low-multiplier "${PREFILTER_LOW_MULTIPLIER}"
+  --augmented-candidates-per-source-aspect "${AUGMENTED_CANDIDATES_PER_SOURCE_ASPECT}"
   --distill-batch-size "${DISTILL_BATCH_SIZE}"
   --distill-max-new-tokens "${DISTILL_MAX_NEW_TOKENS}"
   --temperature "${TEMPERATURE}"
@@ -52,6 +55,9 @@ CMD=(
   --tensor-parallel-size "${TENSOR_PARALLEL_SIZE}"
 )
 
+if [[ -n "${AUGMENTED_DECOMPOSITION_OUTPUT}" ]]; then
+  CMD+=(--augmented-decomposition-output "${AUGMENTED_DECOMPOSITION_OUTPUT}")
+fi
 if bool_true "${OVERWRITE}"; then
   CMD+=(--overwrite)
 fi

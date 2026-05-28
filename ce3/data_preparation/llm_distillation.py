@@ -52,12 +52,14 @@ DECOMPOSITION_OUTPUT_DEFAULT = "ce3/dataset/decomposed/spec_decompositions_combi
 OUTPUT_DIR_DEFAULT = "ce3/dataset/distill"
 DISTILLATION_OUTPUT_DEFAULT = "ce3/dataset/distill/llm_distillation.jsonl"
 PREFILTER_CACHE_BASE_DEFAULT = "ce3/dataset/source/prefilter_cache.jsonl"
+AUGMENTED_DECOMPOSITION_OUTPUT_DEFAULT = "ce3/dataset/decomposed/spec_decompositions_augmented.jsonl"
 TARGET_HIGH_PER_GRANT_ASPECT_DEFAULT = 4
 TARGET_MID_PER_GRANT_ASPECT_DEFAULT = 8
 TARGET_LOW_PER_GRANT_ASPECT_DEFAULT = 4
 PREFILTER_HIGH_MULTIPLIER_DEFAULT = 4.0
 PREFILTER_MID_MULTIPLIER_DEFAULT = 2.0
 PREFILTER_LOW_MULTIPLIER_DEFAULT = 1.25
+AUGMENTED_CANDIDATES_PER_SOURCE_ASPECT_DEFAULT = 3
 DISTILL_BATCH_SIZE_DEFAULT = 24
 DISTILL_MAX_NEW_TOKENS_DEFAULT = 32
 MAX_ATTEMPTS_DEFAULT = 2
@@ -143,6 +145,7 @@ class CandidatePair:
     target_cluster: str
     query_text: str
     doc_text: str
+    pair_source: str = "ce_prefilter"
 
 
 def _unlink_if_exists(path: Path) -> None:
@@ -204,7 +207,14 @@ def _cluster_sort_key(cluster: str) -> int:
 
 def _candidate_priority(cand: CandidatePair) -> tuple[int, int, float, str]:
     score_sort = -cand.prefilter_score if cand.target_cluster != "low" else cand.prefilter_score
-    return (_cluster_sort_key(cand.target_cluster), int(cand.prefilter_rank), float(score_sort), cand.faculty.item_id)
+    source_sort = 0 if cand.pair_source == "augmented_anchor" else 1
+    return (
+        _cluster_sort_key(cand.target_cluster),
+        source_sort,
+        int(cand.prefilter_rank),
+        float(score_sort),
+        cand.faculty.item_id,
+    )
 
 
 def _select_from_ranked_candidates(
@@ -317,9 +327,96 @@ def select_candidate_pairs(
                             target_cluster=cluster,
                             query_text=query_text,
                             doc_text=doc_text,
+                            pair_source="ce_prefilter",
                         )
                     )
 
+    return _dedupe_candidates(selected)
+
+
+def _source_slot(item: SpecItem) -> int:
+    try:
+        return int(item.meta.get("slot", 0))
+    except Exception:
+        return 0
+
+
+def _aspect_items_text(item_id: str, decompositions: Dict[str, Dict[str, Any]], aspect: str) -> str:
+    return normalize_ws(" ".join(_safe_decomposition(decompositions.get(item_id, {})).get(aspect, [])))
+
+
+def select_augmented_candidate_pairs(
+    *,
+    original_grants_by_id: Dict[str, SpecItem],
+    original_faculty_by_id: Dict[str, SpecItem],
+    augmented_grants: Sequence[SpecItem],
+    augmented_faculty: Sequence[SpecItem],
+    decompositions: Dict[str, Dict[str, Any]],
+    max_per_source_aspect: int,
+) -> List[CandidatePair]:
+    limit = max(0, int(max_per_source_aspect))
+    if limit <= 0:
+        return []
+    selected: List[CandidatePair] = []
+    counts: Counter[tuple[str, str, str]] = Counter()
+
+    def has_room(side: str, source_item_id: str, aspect: str) -> bool:
+        key = (side, source_item_id, aspect)
+        return counts[key] < limit
+
+    def mark_added(side: str, source_item_id: str, aspect: str) -> None:
+        key = (side, source_item_id, aspect)
+        counts[key] += 1
+
+    for fac_aug in sorted(augmented_faculty, key=lambda x: (clean_text(x.meta.get("source_item_id")), clean_text(x.meta.get("target_aspect")), _source_slot(x), x.item_id)):
+        source_item_id = clean_text(fac_aug.meta.get("source_item_id"))
+        aspect = clean_text(fac_aug.meta.get("target_aspect"))
+        grant = original_grants_by_id.get(source_item_id)
+        if grant is None or aspect not in ASPECTS or not has_room("fac_aug", source_item_id, aspect):
+            continue
+        query_text = _aspect_items_text(grant.item_id, decompositions, aspect)
+        doc_text = _aspect_items_text(fac_aug.item_id, decompositions, aspect)
+        if not query_text or not doc_text:
+            continue
+        mark_added("fac_aug", source_item_id, aspect)
+        selected.append(
+            CandidatePair(
+                grant=grant,
+                faculty=fac_aug,
+                aspect=aspect,
+                prefilter_score=1.0,
+                prefilter_rank=1 + _source_slot(fac_aug),
+                target_cluster="high",
+                query_text=query_text,
+                doc_text=doc_text,
+                pair_source="augmented_anchor",
+            )
+        )
+
+    for grant_aug in sorted(augmented_grants, key=lambda x: (clean_text(x.meta.get("source_item_id")), clean_text(x.meta.get("target_aspect")), _source_slot(x), x.item_id)):
+        source_item_id = clean_text(grant_aug.meta.get("source_item_id"))
+        aspect = clean_text(grant_aug.meta.get("target_aspect"))
+        faculty = original_faculty_by_id.get(source_item_id)
+        if faculty is None or aspect not in ASPECTS or not has_room("grant_aug", source_item_id, aspect):
+            continue
+        query_text = _aspect_items_text(grant_aug.item_id, decompositions, aspect)
+        doc_text = _aspect_items_text(faculty.item_id, decompositions, aspect)
+        if not query_text or not doc_text:
+            continue
+        mark_added("grant_aug", source_item_id, aspect)
+        selected.append(
+            CandidatePair(
+                grant=grant_aug,
+                faculty=faculty,
+                aspect=aspect,
+                prefilter_score=1.0,
+                prefilter_rank=1 + _source_slot(grant_aug),
+                target_cluster="high",
+                query_text=query_text,
+                doc_text=doc_text,
+                pair_source="augmented_anchor",
+            )
+        )
     return _dedupe_candidates(selected)
 
 
@@ -450,7 +547,7 @@ def distill_pairs(
                     "target_cluster": cand.target_cluster,
                     "prefilter_query_text": cand.query_text,
                     "prefilter_doc_text": cand.doc_text,
-                    "pair_source": f"ce_prefilter_{cand.aspect}_{cand.target_cluster}",
+                    "pair_source": f"{cand.pair_source}_{cand.aspect}_{cand.target_cluster}",
                     "parse_ok": True,
                     "attempt": int(attempt + 1),
                     "model_id": model_id,
@@ -477,6 +574,12 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="CE3 LLM distillation over decomposed specialization pairs.")
     p.add_argument("--model-id", type=str, default=MODEL_ID_DEFAULT)
     p.add_argument("--decomposition-output", type=str, default=DECOMPOSITION_OUTPUT_DEFAULT)
+    p.add_argument(
+        "--augmented-decomposition-output",
+        type=str,
+        default="",
+        help="Optional augmented decomposition JSONL. When set, bounded high-intent augmented anchor pairs are added directly to distillation.",
+    )
     p.add_argument("--prefilter-cache-base", type=str, default=PREFILTER_CACHE_BASE_DEFAULT)
     p.add_argument("--output-dir", type=str, default=OUTPUT_DIR_DEFAULT)
     p.add_argument("--distillation-output", type=str, default=DISTILLATION_OUTPUT_DEFAULT)
@@ -486,6 +589,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--prefilter-high-multiplier", type=float, default=PREFILTER_HIGH_MULTIPLIER_DEFAULT)
     p.add_argument("--prefilter-mid-multiplier", type=float, default=PREFILTER_MID_MULTIPLIER_DEFAULT)
     p.add_argument("--prefilter-low-multiplier", type=float, default=PREFILTER_LOW_MULTIPLIER_DEFAULT)
+    p.add_argument("--augmented-candidates-per-source-aspect", type=int, default=AUGMENTED_CANDIDATES_PER_SOURCE_ASPECT_DEFAULT)
     p.add_argument("--distill-batch-size", type=int, default=DISTILL_BATCH_SIZE_DEFAULT)
     p.add_argument("--distill-max-new-tokens", type=int, default=DISTILL_MAX_NEW_TOKENS_DEFAULT)
     p.add_argument("--temperature", type=float, default=TEMPERATURE_DEFAULT)
@@ -502,6 +606,11 @@ def main() -> int:
     started = time.time()
     args = parse_args()
     decomposition_path = resolve_path(args.decomposition_output)
+    augmented_decomposition_path = (
+        resolve_path(args.augmented_decomposition_output)
+        if clean_text(args.augmented_decomposition_output)
+        else None
+    )
     prefilter_cache_base = resolve_path(args.prefilter_cache_base)
     output_dir = resolve_path(args.output_dir)
     output_path = resolve_path(args.distillation_output)
@@ -510,14 +619,39 @@ def main() -> int:
     if args.overwrite:
         _unlink_if_exists(output_path)
 
-    grant_specs, fac_specs, decompositions = load_items_from_decomposition_rows(decomposition_path)
+    grant_specs, fac_specs, decompositions = load_items_from_decomposition_rows(
+        decomposition_path,
+        grant_kinds=("grant",),
+        faculty_kinds=("faculty",),
+    )
     if not grant_specs or not fac_specs:
         raise RuntimeError(
-            f"Combined decomposition must contain at least one grant-side and one faculty-side item: {decomposition_path}"
+            f"Original decomposition must contain at least one grant-side and one faculty-side item: {decomposition_path}"
+        )
+
+    augmented_pairs: List[CandidatePair] = []
+    if augmented_decomposition_path is not None:
+        if not augmented_decomposition_path.exists():
+            raise FileNotFoundError(f"Missing augmented decomposition output: {augmented_decomposition_path}")
+        aug_grants, aug_faculty, aug_decompositions = load_items_from_decomposition_rows(
+            augmented_decomposition_path,
+            grant_kinds=("grant_aug",),
+            faculty_kinds=("fac_aug",),
+        )
+        merged_decompositions = dict(decompositions)
+        merged_decompositions.update(aug_decompositions)
+        decompositions = merged_decompositions
+        augmented_pairs = select_augmented_candidate_pairs(
+            original_grants_by_id={item.item_id: item for item in grant_specs},
+            original_faculty_by_id={item.item_id: item for item in fac_specs},
+            augmented_grants=aug_grants,
+            augmented_faculty=aug_faculty,
+            decompositions=decompositions,
+            max_per_source_aspect=int(args.augmented_candidates_per_source_aspect),
         )
 
     fac_by_id = {item.item_id: item for item in fac_specs}
-    pairs = select_candidate_pairs(
+    prefilter_pairs = select_candidate_pairs(
         grant_specs=grant_specs,
         fac_by_id=fac_by_id,
         prefilter_cache_base=prefilter_cache_base,
@@ -528,8 +662,10 @@ def main() -> int:
         mid_multiplier=args.prefilter_mid_multiplier,
         low_multiplier=args.prefilter_low_multiplier,
     )
+    pairs = _dedupe_candidates([*prefilter_pairs, *augmented_pairs])
     candidate_aspect_counts = Counter(pair.aspect for pair in pairs)
     candidate_cluster_counts = Counter(pair.target_cluster for pair in pairs)
+    candidate_source_counts = Counter(pair.pair_source for pair in pairs)
     output_dir.mkdir(parents=True, exist_ok=True)
     print(
         json.dumps(
@@ -537,20 +673,25 @@ def main() -> int:
                 "stage": "ce3_distill_setup",
                 "model_id": args.model_id,
                 "decomposition_output": str(decomposition_path),
+                "augmented_decomposition_output": str(augmented_decomposition_path or ""),
                 "prefilter_cache_base": str(prefilter_cache_base),
                 "distillation_output": str(output_path),
                 "aspects": list(ASPECTS),
                 "grant_specs_loaded": int(len(grant_specs)),
                 "fac_specs_loaded": int(len(fac_specs)),
+                "prefilter_candidate_pairs": int(len(prefilter_pairs)),
+                "augmented_candidate_pairs": int(len(augmented_pairs)),
                 "candidate_pairs": int(len(pairs)),
                 "candidate_aspect_counts": dict(candidate_aspect_counts),
                 "candidate_target_cluster_counts": dict(candidate_cluster_counts),
+                "candidate_source_counts": dict(candidate_source_counts),
                 "target_high_per_grant_aspect": int(args.target_high_per_grant_aspect),
                 "target_mid_per_grant_aspect": int(args.target_mid_per_grant_aspect),
                 "target_low_per_grant_aspect": int(args.target_low_per_grant_aspect),
                 "prefilter_high_multiplier": float(args.prefilter_high_multiplier),
                 "prefilter_mid_multiplier": float(args.prefilter_mid_multiplier),
                 "prefilter_low_multiplier": float(args.prefilter_low_multiplier),
+                "augmented_candidates_per_source_aspect": int(args.augmented_candidates_per_source_aspect),
             },
             ensure_ascii=False,
         )

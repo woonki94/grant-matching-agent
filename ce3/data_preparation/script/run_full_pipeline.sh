@@ -41,6 +41,7 @@ TARGET_LOW_PER_GRANT_ASPECT="${TARGET_LOW_PER_GRANT_ASPECT:-3}"
 PREFILTER_HIGH_MULTIPLIER="${PREFILTER_HIGH_MULTIPLIER:-3.0}"
 PREFILTER_MID_MULTIPLIER="${PREFILTER_MID_MULTIPLIER:-2.0}"
 PREFILTER_LOW_MULTIPLIER="${PREFILTER_LOW_MULTIPLIER:-1.0}"
+AUGMENTED_CANDIDATES_PER_SOURCE_ASPECT="${AUGMENTED_CANDIDATES_PER_SOURCE_ASPECT:-3}"
 VAL_RATIO="${VAL_RATIO:-0.10}"
 TEST_RATIO="${TEST_RATIO:-0.10}"
 PREFIX_MODE="${PREFIX_MODE:-bracket}"
@@ -175,7 +176,7 @@ COMBINE_CMD=(
 PREFILTER_CMD=(
   "${PYTHON_BIN}" ce3/data_preparation/build_prefilter_cache.py
   --model-id "${PREFILTER_MODEL_ID}"
-  --decomposition-output "${COMBINED_DECOMPOSITION_OUTPUT}"
+  --decomposition-output "${ORIGINAL_DECOMPOSITION_OUTPUT}"
   --output-base "${PREFILTER_CACHE_BASE}"
   --batch-size "${PREFILTER_BATCH_SIZE}"
   --max-length "${PREFILTER_MAX_LENGTH}"
@@ -187,7 +188,8 @@ fi
 DISTILL_CMD=(
   "${PYTHON_BIN}" ce3/data_preparation/llm_distillation.py
   --model-id "${LLM_MODEL_ID}"
-  --decomposition-output "${COMBINED_DECOMPOSITION_OUTPUT}"
+  --decomposition-output "${ORIGINAL_DECOMPOSITION_OUTPUT}"
+  --augmented-decomposition-output "${AUGMENTED_DECOMPOSITION_OUTPUT}"
   --prefilter-cache-base "${PREFILTER_CACHE_BASE}"
   --output-dir "ce3/dataset/distill"
   --distillation-output "${DISTILLATION_OUTPUT}"
@@ -197,6 +199,7 @@ DISTILL_CMD=(
   --prefilter-high-multiplier "${PREFILTER_HIGH_MULTIPLIER}"
   --prefilter-mid-multiplier "${PREFILTER_MID_MULTIPLIER}"
   --prefilter-low-multiplier "${PREFILTER_LOW_MULTIPLIER}"
+  --augmented-candidates-per-source-aspect "${AUGMENTED_CANDIDATES_PER_SOURCE_ASPECT}"
   --distill-batch-size "${DISTILL_BATCH_SIZE}"
   --distill-max-new-tokens "${DISTILL_MAX_NEW_TOKENS}"
   --temperature "${DISTILL_TEMPERATURE}"
