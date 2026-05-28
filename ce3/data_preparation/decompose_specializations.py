@@ -84,6 +84,7 @@ Rules:
 - Avoid generic standalone terms such as "program", "project", "strategy", "initiative", "intervention", "services", or "management" unless paired with a specific modifier.
 - The objective lens should capture the target object, beneficiary, system, material, outcome, condition, use case, or intended purpose, not merely restate the approach.
 - If the objective is not explicit but the target object or beneficiary is clear, use that target object or beneficiary as the objective.
+- When a phrase contains verbs such as reduce, increase, improve, maintain, maximize, strengthen, prevent, support, or enhance, put the desired state/result/beneficiary in objective unless the phrase clearly describes how the work is performed.
 - Prefer role-specific paraphrases over repeated source spans.
 - Keep items short keyword phrases, not sentences.
 - Lowercase unless proper nouns or technical capitalization is needed.

@@ -15,6 +15,27 @@ def normalize_ws(value: Any) -> str:
     return " ".join(clean_text(value).split())
 
 
+def coerce_score(value: Any) -> float:
+    try:
+        score = float(value)
+    except Exception:
+        score = 0.0
+    if score < 0.0:
+        return 0.0
+    if score > 1.0:
+        return 1.0
+    return score
+
+
+def score_to_band(score: float) -> str:
+    s = float(score)
+    if s >= 0.70:
+        return "high"
+    if s >= 0.30:
+        return "mid"
+    return "low"
+
+
 def batched(seq: Sequence[Any], size: int):
     step = max(1, int(size))
     for i in range(0, len(seq), step):
