@@ -659,12 +659,25 @@ def evaluate(model: nn.Module, pair_loader: DataLoader, list_loader: DataLoader,
         + float(oob.get("oob_mid_rate", 0.0))
         + float(oob.get("oob_low_rate", 0.0))
     ) / 4.0
+    pair_loss = sum(pair_vals) / max(1, len(pair_vals))
+    kl_loss = sum(kl_vals) / max(1, len(kl_vals))
+    mse_loss = sum(mse_vals) / max(1, len(mse_vals))
+    cluster_loss = sum(cluster_vals) / max(1, len(cluster_vals))
+    calibration_loss = sum(calib_vals) / max(1, len(calib_vals))
+    val_total_loss = (
+        float(args.loss_pair_weight) * pair_loss
+        + float(args.loss_kl_weight) * kl_loss
+        + float(args.loss_mse_weight) * mse_loss
+        + float(args.loss_cluster_margin_weight) * cluster_loss
+        + float(args.loss_calibration_weight) * calibration_loss
+    )
     return {
-        "pair_loss": sum(pair_vals) / max(1, len(pair_vals)),
-        "kl_loss": sum(kl_vals) / max(1, len(kl_vals)),
-        "mse_loss": sum(mse_vals) / max(1, len(mse_vals)),
-        "cluster_margin_loss": sum(cluster_vals) / max(1, len(cluster_vals)),
-        "calibration_loss": sum(calib_vals) / max(1, len(calib_vals)),
+        "total_loss": float(val_total_loss),
+        "pair_loss": float(pair_loss),
+        "kl_loss": float(kl_loss),
+        "mse_loss": float(mse_loss),
+        "cluster_margin_loss": float(cluster_loss),
+        "calibration_loss": float(calibration_loss),
         "ndcg@10": sum(ndcg_vals) / max(1, len(ndcg_vals)),
         "mrr@10": sum(mrr_vals) / max(1, len(mrr_vals)),
         "recall@50": sum(recall_vals) / max(1, len(recall_vals)),
@@ -678,6 +691,92 @@ def save_checkpoint(model: nn.Module, tokenizer: Any, path: Path, meta: Dict[str
     model.save_pretrained(path)
     tokenizer.save_pretrained(path)
     (path / "trainer_meta.json").write_text(json.dumps(meta, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+
+def _count_params(params: Iterable[nn.Parameter]) -> int:
+    return int(sum(int(p.numel()) for p in params))
+
+
+def _find_transformer_layer_stack(module: nn.Module) -> Tuple[str, Optional[nn.ModuleList]]:
+    candidates: List[Tuple[int, int, str, nn.ModuleList]] = []
+    for name, child in module.named_modules():
+        if not isinstance(child, nn.ModuleList) or len(child) <= 0:
+            continue
+        lowered = name.lower()
+        score = 0
+        if lowered.endswith("layers") or lowered.endswith("layer"):
+            score += 3
+        if "encoder" in lowered or "model" in lowered or "backbone" in lowered:
+            score += 2
+        if len(child) >= 4:
+            score += 1
+        candidates.append((score, len(child), name, child))
+    if not candidates:
+        return "", None
+    candidates.sort(key=lambda x: (x[0], x[1]), reverse=True)
+    _, _, name, stack = candidates[0]
+    return name, stack
+
+
+def configure_stage2_trainable_params(model: nn.Module, args: argparse.Namespace) -> Dict[str, Any]:
+    """Optionally freeze Stage 2 to aspect heads plus the final N transformer layers."""
+
+    freeze_backbone = bool(getattr(args, "stage2_freeze_backbone", False))
+    last_layers = max(0, int(getattr(args, "stage2_train_last_layers", 0)))
+    total_params = _count_params(model.parameters())
+    if not freeze_backbone and last_layers <= 0:
+        for p in model.parameters():
+            p.requires_grad = True
+        return {
+            "stage2_freeze_backbone": False,
+            "stage2_train_last_layers": 0,
+            "stage2_unfrozen_layer_stack": "",
+            "stage2_unfrozen_layer_count": 0,
+            "stage2_trainable_params": total_params,
+            "stage2_total_params": total_params,
+        }
+
+    for p in model.parameters():
+        p.requires_grad = False
+
+    unfrozen_groups: List[str] = []
+    if isinstance(getattr(model, "heads", None), nn.Module):
+        for p in model.heads.parameters():  # type: ignore[union-attr]
+            p.requires_grad = True
+        unfrozen_groups.append("aspect_heads")
+    else:
+        for attr in ("classifier", "score", "regressor"):
+            head = getattr(model, attr, None)
+            if isinstance(head, nn.Module):
+                for p in head.parameters():
+                    p.requires_grad = True
+                unfrozen_groups.append(attr)
+
+    backbone = getattr(model, "backbone", model)
+    stack_name = ""
+    unfrozen_layer_count = 0
+    if last_layers > 0:
+        stack_name, stack = _find_transformer_layer_stack(backbone)
+        if stack is None:
+            raise RuntimeError("Could not find transformer layer stack for --stage2-train-last-layers.")
+        unfrozen_layer_count = min(last_layers, len(stack))
+        for layer in list(stack)[-unfrozen_layer_count:]:
+            for p in layer.parameters():
+                p.requires_grad = True
+        unfrozen_groups.append(f"{stack_name}[-{unfrozen_layer_count}:]")
+
+    trainable_params = _count_params(p for p in model.parameters() if p.requires_grad)
+    if trainable_params <= 0:
+        raise RuntimeError("Stage 2 freeze configuration left zero trainable parameters.")
+    return {
+        "stage2_freeze_backbone": True,
+        "stage2_train_last_layers": int(last_layers),
+        "stage2_unfrozen_layer_stack": stack_name,
+        "stage2_unfrozen_layer_count": int(unfrozen_layer_count),
+        "stage2_unfrozen_groups": unfrozen_groups,
+        "stage2_trainable_params": trainable_params,
+        "stage2_total_params": total_params,
+    }
 
 
 def train_stage(
@@ -903,6 +1002,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--eval-every-steps", type=int, default=100, help="Run validation and log val metrics every N optimizer steps. 0 disables step validation.")
     p.add_argument("--fp16", action="store_true")
     p.add_argument("--no-multihead", action="store_true")
+    p.add_argument("--stage2-freeze-backbone", action=argparse.BooleanOptionalAction, default=False)
+    p.add_argument("--stage2-train-last-layers", type=int, default=0, help="When Stage 2 freeze is enabled, also train the final N transformer layers.")
     p.add_argument("--trust-remote-code", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--wandb-project", type=str, default="")
     p.add_argument("--wandb-entity", type=str, default="")
@@ -988,6 +1089,8 @@ def main() -> int:
         "test_pair_rows": len(test_pairs),
         "long_prefixes": True,
         "posthoc_calibration": False,
+        "stage2_freeze_backbone": bool(args.stage2_freeze_backbone),
+        "stage2_train_last_layers": int(args.stage2_train_last_layers),
         "wandb_enabled": bool(_wandb_enabled(args)),
     }
     print(json.dumps(setup_meta, ensure_ascii=False))
@@ -1005,6 +1108,8 @@ def main() -> int:
             "multihead": not bool(args.no_multihead),
             "long_prefixes": True,
             "posthoc_calibration": False,
+            "stage2_freeze_backbone": bool(args.stage2_freeze_backbone),
+            "stage2_train_last_layers": int(args.stage2_train_last_layers),
         },
     )
     _wandb_log(wandb_run, {"setup": setup_meta}, step=0)
@@ -1030,7 +1135,11 @@ def main() -> int:
                 wandb_run=wandb_run,
             )
         if int(args.stage2_epochs) > 0:
-            opt = AdamW(model.parameters(), lr=float(args.stage2_learning_rate or args.learning_rate), weight_decay=float(args.weight_decay))
+            stage2_trainable_meta = configure_stage2_trainable_params(model, args)
+            print(json.dumps({"stage": "ce3_stage2_trainable_setup", **stage2_trainable_meta}, ensure_ascii=False))
+            _wandb_log(wandb_run, {"stage2_trainable": stage2_trainable_meta}, step=global_step)
+            trainable_params = [p for p in model.parameters() if p.requires_grad]
+            opt = AdamW(trainable_params, lr=float(args.stage2_learning_rate or args.learning_rate), weight_decay=float(args.weight_decay))
             global_step, best["stage2"] = train_stage(
                 stage=2,
                 model=model,
