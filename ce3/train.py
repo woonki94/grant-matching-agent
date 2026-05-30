@@ -506,6 +506,42 @@ def calibration_band_loss(
     return torch.stack(parts).mean() if parts else logits_flat.sum() * 0.0
 
 
+def _threshold_to_logit(threshold: float, *, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+    t = min(1.0 - 1e-6, max(1e-6, float(threshold)))
+    return torch.tensor(math.log(t / (1.0 - t)), device=device, dtype=dtype)
+
+
+def _balanced_boundary_bce(boundary_logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+    positives = targets.sum()
+    negatives = targets.numel() - positives
+    if positives.detach().item() > 0.0 and negatives.detach().item() > 0.0:
+        pos_weight = (negatives / positives.clamp(min=1.0)).detach()
+        return F.binary_cross_entropy_with_logits(boundary_logits, targets, pos_weight=pos_weight)
+    return F.binary_cross_entropy_with_logits(boundary_logits, targets)
+
+
+def ordinal_boundary_loss(
+    logits_flat: torch.Tensor,
+    cluster_ids_flat: torch.Tensor,
+    *,
+    high_threshold: float,
+    mid_threshold: float,
+) -> torch.Tensor:
+    """Train the scalar score to cross the same low/mid/high boundaries used by OOB."""
+
+    if logits_flat.numel() <= 0:
+        return logits_flat.sum() * 0.0
+    clusters = cluster_ids_flat.to(device=logits_flat.device, dtype=torch.long)
+    at_least_mid = (clusters >= 1).to(dtype=logits_flat.dtype)
+    at_least_high = (clusters >= 2).to(dtype=logits_flat.dtype)
+    mid_boundary = logits_flat - _threshold_to_logit(float(mid_threshold), device=logits_flat.device, dtype=logits_flat.dtype)
+    high_boundary = logits_flat - _threshold_to_logit(float(high_threshold), device=logits_flat.device, dtype=logits_flat.dtype)
+    return 0.5 * (
+        _balanced_boundary_bce(mid_boundary, at_least_mid)
+        + _balanced_boundary_bce(high_boundary, at_least_high)
+    )
+
+
 def pair_loss_from_batch(model: nn.Module, batch: Dict[str, Any], device: torch.device, *, margin_min: float, margin_max: float) -> torch.Tensor:
     pos = _to_device(batch["pos"], device)
     neg = _to_device(batch["neg"], device)
@@ -521,7 +557,7 @@ def pair_loss_from_batch(model: nn.Module, batch: Dict[str, Any], device: torch.
 def list_losses_from_batch(model: nn.Module, batch: Dict[str, Any], device: torch.device, args: argparse.Namespace) -> Dict[str, torch.Tensor]:
     if batch.get("enc") is None:
         zero = torch.zeros((), device=device)
-        return {"kl": zero, "mse": zero, "cluster": zero, "calibration": zero}
+        return {"kl": zero, "mse": zero, "cluster": zero, "calibration": zero, "ordinal": zero}
     enc = _to_device(batch["enc"], device)
     scores = batch["scores"].to(device)
     clusters = batch["cluster_ids"].to(device)
@@ -544,7 +580,13 @@ def list_losses_from_batch(model: nn.Module, batch: Dict[str, Any], device: torc
         mid_high=args.high_threshold,
         low_ceil=args.mid_threshold,
     )
-    return {"kl": kl, "mse": mse, "cluster": cluster, "calibration": calib}
+    ordinal = ordinal_boundary_loss(
+        logits,
+        clusters,
+        high_threshold=args.high_threshold,
+        mid_threshold=args.mid_threshold,
+    )
+    return {"kl": kl, "mse": mse, "cluster": cluster, "calibration": calib, "ordinal": ordinal}
 
 
 def total_loss(pair_loss: torch.Tensor, list_losses: Dict[str, torch.Tensor], args: argparse.Namespace) -> torch.Tensor:
@@ -554,6 +596,7 @@ def total_loss(pair_loss: torch.Tensor, list_losses: Dict[str, torch.Tensor], ar
         + float(args.loss_mse_weight) * list_losses["mse"]
         + float(args.loss_cluster_margin_weight) * list_losses["cluster"]
         + float(args.loss_calibration_weight) * list_losses["calibration"]
+        + float(args.loss_ordinal_weight) * list_losses["ordinal"]
     )
 
 
@@ -607,6 +650,7 @@ def evaluate(model: nn.Module, pair_loader: DataLoader, list_loader: DataLoader,
     mse_vals: List[float] = []
     cluster_vals: List[float] = []
     calib_vals: List[float] = []
+    ordinal_vals: List[float] = []
     all_probs: List[torch.Tensor] = []
     all_clusters: List[torch.Tensor] = []
     ndcg_vals: List[float] = []
@@ -620,6 +664,7 @@ def evaluate(model: nn.Module, pair_loader: DataLoader, list_loader: DataLoader,
         mse_vals.append(float(losses["mse"].detach().cpu().item()))
         cluster_vals.append(float(losses["cluster"].detach().cpu().item()))
         calib_vals.append(float(losses["calibration"].detach().cpu().item()))
+        ordinal_vals.append(float(losses["ordinal"].detach().cpu().item()))
 
         enc = _to_device(batch["enc"], device)
         aspect_ids = batch["aspect_ids"].to(device)
@@ -664,12 +709,14 @@ def evaluate(model: nn.Module, pair_loader: DataLoader, list_loader: DataLoader,
     mse_loss = sum(mse_vals) / max(1, len(mse_vals))
     cluster_loss = sum(cluster_vals) / max(1, len(cluster_vals))
     calibration_loss = sum(calib_vals) / max(1, len(calib_vals))
+    ordinal_loss = sum(ordinal_vals) / max(1, len(ordinal_vals))
     val_total_loss = (
         float(args.loss_pair_weight) * pair_loss
         + float(args.loss_kl_weight) * kl_loss
         + float(args.loss_mse_weight) * mse_loss
         + float(args.loss_cluster_margin_weight) * cluster_loss
         + float(args.loss_calibration_weight) * calibration_loss
+        + float(args.loss_ordinal_weight) * ordinal_loss
     )
     return {
         "total_loss": float(val_total_loss),
@@ -678,6 +725,7 @@ def evaluate(model: nn.Module, pair_loader: DataLoader, list_loader: DataLoader,
         "mse_loss": float(mse_loss),
         "cluster_margin_loss": float(cluster_loss),
         "calibration_loss": float(calibration_loss),
+        "ordinal_boundary_loss": float(ordinal_loss),
         "ndcg@10": sum(ndcg_vals) / max(1, len(ndcg_vals)),
         "mrr@10": sum(mrr_vals) / max(1, len(mrr_vals)),
         "recall@50": sum(recall_vals) / max(1, len(recall_vals)),
@@ -805,7 +853,7 @@ def train_stage(
 
     for epoch in range(1, int(args.stage1_epochs if stage == 1 else args.stage2_epochs) + 1):
         model.train()
-        hist: Dict[str, List[float]] = {k: [] for k in ("total", "pair", "kl", "mse", "cluster", "calibration")}
+        hist: Dict[str, List[float]] = {k: [] for k in ("total", "pair", "kl", "mse", "cluster", "calibration", "ordinal")}
         step_hist: Dict[str, List[float]] = {k: [] for k in hist}
         optimizer.zero_grad(set_to_none=True)
         accum = 0
@@ -889,12 +937,14 @@ def train_stage(
             hist["mse"].append(float(l_losses["mse"].detach().cpu().item()))
             hist["cluster"].append(float(l_losses["cluster"].detach().cpu().item()))
             hist["calibration"].append(float(l_losses["calibration"].detach().cpu().item()))
+            hist["ordinal"].append(float(l_losses["ordinal"].detach().cpu().item()))
             step_hist["total"].append(float(loss.detach().cpu().item() * float(args.grad_accum_steps)))
             step_hist["pair"].append(float(p_loss.detach().cpu().item()))
             step_hist["kl"].append(float(l_losses["kl"].detach().cpu().item()))
             step_hist["mse"].append(float(l_losses["mse"].detach().cpu().item()))
             step_hist["cluster"].append(float(l_losses["cluster"].detach().cpu().item()))
             step_hist["calibration"].append(float(l_losses["calibration"].detach().cpu().item()))
+            step_hist["ordinal"].append(float(l_losses["ordinal"].detach().cpu().item()))
             if accum >= int(args.grad_accum_steps):
                 if float(args.max_grad_norm) > 0.0:
                     torch.nn.utils.clip_grad_norm_(model.parameters(), float(args.max_grad_norm))
@@ -910,6 +960,7 @@ def train_stage(
                     total=f"{latest.get('total', 0.0):.4f}",
                     pair=f"{latest.get('pair', 0.0):.4f}",
                     kl=f"{latest.get('kl', 0.0):.4f}",
+                    ord=f"{latest.get('ordinal', 0.0):.4f}",
                 )
         if accum > 0:
             if float(args.max_grad_norm) > 0.0:
@@ -984,6 +1035,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--loss-mse-weight", type=float, default=0.2)
     p.add_argument("--loss-cluster-margin-weight", type=float, default=0.1)
     p.add_argument("--loss-calibration-weight", type=float, default=0.1)
+    p.add_argument("--loss-ordinal-weight", type=float, default=0.0)
     p.add_argument("--cluster-margin-hm", type=float, default=0.12)
     p.add_argument("--cluster-margin-ml", type=float, default=0.12)
     p.add_argument("--cluster-margin-hl", type=float, default=0.30)
