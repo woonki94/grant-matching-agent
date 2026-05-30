@@ -9,6 +9,8 @@ PYTHON_BIN="${PYTHON_BIN:-python}"
 MODEL_ID="${MODEL_ID:-${PROJECT_ROOT}/ce3/models/aspect_reranker/stage1_epoch_1}"
 SPLIT_DIR="${SPLIT_DIR:-ce3/dataset/splits}"
 OUTPUT_DIR="${OUTPUT_DIR:-ce3/models/aspect_reranker}"
+AUTO_OUTPUT_HASH="${AUTO_OUTPUT_HASH:-true}"
+RUN_NAME="${RUN_NAME:-}"
 
 TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-4}"
 EVAL_BATCH_SIZE="${EVAL_BATCH_SIZE:-8}"
@@ -69,6 +71,60 @@ WANDB_MODE="${WANDB_MODE:-online}"
 WANDB_TAGS="${WANDB_TAGS:-ce3,aspect-conditioned,multihead}"
 TORCHDYNAMO_DISABLE="${TORCHDYNAMO_DISABLE:-1}"
 export TORCHDYNAMO_DISABLE
+
+OUTPUT_BASE_DIR="${OUTPUT_DIR}"
+if [[ "${AUTO_OUTPUT_HASH}" == "true" ]]; then
+  HASH_INPUT="$(printf '%s\n' \
+    "model_id=${MODEL_ID}" \
+    "split_dir=${SPLIT_DIR}" \
+    "train_batch_size=${TRAIN_BATCH_SIZE}" \
+    "eval_batch_size=${EVAL_BATCH_SIZE}" \
+    "grad_accum_steps=${GRAD_ACCUM_STEPS}" \
+    "stage1_epochs=${STAGE1_EPOCHS}" \
+    "stage2_epochs=${STAGE2_EPOCHS}" \
+    "stage2_freeze_backbone=${STAGE2_FREEZE_BACKBONE}" \
+    "stage2_train_last_layers=${STAGE2_TRAIN_LAST_LAYERS}" \
+    "learning_rate=${LEARNING_RATE}" \
+    "stage1_learning_rate=${STAGE1_LEARNING_RATE}" \
+    "stage2_learning_rate=${STAGE2_LEARNING_RATE}" \
+    "max_length=${MAX_LENGTH}" \
+    "loss_pair_weight=${LOSS_PAIR_WEIGHT}" \
+    "loss_kl_weight=${LOSS_KL_WEIGHT}" \
+    "loss_mse_weight=${LOSS_MSE_WEIGHT}" \
+    "loss_cluster_margin_weight=${LOSS_CLUSTER_MARGIN_WEIGHT}" \
+    "loss_calibration_weight=${LOSS_CALIBRATION_WEIGHT}" \
+    "loss_ordinal_weight=${LOSS_ORDINAL_WEIGHT}" \
+    "teacher_temperature=${TEACHER_TEMPERATURE}" \
+    "cluster_margin_hm=${CLUSTER_MARGIN_HM}" \
+    "cluster_margin_ml=${CLUSTER_MARGIN_ML}" \
+    "cluster_margin_hl=${CLUSTER_MARGIN_HL}" \
+    "high_threshold=${HIGH_THRESHOLD}" \
+    "mid_threshold=${MID_THRESHOLD}" \
+    "margin_min=${MARGIN_MIN}" \
+    "margin_max=${MARGIN_MAX}" \
+    "stage1_pair_preset=${STAGE1_PAIR_PRESET}" \
+    "stage1_pair_types=${STAGE1_PAIR_TYPES}" \
+    "stage1_pair_min_margin=${STAGE1_PAIR_MIN_MARGIN}" \
+    "stage1_pair_max_per_query=${STAGE1_PAIR_MAX_PER_QUERY}" \
+    "fp16=${FP16}")"
+  RUN_HASH="$(printf '%s' "${HASH_INPUT}" | "${PYTHON_BIN}" -c 'import hashlib, sys; print(hashlib.sha1(sys.stdin.read().encode("utf-8")).hexdigest()[:10])')"
+  if [[ -z "${RUN_NAME}" ]]; then
+    RUN_NAME="s2cal_l${STAGE2_TRAIN_LAST_LAYERS}_ord${LOSS_ORDINAL_WEIGHT}_${RUN_HASH}"
+  fi
+  OUTPUT_DIR="${OUTPUT_BASE_DIR}/${RUN_NAME}"
+  if [[ "${ALLOW_OUTPUT_OVERWRITE:-false}" != "true" ]]; then
+    OUTPUT_CANDIDATE="${OUTPUT_DIR}"
+    OUTPUT_SUFFIX=2
+    while [[ -e "${OUTPUT_CANDIDATE}" ]]; do
+      OUTPUT_CANDIDATE="${OUTPUT_BASE_DIR}/${RUN_NAME}_r${OUTPUT_SUFFIX}"
+      OUTPUT_SUFFIX=$((OUTPUT_SUFFIX + 1))
+    done
+    OUTPUT_DIR="${OUTPUT_CANDIDATE}"
+  fi
+fi
+mkdir -p "${OUTPUT_BASE_DIR}"
+printf '%s\n' "${OUTPUT_DIR}" > "${OUTPUT_BASE_DIR}/.last_train_output_dir"
+echo "Training output directory: ${OUTPUT_DIR}"
 
 CMD=(
   "${PYTHON_BIN}" ce3/train.py

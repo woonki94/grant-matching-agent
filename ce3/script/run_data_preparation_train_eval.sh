@@ -47,6 +47,10 @@ if [[ "${RUN_TRAIN}" == "true" ]]; then
       SPLIT_DIR="${SPLIT_DIR}" \
       OUTPUT_DIR="${TRAIN_OUTPUT_DIR}" \
       bash "${TRAIN_SCRIPT}"
+  LAST_TRAIN_OUTPUT_MARKER="${TRAIN_OUTPUT_DIR}/.last_train_output_dir"
+  if [[ -f "${LAST_TRAIN_OUTPUT_MARKER}" ]]; then
+    TRAIN_OUTPUT_DIR="$(cat "${LAST_TRAIN_OUTPUT_MARKER}")"
+  fi
 else
   echo "Skipping train because RUN_TRAIN=${RUN_TRAIN}"
 fi
