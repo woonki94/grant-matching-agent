@@ -13,6 +13,7 @@ from transformers import AutoModelForSequenceClassification
 
 ASPECTS = ("topic", "approach", "objective")
 ASPECT_HEADS_FILE = "aspect_heads.pt"
+ASPECT_LOGIT_CALIBRATION_FILE = "aspect_logit_calibration.pt"
 ASPECT_HEADS_CONFIG_FILE = "aspect_heads_config.json"
 
 ASPECT_PREFIX_BY_NAME: Dict[str, str] = {
@@ -155,6 +156,8 @@ class AspectHeadSequenceClassifier(nn.Module):
         if not isinstance(source_head, nn.Module):
             raise RuntimeError("CE3 multi-head mode expects a sequence-classification backbone with a classifier head.")
         self.heads = nn.ModuleDict({aspect: copy.deepcopy(source_head) for aspect in ASPECTS})
+        self.logit_scales = nn.ParameterDict({aspect: nn.Parameter(torch.ones(1)) for aspect in ASPECTS})
+        self.logit_biases = nn.ParameterDict({aspect: nn.Parameter(torch.zeros(1)) for aspect in ASPECTS})
 
     def _clean_aspect_ids(self, aspect_ids: Optional[torch.Tensor], *, batch_size: int, device: torch.device) -> torch.Tensor:
         if aspect_ids is None:
@@ -191,6 +194,7 @@ class AspectHeadSequenceClassifier(nn.Module):
                 head_logits = self.backbone(**sub_kwargs).logits
                 if logits is None:
                     logits = head_logits.new_empty((batch_size, int(head_logits.shape[-1])))
+                head_logits = self._calibrate_aspect_logits(head_logits, aspect_name)
                 logits[mask] = head_logits.to(dtype=logits.dtype)
                 handled = handled | mask
             if bool((~handled).any().item()):
@@ -199,6 +203,7 @@ class AspectHeadSequenceClassifier(nn.Module):
                 head_logits = self.backbone(**sub_kwargs).logits
                 if logits is None:
                     logits = head_logits.new_empty((batch_size, int(head_logits.shape[-1])))
+                head_logits = self._calibrate_aspect_logits(head_logits, "topic")
                 logits[~handled] = head_logits.to(dtype=logits.dtype)
         finally:
             setattr(self.backbone, self.classifier_attr_name, original_head)
@@ -207,17 +212,30 @@ class AspectHeadSequenceClassifier(nn.Module):
             logits = input_ids.new_zeros((batch_size, 1), dtype=torch.float32)
         return SimpleNamespace(logits=logits)
 
+    def _calibrate_aspect_logits(self, logits: torch.Tensor, aspect_name: str) -> torch.Tensor:
+        scale = self.logit_scales[aspect_name].to(device=logits.device, dtype=logits.dtype)
+        bias = self.logit_biases[aspect_name].to(device=logits.device, dtype=logits.dtype)
+        return logits * scale + bias
+
     def save_pretrained(self, save_directory: Any, **kwargs: Any) -> None:
         path = Path(save_directory)
         path.mkdir(parents=True, exist_ok=True)
         self.backbone.save_pretrained(path, **kwargs)
         torch.save(self.heads.state_dict(), path / ASPECT_HEADS_FILE)
+        torch.save(
+            {
+                "logit_scales": self.logit_scales.state_dict(),
+                "logit_biases": self.logit_biases.state_dict(),
+            },
+            path / ASPECT_LOGIT_CALIBRATION_FILE,
+        )
         (path / ASPECT_HEADS_CONFIG_FILE).write_text(
             json.dumps(
                 {
                     "architecture": self.__class__.__name__,
                     "aspects": list(ASPECTS),
                     "head_file": ASPECT_HEADS_FILE,
+                    "logit_calibration_file": ASPECT_LOGIT_CALIBRATION_FILE,
                 },
                 ensure_ascii=False,
                 indent=2,
@@ -231,6 +249,11 @@ class AspectHeadSequenceClassifier(nn.Module):
             return False
         state = torch.load(path, map_location=map_location)
         self.heads.load_state_dict(state, strict=True)
+        calib_path = Path(model_dir) / ASPECT_LOGIT_CALIBRATION_FILE
+        if calib_path.exists():
+            calib = torch.load(calib_path, map_location=map_location)
+            self.logit_scales.load_state_dict(calib.get("logit_scales", {}), strict=False)
+            self.logit_biases.load_state_dict(calib.get("logit_biases", {}), strict=False)
         return True
 
 

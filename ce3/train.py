@@ -792,6 +792,14 @@ def configure_stage2_trainable_params(model: nn.Module, args: argparse.Namespace
         for p in model.heads.parameters():  # type: ignore[union-attr]
             p.requires_grad = True
         unfrozen_groups.append("aspect_heads")
+        if isinstance(getattr(model, "logit_scales", None), nn.Module):
+            for p in model.logit_scales.parameters():  # type: ignore[union-attr]
+                p.requires_grad = True
+            unfrozen_groups.append("aspect_logit_scales")
+        if isinstance(getattr(model, "logit_biases", None), nn.Module):
+            for p in model.logit_biases.parameters():  # type: ignore[union-attr]
+                p.requires_grad = True
+            unfrozen_groups.append("aspect_logit_biases")
     else:
         for attr in ("classifier", "score", "regressor"):
             head = getattr(model, attr, None)
