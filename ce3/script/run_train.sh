@@ -32,6 +32,13 @@ LOSS_MSE_WEIGHT="${LOSS_MSE_WEIGHT:-1.0}"
 LOSS_CLUSTER_MARGIN_WEIGHT="${LOSS_CLUSTER_MARGIN_WEIGHT:-0.4}"
 LOSS_CALIBRATION_WEIGHT="${LOSS_CALIBRATION_WEIGHT:-1.0}"
 LOSS_ORDINAL_WEIGHT="${LOSS_ORDINAL_WEIGHT:-0.4}"
+CALIBRATION_HIGH_WEIGHT="${CALIBRATION_HIGH_WEIGHT:-1.0}"
+CALIBRATION_MID_WEIGHT="${CALIBRATION_MID_WEIGHT:-1.0}"
+CALIBRATION_LOW_WEIGHT="${CALIBRATION_LOW_WEIGHT:-1.0}"
+CALIBRATION_MID_LOW_WEIGHT="${CALIBRATION_MID_LOW_WEIGHT:-1.0}"
+CALIBRATION_MID_HIGH_WEIGHT="${CALIBRATION_MID_HIGH_WEIGHT:-1.0}"
+ORDINAL_MID_BOUNDARY_WEIGHT="${ORDINAL_MID_BOUNDARY_WEIGHT:-1.0}"
+ORDINAL_HIGH_BOUNDARY_WEIGHT="${ORDINAL_HIGH_BOUNDARY_WEIGHT:-1.0}"
 TEACHER_TEMPERATURE="${TEACHER_TEMPERATURE:-0.8}"
 CLUSTER_MARGIN_HM="${CLUSTER_MARGIN_HM:-0.18}"
 CLUSTER_MARGIN_ML="${CLUSTER_MARGIN_ML:-0.18}"
@@ -94,6 +101,13 @@ if [[ "${AUTO_OUTPUT_HASH}" == "true" ]]; then
     "loss_cluster_margin_weight=${LOSS_CLUSTER_MARGIN_WEIGHT}" \
     "loss_calibration_weight=${LOSS_CALIBRATION_WEIGHT}" \
     "loss_ordinal_weight=${LOSS_ORDINAL_WEIGHT}" \
+    "calibration_high_weight=${CALIBRATION_HIGH_WEIGHT}" \
+    "calibration_mid_weight=${CALIBRATION_MID_WEIGHT}" \
+    "calibration_low_weight=${CALIBRATION_LOW_WEIGHT}" \
+    "calibration_mid_low_weight=${CALIBRATION_MID_LOW_WEIGHT}" \
+    "calibration_mid_high_weight=${CALIBRATION_MID_HIGH_WEIGHT}" \
+    "ordinal_mid_boundary_weight=${ORDINAL_MID_BOUNDARY_WEIGHT}" \
+    "ordinal_high_boundary_weight=${ORDINAL_HIGH_BOUNDARY_WEIGHT}" \
     "teacher_temperature=${TEACHER_TEMPERATURE}" \
     "cluster_margin_hm=${CLUSTER_MARGIN_HM}" \
     "cluster_margin_ml=${CLUSTER_MARGIN_ML}" \
@@ -149,6 +163,13 @@ CMD=(
   --loss-cluster-margin-weight "${LOSS_CLUSTER_MARGIN_WEIGHT}"
   --loss-calibration-weight "${LOSS_CALIBRATION_WEIGHT}"
   --loss-ordinal-weight "${LOSS_ORDINAL_WEIGHT}"
+  --calibration-high-weight "${CALIBRATION_HIGH_WEIGHT}"
+  --calibration-mid-weight "${CALIBRATION_MID_WEIGHT}"
+  --calibration-low-weight "${CALIBRATION_LOW_WEIGHT}"
+  --calibration-mid-low-weight "${CALIBRATION_MID_LOW_WEIGHT}"
+  --calibration-mid-high-weight "${CALIBRATION_MID_HIGH_WEIGHT}"
+  --ordinal-mid-boundary-weight "${ORDINAL_MID_BOUNDARY_WEIGHT}"
+  --ordinal-high-boundary-weight "${ORDINAL_HIGH_BOUNDARY_WEIGHT}"
   --teacher-temperature "${TEACHER_TEMPERATURE}"
   --cluster-margin-hm "${CLUSTER_MARGIN_HM}"
   --cluster-margin-ml "${CLUSTER_MARGIN_ML}"

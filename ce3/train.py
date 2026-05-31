@@ -491,19 +491,41 @@ def calibration_band_loss(
     mid_low: float,
     mid_high: float,
     low_ceil: float,
+    high_weight: float,
+    mid_weight: float,
+    mid_low_weight: float,
+    mid_high_weight: float,
+    low_weight: float,
 ) -> torch.Tensor:
     probs = torch.sigmoid(logits_flat)
     parts: List[torch.Tensor] = []
+    weights: List[float] = []
     high = probs[cluster_ids_flat == 2]
     mid = probs[cluster_ids_flat == 1]
     low = probs[cluster_ids_flat == 0]
     if high.numel():
-        parts.append(F.relu(float(high_floor) - high).mean())
+        weight = max(0.0, float(high_weight))
+        if weight > 0.0:
+            parts.append(F.relu(float(high_floor) - high).mean() * weight)
+            weights.append(weight)
     if mid.numel():
-        parts.append((F.relu(float(mid_low) - mid) + F.relu(mid - float(mid_high))).mean())
+        weight = max(0.0, float(mid_weight))
+        if weight > 0.0:
+            mid_loss = (
+                max(0.0, float(mid_low_weight)) * F.relu(float(mid_low) - mid).mean()
+                + max(0.0, float(mid_high_weight)) * F.relu(mid - float(mid_high)).mean()
+            )
+            parts.append(mid_loss * weight)
+            weights.append(weight)
     if low.numel():
-        parts.append(F.relu(low - float(low_ceil)).mean())
-    return torch.stack(parts).mean() if parts else logits_flat.sum() * 0.0
+        weight = max(0.0, float(low_weight))
+        if weight > 0.0:
+            parts.append(F.relu(low - float(low_ceil)).mean() * weight)
+            weights.append(weight)
+    if not parts:
+        return logits_flat.sum() * 0.0
+    denom = max(1e-6, float(sum(weights)))
+    return torch.stack(parts).sum() / denom
 
 
 def _threshold_to_logit(threshold: float, *, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
@@ -526,6 +548,8 @@ def ordinal_boundary_loss(
     *,
     high_threshold: float,
     mid_threshold: float,
+    mid_boundary_weight: float,
+    high_boundary_weight: float,
 ) -> torch.Tensor:
     """Train the scalar score to cross the same low/mid/high boundaries used by OOB."""
 
@@ -536,10 +560,13 @@ def ordinal_boundary_loss(
     at_least_high = (clusters >= 2).to(dtype=logits_flat.dtype)
     mid_boundary = logits_flat - _threshold_to_logit(float(mid_threshold), device=logits_flat.device, dtype=logits_flat.dtype)
     high_boundary = logits_flat - _threshold_to_logit(float(high_threshold), device=logits_flat.device, dtype=logits_flat.dtype)
-    return 0.5 * (
-        _balanced_boundary_bce(mid_boundary, at_least_mid)
-        + _balanced_boundary_bce(high_boundary, at_least_high)
-    )
+    mid_weight = max(0.0, float(mid_boundary_weight))
+    high_weight = max(0.0, float(high_boundary_weight))
+    denom = max(1e-6, mid_weight + high_weight)
+    return (
+        mid_weight * _balanced_boundary_bce(mid_boundary, at_least_mid)
+        + high_weight * _balanced_boundary_bce(high_boundary, at_least_high)
+    ) / denom
 
 
 def pair_loss_from_batch(model: nn.Module, batch: Dict[str, Any], device: torch.device, *, margin_min: float, margin_max: float) -> torch.Tensor:
@@ -579,12 +606,19 @@ def list_losses_from_batch(model: nn.Module, batch: Dict[str, Any], device: torc
         mid_low=args.mid_threshold,
         mid_high=args.high_threshold,
         low_ceil=args.mid_threshold,
+        high_weight=args.calibration_high_weight,
+        mid_weight=args.calibration_mid_weight,
+        mid_low_weight=args.calibration_mid_low_weight,
+        mid_high_weight=args.calibration_mid_high_weight,
+        low_weight=args.calibration_low_weight,
     )
     ordinal = ordinal_boundary_loss(
         logits,
         clusters,
         high_threshold=args.high_threshold,
         mid_threshold=args.mid_threshold,
+        mid_boundary_weight=args.ordinal_mid_boundary_weight,
+        high_boundary_weight=args.ordinal_high_boundary_weight,
     )
     return {"kl": kl, "mse": mse, "cluster": cluster, "calibration": calib, "ordinal": ordinal}
 
@@ -1044,6 +1078,13 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--loss-cluster-margin-weight", type=float, default=0.1)
     p.add_argument("--loss-calibration-weight", type=float, default=0.1)
     p.add_argument("--loss-ordinal-weight", type=float, default=0.0)
+    p.add_argument("--calibration-high-weight", type=float, default=1.0)
+    p.add_argument("--calibration-mid-weight", type=float, default=1.0)
+    p.add_argument("--calibration-low-weight", type=float, default=1.0)
+    p.add_argument("--calibration-mid-low-weight", type=float, default=1.0)
+    p.add_argument("--calibration-mid-high-weight", type=float, default=1.0)
+    p.add_argument("--ordinal-mid-boundary-weight", type=float, default=1.0)
+    p.add_argument("--ordinal-high-boundary-weight", type=float, default=1.0)
     p.add_argument("--cluster-margin-hm", type=float, default=0.12)
     p.add_argument("--cluster-margin-ml", type=float, default=0.12)
     p.add_argument("--cluster-margin-hl", type=float, default=0.30)
