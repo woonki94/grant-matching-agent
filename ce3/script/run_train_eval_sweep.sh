@@ -12,7 +12,7 @@ EVAL_OUTPUT_BASE_DIR="${EVAL_OUTPUT_BASE_DIR:-ce3/eval/results/sweep}"
 TRAIN_EVAL_SCRIPT="${TRAIN_EVAL_SCRIPT:-ce3/script/run_data_preparation_train_eval.sh}"
 
 MODEL_ID="${MODEL_ID:-${PROJECT_ROOT}/ce3/models/aspect_reranker/stage1_epoch_1}"
-COMPARE_BASE="${COMPARE_BASE:-false}"
+COMPARE_BASE="${COMPARE_BASE:-true}"
 SWEEP_CONTINUE_ON_ERROR="${SWEEP_CONTINUE_ON_ERROR:-false}"
 
 run_combo() {

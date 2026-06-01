@@ -63,6 +63,22 @@ def _clamp_01(value: Any) -> float:
     return max(0.0, min(1.0, x))
 
 
+def _parse_float_list(value: Any, *, default: Sequence[float]) -> List[float]:
+    raw = _clean_text(value)
+    if not raw:
+        return [float(x) for x in default]
+    out: List[float] = []
+    for token in raw.split(","):
+        token = token.strip()
+        if not token:
+            continue
+        try:
+            out.append(max(0.0, float(token)))
+        except Exception:
+            continue
+    return out or [float(x) for x in default]
+
+
 def _safe_int(value: Any, default: int = 0) -> int:
     try:
         return int(value)
@@ -667,6 +683,177 @@ def _format_pairwise_table(pair_metrics: Dict[str, Any], *, model_label: str) ->
     return "\n".join(lines)
 
 
+def _format_explicit_pairwise_comparison(
+    *,
+    teacher_pair_metrics: Dict[str, Any],
+    finetuned_pair_metrics: Dict[str, Any],
+    base_pair_metrics: Optional[Dict[str, Any]],
+) -> str:
+    lines = ["", "=== Explicit Pairwise Comparison ==="]
+    lines.append(
+        f"{'PAIR_TYPE':<24} {'N':>8} {'TEACHER':>9} {'FINETUNED':>10} {'BASE':>9} "
+        f"{'IMPROVE':>9} {'FT_M':>9} {'BASE_M':>9}"
+    )
+    lines.append("-" * 96)
+    keys = sorted(
+        set(teacher_pair_metrics) | set(finetuned_pair_metrics) | set(base_pair_metrics or {}),
+        key=lambda x: (0 if x == "overall" else 1, x),
+    )
+    for pair_type in keys:
+        teacher = teacher_pair_metrics.get(pair_type) or {}
+        finetuned = finetuned_pair_metrics.get(pair_type) or {}
+        base = (base_pair_metrics or {}).get(pair_type) or {}
+        base_acc = float(base.get("pair_accuracy")) if base else None
+        ft_acc = float(finetuned.get("pair_accuracy") or 0.0)
+        improve = ft_acc - base_acc if base_acc is not None else None
+        lines.append(
+            f"{pair_type:<24} {int(finetuned.get('pair_count') or teacher.get('pair_count') or base.get('pair_count') or 0):>8} "
+            f"{float(teacher.get('pair_accuracy') or 0.0):>9.4f} "
+            f"{ft_acc:>10.4f} "
+            f"{_fmt_metric_value(base_acc):>9} "
+            f"{_fmt_metric_value(improve):>9} "
+            f"{float(finetuned.get('mean_pred_margin') or 0.0):>9.4f} "
+            f"{_fmt_metric_value(float(base.get('mean_pred_margin')) if base else None):>9}"
+        )
+    lines.append("IMPROVE is finetuned pair accuracy minus base pair accuracy.")
+    return "\n".join(lines)
+
+
+def _oob_metrics_by_margin(
+    rows: Sequence[Dict[str, Any]],
+    *,
+    score_key: str,
+    high_threshold: float,
+    mid_threshold: float,
+    margins: Sequence[float],
+) -> Dict[str, Dict[str, Dict[str, Any]]]:
+    out: Dict[str, Dict[str, Dict[str, Any]]] = {}
+    grouped: Dict[str, Sequence[Dict[str, Any]]] = {"overall": rows, **_by_aspect(rows)}
+    for margin in margins:
+        label = f"{float(margin):.2f}"
+        out[label] = {}
+        for group, group_rows in grouped.items():
+            out[label][group] = _raw_score_sanity(
+                group_rows,
+                score_key=score_key,
+                high_threshold=high_threshold,
+                mid_threshold=mid_threshold,
+                oob_margin=float(margin),
+            )
+    return out
+
+
+def _nested_get(obj: Dict[str, Any], path: Sequence[str], default: float = 0.0) -> float:
+    cur: Any = obj
+    for key in path:
+        if not isinstance(cur, dict):
+            return float(default)
+        cur = cur.get(key)
+    try:
+        return float(cur)
+    except Exception:
+        return float(default)
+
+
+def _fmt_metric_value(value: Optional[float]) -> str:
+    if value is None:
+        return "NA"
+    return f"{float(value):.4f}"
+
+
+def _comparison_metric_rows(
+    *,
+    group: str,
+    teacher_metrics: Dict[str, Dict[str, Any]],
+    finetuned_metrics: Dict[str, Dict[str, Any]],
+    base_metrics: Optional[Dict[str, Dict[str, Any]]],
+    teacher_oob: Dict[str, Dict[str, Dict[str, Any]]],
+    finetuned_oob: Dict[str, Dict[str, Dict[str, Any]]],
+    base_oob: Optional[Dict[str, Dict[str, Dict[str, Any]]]],
+    margins: Sequence[float],
+) -> List[Tuple[str, float, float, Optional[float], Optional[float]]]:
+    metric_specs: List[Tuple[str, Sequence[str], bool]] = [
+        ("MAE", ("regression", "mae"), False),
+        ("RMSE", ("regression", "rmse"), False),
+        ("PEARSON", ("regression", "pearson"), True),
+        ("TOP1", ("ranking", "top1_accuracy"), True),
+        ("MRR@K", ("ranking", "mrr_at_k"), True),
+        ("NDCG@K", ("ranking", "ndcg_at_k"), True),
+        ("RECALL@K", ("ranking", "recall_at_k"), True),
+        ("PAIR_ACC", ("ranking", "pair_metrics", "overall", "pair_accuracy"), True),
+    ]
+    rows: List[Tuple[str, float, float, Optional[float], Optional[float]]] = []
+    for name, path, higher_is_better in metric_specs:
+        teacher = _nested_get(teacher_metrics.get(group) or {}, path)
+        finetuned = _nested_get(finetuned_metrics.get(group) or {}, path)
+        base = _nested_get((base_metrics or {}).get(group) or {}, path) if base_metrics is not None else None
+        improve = None
+        if base is not None:
+            improve = finetuned - base if higher_is_better else base - finetuned
+        rows.append((name, teacher, finetuned, base, improve))
+
+    for margin in margins:
+        label = f"{float(margin):.2f}"
+        prefix = "STRICT" if float(margin) == 0.0 else f"MARGIN{float(margin):.2f}"
+        for name, key in (
+            (f"{prefix}_LOW_OUT", "low_out_rate"),
+            (f"{prefix}_MID_OUT", "mid_out_rate"),
+            (f"{prefix}_HIGH_OUT", "high_out_rate"),
+            (f"{prefix}_OOB_OBJ", "oob_objective"),
+        ):
+            teacher = _nested_get((teacher_oob.get(label) or {}).get(group) or {}, (key,))
+            finetuned = _nested_get((finetuned_oob.get(label) or {}).get(group) or {}, (key,))
+            base = _nested_get(((base_oob or {}).get(label) or {}).get(group) or {}, (key,)) if base_oob is not None else None
+            improve = (base - finetuned) if base is not None else None
+            rows.append((name, teacher, finetuned, base, improve))
+
+    raw_specs = [
+        ("AVG_HIGH", "avg_pred_high"),
+        ("AVG_MID", "avg_pred_mid"),
+        ("AVG_LOW", "avg_pred_low"),
+    ]
+    strict_label = f"{0.0:.2f}"
+    for name, key in raw_specs:
+        teacher = _nested_get((teacher_oob.get(strict_label) or {}).get(group) or {}, (key,))
+        finetuned = _nested_get((finetuned_oob.get(strict_label) or {}).get(group) or {}, (key,))
+        base = _nested_get(((base_oob or {}).get(strict_label) or {}).get(group) or {}, (key,)) if base_oob is not None else None
+        improve = None
+        rows.append((name, teacher, finetuned, base, improve))
+    return rows
+
+
+def _format_comparison_table(
+    *,
+    group: str,
+    teacher_metrics: Dict[str, Dict[str, Any]],
+    finetuned_metrics: Dict[str, Dict[str, Any]],
+    base_metrics: Optional[Dict[str, Dict[str, Any]]],
+    teacher_oob: Dict[str, Dict[str, Dict[str, Any]]],
+    finetuned_oob: Dict[str, Dict[str, Dict[str, Any]]],
+    base_oob: Optional[Dict[str, Dict[str, Dict[str, Any]]]],
+    margins: Sequence[float],
+) -> str:
+    lines = ["", f"=== Metric Comparison: {group} ==="]
+    lines.append(f"{'METRIC':<20} {'TEACHER':>10} {'FINETUNED':>10} {'BASE':>10} {'IMPROVE':>10}")
+    lines.append("-" * 66)
+    for name, teacher, finetuned, base, improve in _comparison_metric_rows(
+        group=group,
+        teacher_metrics=teacher_metrics,
+        finetuned_metrics=finetuned_metrics,
+        base_metrics=base_metrics,
+        teacher_oob=teacher_oob,
+        finetuned_oob=finetuned_oob,
+        base_oob=base_oob,
+        margins=margins,
+    ):
+        lines.append(
+            f"{name:<20} {_fmt_metric_value(teacher):>10} {_fmt_metric_value(finetuned):>10} "
+            f"{_fmt_metric_value(base):>10} {_fmt_metric_value(improve):>10}"
+        )
+    lines.append("IMPROVE is positive when finetuned is better than base; raw averages have NA improve.")
+    return "\n".join(lines)
+
+
 def _compute_model_metrics(
     rows: Sequence[Dict[str, Any]],
     *,
@@ -733,6 +920,7 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--high-threshold", type=float, default=0.70)
     p.add_argument("--mid-threshold", type=float, default=0.30)
     p.add_argument("--oob-margin", type=float, default=0.0)
+    p.add_argument("--oob-margins", type=str, default="0,0.03,0.05", help="Comma-separated OOB margins for comparison tables.")
     p.add_argument("--output-dir", type=str, default=OUTPUT_DIR_DEFAULT)
     p.add_argument("--save-prefix", type=str, default="ce3_test_eval")
     p.add_argument("--save-rows", action=argparse.BooleanOptionalAction, default=False)
@@ -753,6 +941,7 @@ def main() -> int:
     high_threshold = _clamp_01(args.high_threshold)
     mid_threshold = min(high_threshold, _clamp_01(args.mid_threshold))
     oob_margin = _clamp_01(args.oob_margin)
+    oob_margins = sorted({0.0, *_parse_float_list(args.oob_margins, default=(0.0, 0.03, 0.05))})
     batch_size = max(1, int(args.batch_size))
     max_length = max(64, int(args.max_length))
     top_k = max(1, int(args.top_k))
@@ -873,6 +1062,18 @@ def main() -> int:
                 row["base_pos_score"] = float(pos_score)
                 row["base_neg_score"] = float(neg_score)
 
+    teacher_metrics = _compute_model_metrics(
+        rows,
+        score_key="teacher_score",
+        top_k=top_k,
+        pair_eps=float(args.pair_eps),
+        hard_gap_max=float(args.hard_gap_max),
+        medium_gap_max=float(args.medium_gap_max),
+        high_threshold=high_threshold,
+        mid_threshold=mid_threshold,
+        oob_margin=0.0,
+    )
+    teacher_pair_metrics = _pairwise_metrics(pair_rows, score_prefix="teacher") if pair_rows else {}
     finetuned_metrics = _compute_model_metrics(
         rows,
         score_key="finetuned_score",
@@ -899,6 +1100,32 @@ def main() -> int:
         )
         base_pair_metrics = _pairwise_metrics(pair_rows, score_prefix="base") if pair_rows else {}
 
+    teacher_oob_by_margin = _oob_metrics_by_margin(
+        rows,
+        score_key="teacher_score",
+        high_threshold=high_threshold,
+        mid_threshold=mid_threshold,
+        margins=oob_margins,
+    )
+    finetuned_oob_by_margin = _oob_metrics_by_margin(
+        rows,
+        score_key="finetuned_score",
+        high_threshold=high_threshold,
+        mid_threshold=mid_threshold,
+        margins=oob_margins,
+    )
+    base_oob_by_margin = (
+        _oob_metrics_by_margin(
+            rows,
+            score_key="base_score",
+            high_threshold=high_threshold,
+            mid_threshold=mid_threshold,
+            margins=oob_margins,
+        )
+        if bool(args.compare_base)
+        else None
+    )
+
     band_counts = Counter(_clean_text(row.get("band")) for row in rows)
     aspect_counts = Counter(_clean_text(row.get("aspect")) for row in rows)
     pair_type_counts = Counter(_clean_text(row.get("pair_type")) for row in pair_rows)
@@ -915,6 +1142,30 @@ def main() -> int:
         f"device={device}",
         f"rows={len(rows)} aspect_counts={dict(aspect_counts)} band_counts={dict(band_counts)}",
         f"pair_rows={len(pair_rows)} pair_type_counts={dict(pair_type_counts)}",
+        f"comparison_oob_margins={','.join(f'{x:.2f}' for x in oob_margins)}",
+        _format_comparison_table(
+            group="overall",
+            teacher_metrics=teacher_metrics,
+            finetuned_metrics=finetuned_metrics,
+            base_metrics=base_metrics,
+            teacher_oob=teacher_oob_by_margin,
+            finetuned_oob=finetuned_oob_by_margin,
+            base_oob=base_oob_by_margin,
+            margins=oob_margins,
+        ),
+        *[
+            _format_comparison_table(
+                group=aspect,
+                teacher_metrics=teacher_metrics,
+                finetuned_metrics=finetuned_metrics,
+                base_metrics=base_metrics,
+                teacher_oob=teacher_oob_by_margin,
+                finetuned_oob=finetuned_oob_by_margin,
+                base_oob=base_oob_by_margin,
+                margins=oob_margins,
+            )
+            for aspect in ASPECTS
+        ],
         _format_main_table(finetuned_metrics, model_label="finetuned"),
         _format_oob_table(
             finetuned_metrics,
@@ -926,6 +1177,13 @@ def main() -> int:
         _format_raw_table(finetuned_metrics, model_label="finetuned"),
     ]
     if finetuned_pair_metrics:
+        blocks.append(
+            _format_explicit_pairwise_comparison(
+                teacher_pair_metrics=teacher_pair_metrics,
+                finetuned_pair_metrics=finetuned_pair_metrics,
+                base_pair_metrics=base_pair_metrics,
+            )
+        )
         blocks.append(_format_pairwise_table(finetuned_pair_metrics, model_label="finetuned"))
     if base_metrics is not None:
         blocks.extend(
@@ -975,19 +1233,27 @@ def main() -> int:
             "high_threshold": float(high_threshold),
             "mid_threshold": float(mid_threshold),
             "oob_margin": float(oob_margin),
+            "oob_margins": [float(x) for x in oob_margins],
             "device": str(device),
             "elapsed_sec": float(elapsed),
             "aspect_counts": dict(aspect_counts),
             "band_counts": dict(band_counts),
             "pair_type_counts": dict(pair_type_counts),
         },
+        "teacher": {
+            "metrics": teacher_metrics,
+            "pairwise_metrics": teacher_pair_metrics,
+            "oob_by_margin": teacher_oob_by_margin,
+        },
         "finetuned": {
             "metrics": finetuned_metrics,
             "pairwise_metrics": finetuned_pair_metrics,
+            "oob_by_margin": finetuned_oob_by_margin,
         },
         "base": {
             "metrics": base_metrics,
             "pairwise_metrics": base_pair_metrics,
+            "oob_by_margin": base_oob_by_margin,
         },
     }
     if bool(args.save_rows):
