@@ -22,6 +22,7 @@ HIGH_THRESHOLD="${HIGH_THRESHOLD:-0.70}"
 MID_THRESHOLD="${MID_THRESHOLD:-0.30}"
 OOB_MARGIN="${OOB_MARGIN:-0.0}"
 OOB_MARGINS="${OOB_MARGINS:-0,0.03,0.05}"
+COVERAGE_SOFT_MARGIN="${COVERAGE_SOFT_MARGIN:-0.05}"
 COMPARE_BASE="${COMPARE_BASE:-true}"
 MULTIHEAD="${MULTIHEAD:-true}"
 SAVE_ROWS="${SAVE_ROWS:-false}"
@@ -40,6 +41,7 @@ CMD=(
   --mid-threshold "${MID_THRESHOLD}"
   --oob-margin "${OOB_MARGIN}"
   --oob-margins "${OOB_MARGINS}"
+  --coverage-soft-margin "${COVERAGE_SOFT_MARGIN}"
 )
 
 if [[ -n "${MODEL}" ]]; then

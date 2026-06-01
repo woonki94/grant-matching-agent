@@ -743,6 +743,86 @@ def _oob_metrics_by_margin(
     return out
 
 
+def _coverage_binary_metrics(
+    rows: Sequence[Dict[str, Any]],
+    *,
+    score_key: str,
+    threshold: float,
+    margin: float,
+) -> Dict[str, float]:
+    t = float(threshold)
+    m = max(0.0, float(margin))
+    tp = fp = tn = fn = 0
+    for row in rows:
+        teacher = float(row.get("teacher_score", 0.0) or 0.0)
+        pred = float(row.get(score_key, 0.0) or 0.0)
+        teacher_pos = teacher >= t
+        if teacher_pos:
+            if pred >= max(0.0, t - m):
+                tp += 1
+            else:
+                fn += 1
+        else:
+            if pred < min(1.0, t + m):
+                tn += 1
+            else:
+                fp += 1
+    total = tp + fp + tn + fn
+    pos_total = tp + fn
+    neg_total = tn + fp
+    precision = tp / max(1, tp + fp)
+    recall = tp / max(1, tp + fn)
+    f1 = (2.0 * precision * recall / max(1e-12, precision + recall)) if (precision + recall) > 0.0 else 0.0
+    return {
+        "count": float(total),
+        "positive_count": float(pos_total),
+        "negative_count": float(neg_total),
+        "tp": float(tp),
+        "fp": float(fp),
+        "tn": float(tn),
+        "fn": float(fn),
+        "precision": float(precision),
+        "recall": float(recall),
+        "f1": float(f1),
+        "accuracy": float((tp + tn) / max(1, total)),
+        "fp_rate": float(fp / max(1, neg_total)),
+        "fn_rate": float(fn / max(1, pos_total)),
+        "positive_rate": float((tp + fp) / max(1, total)),
+    }
+
+
+def _coverage_metrics_by_group(
+    rows: Sequence[Dict[str, Any]],
+    *,
+    score_key: str,
+    high_threshold: float,
+    mid_threshold: float,
+    soft_margin: float,
+) -> Dict[str, Dict[str, Dict[str, Dict[str, float]]]]:
+    out: Dict[str, Dict[str, Dict[str, Dict[str, float]]]] = {}
+    grouped: Dict[str, Sequence[Dict[str, Any]]] = {"overall": rows, **_by_aspect(rows)}
+    tasks = {
+        "any_coverage": float(mid_threshold),
+        "high_coverage": float(high_threshold),
+    }
+    modes = {
+        "strict": 0.0,
+        f"soft{float(soft_margin):.2f}": float(soft_margin),
+    }
+    for task, threshold in tasks.items():
+        out[task] = {}
+        for mode, margin in modes.items():
+            out[task][mode] = {}
+            for group, group_rows in grouped.items():
+                out[task][mode][group] = _coverage_binary_metrics(
+                    group_rows,
+                    score_key=score_key,
+                    threshold=threshold,
+                    margin=margin,
+                )
+    return out
+
+
 def _nested_get(obj: Dict[str, Any], path: Sequence[str], default: float = 0.0) -> float:
     cur: Any = obj
     for key in path:
@@ -854,6 +934,46 @@ def _format_comparison_table(
     return "\n".join(lines)
 
 
+def _format_coverage_comparison_table(
+    *,
+    group: str,
+    teacher_coverage: Dict[str, Dict[str, Dict[str, Dict[str, float]]]],
+    finetuned_coverage: Dict[str, Dict[str, Dict[str, Dict[str, float]]]],
+    base_coverage: Optional[Dict[str, Dict[str, Dict[str, Dict[str, float]]]]],
+) -> str:
+    lines = ["", f"=== Coverage FP/FN Comparison: {group} ==="]
+    lines.append(f"{'TASK':<13} {'MODE':<8} {'METRIC':<10} {'TEACHER':>10} {'FINETUNED':>10} {'BASE':>10} {'IMPROVE':>10}")
+    lines.append("-" * 82)
+    metric_specs = [
+        ("precision", True),
+        ("recall", True),
+        ("f1", True),
+        ("accuracy", True),
+        ("fp_rate", False),
+        ("fn_rate", False),
+    ]
+    for task in ("any_coverage", "high_coverage"):
+        modes = sorted((finetuned_coverage.get(task) or {}).keys(), key=lambda x: (0 if x == "strict" else 1, x))
+        for mode in modes:
+            teacher_row = (((teacher_coverage.get(task) or {}).get(mode) or {}).get(group) or {})
+            finetuned_row = (((finetuned_coverage.get(task) or {}).get(mode) or {}).get(group) or {})
+            base_row = ((((base_coverage or {}).get(task) or {}).get(mode) or {}).get(group) or {}) if base_coverage is not None else {}
+            for metric, higher_is_better in metric_specs:
+                teacher = float(teacher_row.get(metric, 0.0) or 0.0)
+                finetuned = float(finetuned_row.get(metric, 0.0) or 0.0)
+                base = float(base_row.get(metric, 0.0) or 0.0) if base_row else None
+                improve = None
+                if base is not None:
+                    improve = finetuned - base if higher_is_better else base - finetuned
+                lines.append(
+                    f"{task:<13} {mode:<8} {metric:<10} {_fmt_metric_value(teacher):>10} "
+                    f"{_fmt_metric_value(finetuned):>10} {_fmt_metric_value(base):>10} {_fmt_metric_value(improve):>10}"
+                )
+    lines.append("ANY_COVERAGE uses threshold mid>=0.30; HIGH_COVERAGE uses high>=0.70.")
+    lines.append("Soft mode uses teacher-side labels but only counts FP/FN beyond the margin.")
+    return "\n".join(lines)
+
+
 def _compute_model_metrics(
     rows: Sequence[Dict[str, Any]],
     *,
@@ -921,6 +1041,7 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--mid-threshold", type=float, default=0.30)
     p.add_argument("--oob-margin", type=float, default=0.0)
     p.add_argument("--oob-margins", type=str, default="0,0.03,0.05", help="Comma-separated OOB margins for comparison tables.")
+    p.add_argument("--coverage-soft-margin", type=float, default=0.05, help="Tolerance for soft coverage FP/FN metrics.")
     p.add_argument("--output-dir", type=str, default=OUTPUT_DIR_DEFAULT)
     p.add_argument("--save-prefix", type=str, default="ce3_test_eval")
     p.add_argument("--save-rows", action=argparse.BooleanOptionalAction, default=False)
@@ -942,6 +1063,7 @@ def main() -> int:
     mid_threshold = min(high_threshold, _clamp_01(args.mid_threshold))
     oob_margin = _clamp_01(args.oob_margin)
     oob_margins = sorted({0.0, *_parse_float_list(args.oob_margins, default=(0.0, 0.03, 0.05))})
+    coverage_soft_margin = _clamp_01(args.coverage_soft_margin)
     batch_size = max(1, int(args.batch_size))
     max_length = max(64, int(args.max_length))
     top_k = max(1, int(args.top_k))
@@ -1125,6 +1247,31 @@ def main() -> int:
         if bool(args.compare_base)
         else None
     )
+    teacher_coverage = _coverage_metrics_by_group(
+        rows,
+        score_key="teacher_score",
+        high_threshold=high_threshold,
+        mid_threshold=mid_threshold,
+        soft_margin=coverage_soft_margin,
+    )
+    finetuned_coverage = _coverage_metrics_by_group(
+        rows,
+        score_key="finetuned_score",
+        high_threshold=high_threshold,
+        mid_threshold=mid_threshold,
+        soft_margin=coverage_soft_margin,
+    )
+    base_coverage = (
+        _coverage_metrics_by_group(
+            rows,
+            score_key="base_score",
+            high_threshold=high_threshold,
+            mid_threshold=mid_threshold,
+            soft_margin=coverage_soft_margin,
+        )
+        if bool(args.compare_base)
+        else None
+    )
 
     band_counts = Counter(_clean_text(row.get("band")) for row in rows)
     aspect_counts = Counter(_clean_text(row.get("aspect")) for row in rows)
@@ -1143,6 +1290,7 @@ def main() -> int:
         f"rows={len(rows)} aspect_counts={dict(aspect_counts)} band_counts={dict(band_counts)}",
         f"pair_rows={len(pair_rows)} pair_type_counts={dict(pair_type_counts)}",
         f"comparison_oob_margins={','.join(f'{x:.2f}' for x in oob_margins)}",
+        f"coverage_soft_margin={coverage_soft_margin:.2f}",
         _format_comparison_table(
             group="overall",
             teacher_metrics=teacher_metrics,
@@ -1163,6 +1311,21 @@ def main() -> int:
                 finetuned_oob=finetuned_oob_by_margin,
                 base_oob=base_oob_by_margin,
                 margins=oob_margins,
+            )
+            for aspect in ASPECTS
+        ],
+        _format_coverage_comparison_table(
+            group="overall",
+            teacher_coverage=teacher_coverage,
+            finetuned_coverage=finetuned_coverage,
+            base_coverage=base_coverage,
+        ),
+        *[
+            _format_coverage_comparison_table(
+                group=aspect,
+                teacher_coverage=teacher_coverage,
+                finetuned_coverage=finetuned_coverage,
+                base_coverage=base_coverage,
             )
             for aspect in ASPECTS
         ],
@@ -1234,6 +1397,7 @@ def main() -> int:
             "mid_threshold": float(mid_threshold),
             "oob_margin": float(oob_margin),
             "oob_margins": [float(x) for x in oob_margins],
+            "coverage_soft_margin": float(coverage_soft_margin),
             "device": str(device),
             "elapsed_sec": float(elapsed),
             "aspect_counts": dict(aspect_counts),
@@ -1244,16 +1408,19 @@ def main() -> int:
             "metrics": teacher_metrics,
             "pairwise_metrics": teacher_pair_metrics,
             "oob_by_margin": teacher_oob_by_margin,
+            "coverage": teacher_coverage,
         },
         "finetuned": {
             "metrics": finetuned_metrics,
             "pairwise_metrics": finetuned_pair_metrics,
             "oob_by_margin": finetuned_oob_by_margin,
+            "coverage": finetuned_coverage,
         },
         "base": {
             "metrics": base_metrics,
             "pairwise_metrics": base_pair_metrics,
             "oob_by_margin": base_oob_by_margin,
+            "coverage": base_coverage,
         },
     }
     if bool(args.save_rows):
