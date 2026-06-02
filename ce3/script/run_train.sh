@@ -32,6 +32,9 @@ LOSS_MSE_WEIGHT="${LOSS_MSE_WEIGHT:-1.0}"
 LOSS_CLUSTER_MARGIN_WEIGHT="${LOSS_CLUSTER_MARGIN_WEIGHT:-0.4}"
 LOSS_CALIBRATION_WEIGHT="${LOSS_CALIBRATION_WEIGHT:-1.0}"
 LOSS_ORDINAL_WEIGHT="${LOSS_ORDINAL_WEIGHT:-0.4}"
+LOSS_COVERAGE_WEIGHT="${LOSS_COVERAGE_WEIGHT:-0.35}"
+LOSS_ANY_COVERAGE_WEIGHT="${LOSS_ANY_COVERAGE_WEIGHT:-1.0}"
+LOSS_HIGH_COVERAGE_WEIGHT="${LOSS_HIGH_COVERAGE_WEIGHT:-1.2}"
 CALIBRATION_HIGH_WEIGHT="${CALIBRATION_HIGH_WEIGHT:-1.0}"
 CALIBRATION_MID_WEIGHT="${CALIBRATION_MID_WEIGHT:-1.0}"
 CALIBRATION_LOW_WEIGHT="${CALIBRATION_LOW_WEIGHT:-1.0}"
@@ -39,6 +42,12 @@ CALIBRATION_MID_LOW_WEIGHT="${CALIBRATION_MID_LOW_WEIGHT:-1.0}"
 CALIBRATION_MID_HIGH_WEIGHT="${CALIBRATION_MID_HIGH_WEIGHT:-1.0}"
 ORDINAL_MID_BOUNDARY_WEIGHT="${ORDINAL_MID_BOUNDARY_WEIGHT:-1.0}"
 ORDINAL_HIGH_BOUNDARY_WEIGHT="${ORDINAL_HIGH_BOUNDARY_WEIGHT:-1.0}"
+COVERAGE_BOUNDARY_MARGIN="${COVERAGE_BOUNDARY_MARGIN:-0.0}"
+COVERAGE_ANY_POS_WEIGHT="${COVERAGE_ANY_POS_WEIGHT:-1.0}"
+COVERAGE_ANY_NEG_WEIGHT="${COVERAGE_ANY_NEG_WEIGHT:-1.15}"
+COVERAGE_HIGH_POS_WEIGHT="${COVERAGE_HIGH_POS_WEIGHT:-1.25}"
+COVERAGE_HIGH_NEG_WEIGHT="${COVERAGE_HIGH_NEG_WEIGHT:-1.15}"
+COVERAGE_ASPECT_WEIGHT_MAP="${COVERAGE_ASPECT_WEIGHT_MAP:-topic=1.0,approach=1.1,objective=1.35}"
 TEACHER_TEMPERATURE="${TEACHER_TEMPERATURE:-0.8}"
 CLUSTER_MARGIN_HM="${CLUSTER_MARGIN_HM:-0.18}"
 CLUSTER_MARGIN_ML="${CLUSTER_MARGIN_ML:-0.18}"
@@ -101,6 +110,9 @@ if [[ "${AUTO_OUTPUT_HASH}" == "true" ]]; then
     "loss_cluster_margin_weight=${LOSS_CLUSTER_MARGIN_WEIGHT}" \
     "loss_calibration_weight=${LOSS_CALIBRATION_WEIGHT}" \
     "loss_ordinal_weight=${LOSS_ORDINAL_WEIGHT}" \
+    "loss_coverage_weight=${LOSS_COVERAGE_WEIGHT}" \
+    "loss_any_coverage_weight=${LOSS_ANY_COVERAGE_WEIGHT}" \
+    "loss_high_coverage_weight=${LOSS_HIGH_COVERAGE_WEIGHT}" \
     "calibration_high_weight=${CALIBRATION_HIGH_WEIGHT}" \
     "calibration_mid_weight=${CALIBRATION_MID_WEIGHT}" \
     "calibration_low_weight=${CALIBRATION_LOW_WEIGHT}" \
@@ -108,6 +120,12 @@ if [[ "${AUTO_OUTPUT_HASH}" == "true" ]]; then
     "calibration_mid_high_weight=${CALIBRATION_MID_HIGH_WEIGHT}" \
     "ordinal_mid_boundary_weight=${ORDINAL_MID_BOUNDARY_WEIGHT}" \
     "ordinal_high_boundary_weight=${ORDINAL_HIGH_BOUNDARY_WEIGHT}" \
+    "coverage_boundary_margin=${COVERAGE_BOUNDARY_MARGIN}" \
+    "coverage_any_pos_weight=${COVERAGE_ANY_POS_WEIGHT}" \
+    "coverage_any_neg_weight=${COVERAGE_ANY_NEG_WEIGHT}" \
+    "coverage_high_pos_weight=${COVERAGE_HIGH_POS_WEIGHT}" \
+    "coverage_high_neg_weight=${COVERAGE_HIGH_NEG_WEIGHT}" \
+    "coverage_aspect_weight_map=${COVERAGE_ASPECT_WEIGHT_MAP}" \
     "teacher_temperature=${TEACHER_TEMPERATURE}" \
     "cluster_margin_hm=${CLUSTER_MARGIN_HM}" \
     "cluster_margin_ml=${CLUSTER_MARGIN_ML}" \
@@ -123,7 +141,7 @@ if [[ "${AUTO_OUTPUT_HASH}" == "true" ]]; then
     "fp16=${FP16}")"
   RUN_HASH="$(printf '%s' "${HASH_INPUT}" | "${PYTHON_BIN}" -c 'import hashlib, sys; print(hashlib.sha1(sys.stdin.read().encode("utf-8")).hexdigest()[:10])')"
   if [[ -z "${RUN_NAME}" ]]; then
-    RUN_NAME="s2cal_l${STAGE2_TRAIN_LAST_LAYERS}_ord${LOSS_ORDINAL_WEIGHT}_${RUN_HASH}"
+    RUN_NAME="s2cov_l${STAGE2_TRAIN_LAST_LAYERS}_ord${LOSS_ORDINAL_WEIGHT}_cov${LOSS_COVERAGE_WEIGHT}_${RUN_HASH}"
   fi
   OUTPUT_DIR="${OUTPUT_BASE_DIR}/${RUN_NAME}"
   if [[ "${ALLOW_OUTPUT_OVERWRITE:-false}" != "true" ]]; then
@@ -163,6 +181,9 @@ CMD=(
   --loss-cluster-margin-weight "${LOSS_CLUSTER_MARGIN_WEIGHT}"
   --loss-calibration-weight "${LOSS_CALIBRATION_WEIGHT}"
   --loss-ordinal-weight "${LOSS_ORDINAL_WEIGHT}"
+  --loss-coverage-weight "${LOSS_COVERAGE_WEIGHT}"
+  --loss-any-coverage-weight "${LOSS_ANY_COVERAGE_WEIGHT}"
+  --loss-high-coverage-weight "${LOSS_HIGH_COVERAGE_WEIGHT}"
   --calibration-high-weight "${CALIBRATION_HIGH_WEIGHT}"
   --calibration-mid-weight "${CALIBRATION_MID_WEIGHT}"
   --calibration-low-weight "${CALIBRATION_LOW_WEIGHT}"
@@ -170,6 +191,12 @@ CMD=(
   --calibration-mid-high-weight "${CALIBRATION_MID_HIGH_WEIGHT}"
   --ordinal-mid-boundary-weight "${ORDINAL_MID_BOUNDARY_WEIGHT}"
   --ordinal-high-boundary-weight "${ORDINAL_HIGH_BOUNDARY_WEIGHT}"
+  --coverage-boundary-margin "${COVERAGE_BOUNDARY_MARGIN}"
+  --coverage-any-pos-weight "${COVERAGE_ANY_POS_WEIGHT}"
+  --coverage-any-neg-weight "${COVERAGE_ANY_NEG_WEIGHT}"
+  --coverage-high-pos-weight "${COVERAGE_HIGH_POS_WEIGHT}"
+  --coverage-high-neg-weight "${COVERAGE_HIGH_NEG_WEIGHT}"
+  --coverage-aspect-weight-map "${COVERAGE_ASPECT_WEIGHT_MAP}"
   --teacher-temperature "${TEACHER_TEMPERATURE}"
   --cluster-margin-hm "${CLUSTER_MARGIN_HM}"
   --cluster-margin-ml "${CLUSTER_MARGIN_ML}"
