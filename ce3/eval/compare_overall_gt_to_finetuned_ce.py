@@ -234,13 +234,66 @@ def _infer_aspect_scores(
         row["ce_avg_score"] = float(sum(scores) / max(1, len(scores)))
         row["ce_min_score"] = float(min(scores)) if scores else 0.0
         row["ce_max_score"] = float(max(scores)) if scores else 0.0
-        row["error"] = float(row["ce_avg_score"] - row["gt_score"])
+        row["aggregate_scores"] = _aggregate_scores(row["aspect_scores"])
+        row["error"] = float(row["aggregate_scores"]["mean"] - row["gt_score"])
         row["abs_error"] = float(abs(row["error"]))
     return out
 
 
 def _mean(values: Sequence[float]) -> float:
     return float(sum(values) / max(1, len(values)))
+
+
+def _weighted_mean(scores: Dict[str, float], weights: Dict[str, float]) -> float:
+    denom = sum(float(weights.get(aspect, 0.0)) for aspect in ASPECTS)
+    if denom <= 0.0:
+        return _mean([float(scores.get(aspect, 0.0)) for aspect in ASPECTS])
+    return float(
+        sum(float(scores.get(aspect, 0.0)) * float(weights.get(aspect, 0.0)) for aspect in ASPECTS) / denom
+    )
+
+
+def _geometric_mean(values: Sequence[float]) -> float:
+    vals = [max(0.0, float(x)) for x in values]
+    if not vals or min(vals) <= 0.0:
+        return 0.0
+    return float(math.prod(vals) ** (1.0 / len(vals)))
+
+
+def _harmonic_mean(values: Sequence[float]) -> float:
+    vals = [max(0.0, float(x)) for x in values]
+    if not vals or min(vals) <= 0.0:
+        return 0.0
+    return float(len(vals) / sum(1.0 / x for x in vals))
+
+
+def _aggregate_scores(aspect_scores: Dict[str, Any]) -> Dict[str, float]:
+    scores = {aspect: _clamp_01(aspect_scores.get(aspect, 0.0)) for aspect in ASPECTS}
+    t = scores["topic"]
+    a = scores["approach"]
+    o = scores["objective"]
+    vals = [t, a, o]
+    mean_score = _mean(vals)
+    min_score = min(vals)
+    sorted_vals = sorted(vals)
+
+    aggregators = {
+        "mean": mean_score,
+        "min_mean_0.4_0.6": 0.4 * min_score + 0.6 * mean_score,
+        "topic_objective_half_approach": (t + o + 0.5 * a) / 2.5,
+        "geometric_mean": _geometric_mean(vals),
+        "harmonic_mean": _harmonic_mean(vals),
+        "no_min_drop_min_mean": _mean(sorted_vals[1:]),  # Average only the two strongest aspects.
+        "topic_objective_mean": (t + o) / 2.0,
+        "topic_high_0.50": _weighted_mean(scores, {"topic": 0.50, "approach": 0.25, "objective": 0.25}),
+        "approach_high_0.50": _weighted_mean(scores, {"topic": 0.25, "approach": 0.50, "objective": 0.25}),
+        "objective_high_0.50": _weighted_mean(scores, {"topic": 0.25, "approach": 0.25, "objective": 0.50}),
+        "topic_high_0.60": _weighted_mean(scores, {"topic": 0.60, "approach": 0.20, "objective": 0.20}),
+        "approach_high_0.60": _weighted_mean(scores, {"topic": 0.20, "approach": 0.60, "objective": 0.20}),
+        "objective_high_0.60": _weighted_mean(scores, {"topic": 0.20, "approach": 0.20, "objective": 0.60}),
+        "topic_objective_high": _weighted_mean(scores, {"topic": 0.40, "approach": 0.20, "objective": 0.40}),
+    }
+    return {name: _clamp_01(value) for name, value in aggregators.items()}
 
 
 def _pearson(xs: Sequence[float], ys: Sequence[float]) -> float:
@@ -315,9 +368,15 @@ def _coverage_metrics(gt: Sequence[float], pred: Sequence[float], *, threshold: 
     }
 
 
-def _metrics(rows: Sequence[Dict[str, Any]], *, high_threshold: float, mid_threshold: float) -> Dict[str, Any]:
+def _metrics(
+    rows: Sequence[Dict[str, Any]],
+    *,
+    score_name: str,
+    high_threshold: float,
+    mid_threshold: float,
+) -> Dict[str, Any]:
     gt = [float(row["gt_score"]) for row in rows]
-    pred = [float(row["ce_avg_score"]) for row in rows]
+    pred = [float((row.get("aggregate_scores") or {}).get(score_name, row.get("ce_avg_score", 0.0))) for row in rows]
     errors = [p - y for y, p in zip(gt, pred)]
     abs_errors = [abs(x) for x in errors]
     sq_errors = [x * x for x in errors]
@@ -332,6 +391,7 @@ def _metrics(rows: Sequence[Dict[str, Any]], *, high_threshold: float, mid_thres
         for aspect in ASPECTS
     }
     return {
+        "score_name": score_name,
         "n": int(len(rows)),
         "mae": _mean(abs_errors),
         "rmse": math.sqrt(_mean(sq_errors)),
@@ -339,21 +399,37 @@ def _metrics(rows: Sequence[Dict[str, Any]], *, high_threshold: float, mid_thres
         "pearson": _pearson(gt, pred),
         "spearman": _spearman(gt, pred),
         "mean_gt": _mean(gt),
-        "mean_ce_avg": _mean(pred),
+        "mean_pred": _mean(pred),
         "aspect_pred_means": aspect_means,
         "band_accuracy": float(band_acc),
         "gt_band_counts": dict(Counter(_score_band(x, high_threshold=high_threshold, mid_threshold=mid_threshold) for x in gt)),
-        "ce_avg_band_counts": dict(Counter(_score_band(x, high_threshold=high_threshold, mid_threshold=mid_threshold) for x in pred)),
+        "pred_band_counts": dict(Counter(_score_band(x, high_threshold=high_threshold, mid_threshold=mid_threshold) for x in pred)),
         "any_coverage": _coverage_metrics(gt, pred, threshold=mid_threshold),
         "high_coverage": _coverage_metrics(gt, pred, threshold=high_threshold),
     }
 
 
-def _print_metrics(metrics: Dict[str, Any]) -> None:
-    print("\n=== Finetuned CE Avg vs Claude Overall GT ===")
+def _all_aggregator_metrics(
+    rows: Sequence[Dict[str, Any]],
+    *,
+    high_threshold: float,
+    mid_threshold: float,
+) -> Dict[str, Dict[str, Any]]:
+    if not rows:
+        return {}
+    first = rows[0].get("aggregate_scores") if isinstance(rows[0].get("aggregate_scores"), dict) else {}
+    names = list(first.keys()) or ["mean"]
+    return {
+        name: _metrics(rows, score_name=name, high_threshold=high_threshold, mid_threshold=mid_threshold)
+        for name in names
+    }
+
+
+def _print_single_metrics(metrics: Dict[str, Any]) -> None:
+    print(f"\n=== {metrics.get('score_name', 'score')} vs Claude Overall GT ===")
     print(f"{'METRIC':<24} {'VALUE':>12}")
     print("-" * 38)
-    for key in ("n", "mae", "rmse", "bias_pred_minus_gt", "pearson", "spearman", "mean_gt", "mean_ce_avg", "band_accuracy"):
+    for key in ("n", "mae", "rmse", "bias_pred_minus_gt", "pearson", "spearman", "mean_gt", "mean_pred", "band_accuracy"):
         value = metrics.get(key)
         if isinstance(value, int):
             text = str(value)
@@ -364,7 +440,7 @@ def _print_metrics(metrics: Dict[str, Any]) -> None:
         print(f"{key:<24} {text:>12}")
     print(f"\naspect_pred_means={metrics.get('aspect_pred_means', {})}")
     print(f"gt_band_counts={metrics.get('gt_band_counts', {})}")
-    print(f"ce_avg_band_counts={metrics.get('ce_avg_band_counts', {})}")
+    print(f"pred_band_counts={metrics.get('pred_band_counts', {})}")
     for task in ("any_coverage", "high_coverage"):
         vals = metrics.get(task) if isinstance(metrics.get(task), dict) else {}
         print(
@@ -374,6 +450,34 @@ def _print_metrics(metrics: Dict[str, Any]) -> None:
             f"accuracy={float(vals.get('accuracy', 0.0)):.4f} "
             f"fp_rate={float(vals.get('fp_rate', 0.0)):.4f} "
             f"fn_rate={float(vals.get('fn_rate', 0.0)):.4f}"
+        )
+
+
+def _print_aggregator_table(metric_map: Dict[str, Dict[str, Any]]) -> None:
+    print("\n=== Aggregator Comparison vs Claude Overall GT ===")
+    header = (
+        f"{'AGGREGATOR':<30} {'MAE':>7} {'RMSE':>7} {'BIAS':>7} {'R':>7} {'RHO':>7} "
+        f"{'BAND':>7} {'ANY_F1':>7} {'HIGH_P':>7} {'HIGH_R':>7} {'HIGH_F1':>7} {'HIGH_FP':>7}"
+    )
+    print(header)
+    print("-" * len(header))
+    ordered = sorted(metric_map.items(), key=lambda x: (float(x[1].get("mae", 999.0)), -float(x[1].get("spearman", 0.0))))
+    for name, metrics in ordered:
+        any_cov = metrics.get("any_coverage") if isinstance(metrics.get("any_coverage"), dict) else {}
+        high_cov = metrics.get("high_coverage") if isinstance(metrics.get("high_coverage"), dict) else {}
+        print(
+            f"{name:<30} "
+            f"{float(metrics.get('mae', 0.0)):>7.4f} "
+            f"{float(metrics.get('rmse', 0.0)):>7.4f} "
+            f"{float(metrics.get('bias_pred_minus_gt', 0.0)):>7.4f} "
+            f"{float(metrics.get('pearson', 0.0)):>7.4f} "
+            f"{float(metrics.get('spearman', 0.0)):>7.4f} "
+            f"{float(metrics.get('band_accuracy', 0.0)):>7.4f} "
+            f"{float(any_cov.get('f1', 0.0)):>7.4f} "
+            f"{float(high_cov.get('precision', 0.0)):>7.4f} "
+            f"{float(high_cov.get('recall', 0.0)):>7.4f} "
+            f"{float(high_cov.get('f1', 0.0)):>7.4f} "
+            f"{float(high_cov.get('fp_rate', 0.0)):>7.4f}"
         )
 
 
@@ -445,7 +549,8 @@ def main() -> int:
         batch_size=args.batch_size,
         max_length=args.max_length,
     )
-    metrics = _metrics(scored_rows, high_threshold=high_threshold, mid_threshold=mid_threshold)
+    aggregator_metrics = _all_aggregator_metrics(scored_rows, high_threshold=high_threshold, mid_threshold=mid_threshold)
+    metrics = aggregator_metrics.get("mean") or next(iter(aggregator_metrics.values()))
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     prefix = _clean_text(args.save_prefix) or "overall_gt_vs_finetuned_ce"
@@ -463,6 +568,7 @@ def main() -> int:
         "high_threshold": float(high_threshold),
         "mid_threshold": float(mid_threshold),
         "metrics": metrics,
+        "aggregator_metrics": aggregator_metrics,
         "output_json": str(output_json),
         "details_output": str(details_output),
         "elapsed_sec": float(time.time() - started),
@@ -470,7 +576,8 @@ def main() -> int:
     output_json.write_text(json.dumps(summary, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     _write_jsonl(details_output, scored_rows)
 
-    _print_metrics(metrics)
+    _print_aggregator_table(aggregator_metrics)
+    _print_single_metrics(metrics)
     print(f"\noutput_json={output_json}")
     print(f"details_output={details_output}")
     print(f"elapsed_sec={time.time() - started:.2f}")
