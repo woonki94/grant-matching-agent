@@ -81,11 +81,11 @@ Important calibration rules:
 - Use the full 0..1 range. Near-boundary scores are allowed when the evidence is genuinely borderline.
 
 Output MUST be exactly one JSON object:
-{
+{{
   "items": [
-    {"q": <int>, "score": <float 0..1>}
+    {{"q": <int>, "score": <float 0..1>}}
   ]
-}
+}}
 
 Rules:
 - Include exactly one item for each input q.
@@ -291,7 +291,20 @@ def _select_varied_subset(
         buckets[(_clean_text(item.get("proxy_band")), _clean_text(item.get("aspect_pattern")))].append(item)
 
     band_rank = {"high": 0, "mid": 1, "low": 2}
-    bucket_keys = sorted(buckets, key=lambda key: (band_rank.get(key[0], 99), key[1]))
+
+    def interleaved_bucket_keys(keys: Iterable[Tuple[str, str]]) -> List[Tuple[str, str]]:
+        by_band: Dict[str, List[Tuple[str, str]]] = defaultdict(list)
+        for key in sorted(keys, key=lambda x: (band_rank.get(x[0], 99), x[1])):
+            by_band[key[0]].append(key)
+        out: List[Tuple[str, str]] = []
+        max_len = max((len(v) for v in by_band.values()), default=0)
+        for i in range(max_len):
+            for band in ("high", "mid", "low"):
+                if i < len(by_band.get(band, [])):
+                    out.append(by_band[band][i])
+        return out
+
+    bucket_keys = interleaved_bucket_keys(buckets.keys())
     selected: List[Dict[str, Any]] = []
     selected_ids: set[str] = set()
     per_query_counts: Counter[str] = Counter()
@@ -326,7 +339,7 @@ def _select_varied_subset(
                 buckets = defaultdict(deque)
                 for item in sorted(remaining, key=_candidate_sort_key):
                     buckets[(_clean_text(item.get("proxy_band")), _clean_text(item.get("aspect_pattern")))].append(item)
-                bucket_keys = sorted(buckets, key=lambda key: (band_rank.get(key[0], 99), key[1]))
+                bucket_keys = interleaved_bucket_keys(buckets.keys())
     return selected
 
 
