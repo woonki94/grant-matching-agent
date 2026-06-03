@@ -28,11 +28,13 @@ EVAL_EVERY_STEPS="${EVAL_EVERY_STEPS:-100}"
 
 LOSS_PAIR_WEIGHT="${LOSS_PAIR_WEIGHT:-0.04}"
 LOSS_KL_WEIGHT="${LOSS_KL_WEIGHT:-0.08}"
-LOSS_MSE_WEIGHT="${LOSS_MSE_WEIGHT:-1.20}"
+LOSS_MSE_WEIGHT="${LOSS_MSE_WEIGHT:-1.35}"
 LOSS_CLUSTER_MARGIN_WEIGHT="${LOSS_CLUSTER_MARGIN_WEIGHT:-0.35}"
-LOSS_CALIBRATION_WEIGHT="${LOSS_CALIBRATION_WEIGHT:-1.75}"
-LOSS_ORDINAL_WEIGHT="${LOSS_ORDINAL_WEIGHT:-0.65}"
-LOSS_COVERAGE_WEIGHT="${LOSS_COVERAGE_WEIGHT:-0.60}"
+LOSS_CALIBRATION_WEIGHT="${LOSS_CALIBRATION_WEIGHT:-1.50}"
+LOSS_ORDINAL_WEIGHT="${LOSS_ORDINAL_WEIGHT:-0.55}"
+LOSS_COVERAGE_WEIGHT="${LOSS_COVERAGE_WEIGHT:-0.50}"
+LOSS_CLEAR_BAND_WEIGHT="${LOSS_CLEAR_BAND_WEIGHT:-0.85}"
+LOSS_GLOBAL_PAIR_WEIGHT="${LOSS_GLOBAL_PAIR_WEIGHT:-0.30}"
 LOSS_ANY_COVERAGE_WEIGHT="${LOSS_ANY_COVERAGE_WEIGHT:-1.25}"
 LOSS_HIGH_COVERAGE_WEIGHT="${LOSS_HIGH_COVERAGE_WEIGHT:-1.10}"
 CALIBRATION_HIGH_WEIGHT="${CALIBRATION_HIGH_WEIGHT:-1.55}"
@@ -40,14 +42,27 @@ CALIBRATION_MID_WEIGHT="${CALIBRATION_MID_WEIGHT:-1.75}"
 CALIBRATION_LOW_WEIGHT="${CALIBRATION_LOW_WEIGHT:-1.20}"
 CALIBRATION_MID_LOW_WEIGHT="${CALIBRATION_MID_LOW_WEIGHT:-2.05}"
 CALIBRATION_MID_HIGH_WEIGHT="${CALIBRATION_MID_HIGH_WEIGHT:-2.15}"
-ORDINAL_MID_BOUNDARY_WEIGHT="${ORDINAL_MID_BOUNDARY_WEIGHT:-1.65}"
-ORDINAL_HIGH_BOUNDARY_WEIGHT="${ORDINAL_HIGH_BOUNDARY_WEIGHT:-1.35}"
-COVERAGE_BOUNDARY_MARGIN="${COVERAGE_BOUNDARY_MARGIN:-0.0}"
+ORDINAL_MID_BOUNDARY_WEIGHT="${ORDINAL_MID_BOUNDARY_WEIGHT:-1.55}"
+ORDINAL_HIGH_BOUNDARY_WEIGHT="${ORDINAL_HIGH_BOUNDARY_WEIGHT:-1.30}"
+COVERAGE_BOUNDARY_MARGIN="${COVERAGE_BOUNDARY_MARGIN:-0.05}"
 COVERAGE_ANY_POS_WEIGHT="${COVERAGE_ANY_POS_WEIGHT:-1.35}"
 COVERAGE_ANY_NEG_WEIGHT="${COVERAGE_ANY_NEG_WEIGHT:-1.10}"
 COVERAGE_HIGH_POS_WEIGHT="${COVERAGE_HIGH_POS_WEIGHT:-1.55}"
 COVERAGE_HIGH_NEG_WEIGHT="${COVERAGE_HIGH_NEG_WEIGHT:-1.45}"
 COVERAGE_ASPECT_WEIGHT_MAP="${COVERAGE_ASPECT_WEIGHT_MAP:-topic=1.0,approach=1.05,objective=1.35}"
+CLEAR_LOW_MAX="${CLEAR_LOW_MAX:-0.15}"
+CLEAR_MID_MIN="${CLEAR_MID_MIN:-0.40}"
+CLEAR_MID_MAX="${CLEAR_MID_MAX:-0.60}"
+CLEAR_HIGH_MIN="${CLEAR_HIGH_MIN:-0.85}"
+CLEAR_BAND_LOW_WEIGHT="${CLEAR_BAND_LOW_WEIGHT:-1.0}"
+CLEAR_BAND_MID_WEIGHT="${CLEAR_BAND_MID_WEIGHT:-1.35}"
+CLEAR_BAND_HIGH_WEIGHT="${CLEAR_BAND_HIGH_WEIGHT:-1.10}"
+GLOBAL_PAIR_MIN_GAP="${GLOBAL_PAIR_MIN_GAP:-0.40}"
+GLOBAL_PAIR_MARGIN_MIN="${GLOBAL_PAIR_MARGIN_MIN:-0.05}"
+GLOBAL_PAIR_MARGIN_MAX="${GLOBAL_PAIR_MARGIN_MAX:-0.55}"
+GLOBAL_PAIR_MAX_PAIRS="${GLOBAL_PAIR_MAX_PAIRS:-2048}"
+GLOBAL_PAIR_CROSS_QUERY_ONLY="${GLOBAL_PAIR_CROSS_QUERY_ONLY:-true}"
+GLOBAL_PAIR_SAME_ASPECT_ONLY="${GLOBAL_PAIR_SAME_ASPECT_ONLY:-false}"
 TEACHER_TEMPERATURE="${TEACHER_TEMPERATURE:-0.80}"
 CLUSTER_MARGIN_HM="${CLUSTER_MARGIN_HM:-0.18}"
 CLUSTER_MARGIN_ML="${CLUSTER_MARGIN_ML:-0.18}"
@@ -111,6 +126,8 @@ if [[ "${AUTO_OUTPUT_HASH}" == "true" ]]; then
     "loss_calibration_weight=${LOSS_CALIBRATION_WEIGHT}" \
     "loss_ordinal_weight=${LOSS_ORDINAL_WEIGHT}" \
     "loss_coverage_weight=${LOSS_COVERAGE_WEIGHT}" \
+    "loss_clear_band_weight=${LOSS_CLEAR_BAND_WEIGHT}" \
+    "loss_global_pair_weight=${LOSS_GLOBAL_PAIR_WEIGHT}" \
     "loss_any_coverage_weight=${LOSS_ANY_COVERAGE_WEIGHT}" \
     "loss_high_coverage_weight=${LOSS_HIGH_COVERAGE_WEIGHT}" \
     "calibration_high_weight=${CALIBRATION_HIGH_WEIGHT}" \
@@ -126,6 +143,19 @@ if [[ "${AUTO_OUTPUT_HASH}" == "true" ]]; then
     "coverage_high_pos_weight=${COVERAGE_HIGH_POS_WEIGHT}" \
     "coverage_high_neg_weight=${COVERAGE_HIGH_NEG_WEIGHT}" \
     "coverage_aspect_weight_map=${COVERAGE_ASPECT_WEIGHT_MAP}" \
+    "clear_low_max=${CLEAR_LOW_MAX}" \
+    "clear_mid_min=${CLEAR_MID_MIN}" \
+    "clear_mid_max=${CLEAR_MID_MAX}" \
+    "clear_high_min=${CLEAR_HIGH_MIN}" \
+    "clear_band_low_weight=${CLEAR_BAND_LOW_WEIGHT}" \
+    "clear_band_mid_weight=${CLEAR_BAND_MID_WEIGHT}" \
+    "clear_band_high_weight=${CLEAR_BAND_HIGH_WEIGHT}" \
+    "global_pair_min_gap=${GLOBAL_PAIR_MIN_GAP}" \
+    "global_pair_margin_min=${GLOBAL_PAIR_MARGIN_MIN}" \
+    "global_pair_margin_max=${GLOBAL_PAIR_MARGIN_MAX}" \
+    "global_pair_max_pairs=${GLOBAL_PAIR_MAX_PAIRS}" \
+    "global_pair_cross_query_only=${GLOBAL_PAIR_CROSS_QUERY_ONLY}" \
+    "global_pair_same_aspect_only=${GLOBAL_PAIR_SAME_ASPECT_ONLY}" \
     "teacher_temperature=${TEACHER_TEMPERATURE}" \
     "cluster_margin_hm=${CLUSTER_MARGIN_HM}" \
     "cluster_margin_ml=${CLUSTER_MARGIN_ML}" \
@@ -182,6 +212,8 @@ CMD=(
   --loss-calibration-weight "${LOSS_CALIBRATION_WEIGHT}"
   --loss-ordinal-weight "${LOSS_ORDINAL_WEIGHT}"
   --loss-coverage-weight "${LOSS_COVERAGE_WEIGHT}"
+  --loss-clear-band-weight "${LOSS_CLEAR_BAND_WEIGHT}"
+  --loss-global-pair-weight "${LOSS_GLOBAL_PAIR_WEIGHT}"
   --loss-any-coverage-weight "${LOSS_ANY_COVERAGE_WEIGHT}"
   --loss-high-coverage-weight "${LOSS_HIGH_COVERAGE_WEIGHT}"
   --calibration-high-weight "${CALIBRATION_HIGH_WEIGHT}"
@@ -197,6 +229,17 @@ CMD=(
   --coverage-high-pos-weight "${COVERAGE_HIGH_POS_WEIGHT}"
   --coverage-high-neg-weight "${COVERAGE_HIGH_NEG_WEIGHT}"
   --coverage-aspect-weight-map "${COVERAGE_ASPECT_WEIGHT_MAP}"
+  --clear-low-max "${CLEAR_LOW_MAX}"
+  --clear-mid-min "${CLEAR_MID_MIN}"
+  --clear-mid-max "${CLEAR_MID_MAX}"
+  --clear-high-min "${CLEAR_HIGH_MIN}"
+  --clear-band-low-weight "${CLEAR_BAND_LOW_WEIGHT}"
+  --clear-band-mid-weight "${CLEAR_BAND_MID_WEIGHT}"
+  --clear-band-high-weight "${CLEAR_BAND_HIGH_WEIGHT}"
+  --global-pair-min-gap "${GLOBAL_PAIR_MIN_GAP}"
+  --global-pair-margin-min "${GLOBAL_PAIR_MARGIN_MIN}"
+  --global-pair-margin-max "${GLOBAL_PAIR_MARGIN_MAX}"
+  --global-pair-max-pairs "${GLOBAL_PAIR_MAX_PAIRS}"
   --teacher-temperature "${TEACHER_TEMPERATURE}"
   --cluster-margin-hm "${CLUSTER_MARGIN_HM}"
   --cluster-margin-ml "${CLUSTER_MARGIN_ML}"
@@ -219,6 +262,14 @@ CMD=(
 
 if [[ "${STAGE2_FREEZE_BACKBONE}" == "true" ]]; then
   CMD+=(--stage2-freeze-backbone)
+fi
+
+if [[ "${GLOBAL_PAIR_CROSS_QUERY_ONLY}" == "false" ]]; then
+  CMD+=(--no-global-pair-cross-query-only)
+fi
+
+if [[ "${GLOBAL_PAIR_SAME_ASPECT_ONLY}" == "true" ]]; then
+  CMD+=(--global-pair-same-aspect-only)
 fi
 
 if [[ "${FP16}" == "true" ]]; then

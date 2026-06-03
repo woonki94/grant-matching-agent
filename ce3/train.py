@@ -364,8 +364,9 @@ class ListCollator:
         scores: List[float] = []
         cluster_ids: List[int] = []
         aspect_ids: List[int] = []
+        list_ids: List[int] = []
         list_sizes: List[int] = []
-        for row in batch:
+        for row_idx, row in enumerate(batch):
             query = _clean_text(row.get("query_text"))
             aspect = _clean_text(row.get("aspect")) or aspect_from_prefixed_query(query)
             if not query or aspect not in ASPECTS:
@@ -391,6 +392,7 @@ class ListCollator:
                     )
                 )
                 aspect_ids.append(aspect_id_from_name(aspect))
+                list_ids.append(int(row_idx))
                 used += 1
             if used > 0:
                 list_sizes.append(used)
@@ -403,6 +405,7 @@ class ListCollator:
             "scores": torch.tensor(scores, dtype=torch.float32),
             "cluster_ids": torch.tensor(cluster_ids, dtype=torch.long),
             "aspect_ids": torch.tensor(aspect_ids, dtype=torch.long),
+            "list_ids": torch.tensor(list_ids, dtype=torch.long),
             "list_sizes": list_sizes,
         }
 
@@ -680,6 +683,102 @@ def coverage_boundary_losses(
     return any_loss, high_loss
 
 
+def clear_band_calibration_loss(
+    logits_flat: torch.Tensor,
+    scores_flat: torch.Tensor,
+    *,
+    high_threshold: float,
+    mid_threshold: float,
+    clear_low_max: float,
+    clear_mid_min: float,
+    clear_mid_max: float,
+    clear_high_min: float,
+    low_weight: float,
+    mid_weight: float,
+    high_weight: float,
+) -> torch.Tensor:
+    """Anchor only unambiguous teacher scores to the low/mid/high bands."""
+
+    if logits_flat.numel() <= 0:
+        return logits_flat.sum() * 0.0
+    probs = torch.sigmoid(logits_flat)
+    scores = scores_flat.to(device=logits_flat.device, dtype=logits_flat.dtype).clamp(0.0, 1.0)
+
+    clear_low = scores <= float(clear_low_max)
+    clear_mid = (scores >= float(clear_mid_min)) & (scores <= float(clear_mid_max))
+    clear_high = scores >= float(clear_high_min)
+
+    parts: List[torch.Tensor] = []
+    weights: List[float] = []
+    low_w = max(0.0, float(low_weight))
+    mid_w = max(0.0, float(mid_weight))
+    high_w = max(0.0, float(high_weight))
+
+    if bool(clear_low.any().item()) and low_w > 0.0:
+        low_probs = probs[clear_low]
+        parts.append(F.relu(low_probs - float(mid_threshold)).mean() * low_w)
+        weights.append(low_w)
+    if bool(clear_mid.any().item()) and mid_w > 0.0:
+        mid_probs = probs[clear_mid]
+        mid_loss = F.relu(float(mid_threshold) - mid_probs).mean() + F.relu(mid_probs - float(high_threshold)).mean()
+        parts.append(mid_loss * mid_w)
+        weights.append(mid_w)
+    if bool(clear_high.any().item()) and high_w > 0.0:
+        high_probs = probs[clear_high]
+        parts.append(F.relu(float(high_threshold) - high_probs).mean() * high_w)
+        weights.append(high_w)
+
+    if not parts:
+        return logits_flat.sum() * 0.0
+    return torch.stack(parts).sum() / max(1e-6, float(sum(weights)))
+
+
+def global_pairwise_score_loss(
+    logits_flat: torch.Tensor,
+    scores_flat: torch.Tensor,
+    list_ids_flat: torch.Tensor,
+    aspect_ids_flat: torch.Tensor,
+    *,
+    min_gap: float,
+    margin_min: float,
+    margin_max: float,
+    max_pairs: int,
+    cross_query_only: bool,
+    same_aspect_only: bool,
+) -> torch.Tensor:
+    """Compare teacher-stronger examples against weaker examples across the batch."""
+
+    n = int(logits_flat.numel())
+    if n < 2:
+        return logits_flat.sum() * 0.0
+
+    scores = scores_flat.to(device=logits_flat.device, dtype=logits_flat.dtype).clamp(0.0, 1.0)
+    list_ids = list_ids_flat.to(device=logits_flat.device, dtype=torch.long).view(-1)
+    aspect_ids = aspect_ids_flat.to(device=logits_flat.device, dtype=torch.long).view(-1)
+    score_gap = scores.view(-1, 1) - scores.view(1, -1)
+    mask = score_gap >= float(min_gap)
+    if bool(cross_query_only):
+        mask = mask & (list_ids.view(-1, 1) != list_ids.view(1, -1))
+    if bool(same_aspect_only):
+        mask = mask & (aspect_ids.view(-1, 1) == aspect_ids.view(1, -1))
+
+    pair_idx = mask.nonzero(as_tuple=False)
+    if int(pair_idx.numel()) <= 0:
+        return logits_flat.sum() * 0.0
+
+    gaps = score_gap[pair_idx[:, 0], pair_idx[:, 1]]
+    cap = int(max_pairs)
+    if cap > 0 and int(pair_idx.shape[0]) > cap:
+        _, keep = torch.topk(gaps, k=cap, largest=True)
+        pair_idx = pair_idx[keep]
+        gaps = gaps[keep]
+
+    pos_logits = logits_flat[pair_idx[:, 0]]
+    neg_logits = logits_flat[pair_idx[:, 1]]
+    margins = gaps.clamp(min=float(margin_min), max=float(margin_max))
+    return F.relu(margins - (pos_logits - neg_logits)).mean()
+
+
 def pair_loss_from_batch(model: nn.Module, batch: Dict[str, Any], device: torch.device, *, margin_min: float, margin_max: float) -> torch.Tensor:
     pos = _to_device(batch["pos"], device)
     neg = _to_device(batch["neg"], device)
@@ -704,11 +803,14 @@ def list_losses_from_batch(model: nn.Module, batch: Dict[str, Any], device: torc
             "coverage_any": zero,
             "coverage_high": zero,
             "coverage": zero,
+            "clear_band": zero,
+            "global_pair": zero,
         }
     enc = _to_device(batch["enc"], device)
     scores = batch["scores"].to(device)
     clusters = batch["cluster_ids"].to(device)
     aspect_ids = batch["aspect_ids"].to(device)
+    list_ids = batch["list_ids"].to(device)
     logits = model_logits(model, enc, aspect_ids=aspect_ids).view(-1)
     kl, mse = listwise_kl_mse_loss(logits, scores, batch["list_sizes"], temperature=args.teacher_temperature)
     cluster = cluster_margin_loss(
@@ -756,6 +858,31 @@ def list_losses_from_batch(model: nn.Module, batch: Dict[str, Any], device: torc
     any_weight = max(0.0, float(args.loss_any_coverage_weight))
     high_weight = max(0.0, float(args.loss_high_coverage_weight))
     coverage = (any_weight * coverage_any + high_weight * coverage_high) / max(1e-6, any_weight + high_weight)
+    clear_band = clear_band_calibration_loss(
+        logits,
+        scores,
+        high_threshold=args.high_threshold,
+        mid_threshold=args.mid_threshold,
+        clear_low_max=args.clear_low_max,
+        clear_mid_min=args.clear_mid_min,
+        clear_mid_max=args.clear_mid_max,
+        clear_high_min=args.clear_high_min,
+        low_weight=args.clear_band_low_weight,
+        mid_weight=args.clear_band_mid_weight,
+        high_weight=args.clear_band_high_weight,
+    )
+    global_pair = global_pairwise_score_loss(
+        logits,
+        scores,
+        list_ids,
+        aspect_ids,
+        min_gap=args.global_pair_min_gap,
+        margin_min=args.global_pair_margin_min,
+        margin_max=args.global_pair_margin_max,
+        max_pairs=args.global_pair_max_pairs,
+        cross_query_only=bool(args.global_pair_cross_query_only),
+        same_aspect_only=bool(args.global_pair_same_aspect_only),
+    )
     return {
         "kl": kl,
         "mse": mse,
@@ -765,6 +892,8 @@ def list_losses_from_batch(model: nn.Module, batch: Dict[str, Any], device: torc
         "coverage_any": coverage_any,
         "coverage_high": coverage_high,
         "coverage": coverage,
+        "clear_band": clear_band,
+        "global_pair": global_pair,
     }
 
 
@@ -777,6 +906,8 @@ def total_loss(pair_loss: torch.Tensor, list_losses: Dict[str, torch.Tensor], ar
         + float(args.loss_calibration_weight) * list_losses["calibration"]
         + float(args.loss_ordinal_weight) * list_losses["ordinal"]
         + float(args.loss_coverage_weight) * list_losses["coverage"]
+        + float(args.loss_clear_band_weight) * list_losses["clear_band"]
+        + float(args.loss_global_pair_weight) * list_losses["global_pair"]
     )
 
 
@@ -834,6 +965,8 @@ def evaluate(model: nn.Module, pair_loader: DataLoader, list_loader: DataLoader,
     coverage_any_vals: List[float] = []
     coverage_high_vals: List[float] = []
     coverage_vals: List[float] = []
+    clear_band_vals: List[float] = []
+    global_pair_vals: List[float] = []
     all_probs: List[torch.Tensor] = []
     all_clusters: List[torch.Tensor] = []
     ndcg_vals: List[float] = []
@@ -851,6 +984,8 @@ def evaluate(model: nn.Module, pair_loader: DataLoader, list_loader: DataLoader,
         coverage_any_vals.append(float(losses["coverage_any"].detach().cpu().item()))
         coverage_high_vals.append(float(losses["coverage_high"].detach().cpu().item()))
         coverage_vals.append(float(losses["coverage"].detach().cpu().item()))
+        clear_band_vals.append(float(losses["clear_band"].detach().cpu().item()))
+        global_pair_vals.append(float(losses["global_pair"].detach().cpu().item()))
 
         enc = _to_device(batch["enc"], device)
         aspect_ids = batch["aspect_ids"].to(device)
@@ -899,6 +1034,8 @@ def evaluate(model: nn.Module, pair_loader: DataLoader, list_loader: DataLoader,
     coverage_any_loss = sum(coverage_any_vals) / max(1, len(coverage_any_vals))
     coverage_high_loss = sum(coverage_high_vals) / max(1, len(coverage_high_vals))
     coverage_loss = sum(coverage_vals) / max(1, len(coverage_vals))
+    clear_band_loss = sum(clear_band_vals) / max(1, len(clear_band_vals))
+    global_pair_loss = sum(global_pair_vals) / max(1, len(global_pair_vals))
     val_total_loss = (
         float(args.loss_pair_weight) * pair_loss
         + float(args.loss_kl_weight) * kl_loss
@@ -907,6 +1044,8 @@ def evaluate(model: nn.Module, pair_loader: DataLoader, list_loader: DataLoader,
         + float(args.loss_calibration_weight) * calibration_loss
         + float(args.loss_ordinal_weight) * ordinal_loss
         + float(args.loss_coverage_weight) * coverage_loss
+        + float(args.loss_clear_band_weight) * clear_band_loss
+        + float(args.loss_global_pair_weight) * global_pair_loss
     )
     return {
         "total_loss": float(val_total_loss),
@@ -919,6 +1058,8 @@ def evaluate(model: nn.Module, pair_loader: DataLoader, list_loader: DataLoader,
         "coverage_loss": float(coverage_loss),
         "coverage_any_loss": float(coverage_any_loss),
         "coverage_high_loss": float(coverage_high_loss),
+        "clear_band_loss": float(clear_band_loss),
+        "global_pair_loss": float(global_pair_loss),
         "ndcg@10": sum(ndcg_vals) / max(1, len(ndcg_vals)),
         "mrr@10": sum(mrr_vals) / max(1, len(mrr_vals)),
         "recall@50": sum(recall_vals) / max(1, len(recall_vals)),
@@ -1051,7 +1192,20 @@ def train_stage(
     amp_ctx = torch.autocast(device_type="cuda", dtype=torch.float16) if use_amp else nullcontext()
     train_log_every_steps = max(0, int(getattr(args, "train_log_every_steps", 1)))
     eval_every_steps = max(0, int(getattr(args, "eval_every_steps", 100)))
-    loss_names = ("total", "pair", "kl", "mse", "cluster", "calibration", "ordinal", "coverage", "coverage_any", "coverage_high")
+    loss_names = (
+        "total",
+        "pair",
+        "kl",
+        "mse",
+        "cluster",
+        "calibration",
+        "ordinal",
+        "coverage",
+        "coverage_any",
+        "coverage_high",
+        "clear_band",
+        "global_pair",
+    )
 
     for epoch in range(1, int(args.stage1_epochs if stage == 1 else args.stage2_epochs) + 1):
         model.train()
@@ -1143,6 +1297,8 @@ def train_stage(
             hist["coverage"].append(float(l_losses["coverage"].detach().cpu().item()))
             hist["coverage_any"].append(float(l_losses["coverage_any"].detach().cpu().item()))
             hist["coverage_high"].append(float(l_losses["coverage_high"].detach().cpu().item()))
+            hist["clear_band"].append(float(l_losses["clear_band"].detach().cpu().item()))
+            hist["global_pair"].append(float(l_losses["global_pair"].detach().cpu().item()))
             step_hist["total"].append(float(loss.detach().cpu().item() * float(args.grad_accum_steps)))
             step_hist["pair"].append(float(p_loss.detach().cpu().item()))
             step_hist["kl"].append(float(l_losses["kl"].detach().cpu().item()))
@@ -1153,6 +1309,8 @@ def train_stage(
             step_hist["coverage"].append(float(l_losses["coverage"].detach().cpu().item()))
             step_hist["coverage_any"].append(float(l_losses["coverage_any"].detach().cpu().item()))
             step_hist["coverage_high"].append(float(l_losses["coverage_high"].detach().cpu().item()))
+            step_hist["clear_band"].append(float(l_losses["clear_band"].detach().cpu().item()))
+            step_hist["global_pair"].append(float(l_losses["global_pair"].detach().cpu().item()))
             if accum >= int(args.grad_accum_steps):
                 if float(args.max_grad_norm) > 0.0:
                     torch.nn.utils.clip_grad_norm_(model.parameters(), float(args.max_grad_norm))
@@ -1170,6 +1328,8 @@ def train_stage(
                     kl=f"{latest.get('kl', 0.0):.4f}",
                     ord=f"{latest.get('ordinal', 0.0):.4f}",
                     cov=f"{latest.get('coverage', 0.0):.4f}",
+                    cb=f"{latest.get('clear_band', 0.0):.4f}",
+                    gp=f"{latest.get('global_pair', 0.0):.4f}",
                 )
         if accum > 0:
             if float(args.max_grad_norm) > 0.0:
@@ -1246,6 +1406,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--loss-calibration-weight", type=float, default=0.1)
     p.add_argument("--loss-ordinal-weight", type=float, default=0.0)
     p.add_argument("--loss-coverage-weight", type=float, default=0.0)
+    p.add_argument("--loss-clear-band-weight", type=float, default=0.0)
+    p.add_argument("--loss-global-pair-weight", type=float, default=0.0)
     p.add_argument("--loss-any-coverage-weight", type=float, default=1.0)
     p.add_argument("--loss-high-coverage-weight", type=float, default=1.0)
     p.add_argument("--calibration-high-weight", type=float, default=1.0)
@@ -1261,6 +1423,19 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--coverage-high-pos-weight", type=float, default=1.0)
     p.add_argument("--coverage-high-neg-weight", type=float, default=1.0)
     p.add_argument("--coverage-aspect-weight-map", type=str, default="default=1.0")
+    p.add_argument("--clear-low-max", type=float, default=0.15)
+    p.add_argument("--clear-mid-min", type=float, default=0.40)
+    p.add_argument("--clear-mid-max", type=float, default=0.60)
+    p.add_argument("--clear-high-min", type=float, default=0.85)
+    p.add_argument("--clear-band-low-weight", type=float, default=1.0)
+    p.add_argument("--clear-band-mid-weight", type=float, default=1.0)
+    p.add_argument("--clear-band-high-weight", type=float, default=1.0)
+    p.add_argument("--global-pair-min-gap", type=float, default=0.40)
+    p.add_argument("--global-pair-margin-min", type=float, default=0.05)
+    p.add_argument("--global-pair-margin-max", type=float, default=0.55)
+    p.add_argument("--global-pair-max-pairs", type=int, default=2048)
+    p.add_argument("--global-pair-cross-query-only", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--global-pair-same-aspect-only", action=argparse.BooleanOptionalAction, default=False)
     p.add_argument("--cluster-margin-hm", type=float, default=0.12)
     p.add_argument("--cluster-margin-ml", type=float, default=0.12)
     p.add_argument("--cluster-margin-hl", type=float, default=0.30)
@@ -1367,8 +1542,17 @@ def main() -> int:
         "long_prefixes": True,
         "posthoc_calibration": False,
         "loss_coverage_weight": float(args.loss_coverage_weight),
+        "loss_clear_band_weight": float(args.loss_clear_band_weight),
+        "loss_global_pair_weight": float(args.loss_global_pair_weight),
         "coverage_boundary_margin": float(args.coverage_boundary_margin),
         "coverage_aspect_weight_map": _parse_aspect_weight_map(args.coverage_aspect_weight_map),
+        "clear_band_thresholds": {
+            "low_max": float(args.clear_low_max),
+            "mid_min": float(args.clear_mid_min),
+            "mid_max": float(args.clear_mid_max),
+            "high_min": float(args.clear_high_min),
+        },
+        "global_pair_min_gap": float(args.global_pair_min_gap),
         "stage2_freeze_backbone": bool(args.stage2_freeze_backbone),
         "stage2_train_last_layers": int(args.stage2_train_last_layers),
         "wandb_enabled": bool(_wandb_enabled(args)),
@@ -1389,8 +1573,17 @@ def main() -> int:
             "long_prefixes": True,
             "posthoc_calibration": False,
             "loss_coverage_weight": float(args.loss_coverage_weight),
+            "loss_clear_band_weight": float(args.loss_clear_band_weight),
+            "loss_global_pair_weight": float(args.loss_global_pair_weight),
             "coverage_boundary_margin": float(args.coverage_boundary_margin),
             "coverage_aspect_weight_map": _parse_aspect_weight_map(args.coverage_aspect_weight_map),
+            "clear_band_thresholds": {
+                "low_max": float(args.clear_low_max),
+                "mid_min": float(args.clear_mid_min),
+                "mid_max": float(args.clear_mid_max),
+                "high_min": float(args.clear_high_min),
+            },
+            "global_pair_min_gap": float(args.global_pair_min_gap),
             "stage2_freeze_backbone": bool(args.stage2_freeze_backbone),
             "stage2_train_last_layers": int(args.stage2_train_last_layers),
         },
