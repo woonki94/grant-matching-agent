@@ -32,7 +32,10 @@ TEST_INPUT_DEFAULT = "ce3/dataset/splits/llm_distill_all_listwise_test.jsonl"
 OUTPUT_DEFAULT = "ce3/dataset/ground_truth/overall_coverage_test_subset_claude_opus.jsonl"
 ASPECTS = ("topic", "approach", "objective")
 PREFIXES = ("[TOPIC]", "[APPROACH]", "[OBJECTIVE]")
-DEFAULT_MAX_PAIRS = 10
+DEFAULT_MAX_PAIRS = 110
+DEFAULT_TRAIN_PERCENT = 90.0
+DEFAULT_VAL_PERCENT = 10.0
+DEFAULT_TEST_PERCENT = 10.0
 DEFAULT_BATCH_SIZE = 24
 DEFAULT_MAX_RETRIES = 2
 DEFAULT_PER_QUERY_CAP = 3
@@ -343,6 +346,106 @@ def _select_varied_subset(
     return selected
 
 
+def _split_type_key(item: Dict[str, Any]) -> Tuple[str, str]:
+    return (_clean_text(item.get("proxy_band")), _clean_text(item.get("aspect_pattern")))
+
+
+def _split_targets_from_percentages(total: int, percentages: Dict[str, float]) -> Dict[str, int]:
+    total = max(0, int(total))
+    pct_sum = sum(max(0.0, float(v)) for v in percentages.values())
+    if total <= 0:
+        return {"train": 0, "val": 0, "test": 0}
+    if pct_sum <= 0.0:
+        return {"train": total, "val": 0, "test": 0}
+    raw = {name: total * max(0.0, float(pct)) / pct_sum for name, pct in percentages.items()}
+    scaled = {name: int(raw[name]) for name in percentages}
+    remaining = total - sum(scaled.values())
+    order = sorted(percentages, key=lambda name: (raw[name] - scaled[name], max(0.0, float(percentages[name]))), reverse=True)
+    for name in order[:remaining]:
+        scaled[name] += 1
+    return scaled
+
+
+def _split_balanced_subset(
+    selected: Sequence[Dict[str, Any]],
+    *,
+    split_targets: Dict[str, int],
+) -> Dict[str, List[Dict[str, Any]]]:
+    split_order = [name for name in ("train", "val", "test") if int(split_targets.get(name, 0)) > 0]
+    if not split_order:
+        return {"train": [], "val": [], "test": []}
+
+    grouped: Dict[Tuple[str, str], Deque[Dict[str, Any]]] = defaultdict(deque)
+    for item in sorted(selected, key=lambda x: (_split_type_key(x), _candidate_sort_key(x))):
+        grouped[_split_type_key(item)].append(item)
+
+    band_rank = {"high": 0, "mid": 1, "low": 2}
+    type_keys = sorted(grouped, key=lambda key: (band_rank.get(key[0], 99), key[1]))
+    splits: Dict[str, List[Dict[str, Any]]] = {name: [] for name in ("train", "val", "test")}
+    type_counts: Dict[str, Counter[Tuple[str, str]]] = {name: Counter() for name in ("train", "val", "test")}
+    band_counts: Dict[str, Counter[str]] = {name: Counter() for name in ("train", "val", "test")}
+
+    def choose_split(item: Dict[str, Any]) -> str:
+        type_key = _split_type_key(item)
+        band = type_key[0]
+        candidates = [name for name in split_order if len(splits[name]) < int(split_targets.get(name, 0))]
+        if not candidates:
+            return split_order[-1]
+        return min(
+            candidates,
+            key=lambda name: (
+                type_counts[name][type_key] / max(1, int(split_targets.get(name, 0))),
+                band_counts[name][band] / max(1, int(split_targets.get(name, 0))),
+                len(splits[name]) / max(1, int(split_targets.get(name, 0))),
+                split_order.index(name),
+            ),
+        )
+
+    while any(grouped[key] for key in type_keys):
+        made_progress = False
+        for key in type_keys:
+            if not grouped[key]:
+                continue
+            if all(len(splits[name]) >= int(split_targets.get(name, 0)) for name in split_order):
+                break
+            item = grouped[key].popleft()
+            split_name = choose_split(item)
+            item = dict(item)
+            item["gt_split"] = split_name
+            splits[split_name].append(item)
+            type_counts[split_name][_split_type_key(item)] += 1
+            band_counts[split_name][_clean_text(item.get("proxy_band"))] += 1
+            made_progress = True
+        if not made_progress:
+            break
+
+    return splits
+
+
+def _split_output_paths(output: Path, args: argparse.Namespace) -> Dict[str, Path]:
+    suffix = output.suffix or ".jsonl"
+    stem = output.with_suffix("")
+    defaults = {
+        "train": output.parent / f"{stem.name}_train{suffix}",
+        "val": output.parent / f"{stem.name}_val{suffix}",
+        "test": output.parent / f"{stem.name}_test{suffix}",
+    }
+    overrides = {
+        "train": _clean_text(getattr(args, "train_output", "")),
+        "val": _clean_text(getattr(args, "val_output", "")),
+        "test": _clean_text(getattr(args, "test_output", "")),
+    }
+    return {name: _resolve_path(overrides[name]) if overrides[name] else path.resolve() for name, path in defaults.items()}
+
+
+def _split_summary(items: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
+    return {
+        "count": int(len(items)),
+        "proxy_bands": dict(Counter(_clean_text(x.get("proxy_band")) for x in items)),
+        "aspect_patterns": dict(Counter(_clean_text(x.get("aspect_pattern")) for x in items)),
+    }
+
+
 def _truncate_text(text: str, limit: int = MAX_TEXT_CHARS) -> str:
     clean = _normalize_ws(text)
     if len(clean) <= int(limit):
@@ -477,10 +580,19 @@ def _write_jsonl(path: Path, rows: Sequence[Dict[str, Any]]) -> None:
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Generate CE3 overall coverage ground truth on a deterministic varied test subset with Claude Opus.")
     p.add_argument("--test-input", type=str, default=TEST_INPUT_DEFAULT)
-    p.add_argument("--output", type=str, default=OUTPUT_DEFAULT)
+    p.add_argument("--output", type=str, default=OUTPUT_DEFAULT, help="Base output path used to derive *_train/val/test.jsonl files.")
+    p.add_argument("--train-output", type=str, default="")
+    p.add_argument("--val-output", type=str, default="")
+    p.add_argument("--test-output", type=str, default="")
     p.add_argument("--model-id", type=str, default="")
     p.add_argument("--allow-model-fallback", action="store_true")
-    p.add_argument("--max-pairs", type=int, default=DEFAULT_MAX_PAIRS)
+    p.add_argument("--train-pairs", type=int, default=None)
+    p.add_argument("--val-pairs", type=int, default=None)
+    p.add_argument("--test-pairs", type=int, default=None)
+    p.add_argument("--train-percent", type=float, default=DEFAULT_TRAIN_PERCENT)
+    p.add_argument("--val-percent", type=float, default=DEFAULT_VAL_PERCENT)
+    p.add_argument("--test-percent", type=float, default=DEFAULT_TEST_PERCENT)
+    p.add_argument("--max-pairs", type=int, default=DEFAULT_MAX_PAIRS, help="Total GT pairs to generate when split counts are not provided.")
     p.add_argument("--per-query-cap", type=int, default=DEFAULT_PER_QUERY_CAP)
     p.add_argument("--batch-size", type=int, default=DEFAULT_BATCH_SIZE)
     p.add_argument("--max-retries", type=int, default=DEFAULT_MAX_RETRIES)
@@ -497,13 +609,36 @@ def main() -> int:
     output = _resolve_path(args.output)
     if not test_input.exists():
         raise FileNotFoundError(f"Missing test listwise input: {test_input}")
-    if output.exists() and not bool(args.overwrite):
-        raise FileExistsError(f"Output already exists: {output}. Pass --overwrite to replace it.")
-    output.parent.mkdir(parents=True, exist_ok=True)
+    output_paths = _split_output_paths(output, args)
+    for path in output_paths.values():
+        path.parent.mkdir(parents=True, exist_ok=True)
 
     high_threshold = _clamp_01(args.high_threshold, HIGH_THRESHOLD)
     mid_threshold = min(high_threshold, _clamp_01(args.mid_threshold, MID_THRESHOLD))
-    max_pairs = max(1, int(args.max_pairs))
+    explicit_split_counts = any(x is not None for x in (args.train_pairs, args.val_pairs, args.test_pairs))
+    if explicit_split_counts:
+        split_targets = {
+            "train": max(0, int(args.train_pairs or 0)),
+            "val": max(0, int(args.val_pairs or 0)),
+            "test": max(0, int(args.test_pairs or 0)),
+        }
+    else:
+        split_targets = _split_targets_from_percentages(
+            max(1, int(args.max_pairs or DEFAULT_MAX_PAIRS)),
+            {
+                "train": max(0.0, float(args.train_percent)),
+                "val": max(0.0, float(args.val_percent)),
+                "test": max(0.0, float(args.test_percent)),
+            },
+        )
+    total_target_pairs = sum(split_targets.values())
+    if total_target_pairs <= 0:
+        raise RuntimeError(f"Split targets must select at least one pair: {split_targets}")
+    for split_name, target_count in split_targets.items():
+        path = output_paths[split_name]
+        if target_count > 0 and path.exists() and not bool(args.overwrite):
+            raise FileExistsError(f"{split_name} output already exists: {path}. Pass --overwrite to replace it.")
+
     per_query_cap = max(1, int(args.per_query_cap))
     batch_size = max(1, int(args.batch_size))
     max_retries = max(0, int(args.max_retries))
@@ -512,38 +647,61 @@ def main() -> int:
     candidates = _load_candidate_pairs(test_input, high_threshold=high_threshold, mid_threshold=mid_threshold)
     if not candidates:
         raise RuntimeError(f"No usable candidate pairs loaded from {test_input}")
-    selected = _select_varied_subset(candidates, max_pairs=max_pairs, per_query_cap=per_query_cap)
+    selected = _select_varied_subset(candidates, max_pairs=total_target_pairs, per_query_cap=per_query_cap)
+    split_items = _split_balanced_subset(selected, split_targets=split_targets)
+    selected_for_scoring = [item for split_name in ("train", "val", "test") for item in split_items.get(split_name, [])]
+    split_by_pair_id = {_clean_text(item.get("pair_id")): _clean_text(item.get("gt_split")) for item in selected_for_scoring}
 
     print(f"test_input={test_input}")
-    print(f"output={output}")
+    print(f"output_base={output}")
+    print(f"output_train={output_paths['train']}")
+    print(f"output_val={output_paths['val']}")
+    print(f"output_test={output_paths['test']}")
     print(f"model_id={model_id}")
-    print(f"candidate_pairs={len(candidates)} selected_pairs={len(selected)}")
-    print(f"selected_proxy_bands={dict(Counter(_clean_text(x.get('proxy_band')) for x in selected))}")
-    print(f"selected_aspect_patterns={dict(Counter(_clean_text(x.get('aspect_pattern')) for x in selected))}")
+    print(f"candidate_pairs={len(candidates)} selected_pairs={len(selected_for_scoring)} split_targets={split_targets}")
+    for split_name in ("train", "val", "test"):
+        print(f"selected_{split_name}={json.dumps(_split_summary(split_items.get(split_name, [])), ensure_ascii=False)}")
 
     chain = _build_chain(model_id)
     scored, llm_stats = _score_with_llm(
         chain=chain,
-        pairs=selected,
+        pairs=selected_for_scoring,
         batch_size=batch_size,
         max_retries=max_retries,
     )
-    _write_jsonl(output, scored)
+    scored_splits: Dict[str, List[Dict[str, Any]]] = {"train": [], "val": [], "test": []}
+    for row in scored:
+        pair = row.get("pair") if isinstance(row.get("pair"), dict) else {}
+        split_name = split_by_pair_id.get(_clean_text(pair.get("pair_id")), "")
+        if split_name not in scored_splits:
+            split_name = "train"
+        scored_splits[split_name].append(row)
+    for split_name, rows in scored_splits.items():
+        if split_targets.get(split_name, 0) > 0:
+            _write_jsonl(output_paths[split_name], rows)
 
     summary = {
         "created_at_utc": datetime.now(timezone.utc).isoformat(),
         "test_input": str(test_input),
-        "output": str(output),
+        "output_base": str(output),
+        "outputs": {name: str(path) for name, path in output_paths.items()},
         "model_id": model_id,
         "candidate_pairs": int(len(candidates)),
-        "selected_pairs": int(len(selected)),
+        "selected_pairs": int(len(selected_for_scoring)),
         "written_pairs": int(len(scored)),
-        "max_pairs": int(max_pairs),
+        "split_targets": {name: int(count) for name, count in split_targets.items()},
+        "split_percentages": {
+            "train": float(args.train_percent),
+            "val": float(args.val_percent),
+            "test": float(args.test_percent),
+        },
+        "split_selected": {name: _split_summary(split_items.get(name, [])) for name in ("train", "val", "test")},
+        "split_written": {name: int(len(scored_splits.get(name, []))) for name in ("train", "val", "test")},
         "per_query_cap": int(per_query_cap),
         "batch_size": int(batch_size),
         "max_retries": int(max_retries),
-        "selected_proxy_bands": dict(Counter(_clean_text(x.get("proxy_band")) for x in selected)),
-        "selected_aspect_patterns": dict(Counter(_clean_text(x.get("aspect_pattern")) for x in selected)),
+        "selected_proxy_bands": dict(Counter(_clean_text(x.get("proxy_band")) for x in selected_for_scoring)),
+        "selected_aspect_patterns": dict(Counter(_clean_text(x.get("aspect_pattern")) for x in selected_for_scoring)),
         "llm": llm_stats,
         "elapsed_sec": float(time.time() - started),
     }
