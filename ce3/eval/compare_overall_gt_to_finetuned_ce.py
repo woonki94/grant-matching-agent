@@ -30,9 +30,10 @@ ASPECT_PREFIX_BY_NAME = {
     "approach": "[APPROACH]",
     "objective": "[OBJECTIVE]",
 }
-GROUND_TRUTH_DEFAULT = "ce3/dataset/ground_truth/overall_coverage_test_subset_claude_opus.jsonl"
+GROUND_TRUTH_DEFAULT = "ce3/dataset/ground_truth/overall_coverage_test_subset_claude_opus_test.jsonl"
 MODEL_DIR_DEFAULT = "ce3/models/aspect_reranker"
 OUTPUT_DIR_DEFAULT = "ce3/eval/results"
+PLAIN_CE_MODEL_DEFAULT = "dleemiller/ModernCE-base-sts"
 HIGH_THRESHOLD = 0.70
 MID_THRESHOLD = 0.30
 
@@ -237,6 +238,68 @@ def _infer_aspect_scores(
         row["aggregate_scores"] = _aggregate_scores(row["aspect_scores"])
         row["error"] = float(row["aggregate_scores"]["mean"] - row["gt_score"])
         row["abs_error"] = float(abs(row["error"]))
+    return out
+
+
+def _attach_plain_ce_no_prefix_scores(
+    *,
+    rows: Sequence[Dict[str, Any]],
+    model_ref: str,
+    device: Any,
+    batch_size: int,
+    max_length: int,
+    trust_remote_code: bool,
+) -> List[Dict[str, Any]]:
+    import torch
+    from transformers import AutoModelForSequenceClassification, AutoTokenizer
+
+    out = [dict(row) for row in rows]
+    tokenizer = AutoTokenizer.from_pretrained(model_ref, trust_remote_code=bool(trust_remote_code))
+    model = AutoModelForSequenceClassification.from_pretrained(
+        model_ref,
+        num_labels=1,
+        trust_remote_code=bool(trust_remote_code),
+    )
+    model.to(device)
+    model.eval()
+
+    step = max(1, int(batch_size))
+    chunks = [list(range(i, min(i + step, len(out)))) for i in range(0, len(out), step)]
+    progress = _tqdm_iter(chunks, desc="Plain CE no-prefix GT inference", unit="batch", dynamic_ncols=True)
+
+    with torch.no_grad():
+        for chunk in progress:
+            queries = [out[row_idx]["grant_text"] for row_idx in chunk]
+            docs = [out[row_idx]["faculty_text"] for row_idx in chunk]
+            enc = tokenizer(
+                queries,
+                docs,
+                max_length=int(max_length),
+                truncation=True,
+                padding=True,
+                return_tensors="pt",
+            )
+            enc = _to_device(enc, device)
+            logits = model(**enc).logits.view(-1)
+            probs = torch.sigmoid(logits).detach().cpu().tolist()
+
+            for row_idx, score in zip(chunk, probs):
+                plain_score = float(_clamp_01(score))
+                aggregates = out[row_idx].setdefault("aggregate_scores", {})
+                aggregates["plain_ce_no_prefix"] = plain_score
+                out[row_idx]["plain_ce_no_prefix_score"] = plain_score
+
+            if hasattr(progress, "set_postfix"):
+                done = sum(1 for row in out if "plain_ce_no_prefix_score" in row)
+                progress.set_postfix(scored=done, total=len(out))
+
+    try:
+        model.to("cpu")
+    except Exception:
+        pass
+    del model
+    if getattr(torch, "cuda", None) is not None and torch.cuda.is_available():
+        torch.cuda.empty_cache()
     return out
 
 
@@ -500,6 +563,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--device", type=str, default="")
     p.add_argument("--trust-remote-code", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--no-multihead", action="store_true")
+    p.add_argument("--plain-ce-model", type=str, default=PLAIN_CE_MODEL_DEFAULT)
+    p.add_argument("--skip-plain-ce", action="store_true")
     p.add_argument("--high-threshold", type=float, default=HIGH_THRESHOLD)
     p.add_argument("--mid-threshold", type=float, default=MID_THRESHOLD)
     return p.parse_args()
@@ -549,6 +614,25 @@ def main() -> int:
         batch_size=args.batch_size,
         max_length=args.max_length,
     )
+    plain_ce_model_ref = _resolve_model_ref(args.plain_ce_model) if _clean_text(args.plain_ce_model) else ""
+    if plain_ce_model_ref and not bool(args.skip_plain_ce):
+        try:
+            model.to("cpu")
+        except Exception:
+            pass
+        del model
+        import torch
+
+        if getattr(torch, "cuda", None) is not None and torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        scored_rows = _attach_plain_ce_no_prefix_scores(
+            rows=scored_rows,
+            model_ref=plain_ce_model_ref,
+            device=device,
+            batch_size=args.batch_size,
+            max_length=args.max_length,
+            trust_remote_code=bool(args.trust_remote_code),
+        )
     aggregator_metrics = _all_aggregator_metrics(scored_rows, high_threshold=high_threshold, mid_threshold=mid_threshold)
     metrics = aggregator_metrics.get("mean") or next(iter(aggregator_metrics.values()))
 
@@ -562,6 +646,8 @@ def main() -> int:
         "ground_truth": str(ground_truth),
         "model_ref": model_ref,
         "multihead": not bool(args.no_multihead),
+        "plain_ce_model_ref": plain_ce_model_ref,
+        "plain_ce_no_prefix": bool(plain_ce_model_ref and not bool(args.skip_plain_ce)),
         "device": str(device),
         "batch_size": int(args.batch_size),
         "max_length": int(args.max_length),
