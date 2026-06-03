@@ -488,7 +488,7 @@ def _all_aggregator_metrics(
     }
 
 
-def _print_single_metrics(metrics: Dict[str, Any]) -> None:
+def _print_single_metrics(metrics: Dict[str, Any], *, include_aspect_means: bool = True) -> None:
     print(f"\n=== {metrics.get('score_name', 'score')} vs Claude Overall GT ===")
     print(f"{'METRIC':<24} {'VALUE':>12}")
     print("-" * 38)
@@ -501,7 +501,10 @@ def _print_single_metrics(metrics: Dict[str, Any]) -> None:
         else:
             text = str(value)
         print(f"{key:<24} {text:>12}")
-    print(f"\naspect_pred_means={metrics.get('aspect_pred_means', {})}")
+    if include_aspect_means:
+        print(f"\naspect_pred_means={metrics.get('aspect_pred_means', {})}")
+    else:
+        print("")
     print(f"gt_band_counts={metrics.get('gt_band_counts', {})}")
     print(f"pred_band_counts={metrics.get('pred_band_counts', {})}")
     for task in ("any_coverage", "high_coverage"):
@@ -664,6 +667,9 @@ def main() -> int:
 
     _print_aggregator_table(aggregator_metrics)
     _print_single_metrics(metrics)
+    plain_metrics = aggregator_metrics.get("plain_ce_no_prefix")
+    if isinstance(plain_metrics, dict) and metrics.get("score_name") != "plain_ce_no_prefix":
+        _print_single_metrics(plain_metrics, include_aspect_means=False)
     print(f"\noutput_json={output_json}")
     print(f"details_output={details_output}")
     print(f"elapsed_sec={time.time() - started:.2f}")
