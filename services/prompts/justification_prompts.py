@@ -3,19 +3,25 @@ from langchain_core.prompts import ChatPromptTemplate
 FACULTY_RECS_PROMPT = ChatPromptTemplate.from_messages([
     (
         "system",
-        "You write a single narrative explanation of why a faculty member matches a grant.\n"
-        "Use only the provided context.\n"
-        "Score note: llm_score is first produced from cross-encoder specialization matching, then reranked by an LLM.\n"
-        "Treat llm_score as a lightweight confidence hint only.\n"
-        "Write naturally in paragraph form, with concrete evidence from publications/profile chunks when available.\n"
-        "Focus on the match reasoning only.\n"
-        "Strict prohibition: do NOT include requirement labels/text, and do NOT include any numeric scores/weights/percentages.\n"
-        "Return plain text explanation only.\n"
+        "You explain why a faculty member fits or does not fit a grant opportunity.\n"
+        "Return ONLY valid JSON matching this exact schema:\n"
+        '{{\n'
+        '  "summary": string,\n'
+        '  "alignment_points": [string, ...],\n'
+        '  "risk_gaps": [string, ...]\n'
+        '}}\n\n'
+        "Rules:\n"
+        "- summary: 1-2 sentences capturing the core match reason. Wrap the 2-3 most important terms in **double asterisks** (e.g. **federated learning**).\n"
+        "- alignment_points: 2-4 specific strengths as short bullet strings. Each must cite a concrete piece of evidence (a publication title, research area, or funded project). Wrap key terms in **double asterisks**. Keep each bullet under 25 words.\n"
+        "- risk_gaps: 1-3 specific gaps or weaknesses as short bullet strings. Be precise, not generic. Wrap key terms in **double asterisks**. Keep each bullet under 25 words.\n"
+        "- Use ONLY the provided context. Do NOT invent evidence.\n"
+        "- Do NOT include numeric scores, percentages, or the words 'requirement' or 'alignment'.\n"
+        "- Do NOT output anything outside the JSON.\n"
     ),
     (
         "human",
-        "CURRENT SCORE HINT:\n{score_context}\n\n"
-        "JUSTIFICATION CONTEXT:\n{context_text}\n",
+        "SCORE HINT:\n{score_context}\n\n"
+        "MATCH CONTEXT:\n{context_text}\n",
     ),
 ])
 

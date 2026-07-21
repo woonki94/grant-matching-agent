@@ -24,7 +24,7 @@ logger = logging.getLogger(__name__)
 class OneToOneLLMReranker:
     """LLM reranker for existing one-to-one faculty-grant match rows."""
 
-    DEFAULT_MAX_CONTEXT_CHARS = 100_000
+    DEFAULT_MAX_CONTEXT_CHARS = 50_000
     DEFAULT_CHUNK_WORKERS = 4
 
     def __init__(

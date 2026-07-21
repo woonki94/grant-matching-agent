@@ -8,10 +8,12 @@ from typing import Any, Dict, List, Optional, Tuple
 from config import get_llm_client, settings
 from dao.faculty_dao import FacultyDAO
 from dao.match_dao import MatchDAO
+from dao.opportunity_dao import OpportunityDAO
 from db.db_conn import SessionLocal
 from db.models.faculty import Faculty
-from dto.llm_response_dto import GrantExplanationOut
+from dto.llm_response_dto import GrantBriefOut, GrantExplanationOut, WhyMatchOut
 from services.context_retrieval.context_generator import ContextGenerator
+from services.prompts.group_match_prompt import GRANT_BRIEF_PROMPT
 from services.prompts.justification_prompts import (
     FACULTY_RECS_PROMPT,
     GRANT_EXPLANATION_PROMPT,
@@ -71,6 +73,20 @@ class SingleJustificationGenerator:
         s = re.sub(r"\balignment\b", "fit", s, flags=re.IGNORECASE)
         return " ".join(s.split()).strip()
 
+    def _sanitize_why_match(self, why_match: Dict[str, Any]) -> Dict[str, Any]:
+        """Apply text sanitization to every string field in a why_match dict."""
+        return {
+            "summary": self._sanitize_final_justification_text(why_match.get("summary") or ""),
+            "alignment_points": [
+                self._sanitize_final_justification_text(p)
+                for p in list(why_match.get("alignment_points") or [])
+            ],
+            "risk_gaps": [
+                self._sanitize_final_justification_text(r)
+                for r in list(why_match.get("risk_gaps") or [])
+            ],
+        }
+
     @staticmethod
     def _faculty_name(fac: Optional[Faculty], *, email: str) -> str:
         """Best-effort faculty display name, falling back to email when name is missing."""
@@ -84,11 +100,18 @@ class SingleJustificationGenerator:
         return GRANT_EXPLANATION_PROMPT | llm.with_structured_output(GrantExplanationOut)
 
     @staticmethod
+    def _build_grant_brief_chain():
+        """Build the LLM chain used for grant brief (3-5 sentence) generation."""
+        model_id = (settings.haiku or settings.sonnet or settings.opus or "").strip()
+        llm = get_llm_client(model_id=model_id).build()
+        return GRANT_BRIEF_PROMPT | llm.with_structured_output(GrantBriefOut)
+
+    @staticmethod
     def _build_final_justification_chain():
-        """Build the free-form LLM chain for final one-match justification writing."""
+        """Build the structured LLM chain for final one-match justification writing."""
         model_id = (settings.sonnet or settings.opus or settings.haiku or "").strip()
         llm = get_llm_client(model_id=model_id).build()
-        return FACULTY_RECS_PROMPT | llm
+        return FACULTY_RECS_PROMPT | llm.with_structured_output(WhyMatchOut)
 
     def _generate_grant_explanation(
         self,
@@ -96,15 +119,25 @@ class SingleJustificationGenerator:
         opportunity_id: str,
         preview_chars: int = 50_000,
     ) -> Dict[str, Any]:
-        """Generate one grant explanation from grant-context payload only."""
-        logger.info(
-            "JUSTIFICATION_STEP grant_explanation_start opportunity_id=%s",
-            str(opportunity_id),
-        )
+        """Return grant explanation — from DB cache if available, otherwise generate via LLM and cache."""
+        oid = str(opportunity_id)
+
+        # Cache hit: return stored explanation without an LLM call.
+        with SessionLocal() as sess:
+            kw_row = OpportunityDAO(sess).get_opportunity_keyword(oid)
+            cached = self._norm(getattr(kw_row, "grant_explanation", None) or "")
+            if cached:
+                logger.info(
+                    "JUSTIFICATION_STEP grant_explanation_cache_hit opportunity_id=%s", oid
+                )
+                return {"grant_context": {}, "grant_explanation": cached}
+
+        # Cache miss: generate via LLM, persist, and return.
+        logger.info("JUSTIFICATION_STEP grant_explanation_start opportunity_id=%s", oid)
         with SessionLocal() as sess:
             grant_context = self.context_generator.build_grant_context_only(
                 sess=sess,
-                opportunity_id=str(opportunity_id),
+                opportunity_id=oid,
                 preview_chars=int(preview_chars),
             )
 
@@ -117,15 +150,54 @@ class SingleJustificationGenerator:
             explanation = self._norm(out.get("grant_explanation"))
         else:
             explanation = self._norm(getattr(out, "grant_explanation", None) or str(out or ""))
+
+        if explanation:
+            with SessionLocal() as sess:
+                dao = OpportunityDAO(sess)
+                dao.save_grant_explanation(opportunity_id=oid, explanation=explanation)
+                sess.commit()
+
         logger.info(
             "JUSTIFICATION_STEP grant_explanation_done opportunity_id=%s chars=%s",
-            str(opportunity_id),
-            len(self._norm(explanation)),
+            oid,
+            len(explanation),
         )
         return {
             "grant_context": grant_context,
             "grant_explanation": explanation,
         }
+
+    def _generate_grant_brief(self, *, opportunity_id: str) -> str:
+        """Return grant brief (3-5 sentences) — from DB cache if available, otherwise generate via LLM and cache."""
+        oid = str(opportunity_id)
+
+        with SessionLocal() as sess:
+            kw_row = OpportunityDAO(sess).get_opportunity_keyword(oid)
+            cached = self._norm(getattr(kw_row, "grant_brief", None) or "")
+            if cached:
+                logger.info("JUSTIFICATION_STEP grant_brief_cache_hit opportunity_id=%s", oid)
+                return cached
+
+        logger.info("JUSTIFICATION_STEP grant_brief_start opportunity_id=%s", oid)
+        with SessionLocal() as sess:
+            grant_context = self.context_generator.build_grant_context_only(
+                sess=sess,
+                opportunity_id=oid,
+                preview_chars=50_000,
+            )
+
+        chain = self._build_grant_brief_chain()
+        out = chain.invoke({"input_json": json.dumps({"grant_context": dict(grant_context or {})}, ensure_ascii=False)})
+        brief = self._norm(getattr(out, "grant_quick_explanation", None) or "")
+
+        if brief:
+            with SessionLocal() as sess:
+                dao = OpportunityDAO(sess)
+                dao.save_grant_brief(opportunity_id=oid, brief=brief)
+                sess.commit()
+
+        logger.info("JUSTIFICATION_STEP grant_brief_done opportunity_id=%s chars=%s", oid, len(brief))
+        return brief
 
     def _load_top_grants_for_faculty(
         self,
@@ -173,9 +245,13 @@ class SingleJustificationGenerator:
         opportunity_id: str,
     ) -> Dict[str, Any]:
         """Invoke final justification LLM for a single grant-faculty match payload."""
-        def _fallback(text: str = "") -> Dict[str, Any]:
+        def _fallback() -> Dict[str, Any]:
             return {
-                "justification": str(text or "").strip() or "No match explanation generated.",
+                "why_match": {
+                    "summary": "No match explanation generated.",
+                    "alignment_points": [],
+                    "risk_gaps": [],
+                }
             }
 
         context_text = str(context_text or "")
@@ -206,17 +282,18 @@ class SingleJustificationGenerator:
             )
             return _fallback()
 
-        if isinstance(out, str):
-            text = out
-        elif hasattr(out, "content"):
-            text = getattr(out, "content", "")
-        elif isinstance(out, dict):
-            text = out.get("text") or out.get("output") or json.dumps(out, ensure_ascii=False)
+        if isinstance(out, WhyMatchOut):
+            why_match = out.model_dump()
+        elif isinstance(out, dict) and "summary" in out:
+            why_match = {
+                "summary": str(out.get("summary") or ""),
+                "alignment_points": list(out.get("alignment_points") or []),
+                "risk_gaps": list(out.get("risk_gaps") or []),
+            }
         else:
-            text = str(out or "")
-        parsed = _fallback(text=self._norm(text))
+            return _fallback()
 
-        return parsed
+        return {"why_match": why_match}
 
     def _justification_pipeline(
         self,
@@ -346,8 +423,9 @@ class SingleJustificationGenerator:
             }
 
         explanation_map: Dict[str, str] = {}
+        brief_map: Dict[str, str] = {}
         expl_ids = [self._norm(x) for x in list(ranked_ids or []) if self._norm(x)]
-        # Stage 2: generate grant explanations concurrently.
+        # Stage 2: generate grant explanations and briefs concurrently.
         if expl_ids:
             expl_pool = resolve_pool_size(
                 max_workers=int(self.GRANT_EXPLANATION_WORKERS),
@@ -364,9 +442,11 @@ class SingleJustificationGenerator:
                     opportunity_id=oid,
                     preview_chars=int(preview_chars),
                 )
+                brief = self._generate_grant_brief(opportunity_id=oid)
                 return {
                     "opportunity_id": oid,
                     "grant_explanation": self._norm(out.get("grant_explanation")),
+                    "grant_brief": self._norm(brief),
                 }
 
             def _on_expl_error(_index: int, oid: str, exc: Exception) -> Dict[str, str]:
@@ -375,7 +455,7 @@ class SingleJustificationGenerator:
                     json.dumps({"opportunity_id": oid}, ensure_ascii=False),
                     f"{type(exc).__name__}: {exc}",
                 )
-                return {"opportunity_id": oid, "grant_explanation": ""}
+                return {"opportunity_id": oid, "grant_explanation": "", "grant_brief": ""}
 
             expl_rows = parallel_map(
                 expl_ids,
@@ -388,6 +468,7 @@ class SingleJustificationGenerator:
                 if not oid:
                     continue
                 explanation_map[oid] = self._norm((row or {}).get("grant_explanation"))
+                brief_map[oid] = self._norm((row or {}).get("grant_brief"))
 
         logger.info(
             "JUSTIFICATION_STEP combined_justification_stage_start grants=%s",
@@ -405,12 +486,14 @@ class SingleJustificationGenerator:
                 )
             )
 
-        justifications_by_id: Dict[str, str] = {}
+        why_match_by_id: Dict[str, Dict[str, Any]] = {}
         with SessionLocal() as sess:
             fdao = FacultyDAO(sess)
+            mdao = MatchDAO(sess)
             fac = fdao.get_with_relations_by_email(email_norm)
             if not fac:
                 raise ValueError(f"No faculty found with email: {email_norm}")
+            faculty_id = int(fac.faculty_id)
 
             source_payload = self.context_generator.build_faculty_recommendation_source_linked_payload(
                 sess=sess,
@@ -425,13 +508,30 @@ class SingleJustificationGenerator:
             }
             jobs: List[Dict[str, Any]] = []
             for oid, domain_score, llm_score in top_rows:
+                # Cache hit: parse stored JSON back to why_match dict.
+                cached_str = mdao.get_justification(faculty_id=faculty_id, opportunity_id=oid)
+                cached_why_match = None
+                if cached_str:
+                    try:
+                        parsed_cache = json.loads(cached_str)
+                        if isinstance(parsed_cache, dict) and "summary" in parsed_cache:
+                            cached_why_match = parsed_cache
+                    except Exception:
+                        pass  # old plain-text format — treat as cache miss
+                if cached_why_match is not None:
+                    logger.info(
+                        "JUSTIFICATION_STEP final_justification_cache_hit opportunity_id=%s", oid
+                    )
+                    why_match_by_id[oid] = cached_why_match
+                    continue
+
                 one_match_payload = dict(opp_payload_by_id.get(oid) or by_id.get(oid) or {})
                 if not one_match_payload:
                     logger.info(
                         "JUSTIFICATION_STEP final_justification_skip_missing_payload opportunity_id=%s",
                         oid,
                     )
-                    justifications_by_id[oid] = ""
+                    why_match_by_id[oid] = {}
                     continue
                 one_match_text = self.context_generator.build_faculty_recommendation_source_linked_text(
                     sess=sess,
@@ -441,6 +541,7 @@ class SingleJustificationGenerator:
                 jobs.append(
                     {
                         "opportunity_id": oid,
+                        "faculty_id": faculty_id,
                         "context_text": self._sanitize_context_text_for_final_llm(one_match_text),
                         "payload": one_match_payload,
                     }
@@ -460,6 +561,7 @@ class SingleJustificationGenerator:
 
             def _run_job(job: Dict[str, Any]) -> Dict[str, Any]:
                 oid = self._norm(job.get("opportunity_id"))
+                fid = int(job.get("faculty_id"))
                 logger.info(
                     "JUSTIFICATION_STEP final_justification_one_match_start opportunity_id=%s",
                     oid,
@@ -470,11 +572,19 @@ class SingleJustificationGenerator:
                     one_match_payload=dict(job.get("payload") or {}),
                     opportunity_id=oid,
                 )
-                jtext = self._sanitize_final_justification_text(parsed.get("justification"))
-                return {
-                    "opportunity_id": oid,
-                    "justification": self._norm(jtext),
-                }
+                why_match = self._sanitize_why_match(dict(parsed.get("why_match") or {}))
+
+                if why_match.get("summary"):
+                    with SessionLocal() as _sess:
+                        _mdao = MatchDAO(_sess)
+                        _mdao.save_justification(
+                            faculty_id=fid,
+                            opportunity_id=oid,
+                            justification=json.dumps(why_match, ensure_ascii=False),
+                        )
+                        _sess.commit()
+
+                return {"opportunity_id": oid, "why_match": why_match}
 
             def _on_job_error(_index: int, job: Dict[str, Any], exc: Exception) -> Dict[str, Any]:
                 oid = self._norm((job or {}).get("opportunity_id"))
@@ -483,7 +593,7 @@ class SingleJustificationGenerator:
                     oid,
                     f"{type(exc).__name__}: {exc}",
                 )
-                return {"opportunity_id": oid, "justification": ""}
+                return {"opportunity_id": oid, "why_match": {}}
 
             job_results = parallel_map(
                 jobs,
@@ -493,13 +603,12 @@ class SingleJustificationGenerator:
             )
             for row in list(job_results or []):
                 oid = self._norm((row or {}).get("opportunity_id"))
-                text = self._norm((row or {}).get("justification"))
+                why_match = dict(row.get("why_match") or {})
                 if oid:
-                    justifications_by_id[oid] = text
+                    why_match_by_id[oid] = why_match
                 logger.info(
-                    "JUSTIFICATION_STEP final_justification_one_match_done opportunity_id=%s chars=%s",
+                    "JUSTIFICATION_STEP final_justification_one_match_done opportunity_id=%s",
                     oid,
-                    len(text),
                 )
 
         merged_results: List[Dict[str, Any]] = []
@@ -516,7 +625,8 @@ class SingleJustificationGenerator:
                         grant_row.get("reranked_llm_score", grant_row.get("llm_score"))
                     ),
                     "grant_explanation": explanation_map.get(oid, ""),
-                    "justification": justifications_by_id.get(oid, ""),
+                    "grant_brief": brief_map.get(oid, ""),
+                    "why_match": why_match_by_id.get(oid, {}),
                 }
             )
 

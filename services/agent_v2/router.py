@@ -44,6 +44,7 @@ class IntentRouter:
             "grant_title": None,
             "grant_identifier_type": None,
             "desired_broad_category": None,
+            "agency_filter": None,
             "topic_query": None,
             "requested_team_size": None,
             "requested_top_k_grants": None,
@@ -124,28 +125,33 @@ class IntentRouter:
                 "You are an intent router for a grant matching system.\n"
                 "Return ONLY a JSON object with keys:\n"
                 "scenario,email,emails,grant_link,grant_title,grant_identifier_type,"
-                "desired_broad_category,topic_query,requested_team_size,requested_top_k_grants,"
+                "desired_broad_category,agency_filter,topic_query,requested_team_size,requested_top_k_grants,"
                 "has_faculty_signal,has_group_signal,has_grant_signal,has_grant_intent.\n"
                 "Allowed scenario values: one_to_one, group, group_specific_grant, general.\n"
                 "Never output scenario='general' for grant search/match/funding requests.\n"
                 "grant_identifier_type must be one of: link, title, null.\n"
                 "desired_broad_category must be one of: basic_research, applied_research, educational, "
                 "a list of those values, or null.\n"
+                "agency_filter must be a short agency query string or null "
+                "(examples: NSF, DARPA, NIH, NASA, USDA).\n"
                 "requested_team_size must be an integer >= 2 or null.\n"
                 "requested_top_k_grants must be an integer >= 1 or null.\n"
                 "FIELD-SEPARATION RULES:\n"
                 "- desired_broad_category is ONLY for broad policy classes: basic_research, applied_research, educational.\n"
+                "- agency_filter is ONLY for agency constraints (e.g., NSF, DARPA, NIH, NASA, USDA).\n"
                 "- topic_query is ONLY for topical semantic search phrases like agriculture, robotics, climate resilience.\n"
                 "- Do NOT infer desired_broad_category from topical words (e.g., agriculture, robotics).\n"
+                "- Do NOT put agencies into topic_query; put them in agency_filter.\n"
                 "- If the user asks broad type only (e.g., educational grants) and provides no topical theme, set topic_query to null.\n"
                 "- If the user asks a topical theme only (e.g., related to agriculture), set desired_broad_category to null.\n"
                 "- If user asks about a specific grant by title/link/id, set topic_query to null.\n"
                 "- For exclusion requests (e.g., 'not educational'), set desired_broad_category to the INCLUDED list "
                 "['basic_research','applied_research'] and keep topic_query null unless a separate topic exists.\n"
                 "EXAMPLES:\n"
-                "- Input: 'find matching grant that is related to agriculture' -> desired_broad_category=null, topic_query='agriculture'.\n"
-                "- Input: 'find me educational grant' -> desired_broad_category='educational', topic_query=null.\n"
-                "- Input: 'find grants that are not educational' -> desired_broad_category=['basic_research','applied_research'], topic_query=null.\n"
+                "- Input: 'find matching grant that is related to agriculture' -> desired_broad_category=null, agency_filter=null, topic_query='agriculture'.\n"
+                "- Input: 'find me educational grant' -> desired_broad_category='educational', agency_filter=null, topic_query=null.\n"
+                "- Input: 'find grants that are not educational' -> desired_broad_category=['basic_research','applied_research'], agency_filter=null, topic_query=null.\n"
+                "- Input: 'show DARPA robotics grants' -> agency_filter='DARPA', topic_query='robotics'.\n"
                 "- Input: 'find group match with team size 4 including me' -> requested_team_size=4.\n"
                 "- Input: 'show top 5 grants for me' -> requested_top_k_grants=5.\n"
                 "For booleans, return true or false.\n"
@@ -178,6 +184,7 @@ class IntentRouter:
             else:
                 desired_broad_category = desired_broad_category_list
 
+            agency_filter = str(parsed.get("agency_filter") or "").strip() or None
             topic_query = str(parsed.get("topic_query") or "").strip() or None
             requested_team_size = None
             raw_team_size = parsed.get("requested_team_size")
@@ -207,6 +214,7 @@ class IntentRouter:
                 "grant_title": grant_title,
                 "grant_identifier_type": grant_identifier_type,
                 "desired_broad_category": desired_broad_category,
+                "agency_filter": agency_filter,
                 "topic_query": topic_query,
                 "requested_team_size": requested_team_size,
                 "requested_top_k_grants": requested_top_k_grants,

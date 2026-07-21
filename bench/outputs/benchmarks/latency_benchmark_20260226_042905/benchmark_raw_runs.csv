@@ -1,0 +1,9 @@
+scenario_name,scenario_type,team_size_requested,iteration,total_seconds,steps_count,next_action,source,matches_count,resolved_team_size,error
+single_fac,single,,1,59.84643458599999,4,return_one_to_one_results,match_results_cache,5,,
+single_fac_with_query,single,,1,71.21420271599982,4,return_one_to_one_results,match_results_cache,5,,
+single_fac_with_query_and_broad_category,single,,1,68.46712961599997,4,return_one_to_one_results,match_results_cache,2,,
+group_team_size_2,group,2,1,110.93462820400009,5,return_group_matching_results,,5,2,
+group_team_size_3,group,3,1,125.6337863230001,5,return_group_matching_results,,5,3,
+group_team_size_4,group,4,1,131.508220961,5,return_group_matching_results,,5,4,
+group_team_size_5,group,5,1,129.90028318300006,5,return_group_matching_results,,5,5,
+group_team_size_10,group,10,1,166.63624531699998,5,return_group_matching_results,,5,10,

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import logging
+import os
+import re
 from typing import Any, Dict, List, Optional, Set
 
 from dao.faculty_dao import FacultyDAO
@@ -23,6 +25,37 @@ class MatchingExecutionAgent:
     MIN_QUERY_SCORE_ABS = 0.20
     QUERY_SCORE_REL_MARGIN = 0.12
     MIN_LLM_SCORE_WITH_QUERY = 0.0
+    AGENCY_ALIASES = {
+        "nsf": ["nsf", "national science foundation"],
+        "darpa": ["darpa", "defense advanced research projects agency", "defense sciences office", "dso"],
+        "nih": ["nih", "national institutes of health", "national institute of health", "hhs nih"],
+        "nasa": ["nasa", "national aeronautics and space administration"],
+        "doe": ["doe", "department of energy", "u.s. department of energy"],
+        "usda": ["usda", "u.s. department of agriculture", "department of agriculture"],
+        "fda": ["fda", "food and drug administration"],
+        "va": ["va", "vha", "veterans affairs", "veterans health administration"],
+        "usace": ["usace", "u.s. army corps of engineers", "army corps of engineers"],
+    }
+
+    @staticmethod
+    def _safe_env_int(name: str, default: int, *, minimum: int = 1, maximum: int = 64) -> int:
+        raw = os.getenv(str(name))
+        try:
+            value = int(raw) if raw is not None else int(default)
+        except Exception:
+            value = int(default)
+        return max(int(minimum), min(int(value), int(maximum)))
+
+    @classmethod
+    def _resolve_single_faculty_rerank_chunk_workers(cls) -> int:
+        cpu_hint = max(1, int(os.cpu_count() or 8))
+        default = max(8, cpu_hint * 2)
+        return cls._safe_env_int(
+            "FACULTY_SINGLE_RERANK_CHUNK_WORKERS",
+            default,
+            minimum=1,
+            maximum=64,
+        )
 
     def __init__(self, *, session_factory=SessionLocal, context_generator: Optional[ContextGenerator] = None):
         self.session_factory = session_factory
@@ -69,6 +102,46 @@ class MatchingExecutionAgent:
         return sorted(filters)
 
     @staticmethod
+    def _normalize_free_text(value: Any) -> str:
+        s = str(value or "").strip().lower()
+        if not s:
+            return ""
+        s = re.sub(r"[^a-z0-9]+", " ", s)
+        s = re.sub(r"\s+", " ", s).strip()
+        return s
+
+    @classmethod
+    def _expand_agency_terms(cls, agency_filter: Any) -> List[str]:
+        raw = cls._normalize_free_text(agency_filter)
+        if not raw:
+            return []
+        terms: List[str] = [raw]
+        for token in raw.split():
+            aliases = cls.AGENCY_ALIASES.get(token) or []
+            for alias in aliases:
+                norm_alias = cls._normalize_free_text(alias)
+                if norm_alias and norm_alias not in terms:
+                    terms.append(norm_alias)
+        return terms
+
+    @classmethod
+    def _agency_matches(cls, *, agency_name: Any, agency_terms: List[str]) -> bool:
+        if not agency_terms:
+            return True
+        hay = cls._normalize_free_text(agency_name)
+        if not hay:
+            return False
+        for term in agency_terms:
+            if term and term in hay:
+                return True
+        return False
+
+    @classmethod
+    def _normalize_agency_filter_for_output(cls, agency_filter: Any) -> Optional[str]:
+        s = str(agency_filter or "").strip()
+        return s or None
+
+    @staticmethod
     def _extract_grant_explanation(recommendation: Optional[Dict[str, Any]]) -> Optional[str]:
         if not isinstance(recommendation, dict):
             return None
@@ -112,13 +185,15 @@ class MatchingExecutionAgent:
         rows: List[Dict[str, Any]],
         top_k: int,
         broad_category: Any,
+        agency_filter: Any,
         query_text: Optional[str],
     ) -> List[Dict[str, Any]]:
         if not rows:
             return []
 
         category_filters = self._normalize_broad_category_filter(broad_category)
-        if not category_filters and not str(query_text or "").strip():
+        agency_terms = self._expand_agency_terms(agency_filter)
+        if not category_filters and not agency_terms and not str(query_text or "").strip():
             # No filters — preserve llm_score descending order from DAO, then slice
             sorted_rows = sorted(
                 rows,
@@ -140,10 +215,14 @@ class MatchingExecutionAgent:
                     if not opp_id:
                         continue
                     opp_ctx = odao.read_opportunity_context(opp_id) or {}
+                    agency_name = str(opp_ctx.get("agency") or r.get("agency") or r.get("agency_name") or "").strip()
                     broad = str(opp_ctx.get("broad_category") or "").strip().lower() or None
                     if category_filters and broad not in category_filters:
                         continue
+                    if agency_terms and not self._agency_matches(agency_name=agency_name, agency_terms=agency_terms):
+                        continue
                     item = dict(r)
+                    item["agency_name"] = agency_name or None
                     item["broad_category"] = broad
                     item["specific_categories"] = list(opp_ctx.get("specific_categories") or [])
                     item["query_score"] = float(query_map.get(opp_id, 0.0)) if query_map else None
@@ -152,15 +231,7 @@ class MatchingExecutionAgent:
             out = list(rows)
 
         if query_map:
-            out.sort(
-                key=lambda x: (
-                    float(x.get("query_score") or 0.0),
-                    float(x.get("llm_score") or 0.0),
-                    float(x.get("domain_score") or 0.0),
-                ),
-                reverse=True,
-            )
-            best_query_score = float(out[0].get("query_score") or 0.0) if out else 0.0
+            best_query_score = max((float(x.get("query_score") or 0.0) for x in out), default=0.0)
             query_floor = max(
                 float(self.MIN_QUERY_SCORE_ABS),
                 float(best_query_score - self.QUERY_SCORE_REL_MARGIN),
@@ -172,6 +243,11 @@ class MatchingExecutionAgent:
                 and float(item.get("llm_score") or 0.0) >= float(self.MIN_LLM_SCORE_WITH_QUERY)
             ]
 
+        out = sorted(
+            out,
+            key=lambda r: (float(r.get("llm_score") or 0.0), float(r.get("domain_score") or 0.0)),
+            reverse=True,
+        )
         return out[: int(top_k)]
 
     def _apply_preference_filters_to_group_results(
@@ -179,13 +255,15 @@ class MatchingExecutionAgent:
         *,
         rows: List[Dict[str, Any]],
         broad_category: Any,
+        agency_filter: Any,
         query_text: Optional[str],
     ) -> List[Dict[str, Any]]:
         if not rows:
             return []
 
         category_filters = self._normalize_broad_category_filter(broad_category)
-        if not category_filters and not str(query_text or "").strip():
+        agency_terms = self._expand_agency_terms(agency_filter)
+        if not category_filters and not agency_terms and not str(query_text or "").strip():
             # No filters — sort purely by team_score (SuperFacultySelector score) descending
             return sorted(rows, key=lambda r: float(r.get("team_score") or 0.0), reverse=True)
 
@@ -203,29 +281,24 @@ class MatchingExecutionAgent:
                     if not opp_id:
                         continue
                     opp_ctx = odao.read_opportunity_context(opp_id) or {}
+                    agency_name = str(opp_ctx.get("agency") or r.get("agency") or r.get("agency_name") or "").strip()
                     broad = str(opp_ctx.get("broad_category") or "").strip().lower() or None
                     if category_filters and broad not in category_filters:
+                        continue
+                    if agency_terms and not self._agency_matches(agency_name=agency_name, agency_terms=agency_terms):
                         continue
                     item = dict(r)
                     item["broad_category"] = broad
                     item["specific_categories"] = list(opp_ctx.get("specific_categories") or [])
-                    if not item.get("agency_name") and opp_ctx.get("agency"):
-                        item["agency_name"] = opp_ctx.get("agency")
+                    if agency_name:
+                        item["agency_name"] = agency_name
                     item["query_score"] = float(query_map.get(opp_id, 0.0)) if query_map else None
                     out.append(item)
         except Exception:
             out = list(rows)
 
         if query_map:
-            # With query: primary = query relevance, secondary = team_score
-            out.sort(
-                key=lambda x: (
-                    float(x.get("query_score") or 0.0),
-                    float(x.get("team_score") or 0.0),
-                ),
-                reverse=True,
-            )
-            best_query_score = float(out[0].get("query_score") or 0.0) if out else 0.0
+            best_query_score = max((float(x.get("query_score") or 0.0) for x in out), default=0.0)
             query_floor = max(
                 float(self.MIN_QUERY_SCORE_ABS),
                 float(best_query_score - self.QUERY_SCORE_REL_MARGIN),
@@ -357,11 +430,13 @@ class MatchingExecutionAgent:
                 **out,
             }
         try:
+            rerank_chunk_workers = self._resolve_single_faculty_rerank_chunk_workers()
             upserted = int(
                 self.faculty_matcher.run_for_opportunity(
                     opportunity_id=str(opportunity_id),
                     faculty_ids=[int(faculty_id)],
                     min_domain=0.0,
+                    rerank_chunk_workers=int(rerank_chunk_workers),
                 )
             )
         except Exception as e:
@@ -395,11 +470,17 @@ class MatchingExecutionAgent:
                 **out,
             }
         try:
+            single_faculty_chunk_workers = (
+                int(self._resolve_single_faculty_rerank_chunk_workers())
+                if len(clean_faculty_ids) == 1
+                else None
+            )
             upserted_required = int(
                 self.faculty_matcher.run_for_opportunity(
                     opportunity_id=str(opportunity_id),
                     faculty_ids=clean_faculty_ids,
                     min_domain=0.0,
+                    rerank_chunk_workers=single_faculty_chunk_workers,
                 )
             )
             upserted_pool = 0
@@ -435,6 +516,7 @@ class MatchingExecutionAgent:
         faculty_id: int,
         top_k: int = 10,
         broad_category: Any = None,
+        agency_filter: Any = None,
         query_text: Optional[str] = None,
     ) -> Dict[str, Any]:
         self._call("MatchingExecutionAgent.run_one_to_one_matching")
@@ -467,7 +549,8 @@ class MatchingExecutionAgent:
                 self.faculty_matcher.run_for_faculty(
                     faculty_id=int(faculty_id),
                     k=max(prefilter_k, 20),
-                    min_domain=0.0,
+                    min_domain=0.3,
+                    rerank_chunk_workers=int(self._resolve_single_faculty_rerank_chunk_workers()),
                 )
 
                 with self.session_factory() as sess:
@@ -486,6 +569,7 @@ class MatchingExecutionAgent:
             rows=out,
             top_k=requested_k,
             broad_category=broad_category,
+            agency_filter=agency_filter,
             query_text=query_text,
         )
 
@@ -514,6 +598,7 @@ class MatchingExecutionAgent:
             "top_k_grants": int(requested_k),
             "query_text": (str(query_text or "").strip() or None),
             "broad_category_filter": self._normalize_broad_category_for_output(broad_category),
+            "agency_filter": self._normalize_agency_filter_for_output(agency_filter),
             "matches": out,
             "recommendation": recommendation or {},
             "grant_explanation": self._extract_grant_explanation(recommendation),
@@ -588,6 +673,7 @@ class MatchingExecutionAgent:
                     opportunity_id=opp_id,
                     faculty_ids=[int(faculty_id)],
                     min_domain=0.0,
+                    rerank_chunk_workers=int(self._resolve_single_faculty_rerank_chunk_workers()),
                 )
 
                 with self.session_factory() as sess:
@@ -695,6 +781,7 @@ class MatchingExecutionAgent:
         team_size: int = 3,
         top_k_grants: Optional[int] = None,
         broad_category: Any = None,
+        agency_filter: Any = None,
         query_text: Optional[str] = None,
     ) -> Dict[str, Any]:
         self._call("MatchingExecutionAgent.run_group_matching")
@@ -714,6 +801,7 @@ class MatchingExecutionAgent:
         results = self._apply_preference_filters_to_group_results(
             rows=results or [],
             broad_category=broad_category,
+            agency_filter=agency_filter,
             query_text=query_text,
         )
         results = self._sort_group_results_for_return(rows=list(results or []))
@@ -730,6 +818,7 @@ class MatchingExecutionAgent:
             "top_k_grants": int(top_k_grants) if top_k_grants is not None else None,
             "query_text": (str(query_text or "").strip() or None),
             "broad_category_filter": self._normalize_broad_category_for_output(broad_category),
+            "agency_filter": self._normalize_agency_filter_for_output(agency_filter),
         }
 
     def run_group_matching_with_specific_grant(
@@ -741,6 +830,7 @@ class MatchingExecutionAgent:
         desired_team_count: int = 3,
         top_k_grants: Optional[int] = None,
         broad_category: Any = None,
+        agency_filter: Any = None,
         query_text: Optional[str] = None,
     ) -> Dict[str, Any]:
         self._call("MatchingExecutionAgent.run_group_matching_with_specific_grant")
@@ -761,6 +851,7 @@ class MatchingExecutionAgent:
         results = self._apply_preference_filters_to_group_results(
             rows=results or [],
             broad_category=broad_category,
+            agency_filter=agency_filter,
             query_text=query_text,
         )
         results = self._sort_group_results_for_return(rows=list(results or []))
@@ -777,6 +868,7 @@ class MatchingExecutionAgent:
             "top_k_grants": int(top_k_grants) if top_k_grants is not None else None,
             "query_text": (str(query_text or "").strip() or None),
             "broad_category_filter": self._normalize_broad_category_for_output(broad_category),
+            "agency_filter": self._normalize_agency_filter_for_output(agency_filter),
         }
 
     # ──────────────────────────────────────────────────────────────────
@@ -1052,6 +1144,7 @@ class MatchingExecutionAgent:
             f = list(payload.get("faculty_ids") or [])
             w = dict(payload.get("requirements") or {"application": {}, "research": {}})
             c = dict(payload.get("coverage") or {})
+            l = dict(payload.get("llm_scores") or {})
 
             # Ensure every existing member is represented (add zero-coverage if absent)
             for fid in existing_ids:
@@ -1080,6 +1173,7 @@ class MatchingExecutionAgent:
                 K=K,
                 required_faculty_ids=existing_ids,
                 num_candidates=1,
+                llm_scores=l,
             )
 
             team_score = round(
@@ -1218,6 +1312,7 @@ class MatchingExecutionAgent:
             f = list(payload.get("faculty_ids") or [])
             w = dict(payload.get("requirements") or {"application": {}, "research": {}})
             c = dict(payload.get("coverage") or {})
+            l = dict(payload.get("llm_scores") or {})
 
             for fid in existing_ids:
                 if fid not in c:
@@ -1242,6 +1337,7 @@ class MatchingExecutionAgent:
                 K=K,
                 required_faculty_ids=existing_ids,
                 num_candidates=1,
+                llm_scores=l,
             )
 
             team_score = round(

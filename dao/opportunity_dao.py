@@ -347,3 +347,42 @@ class OpportunityDAO:
             q = q.yield_per(batch_size)
             return q
         return q.all()
+
+    def get_opportunity_keyword(self, opportunity_id: str) -> Optional[OpportunityKeyword]:
+        """Return the OpportunityKeyword row for a given opportunity_id, or None."""
+        return (
+            self.session.query(OpportunityKeyword)
+            .filter(OpportunityKeyword.opportunity_id == str(opportunity_id))
+            .first()
+        )
+
+    def list_opportunities_needing_generation(self) -> List[OpportunityKeyword]:
+        """Return all opportunity_keywords rows missing grant_explanation OR grant_brief."""
+        return (
+            self.session.query(OpportunityKeyword)
+            .filter(
+                (OpportunityKeyword.grant_explanation.is_(None)) |
+                (OpportunityKeyword.grant_brief.is_(None))
+            )
+            .all()
+        )
+
+    def list_opportunities_without_grant_explanation(self) -> List[OpportunityKeyword]:
+        """Return all opportunity_keywords rows where grant_explanation is NULL."""
+        return (
+            self.session.query(OpportunityKeyword)
+            .filter(OpportunityKeyword.grant_explanation.is_(None))
+            .all()
+        )
+
+    def save_grant_explanation(self, opportunity_id: str, explanation: str) -> None:
+        """Write grant_explanation text to the opportunity_keywords row."""
+        self.session.query(OpportunityKeyword).filter(
+            OpportunityKeyword.opportunity_id == str(opportunity_id)
+        ).update({"grant_explanation": str(explanation)})
+
+    def save_grant_brief(self, opportunity_id: str, brief: str) -> None:
+        """Write grant_brief text to the opportunity_keywords row."""
+        self.session.query(OpportunityKeyword).filter(
+            OpportunityKeyword.opportunity_id == str(opportunity_id)
+        ).update({"grant_brief": str(brief)})

@@ -137,6 +137,24 @@ class MatchingContextBuilder:
         return requirements
 
     @classmethod
+    def build_llm_scores_from_match_rows(
+        cls,
+        *,
+        match_rows: List[Dict[str, Any]],
+    ) -> Dict[int, float]:
+        """Extract per-faculty llm_score from stored match rows (max per faculty)."""
+        scores: Dict[int, float] = {}
+        for row in list(match_rows or []):
+            try:
+                fid = int((row or {}).get("faculty_id"))
+            except Exception:
+                continue
+            val = cls._to_float((row or {}).get("llm_score"), default=0.0)
+            if fid not in scores or val > scores[fid]:
+                scores[fid] = val
+        return scores
+
+    @classmethod
     def build_member_coverages_from_match_rows(
         cls,
         *,
@@ -173,6 +191,7 @@ class MatchingContextBuilder:
         faculty_ids: List[int],
         requirements: Dict[str, Dict[int, float]],
         coverage: Dict[int, Dict[str, Dict[int, float]]],
+        llm_scores: Optional[Dict[int, float]] = None,
     ) -> Dict[str, Any]:
         """Build compact input payload used by team matching optimization."""
         return {
@@ -182,6 +201,7 @@ class MatchingContextBuilder:
                 "research": dict((requirements or {}).get("research") or {}),
             },
             "coverage": dict(coverage or {}),
+            "llm_scores": dict(llm_scores or {}),
         }
 
     @classmethod
@@ -198,10 +218,12 @@ class MatchingContextBuilder:
             opportunity_keywords=dict(opp_kw_ctx.get("keywords") or {}),
         )
         coverage = cls.build_member_coverages_from_match_rows(match_rows=match_rows)
+        llm_scores = cls.build_llm_scores_from_match_rows(match_rows=match_rows)
         return cls.build_matching_inputs_payload(
             faculty_ids=sorted(list(coverage.keys())),
             requirements=requirements,
             coverage=coverage,
+            llm_scores=llm_scores,
         )
 
     @classmethod

@@ -132,7 +132,15 @@ class MatchDAO:
         if not rows:
             return 0
 
-        stmt = pg_insert(MatchResult).values(rows)
+        # Match regeneration should invalidate cached one-to-one justification text.
+        # Force NULL for all upserted rows so stale explanations are not reused.
+        payload_rows: List[Dict[str, Any]] = []
+        for row in rows:
+            payload = dict(row or {})
+            payload["justification"] = None
+            payload_rows.append(payload)
+
+        stmt = pg_insert(MatchResult).values(payload_rows)
         stmt = stmt.on_conflict_do_update(
             constraint="ux_match_grant_faculty",
             set_={
@@ -141,10 +149,24 @@ class MatchDAO:
                 "covered": stmt.excluded.covered,
                 "missing": stmt.excluded.missing,
                 "evidence": stmt.excluded.evidence,
+                "justification": None,
             },
         )
         self.session.execute(stmt)
-        return len(rows)
+        return len(payload_rows)
+
+    def delete_matches_for_faculty(self, *, faculty_id: int) -> int:
+        """Delete all one-to-one match rows for one faculty."""
+        result = self.session.execute(
+            text(
+                """
+                DELETE FROM match_results
+                WHERE faculty_id = :faculty_id
+                """
+            ),
+            {"faculty_id": int(faculty_id)},
+        )
+        return int(result.rowcount or 0)
 
     # =============== Search/Ranking Actions ===============
     def topk_opps_for_faculty(self, faculty_id: int, k: int) -> List[Tuple[str, float]]:
@@ -390,3 +412,48 @@ class MatchDAO:
             )
             updated += 1
         return updated
+
+    def get_justification(self, *, faculty_id: int, opportunity_id: str) -> str:
+        """Return cached justification text for a faculty×grant pair, or empty string."""
+        from db.models.match_result import MatchResult
+        row = (
+            self.session.query(MatchResult.justification)
+            .filter(
+                MatchResult.faculty_id == int(faculty_id),
+                MatchResult.grant_id == str(opportunity_id),
+            )
+            .first()
+        )
+        if row is None:
+            return ""
+        return str(row.justification or "")
+
+    def save_justification(self, *, faculty_id: int, opportunity_id: str, justification: str) -> None:
+        """Write justification text to the match_results row for a faculty×grant pair."""
+        from sqlalchemy import text
+        self.session.execute(
+            text(
+                """
+                UPDATE match_results
+                SET justification = :justification
+                WHERE faculty_id = :faculty_id
+                  AND grant_id   = :grant_id
+                """
+            ),
+            {
+                "faculty_id": int(faculty_id),
+                "grant_id": str(opportunity_id),
+                "justification": str(justification),
+            },
+        )
+
+    def nullify_all_justifications(self) -> int:
+        """Set justification=NULL for all match_results rows.
+
+        Call this before re-generating justifications with a new format so stale
+        cached values are not served to callers.
+        """
+        result = self.session.execute(
+            text("UPDATE match_results SET justification = NULL")
+        )
+        return int(result.rowcount or 0)

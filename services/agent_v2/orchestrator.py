@@ -89,6 +89,7 @@ class GrantMatchOrchestrator:
             state.get("desired_broad_category")
             or inferred.get("desired_broad_category")
         )
+        agency_filter = state.get("agency_filter") or inferred.get("agency_filter")
         topic_query = state.get("topic_query") or inferred.get("topic_query")
         requested_team_size = state.get("requested_team_size") or inferred.get("requested_team_size")
         requested_top_k_grants = state.get("requested_top_k_grants") or inferred.get("requested_top_k_grants")
@@ -97,10 +98,21 @@ class GrantMatchOrchestrator:
             or inferred.get("grant_identifier_type")
             or ("link" if grant_link else ("title" if grant_title else None))
         )
+        has_structured_specific_grant_signal = bool(
+            grant_link or grant_title or (grant_identifier_type in {"link", "title"})
+        )
 
-        # Business rule: if user provides 2+ faculty emails, force group routing.
-        if len(emails) >= 2:
-            scenario = "group_specific_grant" if (grant_link or grant_title or grant_identifier_type) else "group"
+        # If frontend passes explicit specific-grant fields, honor them directly.
+        if has_structured_specific_grant_signal:
+            scenario = "group_specific_grant" if len(emails) >= 2 else "one_to_one"
+        # Routing rule: for non-general requests, decide by email count only.
+        # - 2+ emails -> group (or group_specific_grant with specific grant signal)
+        # - 0/1 email -> one_to_one
+        elif scenario != "general":
+            if len(emails) >= 2:
+                scenario = "group_specific_grant" if (grant_link or grant_title or grant_identifier_type) else "group"
+            else:
+                scenario = "one_to_one"
 
         return {
             "scenario": scenario,
@@ -109,6 +121,7 @@ class GrantMatchOrchestrator:
             "grant_link": grant_link,
             "grant_title": grant_title,
             "desired_broad_category": desired_broad_category,
+            "agency_filter": agency_filter,
             "topic_query": topic_query,
             "requested_team_size": requested_team_size,
             "requested_top_k_grants": requested_top_k_grants,
@@ -121,6 +134,7 @@ class GrantMatchOrchestrator:
             "grant_link_detected": grant_link,
             "grant_title_detected": grant_title,
             "desired_broad_category_detected": desired_broad_category,
+            "agency_filter_detected": agency_filter,
             "topic_query_detected": topic_query,
             "requested_team_size_detected": requested_team_size,
             "requested_top_k_grants_detected": requested_top_k_grants,
@@ -151,7 +165,11 @@ class GrantMatchOrchestrator:
         # Only fall back to asking the user when scraping itself failed (i.e., no
         # faculty IDs could be resolved at all — not merely "not in DB").
         if not ingested.get("resolved"):
-            return {"decision": "ask_user_reference_data"}
+            return {
+                "decision": "ask_user_reference_data",
+                "missing_emails": list(ingested.get("failed") or []),
+                "missing_osu_url_emails": list(ingested.get("missing_osu_url_emails") or []),
+            }
         faculty_ids = list(ingested.get("resolved") or [])
         resolved_state: GrantMatchWorkflowState = {
             "faculty_ids": faculty_ids,
@@ -182,14 +200,25 @@ class GrantMatchOrchestrator:
             cv_pdf_map=state.get("cv_pdf_map"),
             osu_url_map=state.get("osu_url_map"),
         )
-        # Proceed even if some emails failed — as long as at least one faculty resolved.
-        # Only hard-stop when no faculty could be resolved at all.
+        # Strict mode: if any provided email failed resolution, stop and ask for
+        # reference data instead of continuing with a partial team.
+        failed_emails = list(ingested.get("failed") or [])
+        if failed_emails:
+            return {
+                "decision": "ask_user_reference_data",
+                "missing_emails": failed_emails,
+                "missing_osu_url_emails": list(ingested.get("missing_osu_url_emails") or []),
+            }
         if not ingested.get("resolved"):
-            return {"decision": "ask_user_reference_data"}
+            return {
+                "decision": "ask_user_reference_data",
+                "missing_emails": failed_emails,
+                "missing_osu_url_emails": list(ingested.get("missing_osu_url_emails") or []),
+            }
         return {
             "emails": emails,
             "faculty_ids": list(ingested.get("resolved") or []),
-            "missing_emails": list(ingested.get("failed") or []),
+            "missing_emails": failed_emails,
             "decision": "generate_keywords_group",
         }
 
@@ -207,15 +236,26 @@ class GrantMatchOrchestrator:
             cv_pdf_map=state.get("cv_pdf_map"),
             osu_url_map=state.get("osu_url_map"),
         )
-        # Proceed even if some emails failed — as long as at least one faculty resolved.
-        # Only hard-stop when no faculty could be resolved at all.
+        # Strict mode: if any provided email failed resolution, stop and ask for
+        # reference data instead of continuing with a partial team.
+        failed_emails = list(ingested.get("failed") or [])
+        if failed_emails:
+            return {
+                "decision": "ask_user_reference_data",
+                "missing_emails": failed_emails,
+                "missing_osu_url_emails": list(ingested.get("missing_osu_url_emails") or []),
+            }
         if not ingested.get("resolved"):
-            return {"decision": "ask_user_reference_data"}
+            return {
+                "decision": "ask_user_reference_data",
+                "missing_emails": failed_emails,
+                "missing_osu_url_emails": list(ingested.get("missing_osu_url_emails") or []),
+            }
 
         resolved_state: GrantMatchWorkflowState = {
             "emails": emails,
             "faculty_ids": list(ingested.get("resolved") or []),
-            "missing_emails": list(ingested.get("failed") or []),
+            "missing_emails": failed_emails,
         }
 
         ident = self._resolve_grant_identifier_type(state)
@@ -241,9 +281,16 @@ class GrantMatchOrchestrator:
         self._call("GrantMatchOrchestrator._node_ask_group_emails")
         return {"result": self.faculty_agent.ask_for_group_emails()}
 
-    def _node_ask_user_reference_data(self, _: GrantMatchWorkflowState) -> GrantMatchWorkflowState:
+    def _node_ask_user_reference_data(self, state: GrantMatchWorkflowState) -> GrantMatchWorkflowState:
         self._call("GrantMatchOrchestrator._node_ask_user_reference_data")
-        return {"result": self.faculty_agent.ask_for_user_reference_data()}
+        out = dict(self.faculty_agent.ask_for_user_reference_data() or {})
+        missing_emails = list(state.get("missing_emails") or [])
+        missing_osu_url_emails = list(state.get("missing_osu_url_emails") or [])
+        if missing_emails:
+            out["missing_emails"] = missing_emails
+        if missing_osu_url_emails:
+            out["missing_osu_url_emails"] = missing_osu_url_emails
+        return {"result": out}
 
     def _node_ask_grant_identifier(self, _: GrantMatchWorkflowState) -> GrantMatchWorkflowState:
         self._call("GrantMatchOrchestrator._node_ask_grant_identifier")
@@ -265,7 +312,7 @@ class GrantMatchOrchestrator:
         next_step = (
             "generate_keywords_group_specific_grant"
             if state.get("scenario") == "group_specific_grant"
-            else "generate_keywords_one_to_one_specific_grant"
+            else "run_one_to_one_matching_with_specific_grant"
         )
         if found.get("found"):
             return {
@@ -283,7 +330,7 @@ class GrantMatchOrchestrator:
         next_step = (
             "generate_keywords_group_specific_grant"
             if state.get("scenario") == "group_specific_grant"
-            else "generate_keywords_one_to_one_specific_grant"
+            else "run_one_to_one_matching_with_specific_grant"
         )
         if found.get("found"):
             return {
@@ -305,7 +352,7 @@ class GrantMatchOrchestrator:
         next_step = (
             "generate_keywords_group_specific_grant"
             if state.get("scenario") == "group_specific_grant"
-            else "generate_keywords_one_to_one_specific_grant"
+            else "run_one_to_one_matching_with_specific_grant"
         )
         return {
             "grant_in_db": bool(fetched.get("fetched")),
@@ -370,6 +417,7 @@ class GrantMatchOrchestrator:
                 faculty_id=int(faculty_ids[0]),
                 top_k=int(state.get("requested_top_k_grants") or 10),
                 broad_category=state.get("desired_broad_category"),
+                agency_filter=state.get("agency_filter"),
                 query_text=state.get("topic_query"),
             )
         }
@@ -427,6 +475,7 @@ class GrantMatchOrchestrator:
                 team_size=team_size,
                 top_k_grants=state.get("requested_top_k_grants"),
                 broad_category=state.get("desired_broad_category"),
+                agency_filter=state.get("agency_filter"),
                 query_text=state.get("topic_query"),
             )
         }
@@ -447,6 +496,7 @@ class GrantMatchOrchestrator:
                 team_size=team_size,
                 top_k_grants=state.get("requested_top_k_grants"),
                 broad_category=state.get("desired_broad_category"),
+                agency_filter=state.get("agency_filter"),
                 query_text=state.get("topic_query"),
             )
         }
@@ -542,6 +592,7 @@ class GrantMatchOrchestrator:
             "grant_link": request.grant_link,
             "grant_title": request.grant_title,
             "desired_broad_category": request.desired_broad_category,
+            "agency_filter": request.agency_filter,
             "topic_query": request.topic_query,
             "requested_team_size": request.requested_team_size,
             "requested_top_k_grants": request.requested_top_k_grants,
@@ -578,6 +629,7 @@ class GrantMatchOrchestrator:
             "grant_link_detected": out.get("grant_link_detected"),
             "grant_title_detected": out.get("grant_title_detected"),
             "desired_broad_category_detected": out.get("desired_broad_category_detected"),
+            "agency_filter_detected": out.get("agency_filter_detected"),
             "topic_query_detected": out.get("topic_query_detected"),
             "requested_team_size_detected": out.get("requested_team_size_detected"),
             "requested_top_k_grants_detected": out.get("requested_top_k_grants_detected"),

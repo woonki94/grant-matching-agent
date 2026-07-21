@@ -1,21 +1,68 @@
 from __future__ import annotations
 
 import logging
+import os
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
-from config import settings
+from config import get_embedding_client, settings
 from dao.faculty_dao import FacultyDAO
 from db.db_conn import SessionLocal
 from mappers.page_to_faculty import map_faculty_profile_to_dto
+from services.faculty.author_publication_fetcher import AuthorPublicationFetcher
 from services.faculty.enrich_profile import enrich_faculty_publications_from_cv, enrich_new_faculty
 from services.faculty.profile_parser import parse_profile
+from services.matching.faculty_grant_matcher import FacultyGrantMatcher
 
 logger = logging.getLogger(__name__)
 
 _STALE_DAYS = 30
 _MAX_SCRAPE_WORKERS = 5
+
+
+def _safe_env_int(name: str, default: int, *, minimum: int = 1, maximum: int = 64) -> int:
+    raw = os.getenv(str(name))
+    try:
+        value = int(raw) if raw is not None else int(default)
+    except Exception:
+        value = int(default)
+    return max(int(minimum), min(int(value), int(maximum)))
+
+
+def _resolve_single_faculty_keyword_batch_workers() -> int:
+    cpu_hint = max(1, int(os.cpu_count() or 8))
+    default = max(8, cpu_hint * 2)
+    return _safe_env_int(
+        "FACULTY_SINGLE_KEYWORD_BATCH_WORKERS",
+        default,
+        minimum=1,
+        maximum=64,
+    )
+
+
+def _resolve_ingest_publication_years_back() -> int:
+    """
+    Year window for runtime faculty ingestion publication prefetch.
+    Matches the default behavior used by services/faculty/import_faculty.py.
+    """
+    return _safe_env_int(
+        "FACULTY_INGEST_PUBLICATION_YEARS_BACK",
+        5,
+        minimum=0,
+        maximum=50,
+    )
+
+
+def _resolve_single_faculty_rerank_chunk_workers() -> int:
+    cpu_hint = max(1, int(os.cpu_count() or 8))
+    default = max(8, cpu_hint * 2)
+    return _safe_env_int(
+        "FACULTY_SINGLE_RERANK_CHUNK_WORKERS",
+        default,
+        minimum=1,
+        maximum=64,
+    )
 
 
 class FacultyContextAgent:
@@ -120,8 +167,11 @@ class FacultyContextAgent:
     def _scrape_and_upsert_one(self, email: str, osu_url: str) -> int:
         """
         Scrape the OSU engineering profile for `email` using the supplied URL,
-        upsert the record into the DB, and enrich from personal/lab website links.
-        Publication ingestion from a CV PDF is handled separately.
+        upsert the record into the DB, prefetch publications from OpenAlex,
+        and enrich from personal/lab website links.
+
+        Publication ingestion from a CV PDF is still supported separately and
+        can add more entries (title-dedup keeps re-runs safe).
 
         osu_url: the exact OSU engineering profile URL provided by the caller.
                  No URL is derived automatically — callers must always pass it.
@@ -138,6 +188,33 @@ class FacultyContextAgent:
 
         dto = map_faculty_profile_to_dto(profile)
 
+        # Keep runtime ingestion aligned with bulk import behavior:
+        # fetch publications from OpenAlex by faculty name + OSU org hint.
+        publications = []
+        full_name = str(dto.name or "").strip()
+        if full_name:
+            years_back = _resolve_ingest_publication_years_back()
+            current_year = int(datetime.now(timezone.utc).year)
+            year_from = (
+                int(current_year) - (int(years_back) - 1)
+                if int(years_back) > 0
+                else 1900
+            )
+            try:
+                fetcher = AuthorPublicationFetcher()
+                publications = fetcher.fetch_publications_for_name_year_range(
+                    faculty_name=full_name,
+                    year_from=year_from,
+                    year_to=int(current_year),
+                    org_hint=settings.university_name,
+                )
+            except Exception:
+                logger.exception(
+                    "FacultyContextAgent: publication prefetch failed for email=%s name=%s",
+                    email,
+                    full_name,
+                )
+
         with self.session_factory() as sess:
             dao = FacultyDAO(sess)
             fac = dao.upsert_faculty(dto)
@@ -146,6 +223,23 @@ class FacultyContextAgent:
 
             if dto.additional_info:
                 dao.upsert_additional_info(faculty_id, dto.additional_info)
+
+            if publications:
+                embedding_client = None
+                try:
+                    embedding_client = get_embedding_client().build()
+                except Exception:
+                    logger.exception(
+                        "FacultyContextAgent: failed to build embedding client for publication upsert "
+                        "email=%s faculty_id=%s",
+                        email,
+                        faculty_id,
+                    )
+                dao.upsert_publications(
+                    faculty_id,
+                    publications,
+                    embedding_client=embedding_client,
+                )
 
             fac.profile_last_refreshed_at = datetime.now(timezone.utc)
             sess.commit()
@@ -169,6 +263,7 @@ class FacultyContextAgent:
             faculty_id=faculty_id,
             osu_webpage=url,
             personal_website=personal_website_url,
+            google_scholar=None,
         )
 
         return faculty_id
@@ -185,13 +280,15 @@ class FacultyContextAgent:
         stale_threshold_days: int = _STALE_DAYS,
         cv_pdf_map: Optional[Dict[str, bytes]] = None,
         osu_url_map: Optional[Dict[str, str]] = None,
+        run_matching_for_new: bool = False,
     ) -> Dict[str, Any]:
         """
         Full resolution with automatic ingestion of missing or stale faculty.
 
         Steps:
           1. Classify each email as known / stale / unknown.
-          2. Scrape + upsert stale and unknown emails in parallel
+          2. Scrape + upsert stale and unknown emails in parallel,
+             including OpenAlex publication prefetch by faculty name
              (up to _MAX_SCRAPE_WORKERS threads, each with its own DB session).
           3. Run keyword generation sequentially for every newly ingested
              faculty (serialised to avoid Bedrock rate limits).
@@ -199,6 +296,8 @@ class FacultyContextAgent:
              per-faculty CV PDFs.  Only emails present as keys in cv_pdf_map
              are enriched — the rest are skipped.  Title-based dedup makes
              re-runs safe.
+          5. (Optional) Run one-to-one matching generation for newly ingested
+             faculty and persist rows to match_results.
 
         cv_pdf_map: Dict[str, bytes]
             email (lowercase) → raw PDF bytes for that faculty member's CV.
@@ -215,6 +314,10 @@ class FacultyContextAgent:
                 "resolved":    List[int],   # faculty_ids ready for matching
                 "newly_added": List[str],   # emails successfully scraped + inserted
                 "failed":      List[str],   # emails whose ingestion failed
+                "missing_osu_url_emails": List[str],  # emails not in DB and missing osu_url
+                "match_rows_upserted": int,
+                "matching_failed_emails": List[str],
+                "matching_ran": bool,
             }
         """
         self._call("FacultyContextAgent.resolve_and_ingest_faculties")
@@ -295,16 +398,28 @@ class FacultyContextAgent:
 
         # ── 3. Sequential keyword generation ─────────────────────────
         if keyword_generator is not None:
+            batch_workers = _resolve_single_faculty_keyword_batch_workers()
             for email in newly_added:
                 fid = email_to_fid.get(email)
                 if not fid:
                     continue
                 try:
-                    keyword_generator.generate_faculty_keywords_for_id(
-                        fid, force_regenerate=True
-                    )
+                    try:
+                        keyword_generator.generate_faculty_keywords_for_id(
+                            fid,
+                            force_regenerate=True,
+                            batch_workers=int(batch_workers),
+                        )
+                    except TypeError:
+                        # Backward compatibility for alternate generator implementations.
+                        keyword_generator.generate_faculty_keywords_for_id(
+                            fid,
+                            force_regenerate=True,
+                        )
                     logger.info(
-                        "FacultyContextAgent: keywords generated for faculty_id=%s", fid
+                        "FacultyContextAgent: keywords generated for faculty_id=%s batch_workers=%s",
+                        fid,
+                        int(batch_workers),
                     )
                 except Exception:
                     logger.exception(
@@ -336,11 +451,47 @@ class FacultyContextAgent:
                         fid,
                     )
 
+        # ── 5. Optional match generation for newly added faculty ──────
+        match_rows_upserted = 0
+        matching_failed_emails: List[str] = []
+        if run_matching_for_new and newly_added:
+            rerank_chunk_workers = _resolve_single_faculty_rerank_chunk_workers()
+            matcher = FacultyGrantMatcher(session_factory=self.session_factory)
+            for email in newly_added:
+                fid = email_to_fid.get(email)
+                if not fid:
+                    continue
+                try:
+                    upserted = matcher.run_for_faculty(
+                        faculty_id=int(fid),
+                        k=200,
+                        min_domain=0.3,
+                        rerank_chunk_workers=int(rerank_chunk_workers),
+                    )
+                    match_rows_upserted += int(upserted or 0)
+                    logger.info(
+                        "FacultyContextAgent: matching generated for email=%s faculty_id=%s rows=%s",
+                        email,
+                        int(fid),
+                        int(upserted or 0),
+                    )
+                except Exception:
+                    matching_failed_emails.append(email)
+                    logger.exception(
+                        "FacultyContextAgent: match generation failed for email=%s faculty_id=%s",
+                        email,
+                        int(fid),
+                    )
+
         resolved = list(email_to_fid.values())
         return {
             "resolved": resolved,
             "newly_added": newly_added,
             "failed": failed,
+            "missing_osu_url_emails": list(unknown_without_url),
+            "match_rows_upserted": int(match_rows_upserted),
+            "matching_failed_emails": matching_failed_emails,
+            "matching_ran": bool(run_matching_for_new and bool(newly_added)),
         }
 
     # ──────────────────────────────────────────────────────────────────
@@ -358,4 +509,3 @@ class FacultyContextAgent:
     def ask_for_user_reference_data(self) -> Dict[str, str]:
         self._call("FacultyContextAgent.ask_for_user_reference_data")
         return {"next_action": "ask_user_reference_data"}
-

@@ -154,6 +154,7 @@ class Settings(BaseSettings):
     # OpenAlex: fetching publications
     # =========================
     openalex_base_url: str = "https://api.openalex.org"
+    semantic_scholar_paper_search_api: str = "https://api.semanticscholar.org/graph/v1/paper/search"
 
     # =========================
     # LOG Config

@@ -1,5 +1,5 @@
 from sqlalchemy import (
-    Column, Float, String, Integer, ForeignKey,
+    Column, Float, String, Integer, Text, ForeignKey,
     UniqueConstraint, Index
 )
 from sqlalchemy.dialects.postgresql import JSONB
@@ -32,6 +32,7 @@ class MatchResult(Base):
     covered = Column(JSONB, nullable=False, default=dict)  # {"application": {"0": 0.83}, "research": {...}}
     missing = Column(JSONB, nullable=False, default=dict)  # {"application": [1, 2], "research": [...]}
     evidence = Column(JSONB, nullable=False, default=dict)  # scorer metadata / trace details
+    justification = Column(Text, nullable=True)             # cached per-faculty×grant justification text
 
     grant = relationship("Opportunity", backref="match_results")
     faculty = relationship("Faculty", backref="match_results")

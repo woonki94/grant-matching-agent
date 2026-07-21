@@ -2,6 +2,7 @@
 /venv/
 /venv2/
 .env
+*.bak
 .DS_Store
 
 # Python cache
