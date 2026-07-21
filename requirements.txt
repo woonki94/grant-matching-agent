@@ -52,4 +52,5 @@ transformers>=4.51.0
 huggingface-hub>=0.30.0,<1.0
 torch
 
+wandb>=0.25.1
 bcrypt

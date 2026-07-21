@@ -1,0 +1,1654 @@
+from __future__ import annotations
+
+import argparse
+import json
+import math
+import os
+import shutil
+import sys
+import time
+from contextlib import nullcontext
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
+
+# ModernBERT may invoke torch.compile for embeddings. In this training setup the
+# aspect-head routing wrapper can make Dynamo tracing fail with fake CPU/CUDA
+# device propagation errors, so keep eager execution unless explicitly changed.
+os.environ.setdefault("TORCHDYNAMO_DISABLE", "1")
+
+import torch
+import torch.nn.functional as F
+from torch import nn
+from torch.optim import AdamW
+from torch.utils.data import DataLoader, Dataset
+from transformers import AutoTokenizer
+
+try:
+    from tqdm.auto import tqdm
+except Exception:
+    tqdm = None  # type: ignore[assignment]
+
+
+def _find_project_root() -> Path:
+    here = Path(__file__).resolve()
+    for parent in (here.parent, *here.parents):
+        if (parent / "ce3").is_dir():
+            return parent
+    return here.parent
+
+
+PROJECT_ROOT = _find_project_root()
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from ce3.aspect_modeling import (  # noqa: E402
+    ASPECTS,
+    aspect_from_prefixed_query,
+    aspect_id_from_name,
+    format_aspect_pair,
+    load_sequence_classifier_model,
+    model_logits,
+)
+
+
+MODEL_ID_DEFAULT = "dleemiller/ModernCE-base-sts"
+SPLIT_DIR_DEFAULT = "ce3/dataset/splits"
+OUTPUT_DIR_DEFAULT = "ce3/models/aspect_reranker"
+PAIR_TYPE_WEIGHT_MAP_DEFAULT = "default=1.0,llm_disagreement=1.15,strong_vs_boundary=1.05,strong_vs_weak=0.95,strong_vs_hard=1.0"
+STAGE1_PAIR_TYPES_DEFAULT = "llm_disagreement,strong_vs_hard,strong_vs_weak,strong_vs_boundary"
+STAGE1_PAIR_TYPE_PRIORITY = {
+    "llm_disagreement": 0,
+    "strong_vs_hard": 1,
+    "strong_vs_weak": 2,
+    "strong_vs_boundary": 3,
+}
+
+
+def _wandb_enabled(args: argparse.Namespace) -> bool:
+    return _clean_text(getattr(args, "wandb_mode", "")).lower() not in {"", "disabled", "off", "false", "none"}
+
+
+def _flatten_metrics(prefix: str, obj: Dict[str, Any]) -> Dict[str, float]:
+    out: Dict[str, float] = {}
+    for key, value in obj.items():
+        metric_key = f"{prefix}/{key}" if prefix else str(key)
+        if isinstance(value, dict):
+            out.update(_flatten_metrics(metric_key, value))
+            continue
+        if isinstance(value, bool):
+            out[metric_key] = float(value)
+            continue
+        if isinstance(value, (int, float)):
+            out[metric_key] = float(value)
+    return out
+
+
+def _init_wandb(args: argparse.Namespace, *, run_config: Dict[str, Any]) -> Any:
+    if not _wandb_enabled(args):
+        return None
+    try:
+        import wandb
+    except Exception as exc:
+        raise RuntimeError("W&B logging requested, but wandb is not installed in this environment.") from exc
+    tags = [_clean_text(x) for x in _clean_text(args.wandb_tags).split(",") if _clean_text(x)]
+    return wandb.init(
+        project=_clean_text(args.wandb_project) or "ce3_distill",
+        entity=_clean_text(args.wandb_entity) or None,
+        name=_clean_text(args.wandb_run_name) or None,
+        mode=_clean_text(args.wandb_mode) or "online",
+        tags=tags or None,
+        config=run_config,
+    )
+
+
+def _wandb_log(wandb_run: Any, payload: Dict[str, Any], *, step: Optional[int] = None) -> None:
+    if wandb_run is None:
+        return
+    wandb_run.log(_flatten_metrics("", payload), step=step)
+
+
+@dataclass(frozen=True)
+class PairExample:
+    query_text: str
+    pos_text: str
+    neg_text: str
+    aspect: str
+    teacher_margin: float
+    teacher_pos_score: float
+    teacher_neg_score: float
+    pair_type: str
+
+
+class PairDataset(Dataset):
+    def __init__(self, rows: Sequence[PairExample]) -> None:
+        self.rows = list(rows)
+
+    def __len__(self) -> int:
+        return len(self.rows)
+
+    def __getitem__(self, idx: int) -> PairExample:
+        return self.rows[idx]
+
+
+class ListDataset(Dataset):
+    def __init__(self, rows: Sequence[Dict[str, Any]]) -> None:
+        self.rows = list(rows)
+
+    def __len__(self) -> int:
+        return len(self.rows)
+
+    def __getitem__(self, idx: int) -> Dict[str, Any]:
+        return self.rows[idx]
+
+
+def _clean_text(value: Any) -> str:
+    return str(value or "").strip()
+
+
+def _resolve_path(value: Any) -> Path:
+    path = Path(_clean_text(value)).expanduser()
+    if not path.is_absolute():
+        path = PROJECT_ROOT / path
+    return path.resolve()
+
+
+def _clamp_01(value: Any) -> float:
+    try:
+        x = float(value)
+    except Exception:
+        x = 0.0
+    return max(0.0, min(1.0, x))
+
+
+def _cluster_id_from_band_or_score(band: Any, score: Any, *, high_threshold: float, mid_threshold: float) -> int:
+    b = _clean_text(band).lower()
+    if b == "high":
+        return 2
+    if b == "mid":
+        return 1
+    if b == "low":
+        return 0
+    s = _clamp_01(score)
+    if s >= float(high_threshold):
+        return 2
+    if s >= float(mid_threshold):
+        return 1
+    return 0
+
+
+def _parse_pair_type_weight_map(value: Any) -> Tuple[Dict[str, float], float]:
+    default = 1.0
+    out: Dict[str, float] = {}
+    for token in _clean_text(value).split(","):
+        if "=" not in token:
+            continue
+        key, raw_val = token.split("=", 1)
+        key = _clean_text(key).lower()
+        if not key:
+            continue
+        try:
+            parsed = max(0.0, min(10.0, float(raw_val)))
+        except Exception:
+            continue
+        if key == "default":
+            default = parsed
+        else:
+            out[key] = parsed
+    return out, default
+
+
+def _parse_aspect_weight_map(value: Any, *, default: float = 1.0) -> Dict[str, float]:
+    out = {aspect: float(default) for aspect in ASPECTS}
+    for token in _clean_text(value).split(","):
+        if "=" not in token:
+            continue
+        key, raw_val = token.split("=", 1)
+        key = _clean_text(key).lower()
+        if not key:
+            continue
+        try:
+            parsed = max(0.0, min(10.0, float(raw_val)))
+        except Exception:
+            continue
+        if key == "default":
+            out = {aspect: parsed for aspect in ASPECTS}
+        elif key in out:
+            out[key] = parsed
+    return out
+
+
+def _parse_csv_set(value: Any) -> set[str]:
+    return {_clean_text(x).lower() for x in _clean_text(value).split(",") if _clean_text(x)}
+
+
+def _load_jsonl(path: Path) -> List[Dict[str, Any]]:
+    rows: List[Dict[str, Any]] = []
+    if not path.exists():
+        return rows
+    with path.open("r", encoding="utf-8") as f:
+        for raw in f:
+            try:
+                obj = json.loads(raw)
+            except Exception:
+                continue
+            if isinstance(obj, dict):
+                rows.append(obj)
+    return rows
+
+
+def load_pair_rows(path: Path) -> List[PairExample]:
+    out: List[PairExample] = []
+    for row in _load_jsonl(path):
+        query = _clean_text(row.get("query_text"))
+        pos = _clean_text(row.get("pos_text"))
+        neg = _clean_text(row.get("neg_text"))
+        aspect = _clean_text(row.get("aspect")) or aspect_from_prefixed_query(query)
+        if not query or not pos or not neg or aspect not in ASPECTS:
+            continue
+        out.append(
+            PairExample(
+                query_text=query,
+                pos_text=pos,
+                neg_text=neg,
+                aspect=aspect,
+                teacher_margin=max(0.0, float(row.get("teacher_margin", 0.0) or 0.0)),
+                teacher_pos_score=_clamp_01(row.get("teacher_pos_score")),
+                teacher_neg_score=_clamp_01(row.get("teacher_neg_score")),
+                pair_type=_clean_text(row.get("pair_type")) or "unknown",
+            )
+        )
+    return out
+
+
+def filter_stage1_pairs(
+    pairs: Sequence[PairExample],
+    *,
+    pair_types: str,
+    min_margin: float,
+    max_per_query: int,
+) -> List[PairExample]:
+    allowed_types = _parse_csv_set(pair_types)
+    margin_floor = max(0.0, float(min_margin))
+    filtered = [
+        row for row in pairs
+        if (not allowed_types or row.pair_type.lower() in allowed_types)
+        and float(row.teacher_margin) >= margin_floor
+    ]
+    cap = int(max_per_query)
+    if cap <= 0:
+        return sorted(filtered, key=_stage1_pair_sort_key)
+
+    grouped: Dict[Tuple[str, str], List[PairExample]] = {}
+    for row in filtered:
+        grouped.setdefault((row.aspect, row.query_text), []).append(row)
+
+    out: List[PairExample] = []
+    for key in sorted(grouped):
+        rows = sorted(grouped[key], key=_stage1_pair_sort_key)
+        out.extend(rows[:cap])
+    return out
+
+
+def _stage1_pair_sort_key(row: PairExample) -> Tuple[int, float, float, float, str, str]:
+    priority = STAGE1_PAIR_TYPE_PRIORITY.get(row.pair_type.lower(), 99)
+    return (
+        priority,
+        -float(row.teacher_margin),
+        -float(row.teacher_pos_score),
+        float(row.teacher_neg_score),
+        row.pos_text,
+        row.neg_text,
+    )
+
+
+class PairCollator:
+    def __init__(
+        self,
+        tokenizer: Any,
+        max_length: int,
+        *,
+        pair_type_weights: Dict[str, float],
+        default_pair_weight: float,
+    ) -> None:
+        self.tokenizer = tokenizer
+        self.max_length = int(max_length)
+        self.pair_type_weights = dict(pair_type_weights)
+        self.default_pair_weight = float(default_pair_weight)
+
+    def __call__(self, batch: Sequence[PairExample]) -> Dict[str, Any]:
+        pos_q: List[str] = []
+        pos_d: List[str] = []
+        neg_q: List[str] = []
+        neg_d: List[str] = []
+        aspect_ids: List[int] = []
+        weights: List[float] = []
+        for row in batch:
+            q1, d1 = format_aspect_pair(row.query_text, row.pos_text)
+            q2, d2 = format_aspect_pair(row.query_text, row.neg_text)
+            pos_q.append(q1)
+            pos_d.append(d1)
+            neg_q.append(q2)
+            neg_d.append(d2)
+            aspect_ids.append(aspect_id_from_name(row.aspect))
+            weights.append(float(self.pair_type_weights.get(row.pair_type.lower(), self.default_pair_weight)))
+
+        pos_enc = self.tokenizer(pos_q, pos_d, max_length=self.max_length, truncation=True, padding=True, return_tensors="pt")
+        neg_enc = self.tokenizer(neg_q, neg_d, max_length=self.max_length, truncation=True, padding=True, return_tensors="pt")
+        return {
+            "pos": pos_enc,
+            "neg": neg_enc,
+            "margins": torch.tensor([row.teacher_margin for row in batch], dtype=torch.float32),
+            "pair_weights": torch.tensor(weights, dtype=torch.float32),
+            "aspect_ids": torch.tensor(aspect_ids, dtype=torch.long),
+        }
+
+
+class ListCollator:
+    def __init__(
+        self,
+        tokenizer: Any,
+        max_length: int,
+        *,
+        high_threshold: float,
+        mid_threshold: float,
+    ) -> None:
+        self.tokenizer = tokenizer
+        self.max_length = int(max_length)
+        self.high_threshold = float(high_threshold)
+        self.mid_threshold = float(mid_threshold)
+
+    def __call__(self, batch: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
+        queries: List[str] = []
+        docs: List[str] = []
+        scores: List[float] = []
+        cluster_ids: List[int] = []
+        aspect_ids: List[int] = []
+        list_ids: List[int] = []
+        list_sizes: List[int] = []
+        for row_idx, row in enumerate(batch):
+            query = _clean_text(row.get("query_text"))
+            aspect = _clean_text(row.get("aspect")) or aspect_from_prefixed_query(query)
+            if not query or aspect not in ASPECTS:
+                continue
+            used = 0
+            for doc in list(row.get("docs") or row.get("ranked_docs") or row.get("candidates") or []):
+                if not isinstance(doc, dict):
+                    continue
+                doc_text = _clean_text(doc.get("text"))
+                if not doc_text:
+                    continue
+                q_fmt, d_fmt = format_aspect_pair(query, doc_text)
+                score = _clamp_01(doc.get("teacher_score", doc.get("score")))
+                queries.append(q_fmt)
+                docs.append(d_fmt)
+                scores.append(score)
+                cluster_ids.append(
+                    _cluster_id_from_band_or_score(
+                        doc.get("target_cluster", doc.get("band")),
+                        score,
+                        high_threshold=self.high_threshold,
+                        mid_threshold=self.mid_threshold,
+                    )
+                )
+                aspect_ids.append(aspect_id_from_name(aspect))
+                list_ids.append(int(row_idx))
+                used += 1
+            if used > 0:
+                list_sizes.append(used)
+
+        if not queries:
+            return {"enc": None, "scores": None, "cluster_ids": None, "aspect_ids": None, "list_sizes": []}
+        enc = self.tokenizer(queries, docs, max_length=self.max_length, truncation=True, padding=True, return_tensors="pt")
+        return {
+            "enc": enc,
+            "scores": torch.tensor(scores, dtype=torch.float32),
+            "cluster_ids": torch.tensor(cluster_ids, dtype=torch.long),
+            "aspect_ids": torch.tensor(aspect_ids, dtype=torch.long),
+            "list_ids": torch.tensor(list_ids, dtype=torch.long),
+            "list_sizes": list_sizes,
+        }
+
+
+def _to_device(obj: Any, device: torch.device) -> Any:
+    if isinstance(obj, dict):
+        return {k: _to_device(v, device) for k, v in obj.items()}
+    if torch.is_tensor(obj):
+        return obj.to(device, non_blocking=(device.type == "cuda"))
+    if hasattr(obj, "to"):
+        try:
+            return obj.to(device)
+        except Exception:
+            return obj
+    return obj
+
+
+def _concat_encoder_batches(a: Dict[str, torch.Tensor], b: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+    out: Dict[str, torch.Tensor] = {}
+    for key in a.keys():
+        if key not in b:
+            continue
+        av, bv = a[key], b[key]
+        if av.dim() >= 2 and bv.dim() >= 2 and int(av.shape[1]) != int(bv.shape[1]):
+            target = max(int(av.shape[1]), int(bv.shape[1]))
+            av = F.pad(av, (0, target - int(av.shape[1])), value=0)
+            bv = F.pad(bv, (0, target - int(bv.shape[1])), value=0)
+        out[key] = torch.cat([av, bv], dim=0)
+    return out
+
+
+def _split_pair_logits(logits: torch.Tensor, n: int) -> Tuple[torch.Tensor, torch.Tensor]:
+    flat = logits.view(-1)
+    return flat[:n], flat[n : n * 2]
+
+
+def variable_margin_loss(pos_logits: torch.Tensor, neg_logits: torch.Tensor, margins: torch.Tensor, weights: torch.Tensor) -> torch.Tensor:
+    raw = F.relu(margins - (pos_logits - neg_logits))
+    weights = weights.clamp(min=0.0)
+    return (raw * weights).sum() / weights.sum().clamp(min=1e-6)
+
+
+def listwise_kl_mse_loss(
+    logits_flat: torch.Tensor,
+    scores_flat: torch.Tensor,
+    list_sizes: Sequence[int],
+    *,
+    temperature: float,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    kl_parts: List[torch.Tensor] = []
+    mse_parts: List[torch.Tensor] = []
+    cursor = 0
+    temp = max(1e-6, float(temperature))
+    for size in list_sizes:
+        n = int(size)
+        if n <= 0:
+            continue
+        logits = logits_flat[cursor : cursor + n]
+        scores = scores_flat[cursor : cursor + n].clamp(0.0, 1.0)
+        cursor += n
+        if n > 1:
+            teacher = torch.softmax(scores / temp, dim=0)
+            student_log = torch.log_softmax(logits / temp, dim=0)
+            kl_parts.append(F.kl_div(student_log, teacher, reduction="sum") * (temp * temp))
+        mse_parts.append(F.mse_loss(torch.sigmoid(logits), scores, reduction="mean"))
+    zero = logits_flat.sum() * 0.0
+    kl = torch.stack(kl_parts).mean() if kl_parts else zero
+    mse = torch.stack(mse_parts).mean() if mse_parts else zero
+    return kl, mse
+
+
+def cluster_margin_loss(
+    logits_flat: torch.Tensor,
+    cluster_ids_flat: torch.Tensor,
+    list_sizes: Sequence[int],
+    *,
+    margin_hm: float,
+    margin_ml: float,
+    margin_hl: float,
+) -> torch.Tensor:
+    probs = torch.sigmoid(logits_flat)
+    parts: List[torch.Tensor] = []
+    cursor = 0
+    for size in list_sizes:
+        n = int(size)
+        s = probs[cursor : cursor + n]
+        c = cluster_ids_flat[cursor : cursor + n]
+        cursor += n
+        high = s[c == 2]
+        mid = s[c == 1]
+        low = s[c == 0]
+        if high.numel() and mid.numel():
+            parts.append(F.relu(torch.tensor(float(margin_hm), device=s.device, dtype=s.dtype) - (high.mean() - mid.mean())))
+        if mid.numel() and low.numel():
+            parts.append(F.relu(torch.tensor(float(margin_ml), device=s.device, dtype=s.dtype) - (mid.mean() - low.mean())))
+        if high.numel() and low.numel():
+            parts.append(F.relu(torch.tensor(float(margin_hl), device=s.device, dtype=s.dtype) - (high.mean() - low.mean())))
+    return torch.stack(parts).mean() if parts else logits_flat.sum() * 0.0
+
+
+def calibration_band_loss(
+    logits_flat: torch.Tensor,
+    cluster_ids_flat: torch.Tensor,
+    *,
+    high_floor: float,
+    mid_low: float,
+    mid_high: float,
+    low_ceil: float,
+    high_weight: float,
+    mid_weight: float,
+    mid_low_weight: float,
+    mid_high_weight: float,
+    low_weight: float,
+) -> torch.Tensor:
+    probs = torch.sigmoid(logits_flat)
+    parts: List[torch.Tensor] = []
+    weights: List[float] = []
+    high = probs[cluster_ids_flat == 2]
+    mid = probs[cluster_ids_flat == 1]
+    low = probs[cluster_ids_flat == 0]
+    if high.numel():
+        weight = max(0.0, float(high_weight))
+        if weight > 0.0:
+            parts.append(F.relu(float(high_floor) - high).mean() * weight)
+            weights.append(weight)
+    if mid.numel():
+        weight = max(0.0, float(mid_weight))
+        if weight > 0.0:
+            mid_loss = (
+                max(0.0, float(mid_low_weight)) * F.relu(float(mid_low) - mid).mean()
+                + max(0.0, float(mid_high_weight)) * F.relu(mid - float(mid_high)).mean()
+            )
+            parts.append(mid_loss * weight)
+            weights.append(weight)
+    if low.numel():
+        weight = max(0.0, float(low_weight))
+        if weight > 0.0:
+            parts.append(F.relu(low - float(low_ceil)).mean() * weight)
+            weights.append(weight)
+    if not parts:
+        return logits_flat.sum() * 0.0
+    denom = max(1e-6, float(sum(weights)))
+    return torch.stack(parts).sum() / denom
+
+
+def _threshold_to_logit(threshold: float, *, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+    t = min(1.0 - 1e-6, max(1e-6, float(threshold)))
+    return torch.tensor(math.log(t / (1.0 - t)), device=device, dtype=dtype)
+
+
+def _balanced_boundary_bce(boundary_logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+    positives = targets.sum()
+    negatives = targets.numel() - positives
+    if positives.detach().item() > 0.0 and negatives.detach().item() > 0.0:
+        pos_weight = (negatives / positives.clamp(min=1.0)).detach()
+        return F.binary_cross_entropy_with_logits(boundary_logits, targets, pos_weight=pos_weight)
+    return F.binary_cross_entropy_with_logits(boundary_logits, targets)
+
+
+def ordinal_boundary_loss(
+    logits_flat: torch.Tensor,
+    cluster_ids_flat: torch.Tensor,
+    *,
+    high_threshold: float,
+    mid_threshold: float,
+    mid_boundary_weight: float,
+    high_boundary_weight: float,
+) -> torch.Tensor:
+    """Train the scalar score to cross the same low/mid/high boundaries used by OOB."""
+
+    if logits_flat.numel() <= 0:
+        return logits_flat.sum() * 0.0
+    clusters = cluster_ids_flat.to(device=logits_flat.device, dtype=torch.long)
+    at_least_mid = (clusters >= 1).to(dtype=logits_flat.dtype)
+    at_least_high = (clusters >= 2).to(dtype=logits_flat.dtype)
+    mid_boundary = logits_flat - _threshold_to_logit(float(mid_threshold), device=logits_flat.device, dtype=logits_flat.dtype)
+    high_boundary = logits_flat - _threshold_to_logit(float(high_threshold), device=logits_flat.device, dtype=logits_flat.dtype)
+    mid_weight = max(0.0, float(mid_boundary_weight))
+    high_weight = max(0.0, float(high_boundary_weight))
+    denom = max(1e-6, mid_weight + high_weight)
+    return (
+        mid_weight * _balanced_boundary_bce(mid_boundary, at_least_mid)
+        + high_weight * _balanced_boundary_bce(high_boundary, at_least_high)
+    ) / denom
+
+
+def _aspect_sample_weights(aspect_ids_flat: torch.Tensor, *, weight_map: Dict[str, float], dtype: torch.dtype) -> torch.Tensor:
+    weights = torch.ones(aspect_ids_flat.shape, device=aspect_ids_flat.device, dtype=dtype)
+    for aspect, weight in weight_map.items():
+        aspect_id = aspect_id_from_name(aspect)
+        weights = torch.where(
+            aspect_ids_flat == int(aspect_id),
+            torch.full_like(weights, float(weight)),
+            weights,
+        )
+    return weights
+
+
+def _coverage_boundary_bce(
+    logits_flat: torch.Tensor,
+    scores_flat: torch.Tensor,
+    aspect_ids_flat: torch.Tensor,
+    *,
+    threshold: float,
+    boundary_margin: float,
+    pos_weight: float,
+    neg_weight: float,
+    aspect_weight_map: Dict[str, float],
+) -> torch.Tensor:
+    if logits_flat.numel() <= 0:
+        return logits_flat.sum() * 0.0
+    t = float(threshold)
+    m = max(0.0, float(boundary_margin))
+    scores = scores_flat.to(device=logits_flat.device, dtype=logits_flat.dtype).clamp(0.0, 1.0)
+    targets = (scores >= t).to(dtype=logits_flat.dtype)
+    if m > 0.0:
+        mask = (scores < max(0.0, t - m)) | (scores >= min(1.0, t + m))
+    else:
+        mask = torch.ones_like(targets, dtype=torch.bool)
+    if not bool(mask.any().item()):
+        return logits_flat.sum() * 0.0
+
+    boundary_logits = logits_flat - _threshold_to_logit(t, device=logits_flat.device, dtype=logits_flat.dtype)
+    raw_loss = F.binary_cross_entropy_with_logits(boundary_logits[mask], targets[mask], reduction="none")
+    class_weights = torch.where(
+        targets > 0.5,
+        torch.full_like(targets, max(0.0, float(pos_weight))),
+        torch.full_like(targets, max(0.0, float(neg_weight))),
+    )
+    aspect_weights = _aspect_sample_weights(
+        aspect_ids_flat.to(device=logits_flat.device, dtype=torch.long),
+        weight_map=aspect_weight_map,
+        dtype=logits_flat.dtype,
+    )
+    weights = (class_weights * aspect_weights)[mask].clamp(min=0.0)
+    if float(weights.detach().sum().item()) <= 0.0:
+        return logits_flat.sum() * 0.0
+    return (raw_loss * weights).sum() / weights.sum().clamp(min=1e-6)
+
+
+def coverage_boundary_losses(
+    logits_flat: torch.Tensor,
+    scores_flat: torch.Tensor,
+    aspect_ids_flat: torch.Tensor,
+    *,
+    high_threshold: float,
+    mid_threshold: float,
+    boundary_margin: float,
+    any_pos_weight: float,
+    any_neg_weight: float,
+    high_pos_weight: float,
+    high_neg_weight: float,
+    aspect_weight_map: Dict[str, float],
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    any_loss = _coverage_boundary_bce(
+        logits_flat,
+        scores_flat,
+        aspect_ids_flat,
+        threshold=float(mid_threshold),
+        boundary_margin=float(boundary_margin),
+        pos_weight=float(any_pos_weight),
+        neg_weight=float(any_neg_weight),
+        aspect_weight_map=aspect_weight_map,
+    )
+    high_loss = _coverage_boundary_bce(
+        logits_flat,
+        scores_flat,
+        aspect_ids_flat,
+        threshold=float(high_threshold),
+        boundary_margin=float(boundary_margin),
+        pos_weight=float(high_pos_weight),
+        neg_weight=float(high_neg_weight),
+        aspect_weight_map=aspect_weight_map,
+    )
+    return any_loss, high_loss
+
+
+def clear_band_calibration_loss(
+    logits_flat: torch.Tensor,
+    scores_flat: torch.Tensor,
+    *,
+    high_threshold: float,
+    mid_threshold: float,
+    clear_low_max: float,
+    clear_mid_min: float,
+    clear_mid_max: float,
+    clear_high_min: float,
+    low_weight: float,
+    mid_weight: float,
+    high_weight: float,
+) -> torch.Tensor:
+    """Anchor only unambiguous teacher scores to the low/mid/high bands."""
+
+    if logits_flat.numel() <= 0:
+        return logits_flat.sum() * 0.0
+    probs = torch.sigmoid(logits_flat)
+    scores = scores_flat.to(device=logits_flat.device, dtype=logits_flat.dtype).clamp(0.0, 1.0)
+
+    clear_low = scores <= float(clear_low_max)
+    clear_mid = (scores >= float(clear_mid_min)) & (scores <= float(clear_mid_max))
+    clear_high = scores >= float(clear_high_min)
+
+    parts: List[torch.Tensor] = []
+    weights: List[float] = []
+    low_w = max(0.0, float(low_weight))
+    mid_w = max(0.0, float(mid_weight))
+    high_w = max(0.0, float(high_weight))
+
+    if bool(clear_low.any().item()) and low_w > 0.0:
+        low_probs = probs[clear_low]
+        parts.append(F.relu(low_probs - float(mid_threshold)).mean() * low_w)
+        weights.append(low_w)
+    if bool(clear_mid.any().item()) and mid_w > 0.0:
+        mid_probs = probs[clear_mid]
+        mid_loss = F.relu(float(mid_threshold) - mid_probs).mean() + F.relu(mid_probs - float(high_threshold)).mean()
+        parts.append(mid_loss * mid_w)
+        weights.append(mid_w)
+    if bool(clear_high.any().item()) and high_w > 0.0:
+        high_probs = probs[clear_high]
+        parts.append(F.relu(float(high_threshold) - high_probs).mean() * high_w)
+        weights.append(high_w)
+
+    if not parts:
+        return logits_flat.sum() * 0.0
+    return torch.stack(parts).sum() / max(1e-6, float(sum(weights)))
+
+
+def global_pairwise_score_loss(
+    logits_flat: torch.Tensor,
+    scores_flat: torch.Tensor,
+    list_ids_flat: torch.Tensor,
+    aspect_ids_flat: torch.Tensor,
+    *,
+    min_gap: float,
+    margin_min: float,
+    margin_max: float,
+    max_pairs: int,
+    cross_query_only: bool,
+    same_aspect_only: bool,
+) -> torch.Tensor:
+    """Compare teacher-stronger examples against weaker examples across the batch."""
+
+    n = int(logits_flat.numel())
+    if n < 2:
+        return logits_flat.sum() * 0.0
+
+    scores = scores_flat.to(device=logits_flat.device, dtype=logits_flat.dtype).clamp(0.0, 1.0)
+    list_ids = list_ids_flat.to(device=logits_flat.device, dtype=torch.long).view(-1)
+    aspect_ids = aspect_ids_flat.to(device=logits_flat.device, dtype=torch.long).view(-1)
+    score_gap = scores.view(-1, 1) - scores.view(1, -1)
+    mask = score_gap >= float(min_gap)
+    if bool(cross_query_only):
+        mask = mask & (list_ids.view(-1, 1) != list_ids.view(1, -1))
+    if bool(same_aspect_only):
+        mask = mask & (aspect_ids.view(-1, 1) == aspect_ids.view(1, -1))
+
+    pair_idx = mask.nonzero(as_tuple=False)
+    if int(pair_idx.numel()) <= 0:
+        return logits_flat.sum() * 0.0
+
+    gaps = score_gap[pair_idx[:, 0], pair_idx[:, 1]]
+    cap = int(max_pairs)
+    if cap > 0 and int(pair_idx.shape[0]) > cap:
+        _, keep = torch.topk(gaps, k=cap, largest=True)
+        pair_idx = pair_idx[keep]
+        gaps = gaps[keep]
+
+    pos_logits = logits_flat[pair_idx[:, 0]]
+    neg_logits = logits_flat[pair_idx[:, 1]]
+    margins = gaps.clamp(min=float(margin_min), max=float(margin_max))
+    return F.relu(margins - (pos_logits - neg_logits)).mean()
+
+
+def pair_loss_from_batch(model: nn.Module, batch: Dict[str, Any], device: torch.device, *, margin_min: float, margin_max: float) -> torch.Tensor:
+    pos = _to_device(batch["pos"], device)
+    neg = _to_device(batch["neg"], device)
+    margins = batch["margins"].to(device).clamp(min=float(margin_min), max=float(margin_max))
+    weights = batch["pair_weights"].to(device)
+    aspect_ids = batch["aspect_ids"].to(device)
+    pair_aspects = torch.cat([aspect_ids, aspect_ids], dim=0)
+    logits = model_logits(model, _concat_encoder_batches(pos, neg), aspect_ids=pair_aspects)
+    pos_logits, neg_logits = _split_pair_logits(logits, int(margins.shape[0]))
+    return variable_margin_loss(pos_logits, neg_logits, margins, weights)
+
+
+def list_losses_from_batch(model: nn.Module, batch: Dict[str, Any], device: torch.device, args: argparse.Namespace) -> Dict[str, torch.Tensor]:
+    if batch.get("enc") is None:
+        zero = torch.zeros((), device=device)
+        return {
+            "kl": zero,
+            "mse": zero,
+            "cluster": zero,
+            "calibration": zero,
+            "ordinal": zero,
+            "coverage_any": zero,
+            "coverage_high": zero,
+            "coverage": zero,
+            "clear_band": zero,
+            "global_pair": zero,
+        }
+    enc = _to_device(batch["enc"], device)
+    scores = batch["scores"].to(device)
+    clusters = batch["cluster_ids"].to(device)
+    aspect_ids = batch["aspect_ids"].to(device)
+    list_ids = batch["list_ids"].to(device)
+    logits = model_logits(model, enc, aspect_ids=aspect_ids).view(-1)
+    kl, mse = listwise_kl_mse_loss(logits, scores, batch["list_sizes"], temperature=args.teacher_temperature)
+    cluster = cluster_margin_loss(
+        logits,
+        clusters,
+        batch["list_sizes"],
+        margin_hm=args.cluster_margin_hm,
+        margin_ml=args.cluster_margin_ml,
+        margin_hl=args.cluster_margin_hl,
+    )
+    calib = calibration_band_loss(
+        logits,
+        clusters,
+        high_floor=args.high_threshold,
+        mid_low=args.mid_threshold,
+        mid_high=args.high_threshold,
+        low_ceil=args.mid_threshold,
+        high_weight=args.calibration_high_weight,
+        mid_weight=args.calibration_mid_weight,
+        mid_low_weight=args.calibration_mid_low_weight,
+        mid_high_weight=args.calibration_mid_high_weight,
+        low_weight=args.calibration_low_weight,
+    )
+    ordinal = ordinal_boundary_loss(
+        logits,
+        clusters,
+        high_threshold=args.high_threshold,
+        mid_threshold=args.mid_threshold,
+        mid_boundary_weight=args.ordinal_mid_boundary_weight,
+        high_boundary_weight=args.ordinal_high_boundary_weight,
+    )
+    coverage_any, coverage_high = coverage_boundary_losses(
+        logits,
+        scores,
+        aspect_ids,
+        high_threshold=args.high_threshold,
+        mid_threshold=args.mid_threshold,
+        boundary_margin=args.coverage_boundary_margin,
+        any_pos_weight=args.coverage_any_pos_weight,
+        any_neg_weight=args.coverage_any_neg_weight,
+        high_pos_weight=args.coverage_high_pos_weight,
+        high_neg_weight=args.coverage_high_neg_weight,
+        aspect_weight_map=_parse_aspect_weight_map(args.coverage_aspect_weight_map),
+    )
+    any_weight = max(0.0, float(args.loss_any_coverage_weight))
+    high_weight = max(0.0, float(args.loss_high_coverage_weight))
+    coverage = (any_weight * coverage_any + high_weight * coverage_high) / max(1e-6, any_weight + high_weight)
+    clear_band = clear_band_calibration_loss(
+        logits,
+        scores,
+        high_threshold=args.high_threshold,
+        mid_threshold=args.mid_threshold,
+        clear_low_max=args.clear_low_max,
+        clear_mid_min=args.clear_mid_min,
+        clear_mid_max=args.clear_mid_max,
+        clear_high_min=args.clear_high_min,
+        low_weight=args.clear_band_low_weight,
+        mid_weight=args.clear_band_mid_weight,
+        high_weight=args.clear_band_high_weight,
+    )
+    global_pair = global_pairwise_score_loss(
+        logits,
+        scores,
+        list_ids,
+        aspect_ids,
+        min_gap=args.global_pair_min_gap,
+        margin_min=args.global_pair_margin_min,
+        margin_max=args.global_pair_margin_max,
+        max_pairs=args.global_pair_max_pairs,
+        cross_query_only=bool(args.global_pair_cross_query_only),
+        same_aspect_only=bool(args.global_pair_same_aspect_only),
+    )
+    return {
+        "kl": kl,
+        "mse": mse,
+        "cluster": cluster,
+        "calibration": calib,
+        "ordinal": ordinal,
+        "coverage_any": coverage_any,
+        "coverage_high": coverage_high,
+        "coverage": coverage,
+        "clear_band": clear_band,
+        "global_pair": global_pair,
+    }
+
+
+def total_loss(pair_loss: torch.Tensor, list_losses: Dict[str, torch.Tensor], args: argparse.Namespace) -> torch.Tensor:
+    return (
+        float(args.loss_pair_weight) * pair_loss
+        + float(args.loss_kl_weight) * list_losses["kl"]
+        + float(args.loss_mse_weight) * list_losses["mse"]
+        + float(args.loss_cluster_margin_weight) * list_losses["cluster"]
+        + float(args.loss_calibration_weight) * list_losses["calibration"]
+        + float(args.loss_ordinal_weight) * list_losses["ordinal"]
+        + float(args.loss_coverage_weight) * list_losses["coverage"]
+        + float(args.loss_clear_band_weight) * list_losses["clear_band"]
+        + float(args.loss_global_pair_weight) * list_losses["global_pair"]
+    )
+
+
+def cycle_loader(loader: DataLoader) -> Iterator[Any]:
+    while True:
+        for batch in loader:
+            yield batch
+
+
+def oob_summary(probs: torch.Tensor, clusters: torch.Tensor, *, high_threshold: float, mid_threshold: float) -> Dict[str, float]:
+    p = probs.detach().cpu()
+    c = clusters.detach().cpu()
+    low = c == 0
+    mid = c == 1
+    high = c == 2
+    low_total = int(low.sum().item())
+    mid_total = int(mid.sum().item())
+    high_total = int(high.sum().item())
+    low_out = int(((p >= mid_threshold) & low).sum().item())
+    mid_low_out = int(((p < mid_threshold) & mid).sum().item())
+    mid_high_out = int(((p >= high_threshold) & mid).sum().item())
+    high_out = int(((p < high_threshold) & high).sum().item())
+    return {
+        "oob_low_rate": low_out / max(1, low_total),
+        "oob_mid_rate": (mid_low_out + mid_high_out) / max(1, mid_total),
+        "oob_mid_low_rate": mid_low_out / max(1, mid_total),
+        "oob_mid_high_rate": mid_high_out / max(1, mid_total),
+        "oob_high_rate": high_out / max(1, high_total),
+        "oob_low_out": float(low_out),
+        "oob_mid_out": float(mid_low_out + mid_high_out),
+        "oob_high_out": float(high_out),
+        "oob_low_total": float(low_total),
+        "oob_mid_total": float(mid_total),
+        "oob_high_total": float(high_total),
+    }
+
+
+def _dcg(rels: Sequence[float]) -> float:
+    return sum((float(rel) / math.log2(i + 2.0)) for i, rel in enumerate(rels))
+
+
+@torch.no_grad()
+def evaluate(model: nn.Module, pair_loader: DataLoader, list_loader: DataLoader, device: torch.device, args: argparse.Namespace) -> Dict[str, float]:
+    model.eval()
+    pair_vals: List[float] = []
+    for batch in pair_loader:
+        loss = pair_loss_from_batch(model, batch, device, margin_min=args.margin_min, margin_max=args.margin_max)
+        pair_vals.append(float(loss.detach().cpu().item()))
+
+    kl_vals: List[float] = []
+    mse_vals: List[float] = []
+    cluster_vals: List[float] = []
+    calib_vals: List[float] = []
+    ordinal_vals: List[float] = []
+    coverage_any_vals: List[float] = []
+    coverage_high_vals: List[float] = []
+    coverage_vals: List[float] = []
+    clear_band_vals: List[float] = []
+    global_pair_vals: List[float] = []
+    all_probs: List[torch.Tensor] = []
+    all_clusters: List[torch.Tensor] = []
+    ndcg_vals: List[float] = []
+    mrr_vals: List[float] = []
+    recall_vals: List[float] = []
+    for batch in list_loader:
+        if batch.get("enc") is None:
+            continue
+        losses = list_losses_from_batch(model, batch, device, args)
+        kl_vals.append(float(losses["kl"].detach().cpu().item()))
+        mse_vals.append(float(losses["mse"].detach().cpu().item()))
+        cluster_vals.append(float(losses["cluster"].detach().cpu().item()))
+        calib_vals.append(float(losses["calibration"].detach().cpu().item()))
+        ordinal_vals.append(float(losses["ordinal"].detach().cpu().item()))
+        coverage_any_vals.append(float(losses["coverage_any"].detach().cpu().item()))
+        coverage_high_vals.append(float(losses["coverage_high"].detach().cpu().item()))
+        coverage_vals.append(float(losses["coverage"].detach().cpu().item()))
+        clear_band_vals.append(float(losses["clear_band"].detach().cpu().item()))
+        global_pair_vals.append(float(losses["global_pair"].detach().cpu().item()))
+
+        enc = _to_device(batch["enc"], device)
+        aspect_ids = batch["aspect_ids"].to(device)
+        logits = model_logits(model, enc, aspect_ids=aspect_ids).view(-1)
+        probs = torch.sigmoid(logits).detach().cpu()
+        scores = batch["scores"].detach().cpu()
+        clusters = batch["cluster_ids"].detach().cpu()
+        all_probs.append(probs)
+        all_clusters.append(clusters)
+
+        cursor = 0
+        for size in batch["list_sizes"]:
+            n = int(size)
+            pred = probs[cursor : cursor + n]
+            rel = scores[cursor : cursor + n]
+            cursor += n
+            if n <= 0:
+                continue
+            order = torch.argsort(pred, descending=True)
+            rel_sorted = [float(rel[i].item()) for i in order[:10]]
+            ideal = sorted([float(x.item()) for x in rel], reverse=True)[:10]
+            denom = _dcg(ideal)
+            ndcg_vals.append(_dcg(rel_sorted) / denom if denom > 0.0 else 0.0)
+            relevant = (rel >= float(args.high_threshold)).nonzero().view(-1)
+            if relevant.numel() > 0:
+                ranks = {int(idx.item()): rank + 1 for rank, idx in enumerate(order[:10])}
+                hits = [ranks[int(idx.item())] for idx in relevant if int(idx.item()) in ranks]
+                mrr_vals.append(1.0 / min(hits) if hits else 0.0)
+                top50 = set(int(i.item()) for i in order[:50])
+                recall_vals.append(sum(1 for idx in relevant if int(idx.item()) in top50) / float(relevant.numel()))
+
+    probs_all = torch.cat(all_probs) if all_probs else torch.empty(0)
+    clusters_all = torch.cat(all_clusters) if all_clusters else torch.empty(0, dtype=torch.long)
+    oob = oob_summary(probs_all, clusters_all, high_threshold=args.high_threshold, mid_threshold=args.mid_threshold) if probs_all.numel() else {}
+    oob_objective = (
+        2.0 * float(oob.get("oob_high_rate", 0.0))
+        + float(oob.get("oob_mid_rate", 0.0))
+        + float(oob.get("oob_low_rate", 0.0))
+    ) / 4.0
+    pair_loss = sum(pair_vals) / max(1, len(pair_vals))
+    kl_loss = sum(kl_vals) / max(1, len(kl_vals))
+    mse_loss = sum(mse_vals) / max(1, len(mse_vals))
+    cluster_loss = sum(cluster_vals) / max(1, len(cluster_vals))
+    calibration_loss = sum(calib_vals) / max(1, len(calib_vals))
+    ordinal_loss = sum(ordinal_vals) / max(1, len(ordinal_vals))
+    coverage_any_loss = sum(coverage_any_vals) / max(1, len(coverage_any_vals))
+    coverage_high_loss = sum(coverage_high_vals) / max(1, len(coverage_high_vals))
+    coverage_loss = sum(coverage_vals) / max(1, len(coverage_vals))
+    clear_band_loss = sum(clear_band_vals) / max(1, len(clear_band_vals))
+    global_pair_loss = sum(global_pair_vals) / max(1, len(global_pair_vals))
+    val_total_loss = (
+        float(args.loss_pair_weight) * pair_loss
+        + float(args.loss_kl_weight) * kl_loss
+        + float(args.loss_mse_weight) * mse_loss
+        + float(args.loss_cluster_margin_weight) * cluster_loss
+        + float(args.loss_calibration_weight) * calibration_loss
+        + float(args.loss_ordinal_weight) * ordinal_loss
+        + float(args.loss_coverage_weight) * coverage_loss
+        + float(args.loss_clear_band_weight) * clear_band_loss
+        + float(args.loss_global_pair_weight) * global_pair_loss
+    )
+    return {
+        "total_loss": float(val_total_loss),
+        "pair_loss": float(pair_loss),
+        "kl_loss": float(kl_loss),
+        "mse_loss": float(mse_loss),
+        "cluster_margin_loss": float(cluster_loss),
+        "calibration_loss": float(calibration_loss),
+        "ordinal_boundary_loss": float(ordinal_loss),
+        "coverage_loss": float(coverage_loss),
+        "coverage_any_loss": float(coverage_any_loss),
+        "coverage_high_loss": float(coverage_high_loss),
+        "clear_band_loss": float(clear_band_loss),
+        "global_pair_loss": float(global_pair_loss),
+        "ndcg@10": sum(ndcg_vals) / max(1, len(ndcg_vals)),
+        "mrr@10": sum(mrr_vals) / max(1, len(mrr_vals)),
+        "recall@50": sum(recall_vals) / max(1, len(recall_vals)),
+        "oob_objective": float(oob_objective),
+        **{k: float(v) for k, v in oob.items()},
+    }
+
+
+def save_checkpoint(model: nn.Module, tokenizer: Any, path: Path, meta: Dict[str, Any]) -> None:
+    path.mkdir(parents=True, exist_ok=True)
+    model.save_pretrained(path)
+    tokenizer.save_pretrained(path)
+    (path / "trainer_meta.json").write_text(json.dumps(meta, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+
+def _count_params(params: Iterable[nn.Parameter]) -> int:
+    return int(sum(int(p.numel()) for p in params))
+
+
+def _find_transformer_layer_stack(module: nn.Module) -> Tuple[str, Optional[nn.ModuleList]]:
+    candidates: List[Tuple[int, int, str, nn.ModuleList]] = []
+    for name, child in module.named_modules():
+        if not isinstance(child, nn.ModuleList) or len(child) <= 0:
+            continue
+        lowered = name.lower()
+        score = 0
+        if lowered.endswith("layers") or lowered.endswith("layer"):
+            score += 3
+        if "encoder" in lowered or "model" in lowered or "backbone" in lowered:
+            score += 2
+        if len(child) >= 4:
+            score += 1
+        candidates.append((score, len(child), name, child))
+    if not candidates:
+        return "", None
+    candidates.sort(key=lambda x: (x[0], x[1]), reverse=True)
+    _, _, name, stack = candidates[0]
+    return name, stack
+
+
+def configure_stage2_trainable_params(model: nn.Module, args: argparse.Namespace) -> Dict[str, Any]:
+    """Optionally freeze Stage 2 to aspect heads plus the final N transformer layers."""
+
+    freeze_backbone = bool(getattr(args, "stage2_freeze_backbone", False))
+    last_layers = max(0, int(getattr(args, "stage2_train_last_layers", 0)))
+    total_params = _count_params(model.parameters())
+    if not freeze_backbone and last_layers <= 0:
+        for p in model.parameters():
+            p.requires_grad = True
+        return {
+            "stage2_freeze_backbone": False,
+            "stage2_train_last_layers": 0,
+            "stage2_unfrozen_layer_stack": "",
+            "stage2_unfrozen_layer_count": 0,
+            "stage2_trainable_params": total_params,
+            "stage2_total_params": total_params,
+        }
+
+    for p in model.parameters():
+        p.requires_grad = False
+
+    unfrozen_groups: List[str] = []
+    if isinstance(getattr(model, "heads", None), nn.Module):
+        for p in model.heads.parameters():  # type: ignore[union-attr]
+            p.requires_grad = True
+        unfrozen_groups.append("aspect_heads")
+        if isinstance(getattr(model, "logit_scales", None), nn.Module):
+            for p in model.logit_scales.parameters():  # type: ignore[union-attr]
+                p.requires_grad = True
+            unfrozen_groups.append("aspect_logit_scales")
+        if isinstance(getattr(model, "logit_biases", None), nn.Module):
+            for p in model.logit_biases.parameters():  # type: ignore[union-attr]
+                p.requires_grad = True
+            unfrozen_groups.append("aspect_logit_biases")
+    else:
+        for attr in ("classifier", "score", "regressor"):
+            head = getattr(model, attr, None)
+            if isinstance(head, nn.Module):
+                for p in head.parameters():
+                    p.requires_grad = True
+                unfrozen_groups.append(attr)
+
+    backbone = getattr(model, "backbone", model)
+    stack_name = ""
+    unfrozen_layer_count = 0
+    if last_layers > 0:
+        stack_name, stack = _find_transformer_layer_stack(backbone)
+        if stack is None:
+            raise RuntimeError("Could not find transformer layer stack for --stage2-train-last-layers.")
+        unfrozen_layer_count = min(last_layers, len(stack))
+        for layer in list(stack)[-unfrozen_layer_count:]:
+            for p in layer.parameters():
+                p.requires_grad = True
+        unfrozen_groups.append(f"{stack_name}[-{unfrozen_layer_count}:]")
+
+    trainable_params = _count_params(p for p in model.parameters() if p.requires_grad)
+    if trainable_params <= 0:
+        raise RuntimeError("Stage 2 freeze configuration left zero trainable parameters.")
+    return {
+        "stage2_freeze_backbone": True,
+        "stage2_train_last_layers": int(last_layers),
+        "stage2_unfrozen_layer_stack": stack_name,
+        "stage2_unfrozen_layer_count": int(unfrozen_layer_count),
+        "stage2_unfrozen_groups": unfrozen_groups,
+        "stage2_trainable_params": trainable_params,
+        "stage2_total_params": total_params,
+    }
+
+
+def train_stage(
+    *,
+    stage: int,
+    model: nn.Module,
+    optimizer: AdamW,
+    tokenizer: Any,
+    primary_loader: DataLoader,
+    secondary_loader: DataLoader,
+    val_pair_loader: DataLoader,
+    val_list_loader: DataLoader,
+    device: torch.device,
+    output_dir: Path,
+    args: argparse.Namespace,
+    global_step: int,
+    wandb_run: Any = None,
+) -> Tuple[int, Dict[str, Any]]:
+    secondary_iter = cycle_loader(secondary_loader)
+    best_selection = float("-inf")
+    best_meta: Dict[str, Any] = {}
+    use_amp = device.type == "cuda" and bool(args.fp16)
+    amp_ctx = torch.autocast(device_type="cuda", dtype=torch.float16) if use_amp else nullcontext()
+    train_log_every_steps = max(0, int(getattr(args, "train_log_every_steps", 1)))
+    eval_every_steps = max(0, int(getattr(args, "eval_every_steps", 100)))
+    loss_names = (
+        "total",
+        "pair",
+        "kl",
+        "mse",
+        "cluster",
+        "calibration",
+        "ordinal",
+        "coverage",
+        "coverage_any",
+        "coverage_high",
+        "clear_band",
+        "global_pair",
+    )
+
+    for epoch in range(1, int(args.stage1_epochs if stage == 1 else args.stage2_epochs) + 1):
+        model.train()
+        hist: Dict[str, List[float]] = {k: [] for k in loss_names}
+        step_hist: Dict[str, List[float]] = {k: [] for k in hist}
+        optimizer.zero_grad(set_to_none=True)
+        accum = 0
+
+        def mean_hist(values: Dict[str, List[float]]) -> Dict[str, float]:
+            return {k: float(sum(v) / max(1, len(v))) for k, v in values.items()}
+
+        def log_after_optimizer_step() -> None:
+            nonlocal step_hist
+            if train_log_every_steps > 0 and global_step % train_log_every_steps == 0:
+                _wandb_log(
+                    wandb_run,
+                    {
+                        "stage": float(stage),
+                        "epoch": float(epoch),
+                        "train": mean_hist(step_hist),
+                    },
+                    step=global_step,
+                )
+            if eval_every_steps > 0 and global_step % eval_every_steps == 0:
+                step_metrics = evaluate(model, val_pair_loader, val_list_loader, device, args)
+                step_ranking = (
+                    float(step_metrics.get("ndcg@10", 0.0))
+                    + float(step_metrics.get("mrr@10", 0.0))
+                    + float(step_metrics.get("recall@50", 0.0))
+                )
+                step_selection = step_ranking - float(step_metrics.get("oob_objective", 0.0))
+                print(
+                    json.dumps(
+                        {
+                            "stage": int(stage),
+                            "epoch": int(epoch),
+                            "global_step": int(global_step),
+                            "event": "step_eval",
+                            "selection_score": float(step_selection),
+                            "ranking_sum": float(step_ranking),
+                            "val": step_metrics,
+                        },
+                        ensure_ascii=False,
+                    )
+                )
+                _wandb_log(
+                    wandb_run,
+                    {
+                        "stage": float(stage),
+                        "epoch": float(epoch),
+                        "selection_score": float(step_selection),
+                        "ranking_sum": float(step_ranking),
+                        "val": step_metrics,
+                    },
+                    step=global_step,
+                )
+                model.train()
+            step_hist = {k: [] for k in hist}
+
+        train_iter = primary_loader
+        bar = None
+        if tqdm is not None:
+            total_batches = len(primary_loader) if hasattr(primary_loader, "__len__") else None
+            bar = tqdm(
+                primary_loader,
+                total=total_batches,
+                desc=f"CE3 stage{stage} epoch{epoch}",
+                unit="batch",
+                dynamic_ncols=True,
+            )
+            train_iter = bar
+        for primary_batch in train_iter:
+            secondary_batch = next(secondary_iter)
+            pair_batch = primary_batch if stage == 1 else secondary_batch
+            list_batch = secondary_batch if stage == 1 else primary_batch
+            with amp_ctx:
+                p_loss = pair_loss_from_batch(model, pair_batch, device, margin_min=args.margin_min, margin_max=args.margin_max)
+                l_losses = list_losses_from_batch(model, list_batch, device, args)
+                loss = total_loss(p_loss, l_losses, args) / float(args.grad_accum_steps)
+            loss.backward()
+            accum += 1
+            hist["total"].append(float(loss.detach().cpu().item() * float(args.grad_accum_steps)))
+            hist["pair"].append(float(p_loss.detach().cpu().item()))
+            hist["kl"].append(float(l_losses["kl"].detach().cpu().item()))
+            hist["mse"].append(float(l_losses["mse"].detach().cpu().item()))
+            hist["cluster"].append(float(l_losses["cluster"].detach().cpu().item()))
+            hist["calibration"].append(float(l_losses["calibration"].detach().cpu().item()))
+            hist["ordinal"].append(float(l_losses["ordinal"].detach().cpu().item()))
+            hist["coverage"].append(float(l_losses["coverage"].detach().cpu().item()))
+            hist["coverage_any"].append(float(l_losses["coverage_any"].detach().cpu().item()))
+            hist["coverage_high"].append(float(l_losses["coverage_high"].detach().cpu().item()))
+            hist["clear_band"].append(float(l_losses["clear_band"].detach().cpu().item()))
+            hist["global_pair"].append(float(l_losses["global_pair"].detach().cpu().item()))
+            step_hist["total"].append(float(loss.detach().cpu().item() * float(args.grad_accum_steps)))
+            step_hist["pair"].append(float(p_loss.detach().cpu().item()))
+            step_hist["kl"].append(float(l_losses["kl"].detach().cpu().item()))
+            step_hist["mse"].append(float(l_losses["mse"].detach().cpu().item()))
+            step_hist["cluster"].append(float(l_losses["cluster"].detach().cpu().item()))
+            step_hist["calibration"].append(float(l_losses["calibration"].detach().cpu().item()))
+            step_hist["ordinal"].append(float(l_losses["ordinal"].detach().cpu().item()))
+            step_hist["coverage"].append(float(l_losses["coverage"].detach().cpu().item()))
+            step_hist["coverage_any"].append(float(l_losses["coverage_any"].detach().cpu().item()))
+            step_hist["coverage_high"].append(float(l_losses["coverage_high"].detach().cpu().item()))
+            step_hist["clear_band"].append(float(l_losses["clear_band"].detach().cpu().item()))
+            step_hist["global_pair"].append(float(l_losses["global_pair"].detach().cpu().item()))
+            if accum >= int(args.grad_accum_steps):
+                if float(args.max_grad_norm) > 0.0:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), float(args.max_grad_norm))
+                optimizer.step()
+                optimizer.zero_grad(set_to_none=True)
+                global_step += 1
+                accum = 0
+                log_after_optimizer_step()
+            if bar is not None:
+                latest = mean_hist(step_hist if any(step_hist.values()) else hist)
+                bar.set_postfix(
+                    step=int(global_step),
+                    total=f"{latest.get('total', 0.0):.4f}",
+                    pair=f"{latest.get('pair', 0.0):.4f}",
+                    kl=f"{latest.get('kl', 0.0):.4f}",
+                    ord=f"{latest.get('ordinal', 0.0):.4f}",
+                    cov=f"{latest.get('coverage', 0.0):.4f}",
+                    cb=f"{latest.get('clear_band', 0.0):.4f}",
+                    gp=f"{latest.get('global_pair', 0.0):.4f}",
+                )
+        if accum > 0:
+            if float(args.max_grad_norm) > 0.0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), float(args.max_grad_norm))
+            optimizer.step()
+            optimizer.zero_grad(set_to_none=True)
+            global_step += 1
+            log_after_optimizer_step()
+        if bar is not None:
+            bar.close()
+
+        metrics = evaluate(model, val_pair_loader, val_list_loader, device, args)
+        ranking = float(metrics.get("ndcg@10", 0.0)) + float(metrics.get("mrr@10", 0.0)) + float(metrics.get("recall@50", 0.0))
+        selection = ranking - float(metrics.get("oob_objective", 0.0))
+        meta = {
+            "stage": int(stage),
+            "epoch": int(epoch),
+            "global_step": int(global_step),
+            "selection_score": float(selection),
+            "ranking_sum": float(ranking),
+            "train": {k: sum(v) / max(1, len(v)) for k, v in hist.items()},
+            "val": metrics,
+        }
+        print(json.dumps(meta, ensure_ascii=False))
+        _wandb_log(
+            wandb_run,
+            {
+                "stage": float(stage),
+                "epoch": float(epoch),
+                "selection_score": float(selection),
+                "ranking_sum": float(ranking),
+                "train": meta["train"],
+                "val": metrics,
+            },
+            step=global_step,
+        )
+        save_checkpoint(model, tokenizer, output_dir / f"stage{stage}_epoch_{epoch}", meta)
+        if selection > best_selection:
+            best_selection = selection
+            best_meta = meta
+            best_dir = output_dir / f"best_stage{stage}_selected"
+            if best_dir.exists():
+                shutil.rmtree(best_dir)
+            save_checkpoint(model, tokenizer, best_dir, meta)
+    return global_step, best_meta
+
+
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(description="CE3 aspect-conditioned multi-head cross-encoder trainer.")
+    p.add_argument("--model-id", type=str, default=MODEL_ID_DEFAULT)
+    p.add_argument("--split-dir", type=str, default=SPLIT_DIR_DEFAULT)
+    p.add_argument("--output-dir", type=str, default=OUTPUT_DIR_DEFAULT)
+    p.add_argument("--train-listwise", type=str, default="")
+    p.add_argument("--val-listwise", type=str, default="")
+    p.add_argument("--test-listwise", type=str, default="")
+    p.add_argument("--train-pairwise", type=str, default="")
+    p.add_argument("--val-pairwise", type=str, default="")
+    p.add_argument("--test-pairwise", type=str, default="")
+    p.add_argument("--stage1-epochs", type=int, default=1)
+    p.add_argument("--stage2-epochs", type=int, default=3)
+    p.add_argument("--train-batch-size", type=int, default=16)
+    p.add_argument("--eval-batch-size", type=int, default=32)
+    p.add_argument("--grad-accum-steps", type=int, default=1)
+    p.add_argument("--learning-rate", type=float, default=2e-5)
+    p.add_argument("--stage1-learning-rate", type=float, default=0.0)
+    p.add_argument("--stage2-learning-rate", type=float, default=0.0)
+    p.add_argument("--weight-decay", type=float, default=0.01)
+    p.add_argument("--max-length", type=int, default=384)
+    p.add_argument("--teacher-temperature", type=float, default=1.0)
+    p.add_argument("--loss-pair-weight", type=float, default=0.5)
+    p.add_argument("--loss-kl-weight", type=float, default=1.0)
+    p.add_argument("--loss-mse-weight", type=float, default=0.2)
+    p.add_argument("--loss-cluster-margin-weight", type=float, default=0.1)
+    p.add_argument("--loss-calibration-weight", type=float, default=0.1)
+    p.add_argument("--loss-ordinal-weight", type=float, default=0.0)
+    p.add_argument("--loss-coverage-weight", type=float, default=0.0)
+    p.add_argument("--loss-clear-band-weight", type=float, default=0.0)
+    p.add_argument("--loss-global-pair-weight", type=float, default=0.0)
+    p.add_argument("--loss-any-coverage-weight", type=float, default=1.0)
+    p.add_argument("--loss-high-coverage-weight", type=float, default=1.0)
+    p.add_argument("--calibration-high-weight", type=float, default=1.0)
+    p.add_argument("--calibration-mid-weight", type=float, default=1.0)
+    p.add_argument("--calibration-low-weight", type=float, default=1.0)
+    p.add_argument("--calibration-mid-low-weight", type=float, default=1.0)
+    p.add_argument("--calibration-mid-high-weight", type=float, default=1.0)
+    p.add_argument("--ordinal-mid-boundary-weight", type=float, default=1.0)
+    p.add_argument("--ordinal-high-boundary-weight", type=float, default=1.0)
+    p.add_argument("--coverage-boundary-margin", type=float, default=0.0)
+    p.add_argument("--coverage-any-pos-weight", type=float, default=1.0)
+    p.add_argument("--coverage-any-neg-weight", type=float, default=1.0)
+    p.add_argument("--coverage-high-pos-weight", type=float, default=1.0)
+    p.add_argument("--coverage-high-neg-weight", type=float, default=1.0)
+    p.add_argument("--coverage-aspect-weight-map", type=str, default="default=1.0")
+    p.add_argument("--clear-low-max", type=float, default=0.15)
+    p.add_argument("--clear-mid-min", type=float, default=0.40)
+    p.add_argument("--clear-mid-max", type=float, default=0.60)
+    p.add_argument("--clear-high-min", type=float, default=0.85)
+    p.add_argument("--clear-band-low-weight", type=float, default=1.0)
+    p.add_argument("--clear-band-mid-weight", type=float, default=1.0)
+    p.add_argument("--clear-band-high-weight", type=float, default=1.0)
+    p.add_argument("--global-pair-min-gap", type=float, default=0.40)
+    p.add_argument("--global-pair-margin-min", type=float, default=0.05)
+    p.add_argument("--global-pair-margin-max", type=float, default=0.55)
+    p.add_argument("--global-pair-max-pairs", type=int, default=2048)
+    p.add_argument("--global-pair-cross-query-only", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--global-pair-same-aspect-only", action=argparse.BooleanOptionalAction, default=False)
+    p.add_argument("--cluster-margin-hm", type=float, default=0.12)
+    p.add_argument("--cluster-margin-ml", type=float, default=0.12)
+    p.add_argument("--cluster-margin-hl", type=float, default=0.30)
+    p.add_argument("--high-threshold", type=float, default=0.70)
+    p.add_argument("--mid-threshold", type=float, default=0.30)
+    p.add_argument("--margin-min", type=float, default=0.02)
+    p.add_argument("--margin-max", type=float, default=0.60)
+    p.add_argument("--pair-type-weight-map", type=str, default=PAIR_TYPE_WEIGHT_MAP_DEFAULT)
+    p.add_argument("--stage1-pair-preset", type=str, default="balanced", help="Run-script preset label for tracking only.")
+    p.add_argument("--stage1-pair-types", type=str, default=STAGE1_PAIR_TYPES_DEFAULT, help="Comma-separated pair types used in Stage 1. Empty keeps all.")
+    p.add_argument("--stage1-pair-min-margin", type=float, default=0.10)
+    p.add_argument("--stage1-pair-max-per-query", type=int, default=16, help="Max Stage 1 pairs per query/aspect. 0 keeps all filtered pairs.")
+    p.add_argument("--num-workers", type=int, default=0)
+    p.add_argument("--max-grad-norm", type=float, default=1.0)
+    p.add_argument("--train-log-every-steps", type=int, default=1, help="Log train losses to W&B every N optimizer steps. 0 disables step train logs.")
+    p.add_argument("--eval-every-steps", type=int, default=100, help="Run validation and log val metrics every N optimizer steps. 0 disables step validation.")
+    p.add_argument("--fp16", action="store_true")
+    p.add_argument("--no-multihead", action="store_true")
+    p.add_argument("--stage2-freeze-backbone", action=argparse.BooleanOptionalAction, default=False)
+    p.add_argument("--stage2-train-last-layers", type=int, default=0, help="When Stage 2 freeze is enabled, also train the final N transformer layers.")
+    p.add_argument("--trust-remote-code", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--wandb-project", type=str, default="")
+    p.add_argument("--wandb-entity", type=str, default="")
+    p.add_argument("--wandb-run-name", type=str, default="")
+    p.add_argument("--wandb-mode", type=str, default="online", help="online, offline, dryrun, or disabled.")
+    p.add_argument("--wandb-tags", type=str, default="ce3,aspect-conditioned,multihead")
+    return p.parse_args()
+
+
+def _path_arg(args: argparse.Namespace, attr: str, default_name: str) -> Path:
+    value = _clean_text(getattr(args, attr))
+    if value:
+        return _resolve_path(value)
+    return _resolve_path(Path(args.split_dir) / default_name)
+
+
+def main() -> int:
+    started = time.time()
+    args = parse_args()
+    output_dir = _resolve_path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    train_list_path = _path_arg(args, "train_listwise", "llm_distill_all_listwise_train.jsonl")
+    val_list_path = _path_arg(args, "val_listwise", "llm_distill_all_listwise_val.jsonl")
+    test_list_path = _path_arg(args, "test_listwise", "llm_distill_all_listwise_test.jsonl")
+    train_pair_path = _path_arg(args, "train_pairwise", "llm_distill_all_pairwise_train.jsonl")
+    val_pair_path = _path_arg(args, "val_pairwise", "llm_distill_all_pairwise_val.jsonl")
+    test_pair_path = _path_arg(args, "test_pairwise", "llm_distill_all_pairwise_test.jsonl")
+
+    train_list_rows = _load_jsonl(train_list_path)
+    val_list_rows = _load_jsonl(val_list_path)
+    test_list_rows = _load_jsonl(test_list_path)
+    train_pairs = load_pair_rows(train_pair_path)
+    val_pairs = load_pair_rows(val_pair_path)
+    test_pairs = load_pair_rows(test_pair_path)
+    stage1_train_pairs = filter_stage1_pairs(
+        train_pairs,
+        pair_types=args.stage1_pair_types,
+        min_margin=float(args.stage1_pair_min_margin),
+        max_per_query=int(args.stage1_pair_max_per_query),
+    )
+    if not train_list_rows or not train_pairs:
+        raise RuntimeError("Training requires non-empty train listwise and pairwise split files.")
+    if int(args.stage1_epochs) > 0 and not stage1_train_pairs:
+        raise RuntimeError("Stage 1 pair filtering produced zero pairs. Loosen --stage1-pair-types or --stage1-pair-min-margin.")
+    if not val_list_rows or not val_pairs:
+        raise RuntimeError("Validation requires non-empty val listwise and pairwise split files.")
+
+    pair_weights, pair_default = _parse_pair_type_weight_map(args.pair_type_weight_map)
+    tokenizer = AutoTokenizer.from_pretrained(args.model_id, trust_remote_code=bool(args.trust_remote_code))
+    model = load_sequence_classifier_model(
+        args.model_id,
+        num_labels=1,
+        multi_aspect_heads=not bool(args.no_multihead),
+        trust_remote_code=bool(args.trust_remote_code),
+    )
+    device = torch.device("cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu")
+    model.to(device)
+
+    pair_collator = PairCollator(tokenizer, args.max_length, pair_type_weights=pair_weights, default_pair_weight=pair_default)
+    list_collator = ListCollator(tokenizer, args.max_length, high_threshold=args.high_threshold, mid_threshold=args.mid_threshold)
+    loader_kwargs = {"num_workers": max(0, int(args.num_workers)), "pin_memory": device.type == "cuda"}
+
+    pair_stage1_loader = DataLoader(PairDataset(stage1_train_pairs), batch_size=args.train_batch_size, shuffle=True, collate_fn=pair_collator, **loader_kwargs)
+    pair_train_loader = DataLoader(PairDataset(train_pairs), batch_size=args.train_batch_size, shuffle=True, collate_fn=pair_collator, **loader_kwargs)
+    list_train_loader = DataLoader(ListDataset(train_list_rows), batch_size=args.train_batch_size, shuffle=True, collate_fn=list_collator, **loader_kwargs)
+    pair_val_loader = DataLoader(PairDataset(val_pairs), batch_size=args.eval_batch_size, shuffle=False, collate_fn=pair_collator, **loader_kwargs)
+    list_val_loader = DataLoader(ListDataset(val_list_rows), batch_size=args.eval_batch_size, shuffle=False, collate_fn=list_collator, **loader_kwargs)
+    pair_test_loader = DataLoader(PairDataset(test_pairs or val_pairs), batch_size=args.eval_batch_size, shuffle=False, collate_fn=pair_collator, **loader_kwargs)
+    list_test_loader = DataLoader(ListDataset(test_list_rows or val_list_rows), batch_size=args.eval_batch_size, shuffle=False, collate_fn=list_collator, **loader_kwargs)
+
+    setup_meta = {
+        "stage": "ce3_train_setup",
+        "model_id": args.model_id,
+        "multihead": not bool(args.no_multihead),
+        "device": str(device),
+        "train_list_rows": len(train_list_rows),
+        "train_pair_rows": len(train_pairs),
+        "stage1_train_pair_rows": len(stage1_train_pairs),
+        "val_list_rows": len(val_list_rows),
+        "val_pair_rows": len(val_pairs),
+        "test_list_rows": len(test_list_rows),
+        "test_pair_rows": len(test_pairs),
+        "long_prefixes": True,
+        "posthoc_calibration": False,
+        "loss_coverage_weight": float(args.loss_coverage_weight),
+        "loss_clear_band_weight": float(args.loss_clear_band_weight),
+        "loss_global_pair_weight": float(args.loss_global_pair_weight),
+        "coverage_boundary_margin": float(args.coverage_boundary_margin),
+        "coverage_aspect_weight_map": _parse_aspect_weight_map(args.coverage_aspect_weight_map),
+        "clear_band_thresholds": {
+            "low_max": float(args.clear_low_max),
+            "mid_min": float(args.clear_mid_min),
+            "mid_max": float(args.clear_mid_max),
+            "high_min": float(args.clear_high_min),
+        },
+        "global_pair_min_gap": float(args.global_pair_min_gap),
+        "stage2_freeze_backbone": bool(args.stage2_freeze_backbone),
+        "stage2_train_last_layers": int(args.stage2_train_last_layers),
+        "wandb_enabled": bool(_wandb_enabled(args)),
+    }
+    print(json.dumps(setup_meta, ensure_ascii=False))
+    wandb_run = _init_wandb(
+        args,
+        run_config={
+            **vars(args),
+            "train_list_rows": len(train_list_rows),
+            "train_pair_rows": len(train_pairs),
+            "stage1_train_pair_rows": len(stage1_train_pairs),
+            "val_list_rows": len(val_list_rows),
+            "val_pair_rows": len(val_pairs),
+            "test_list_rows": len(test_list_rows),
+            "test_pair_rows": len(test_pairs),
+            "multihead": not bool(args.no_multihead),
+            "long_prefixes": True,
+            "posthoc_calibration": False,
+            "loss_coverage_weight": float(args.loss_coverage_weight),
+            "loss_clear_band_weight": float(args.loss_clear_band_weight),
+            "loss_global_pair_weight": float(args.loss_global_pair_weight),
+            "coverage_boundary_margin": float(args.coverage_boundary_margin),
+            "coverage_aspect_weight_map": _parse_aspect_weight_map(args.coverage_aspect_weight_map),
+            "clear_band_thresholds": {
+                "low_max": float(args.clear_low_max),
+                "mid_min": float(args.clear_mid_min),
+                "mid_max": float(args.clear_mid_max),
+                "high_min": float(args.clear_high_min),
+            },
+            "global_pair_min_gap": float(args.global_pair_min_gap),
+            "stage2_freeze_backbone": bool(args.stage2_freeze_backbone),
+            "stage2_train_last_layers": int(args.stage2_train_last_layers),
+        },
+    )
+    _wandb_log(wandb_run, {"setup": setup_meta}, step=0)
+
+    global_step = 0
+    best: Dict[str, Any] = {}
+    try:
+        if int(args.stage1_epochs) > 0:
+            opt = AdamW(model.parameters(), lr=float(args.stage1_learning_rate or args.learning_rate), weight_decay=float(args.weight_decay))
+            global_step, best["stage1"] = train_stage(
+                stage=1,
+                model=model,
+                optimizer=opt,
+                tokenizer=tokenizer,
+                primary_loader=pair_stage1_loader,
+                secondary_loader=list_train_loader,
+                val_pair_loader=pair_val_loader,
+                val_list_loader=list_val_loader,
+                device=device,
+                output_dir=output_dir,
+                args=args,
+                global_step=global_step,
+                wandb_run=wandb_run,
+            )
+        if int(args.stage2_epochs) > 0:
+            stage2_trainable_meta = configure_stage2_trainable_params(model, args)
+            print(json.dumps({"stage": "ce3_stage2_trainable_setup", **stage2_trainable_meta}, ensure_ascii=False))
+            _wandb_log(wandb_run, {"stage2_trainable": stage2_trainable_meta}, step=global_step)
+            trainable_params = [p for p in model.parameters() if p.requires_grad]
+            opt = AdamW(trainable_params, lr=float(args.stage2_learning_rate or args.learning_rate), weight_decay=float(args.weight_decay))
+            global_step, best["stage2"] = train_stage(
+                stage=2,
+                model=model,
+                optimizer=opt,
+                tokenizer=tokenizer,
+                primary_loader=list_train_loader,
+                secondary_loader=pair_train_loader,
+                val_pair_loader=pair_val_loader,
+                val_list_loader=list_val_loader,
+                device=device,
+                output_dir=output_dir,
+                args=args,
+                global_step=global_step,
+                wandb_run=wandb_run,
+            )
+
+        test_metrics = evaluate(model, pair_test_loader, list_test_loader, device, args)
+        _wandb_log(wandb_run, {"test": test_metrics}, step=global_step)
+        final_meta = {
+            "elapsed_sec": time.time() - started,
+            "global_step": int(global_step),
+            "best": best,
+            "test": test_metrics,
+            "args": vars(args),
+        }
+        save_checkpoint(model, tokenizer, output_dir / "final", final_meta)
+        (output_dir / "train_manifest.json").write_text(json.dumps(final_meta, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        print(json.dumps({"stage": "ce3_train_done", **final_meta}, ensure_ascii=False))
+        return 0
+    finally:
+        if wandb_run is not None:
+            wandb_run.finish()
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

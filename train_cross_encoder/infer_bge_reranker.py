@@ -82,6 +82,8 @@ def _resolve_model_dir(model_dir: str) -> Path:
 def _select_device(*, cpu_only: bool) -> Tuple[Any, str]:
     import torch
 
+    if not cpu_only and torch.cuda.is_available():
+        return torch.device("cuda"), "cuda"
     if not cpu_only and hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
         return torch.device("mps"), "mps"
     return torch.device("cpu"), "cpu"
@@ -99,9 +101,13 @@ def _load_model(model_dir: Path, device, device_name: str):
 
     tok_last_err: Optional[Exception] = None
     tokenizer = None
+    # Prefer slow tokenizer first to avoid known fast-tokenizer regex incompatibility warnings.
     tok_attempts = (
-        {"use_fast": True},
+        {"use_fast": False, "fix_mistral_regex": True},
+        {"use_fast": True, "fix_mistral_regex": True},
+        {"fix_mistral_regex": True},
         {"use_fast": False},
+        {"use_fast": True},
         {},
     )
     for kwargs in tok_attempts:
@@ -143,7 +149,7 @@ def _load_model(model_dir: Path, device, device_name: str):
     model.to(device)
     model.eval()
 
-    # Explicitly avoid CUDA usage in this inference script.
+    # Keep CPU thread settings explicit for non-MPS devices.
     if device_name != "mps":
         torch.set_num_threads(max(1, torch.get_num_threads()))
     return tokenizer, model
@@ -341,7 +347,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
     parser.add_argument("--batch-size", type=int, default=64, help="Inference batch size.")
     parser.add_argument("--max-length", type=int, default=256, help="Tokenizer max length.")
-    parser.add_argument("--cpu-only", action="store_true", help="Force CPU even if MPS is available.")
+    parser.add_argument("--cpu-only", action="store_true", help="Force CPU even if CUDA/MPS is available.")
     parser.add_argument("--json-only", action="store_true", help="Print only JSON payload.")
     return parser
 

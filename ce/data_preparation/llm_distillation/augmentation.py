@@ -1,0 +1,1081 @@
+from __future__ import annotations
+
+import inspect
+import json
+import re
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional, Sequence, Tuple
+
+DOMAIN_AUGMENT_SYSTEM_PROMPT = """
+
+You are generating augmented training data for DOMAIN similarity.
+
+Final output must be exactly one JSON object and nothing else.
+
+Goal:
+
+Generate one candidate specialization text (D text only) whose DOMAIN similarity to the query matches the requested target band.
+
+Domain means:
+
+- application area
+
+- subject area
+
+- problem space
+
+- research or operational context
+
+Important:
+
+- Optimize for domain similarity only.
+
+- Do NOT optimize for method similarity.
+
+- Do NOT simply paraphrase the query.
+
+- Do NOT copy distinctive phrases from the query.
+
+- Preserve meaning at the domain level, not wording at the sentence level.
+
+Band targets:
+
+- high: same or very close domain/problem area/context
+
+- mid: related or adjacent domain with one or more meaningful domain gaps
+
+- low: weakly related or clearly different domain/problem area
+
+Generation rules:
+
+- For high: keep the same core domain, but rewrite the role and phrasing substantially.
+
+- For mid: keep one clear domain connection, but change the specific problem area or context enough that it is not fully equivalent.
+
+- For low: use a weakly related neighboring area or a clearly different domain, but keep the text realistic and plausible.
+
+Required JSON schema:
+
+{
+
+  "augmented_text": "<D text only: concise capability phrase, 8-26 words>",
+
+  "target_band": "<high|mid|low>",
+
+  "notes": "<very short phrase>"
+
+}
+
+Style for augmented_text:
+
+- compact dataset style
+
+- capability-focused phrase, not biography
+
+- do NOT start with phrases like "Specializes in", "Focuses on", "Expert in"
+
+- avoid long phrase overlap with the query
+
+- avoid exact reuse of rare multiword spans from the query
+
+Output rules (strict):
+
+- Do not output reasoning, analysis, or explanations.
+
+- Do not output markdown fences.
+
+- Do not output <think> tags.
+
+- Output only one valid JSON object with the keys above.
+
+""".strip()
+
+METHOD_AUGMENT_SYSTEM_PROMPT = """
+You are generating augmented training data for METHOD similarity.
+Final output must be exactly one JSON object and nothing else.
+
+Goal:
+Generate one candidate specialization text (D text only) whose METHOD similarity to the query matches the requested target band.
+
+Method means:
+- concrete methods
+- techniques
+- procedures
+- workflows
+- analytical approaches
+- technical mechanisms
+
+Important:
+- Optimize for method similarity only.
+- Do NOT optimize for domain overlap alone.
+- Do NOT simply paraphrase the query.
+- Do NOT copy distinctive phrases from the query.
+- Preserve the method logic, not the surface wording.
+
+Band targets:
+- high: same or very close method stack
+- mid: partial method overlap with at least one important missing or changed method component
+- low: weakly related or different method
+
+Generation rules:
+- For high: preserve the same core method family, but rewrite with different wording and structure.
+- For mid: preserve one meaningful method overlap, but intentionally remove or replace at least one key method component.
+- For low: use a different or only weakly related method, while keeping the text realistic and plausible.
+
+Required JSON schema:
+{
+  "augmented_text": "<D text only: concise capability phrase, 8-26 words>",
+  "target_band": "<high|mid|low>",
+  "notes": "<very short phrase>"
+}
+
+Style for augmented_text:
+- compact dataset style
+- capability-focused phrase, not biography
+- do NOT start with phrases like "Specializes in", "Focuses on", "Expert in"
+- avoid long phrase overlap with the query
+- avoid exact reuse of rare multiword spans from the query
+
+Output rules (strict):
+- Do not output reasoning, analysis, or explanations.
+- Do not output markdown fences.
+- Do not output <think> tags.
+- Output only one valid JSON object with the keys above.
+""".strip()
+
+CONSTRAINT_AUGMENT_SYSTEM_PROMPT = """
+You are generating augmented training data for CONSTRAINT/SPECIFICITY match.
+Final output must be exactly one JSON object and nothing else.
+
+Goal:
+Generate one candidate specialization text (D text only) whose CONSTRAINT match to the query matches the requested target band.
+
+Constraint match means:
+- required objects or data types
+- standards, tools, systems, or named frameworks
+- populations, organisms, materials, or environments
+- deliverables, documentation, validation, or implementation conditions
+- qualifiers that make the requirement specific rather than broad
+
+Important:
+- Optimize for constraint/specificity match only.
+- Do NOT optimize for broad domain similarity alone.
+- Do NOT optimize for method similarity alone.
+- Do NOT simply paraphrase the query.
+- Do NOT copy distinctive phrases from the query.
+- Preserve or omit specific required details according to the target band.
+
+Band targets:
+- high: covers most or all central required constraints/details, with different wording
+- mid: covers some important constraints/details but omits or weakens at least one central constraint
+- low: may be in a related domain or use a related method, but misses the key required constraints/details
+
+Generation rules:
+- For high: include the concrete required details while rephrasing substantially.
+- For mid: include one meaningful required detail, but intentionally omit or alter another central detail.
+- For low: keep the text realistic and plausibly related, but remove the must-have specifics that would satisfy the query.
+
+Required JSON schema:
+{
+  "augmented_text": "<D text only: concise capability phrase, 8-26 words>",
+  "target_band": "<high|mid|low>",
+  "notes": "<very short phrase>"
+}
+
+Style for augmented_text:
+- compact dataset style
+- capability-focused phrase, not biography
+- do NOT start with phrases like "Specializes in", "Focuses on", "Expert in"
+- avoid long phrase overlap with the query
+- avoid exact reuse of rare multiword spans from the query
+
+Output rules (strict):
+- Do not output reasoning, analysis, or explanations.
+- Do not output markdown fences.
+- Do not output <think> tags.
+- Output only one valid JSON object with the keys above.
+""".strip()
+
+
+AUGMENT_USER_PROMPT_TEMPLATE = """
+Requirement query:
+{query}
+
+Aspect to optimize:
+{aspect_label}
+
+Target band:
+{target_band}
+
+Desired judge score range:
+{target_min} to {target_max}
+
+Preferred center:
+{target_center}
+
+Generate one realistic candidate specialization phrase that matches the requested aspect band.
+""".strip()
+
+AUGMENT_PROMPT_CONFIGS: Dict[str, Tuple[str, str]] = {
+    "domain": (DOMAIN_AUGMENT_SYSTEM_PROMPT, "domain"),
+    "method": (METHOD_AUGMENT_SYSTEM_PROMPT, "method"),
+    "constraint": (CONSTRAINT_AUGMENT_SYSTEM_PROMPT, "constraint/specificity"),
+}
+
+
+# Sharp generation target range.
+AIM_SCORE_RANGES: Dict[str, tuple[float, float]] = {
+    "high": (0.70, 0.80),
+    "mid": (0.40, 0.50),
+    "low": (0.00, 0.39),
+}
+
+# Loose acceptance range after validation.
+VALID_SCORE_RANGES: Dict[str, tuple[float, float]] = {
+    "high": (0.70, 1.00),
+    "mid": (0.30, 0.69),
+    "low": (0.00, 0.39),
+}
+
+# Lexical-diversity filters (same style as eval multi-model test).
+MAX_QUERY_TOKEN_COVERAGE = 0.60
+MAX_QUERY_BIGRAM_OVERLAP = 0.45
+MAX_QUERY_TRIGRAM_OVERLAP = 0.25
+MIN_NOVEL_TOKEN_RATIO = 0.50
+MIN_QUERY_TOKEN_COVERAGE_HIGH = 0.20
+MIN_QUERY_TOKEN_COVERAGE_MID = 0.10
+MIN_QUERY_TOKEN_COVERAGE_LOW = 0.05
+
+DOMAIN_VALIDATION_SYSTEM_PROMPT = """
+You are a strict DOMAIN similarity judge.
+
+Your task is to evaluate DOMAIN/TOPIC overlap only between a requirement query and a candidate specialization.
+
+Domain means:
+- application area
+- subject area
+- problem space
+- research context
+- operational context
+
+Do NOT reward overlap that is only:
+- same method
+- same workflow
+- same analytical style
+- generic technical language
+- broad umbrella adjacency without the same concrete problem area
+
+Scoring rules:
+- high: score >= 0.70 -> same or very close domain/topic
+- mid: 0.40 <= score < 0.70 -> related or adjacent domain, but not the same
+- low: score < 0.40 -> weakly related or different domain
+
+Band must match score exactly.
+
+Return exactly one JSON object:
+{"score": <float in [0,1]>, "reason": "<short sentence>", "band": "<high|mid|low>"}
+
+No markdown or extra text.
+""".strip()
+METHOD_VALIDATION_SYSTEM_PROMPT = """
+You are a strict METHOD similarity judge.
+
+Your task is to evaluate METHOD overlap only between a requirement query and a candidate specialization.
+
+Method means:
+- concrete methods
+- techniques
+- procedures
+- workflows
+- analytical approaches
+- technical mechanisms
+
+Do NOT reward overlap that is only:
+- same topic/domain
+- same broad goal
+- same environment
+- generic data work
+- generic scientific language
+
+Scoring rules:
+- high: score >= 0.70 -> strong overlap in concrete methods/techniques/procedures
+- mid: 0.40 <= score < 0.70 -> partial method overlap or same general method family with missing components
+- low: score < 0.40 -> weak or no real method overlap
+
+Band must match score exactly.
+
+Return exactly one JSON object:
+{"score": <float in [0,1]>, "reason": "<short sentence>", "band": "<high|mid|low>"}
+
+No markdown or extra text.
+""".strip()
+
+CONSTRAINT_VALIDATION_SYSTEM_PROMPT = """
+You are a strict CONSTRAINT/SPECIFICITY match judge.
+
+Your task is to evaluate whether the candidate specialization contains the specific required details in the requirement query.
+
+Constraint match means:
+- required objects or data types
+- standards, tools, systems, or named frameworks
+- populations, organisms, materials, or environments
+- deliverables, documentation, validation, or implementation conditions
+- qualifiers that narrow the requirement beyond broad domain or method
+
+Do NOT reward overlap that is only:
+- same broad topic/domain
+- same general method
+- same broad goal
+- generic data, analysis, modeling, or workflow language
+- adjacent but missing the specific requested objects/conditions
+
+Scoring rules:
+- high: score >= 0.70 -> most or all central required constraints/details are covered
+- mid: 0.30 <= score < 0.70 -> some important constraints/details are covered, but at least one central constraint is missing or weakened
+- low: score < 0.30 -> key required constraints/details are missing, even if domain or method is related
+
+Band must match score exactly.
+
+Return exactly one JSON object:
+{"score": <float in [0,1]>, "reason": "<short sentence>", "band": "<high|mid|low>"}
+
+No markdown or extra text.
+""".strip()
+
+VALIDATION_PROMPT_CONFIGS: Dict[str, str] = {
+    "domain": DOMAIN_VALIDATION_SYSTEM_PROMPT,
+    "method": METHOD_VALIDATION_SYSTEM_PROMPT,
+    "constraint": CONSTRAINT_VALIDATION_SYSTEM_PROMPT,
+}
+
+VALIDATION_USER_PROMPT_TEMPLATE = """
+Requirement query:
+{query}
+
+Candidate specialization:
+{candidate}
+""".strip()
+
+
+def _clean_text(value: Any) -> str:
+    return str(value or "").strip()
+
+
+def _normalize_target_cluster(value: Any) -> str:
+    token = _clean_text(value).lower()
+    if token in {"high", "top", "strong"}:
+        return "high"
+    if token in {"mid", "middle", "boundary"}:
+        return "mid"
+    if token in {"low", "rand", "random", "weak"}:
+        return "low"
+    return "mid"
+
+
+def _normalize_judge_aspect(value: Any) -> str:
+    token = _clean_text(value).lower()
+    if token in {"method", "methods"}:
+        return "method"
+    if token in {"constraint", "constraints", "specificity", "specific", "detail", "details"}:
+        return "constraint"
+    return "domain"
+
+
+def _clamp_score(value: Any) -> float:
+    try:
+        score = float(value)
+    except Exception:
+        score = 0.0
+    if score < 0.0:
+        return 0.0
+    if score > 1.0:
+        return 1.0
+    return score
+
+
+def _normalize_band(value: Any) -> str:
+    token = _clean_text(value).lower()
+    if token in {"high", "mid", "low"}:
+        return token
+    return "low"
+
+
+def _tokenize_simple(text: str) -> List[str]:
+    return re.findall(r"[a-z0-9]+", _clean_text(text).lower())
+
+
+def _query_token_coverage(query: str, candidate: str) -> float:
+    q_tokens = set(_tokenize_simple(query))
+    c_tokens = set(_tokenize_simple(candidate))
+    if not q_tokens:
+        return 0.0
+    return float(len(q_tokens.intersection(c_tokens)) / float(max(1, len(q_tokens))))
+
+
+def _query_bigram_overlap(query: str, candidate: str) -> float:
+    q_toks = _tokenize_simple(query)
+    c_toks = _tokenize_simple(candidate)
+    if len(q_toks) < 2:
+        return 0.0
+    q_bi = set(zip(q_toks[:-1], q_toks[1:]))
+    c_bi = set(zip(c_toks[:-1], c_toks[1:])) if len(c_toks) >= 2 else set()
+    if not q_bi:
+        return 0.0
+    return float(len(q_bi.intersection(c_bi)) / float(len(q_bi)))
+
+
+def _query_trigram_overlap(query: str, candidate: str) -> float:
+    q_toks = _tokenize_simple(query)
+    c_toks = _tokenize_simple(candidate)
+    if len(q_toks) < 3:
+        return 0.0
+    q_tri = set(zip(q_toks[:-2], q_toks[1:-1], q_toks[2:]))
+    c_tri = set(zip(c_toks[:-2], c_toks[1:-1], c_toks[2:])) if len(c_toks) >= 3 else set()
+    if not q_tri:
+        return 0.0
+    return float(len(q_tri.intersection(c_tri)) / float(len(q_tri)))
+
+
+def _novel_token_ratio(query: str, candidate: str) -> float:
+    q_tokens = set(_tokenize_simple(query))
+    c_tokens = set(_tokenize_simple(candidate))
+    if not c_tokens:
+        return 0.0
+    novel = len([t for t in c_tokens if t not in q_tokens])
+    return float(novel / float(len(c_tokens)))
+
+
+def _extract_score(raw_text: str) -> tuple[float, bool]:
+    raw = _clean_text(raw_text)
+    if not raw:
+        return 0.0, False
+
+    if raw.startswith("{") and raw.count("{") > raw.count("}"):
+        raw = raw + ("}" * (raw.count("{") - raw.count("}")))
+
+    try:
+        obj = json.loads(raw)
+        if isinstance(obj, dict) and ("score" in obj):
+            return _clamp_score(obj.get("score")), True
+    except Exception:
+        pass
+
+    m = re.search(r"\{[\s\S]*\}", raw)
+    if m:
+        try:
+            obj = json.loads(m.group(0))
+            if isinstance(obj, dict) and ("score" in obj):
+                return _clamp_score(obj.get("score")), True
+        except Exception:
+            pass
+
+    n = re.search(r"[-+]?\d*\.?\d+", raw)
+    if n:
+        return _clamp_score(n.group(0)), False
+    return 0.0, False
+
+
+def _range_for_cluster(cluster: str, table: Dict[str, tuple[float, float]]) -> tuple[float, float]:
+    key = _normalize_target_cluster(cluster)
+    out = table.get(key)
+    if out is None:
+        return (0.0, 1.0)
+    lo, hi = float(out[0]), float(out[1])
+    if lo > hi:
+        lo, hi = hi, lo
+    return (max(0.0, lo), min(1.0, hi))
+
+
+def _score_distance_to_range(score: float, lo: float, hi: float) -> float:
+    s = _clamp_score(score)
+    if lo <= s <= hi:
+        return 0.0
+    if s < lo:
+        return float(lo - s)
+    return float(s - hi)
+
+
+def _extract_json_object(text: str) -> Optional[Dict[str, Any]]:
+    raw = _clean_text(text)
+    if not raw:
+        return None
+
+    def _try_parse(candidate: str) -> Optional[Dict[str, Any]]:
+        s = _clean_text(candidate)
+        if not s:
+            return None
+        if s.startswith("{") and s.count("{") > s.count("}"):
+            s = s + ("}" * (s.count("{") - s.count("}")))
+        try:
+            obj = json.loads(s)
+        except Exception:
+            return None
+        if isinstance(obj, dict):
+            return obj
+        return None
+
+    direct = _try_parse(raw)
+    if direct is not None:
+        return direct
+
+    stripped = re.sub(r"(?is)<think>[\s\S]*?</think>", "", raw).strip()
+    if "</think>" in stripped:
+        stripped = stripped.split("</think>", 1)[-1].strip()
+    via_stripped = _try_parse(stripped)
+    if via_stripped is not None:
+        return via_stripped
+
+    fenced_blocks = re.findall(r"```(?:json)?\s*([\s\S]*?)```", stripped, flags=re.IGNORECASE)
+    for block in reversed(fenced_blocks):
+        obj = _try_parse(block)
+        if obj is not None:
+            return obj
+
+    candidates: List[str] = []
+    depth = 0
+    start = -1
+    for i, ch in enumerate(stripped):
+        if ch == "{":
+            if depth == 0:
+                start = i
+            depth += 1
+        elif ch == "}":
+            if depth > 0:
+                depth -= 1
+                if depth == 0 and start >= 0:
+                    candidates.append(stripped[start : i + 1])
+                    start = -1
+    for cand in reversed(candidates):
+        obj = _try_parse(cand)
+        if obj is not None:
+            return obj
+    return None
+
+
+def _extract_augmented_text(parsed: Dict[str, Any]) -> str:
+    for key in (
+        "augmented_text",
+        "d_text",
+        "constraint_text",
+        "specificity_text",
+        "domain_text",
+        "method_text",
+        "candidate_text",
+        "candidate",
+        "text",
+        "output",
+    ):
+        text = _clean_text(parsed.get(key))
+        if text:
+            return text
+    return ""
+
+
+def _looks_like_reasoning_spill(text: str) -> bool:
+    t = _clean_text(text).lower()
+    if not t:
+        return True
+    markers = [
+        "<think>",
+        "</think>",
+        "```",
+        "alright, i need to",
+        "let me think",
+        "reasoning:",
+    ]
+    return any(marker in t for marker in markers)
+
+
+def _normalize_augmented_text(text: str) -> str:
+    s = _clean_text(text)
+    if not s:
+        return ""
+    s = s.strip().strip('"').strip("'").strip()
+    s = re.sub(
+        r"^(specializes in|specialising in|focuses on|focused on|expert in|expertise in|works on|researches)\s+",
+        "",
+        s,
+        flags=re.IGNORECASE,
+    )
+    s = re.sub(r"\s+", " ", s).strip()
+    s = s.rstrip(" .;")
+    if not s:
+        return ""
+    return s[0].upper() + s[1:] if len(s) > 1 else s.upper()
+
+
+def _model_generation_sampling(model_id: str) -> tuple[float, float]:
+    token = _clean_text(model_id).lower()
+    if "qwen3" in token or "ophiuchi-qwen3" in token or "deepseek-r1" in token:
+        return 0.6, 0.95
+    return 0.1, 0.9
+
+
+@dataclass
+class AugmentationResult:
+    query: str
+    target_cluster: str
+    augmented_text: str
+    parsed_ok: bool
+    attempt: int
+    raw_response: str
+    parsed: Dict[str, Any]
+    notes: str
+    validation: Dict[str, Any]
+    failure_reason: str
+
+
+class LLMDistillationAugmenter:
+    """
+    Reusable augmentation helper that keeps one loaded LLM in memory.
+
+    Pass an already-loaded LLM object (typically vLLM `LLM`) so repeated calls
+    do not re-load model weights.
+    """
+
+    def __init__(
+        self,
+        *,
+        llm: Any,
+        tokenizer: Optional[Any] = None,
+        model_id: str = "Qwen/Qwen2.5-14B-Instruct",
+        judge_aspect: str = "domain",
+        max_attempts: int = 3,
+        max_new_tokens: int = 512,
+        temperature: float = 0.2,
+        top_p: float = 0.9,
+        enable_validation: bool = True,
+        validation_max_new_tokens: int = 160,
+    ) -> None:
+        self.llm = llm
+        self.tokenizer = tokenizer if tokenizer is not None else self._infer_tokenizer(llm)
+        self.model_id = _clean_text(model_id) or "Qwen/Qwen2.5-14B-Instruct"
+        self.judge_aspect = _normalize_judge_aspect(judge_aspect)
+        self.max_attempts = max(1, int(max_attempts))
+        self.max_new_tokens = max(32, int(max_new_tokens))
+        self.temperature = max(0.0, float(temperature))
+        self.top_p = max(0.01, min(1.0, float(top_p)))
+        self.enable_validation = bool(enable_validation)
+        self.validation_max_new_tokens = max(32, int(validation_max_new_tokens))
+
+        if not hasattr(self.tokenizer, "apply_chat_template"):
+            raise RuntimeError("Tokenizer does not support apply_chat_template().")
+        if not getattr(self.tokenizer, "chat_template", None):
+            raise RuntimeError("tokenizer.chat_template is not set for this model/tokenizer.")
+
+    @staticmethod
+    def _infer_tokenizer(llm: Any) -> Any:
+        if hasattr(llm, "get_tokenizer"):
+            return llm.get_tokenizer()
+        raise RuntimeError("Tokenizer was not provided and could not be inferred from llm.get_tokenizer().")
+
+    def _apply_chat_template(self, messages: Sequence[Dict[str, str]]) -> str:
+        kwargs: Dict[str, Any] = {
+            "tokenize": False,
+            "add_generation_prompt": True,
+        }
+        token = _clean_text(self.model_id).lower()
+        if "qwen3" in token or "ophiuchi-qwen3" in token:
+            try:
+                sig = inspect.signature(self.tokenizer.apply_chat_template)
+                if "enable_thinking" in sig.parameters:
+                    kwargs["enable_thinking"] = True
+            except Exception:
+                pass
+        try:
+            return self.tokenizer.apply_chat_template(list(messages), **kwargs)
+        except TypeError:
+            kwargs.pop("enable_thinking", None)
+            return self.tokenizer.apply_chat_template(list(messages), **kwargs)
+
+    def _build_prompt(self, *, query: str, target_cluster: str) -> str:
+        target_min, target_max = _range_for_cluster(target_cluster, AIM_SCORE_RANGES)
+        target_band = _normalize_target_cluster(target_cluster)
+        system_prompt, aspect_label = AUGMENT_PROMPT_CONFIGS.get(
+            self.judge_aspect,
+            AUGMENT_PROMPT_CONFIGS["domain"],
+        )
+        user_prompt = AUGMENT_USER_PROMPT_TEMPLATE.format(
+            query=_clean_text(query),
+            aspect_label=aspect_label,
+            target_band=target_band,
+            target_min=f"{target_min:.2f}",
+            target_max=f"{target_max:.2f}",
+            target_center=f"{((target_min + target_max) / 2.0):.2f}",
+        )
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ]
+        return self._apply_chat_template(messages)
+
+    def _generate_raw_batch(
+        self,
+        prompts: Sequence[str],
+        *,
+        max_new_tokens: Optional[int] = None,
+        temperature: Optional[float] = None,
+        top_p: Optional[float] = None,
+    ) -> List[str]:
+        try:
+            from vllm import SamplingParams
+        except Exception as exc:
+            raise RuntimeError(
+                "vLLM SamplingParams is required for this augmenter. "
+                "Install/import vllm in the same environment."
+            ) from exc
+
+        params = SamplingParams(
+            max_tokens=int(self.max_new_tokens if max_new_tokens is None else max_new_tokens),
+            temperature=float(self.temperature if temperature is None else temperature),
+            top_p=float(self.top_p if top_p is None else top_p),
+        )
+        outputs = self.llm.generate(list(prompts), params, use_tqdm=False)
+        out_texts: List[str] = []
+        for row in outputs:
+            if not row.outputs:
+                out_texts.append("")
+                continue
+            out_texts.append(_clean_text(row.outputs[0].text))
+        return out_texts
+
+    def _build_validation_prompt(self, *, query: str, candidate_text: str) -> str:
+        system_prompt = VALIDATION_PROMPT_CONFIGS.get(
+            self.judge_aspect,
+            VALIDATION_PROMPT_CONFIGS["domain"],
+        )
+        user_prompt = VALIDATION_USER_PROMPT_TEMPLATE.format(
+            query=_clean_text(query),
+            candidate=_clean_text(candidate_text),
+        )
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ]
+        return self._apply_chat_template(messages)
+
+    def validate_pair(
+        self,
+        *,
+        query: str,
+        candidate_text: str,
+        target_cluster: str = "mid",
+    ) -> Dict[str, Any]:
+        query_text = _clean_text(query)
+        candidate = _clean_text(candidate_text)
+        cluster = _normalize_target_cluster(target_cluster)
+        valid_min, valid_max = _range_for_cluster(cluster, VALID_SCORE_RANGES)
+        aim_min, aim_max = _range_for_cluster(cluster, AIM_SCORE_RANGES)
+        if not query_text:
+            raise ValueError("query must be non-empty.")
+        if not candidate:
+            return {
+                "score": 0.0,
+                "parsed_ok": False,
+                "raw_response": "",
+                "target_cluster": cluster,
+                "valid_min": float(valid_min),
+                "valid_max": float(valid_max),
+                "aim_min": float(aim_min),
+                "aim_max": float(aim_max),
+                "pass_valid_range": False,
+                "distance_to_aim_range": 1.0,
+            }
+        prompt = self._build_validation_prompt(query=query_text, candidate_text=candidate)
+        raw = self._generate_raw_batch(
+            [prompt],
+            max_new_tokens=int(self.validation_max_new_tokens),
+            temperature=0.0,
+            top_p=1.0,
+        )[0]
+        parsed_obj = _extract_json_object(raw)
+        score, parsed_ok = _extract_score(raw)
+        if parsed_obj is not None and ("score" in parsed_obj):
+            score = _clamp_score(parsed_obj.get("score"))
+            parsed_ok = True
+        pass_valid = bool(valid_min <= float(score) <= valid_max)
+        return {
+            "score": float(score),
+            "parsed_ok": bool(parsed_ok),
+            "raw_response": raw,
+            "target_cluster": cluster,
+            "valid_min": float(valid_min),
+            "valid_max": float(valid_max),
+            "aim_min": float(aim_min),
+            "aim_max": float(aim_max),
+            "pass_valid_range": bool(pass_valid),
+            "distance_to_aim_range": float(_score_distance_to_range(float(score), float(aim_min), float(aim_max))),
+        }
+
+    def _validate_batch(
+        self,
+        *,
+        items: Sequence[Tuple[str, str, str]],
+        batch_size: int,
+    ) -> List[Dict[str, Any]]:
+        out: List[Dict[str, Any]] = []
+        if not items:
+            return out
+
+        for start in range(0, len(items), max(1, int(batch_size))):
+            chunk = list(items[start : start + max(1, int(batch_size))])
+            prompts = [
+                self._build_validation_prompt(query=query_text, candidate_text=candidate_text)
+                for query_text, candidate_text, _cluster in chunk
+            ]
+            raws = self._generate_raw_batch(
+                prompts,
+                max_new_tokens=int(self.validation_max_new_tokens),
+                temperature=0.0,
+                top_p=1.0,
+            )
+            for (query_text, candidate_text, cluster), raw in zip(chunk, raws):
+                valid_min, valid_max = _range_for_cluster(cluster, VALID_SCORE_RANGES)
+                aim_min, aim_max = _range_for_cluster(cluster, AIM_SCORE_RANGES)
+                parsed_obj = _extract_json_object(raw)
+                score, parsed_ok = _extract_score(raw)
+                if parsed_obj is not None and ("score" in parsed_obj):
+                    score = _clamp_score(parsed_obj.get("score"))
+                    parsed_ok = True
+                pass_valid = bool(valid_min <= float(score) <= valid_max)
+                out.append(
+                    {
+                        "score": float(score),
+                        "parsed_ok": bool(parsed_ok),
+                        "raw_response": raw,
+                        "target_cluster": cluster,
+                        "valid_min": float(valid_min),
+                        "valid_max": float(valid_max),
+                        "aim_min": float(aim_min),
+                        "aim_max": float(aim_max),
+                        "pass_valid_range": bool(pass_valid),
+                        "distance_to_aim_range": float(
+                            _score_distance_to_range(float(score), float(aim_min), float(aim_max))
+                        ),
+                    }
+                )
+        return out
+
+    def augment(self, *, query: str, target_cluster: str) -> Dict[str, Any]:
+        query_text = _clean_text(query)
+        if not query_text:
+            raise ValueError("query must be non-empty.")
+        cluster = _normalize_target_cluster(target_cluster)
+        out = self.augment_batch(
+            [{"query": query_text, "target_cluster": cluster}],
+            batch_size=1,
+        )
+        if not out:
+            return {
+                "query": query_text,
+                "target_cluster": cluster,
+                "augmented_text": "",
+                "parsed_ok": False,
+                "attempt": int(self.max_attempts),
+                "raw_response": "",
+                "parsed": {},
+                "notes": "",
+                "validation": {},
+                "failure_reason": "No usable candidate produced.",
+            }
+        return out[0]
+
+    def augment_batch(self, items: Sequence[Dict[str, Any]], *, batch_size: int = 32) -> List[Dict[str, Any]]:
+        batch_n = max(1, int(batch_size))
+        results: List[Optional[Dict[str, Any]]] = [None] * len(items)
+        jobs: List[Dict[str, Any]] = []
+        gen_temp, gen_top_p = _model_generation_sampling(self.model_id)
+
+        for idx, row in enumerate(items):
+            query_text = _clean_text(row.get("query"))
+            cluster = _normalize_target_cluster(row.get("target_cluster") or row.get("target_band") or "mid")
+            if not query_text:
+                results[idx] = {
+                    "query": "",
+                    "target_cluster": cluster,
+                    "augmented_text": "",
+                    "parsed_ok": False,
+                    "attempt": 0,
+                    "raw_response": "",
+                    "parsed": {},
+                    "notes": "",
+                    "validation": {},
+                    "failure_reason": "query must be non-empty.",
+                }
+                continue
+            target_min, target_max = _range_for_cluster(cluster, AIM_SCORE_RANGES)
+            target_center = float((target_min + target_max) / 2.0)
+            min_coverage = (
+                float(MIN_QUERY_TOKEN_COVERAGE_HIGH)
+                if cluster == "high"
+                else float(MIN_QUERY_TOKEN_COVERAGE_MID if cluster == "mid" else MIN_QUERY_TOKEN_COVERAGE_LOW)
+            )
+            jobs.append(
+                {
+                    "idx": int(idx),
+                    "query": query_text,
+                    "cluster": cluster,
+                    "target_center": target_center,
+                    "min_coverage": float(min_coverage),
+                    "attempt": 0,
+                    "done": False,
+                    "last_raw": "",
+                    "last_parsed": {},
+                    "best_candidate": None,
+                    "best_distance": float("inf"),
+                    "best_key": (float("inf"), float("inf"), float("inf"), float("inf")),
+                }
+            )
+
+        for _round in range(1, self.max_attempts + 1):
+            active = [j for j in jobs if (not bool(j["done"])) and int(j["attempt"]) < self.max_attempts]
+            if not active:
+                break
+
+            validate_queue: List[Dict[str, Any]] = []
+            for start in range(0, len(active), batch_n):
+                chunk = active[start : start + batch_n]
+                prompts = [self._build_prompt(query=j["query"], target_cluster=j["cluster"]) for j in chunk]
+                raws = self._generate_raw_batch(
+                    prompts,
+                    max_new_tokens=int(self.max_new_tokens),
+                    temperature=float(gen_temp),
+                    top_p=float(gen_top_p),
+                )
+                for j, raw in zip(chunk, raws):
+                    j["attempt"] = int(j["attempt"]) + 1
+                    j["last_raw"] = raw
+                    parsed_obj = _extract_json_object(raw)
+                    parsed = dict(parsed_obj or {})
+                    j["last_parsed"] = parsed
+
+                    candidate = _normalize_augmented_text(_extract_augmented_text(parsed))
+                    if not candidate:
+                        continue
+                    if _looks_like_reasoning_spill(candidate):
+                        continue
+                    coverage = _query_token_coverage(query=j["query"], candidate=candidate)
+                    if float(coverage) < float(j["min_coverage"]):
+                        continue
+                    if float(coverage) > float(MAX_QUERY_TOKEN_COVERAGE):
+                        continue
+                    bigram_overlap = _query_bigram_overlap(query=j["query"], candidate=candidate)
+                    if float(bigram_overlap) > float(MAX_QUERY_BIGRAM_OVERLAP):
+                        continue
+                    trigram_overlap = _query_trigram_overlap(query=j["query"], candidate=candidate)
+                    if float(trigram_overlap) > float(MAX_QUERY_TRIGRAM_OVERLAP):
+                        continue
+                    novel_ratio = _novel_token_ratio(query=j["query"], candidate=candidate)
+                    if float(novel_ratio) < float(MIN_NOVEL_TOKEN_RATIO):
+                        continue
+
+                    out_cluster = _normalize_target_cluster(
+                        parsed.get("target_cluster") or parsed.get("target_band") or j["cluster"]
+                    )
+                    if not self.enable_validation:
+                        result = AugmentationResult(
+                            query=j["query"],
+                            target_cluster=out_cluster,
+                            augmented_text=candidate,
+                            parsed_ok=bool(parsed_obj is not None),
+                            attempt=int(j["attempt"]),
+                            raw_response=raw,
+                            parsed=parsed,
+                            notes=_clean_text(parsed.get("notes")),
+                            validation={},
+                            failure_reason="",
+                        )
+                        results[int(j["idx"])] = result.__dict__
+                        j["done"] = True
+                        continue
+
+                    validate_queue.append(
+                        {
+                            "job": j,
+                            "candidate": candidate,
+                            "out_cluster": out_cluster,
+                            "parsed_ok": bool(parsed_obj is not None),
+                            "raw_response": raw,
+                            "parsed": parsed,
+                            "notes": _clean_text(parsed.get("notes")),
+                            "bigram_overlap": float(bigram_overlap),
+                            "trigram_overlap": float(trigram_overlap),
+                            "novel_ratio": float(novel_ratio),
+                        }
+                    )
+
+            if self.enable_validation and validate_queue:
+                validate_items = [
+                    (v["job"]["query"], v["candidate"], _normalize_target_cluster(v["job"]["cluster"]))
+                    for v in validate_queue
+                ]
+                validations = self._validate_batch(items=validate_items, batch_size=batch_n)
+                for item, validation in zip(validate_queue, validations):
+                    j = item["job"]
+                    result = AugmentationResult(
+                        query=j["query"],
+                        target_cluster=item["out_cluster"],
+                        augmented_text=item["candidate"],
+                        parsed_ok=bool(item["parsed_ok"]),
+                        attempt=int(j["attempt"]),
+                        raw_response=item["raw_response"],
+                        parsed=item["parsed"],
+                        notes=item["notes"],
+                        validation=validation,
+                        failure_reason="",
+                    )
+                    if bool(validation.get("pass_valid_range")):
+                        results[int(j["idx"])] = result.__dict__
+                        j["done"] = True
+                        continue
+
+                    dist = float(validation.get("distance_to_aim_range", 1.0))
+                    score = _clamp_score(validation.get("score"))
+                    rank_key = (
+                        abs(float(score) - float(j["target_center"])),
+                        float(item["trigram_overlap"]),
+                        float(item["bigram_overlap"]),
+                        -float(item["novel_ratio"]),
+                    )
+                    if (dist < float(j["best_distance"])) or (
+                        dist == float(j["best_distance"]) and rank_key < tuple(j["best_key"])
+                    ):
+                        j["best_distance"] = float(dist)
+                        j["best_key"] = rank_key
+                        j["best_candidate"] = result
+
+        for j in jobs:
+            idx = int(j["idx"])
+            if results[idx] is not None:
+                continue
+            best = j.get("best_candidate")
+            if isinstance(best, AugmentationResult):
+                out = best.__dict__.copy()
+                out["failure_reason"] = "No candidate passed validation range; returning closest-to-aim candidate."
+                results[idx] = out
+                continue
+            results[idx] = AugmentationResult(
+                query=j["query"],
+                target_cluster=j["cluster"],
+                augmented_text="",
+                parsed_ok=False,
+                attempt=int(j["attempt"]),
+                raw_response=_clean_text(j.get("last_raw")),
+                parsed=dict(j.get("last_parsed") or {}),
+                notes="",
+                validation={},
+                failure_reason="No usable candidate produced.",
+            ).__dict__
+
+        return [r if r is not None else {
+            "query": "",
+            "target_cluster": "mid",
+            "augmented_text": "",
+            "parsed_ok": False,
+            "attempt": 0,
+            "raw_response": "",
+            "parsed": {},
+            "notes": "",
+            "validation": {},
+            "failure_reason": "No usable candidate produced.",
+        } for r in results]

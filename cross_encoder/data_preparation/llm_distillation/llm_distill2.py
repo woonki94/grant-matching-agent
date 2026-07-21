@@ -1,0 +1,2040 @@
+from __future__ import annotations
+
+import argparse
+import gc
+import hashlib
+import json
+import math
+import random
+import re
+import sys
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Dict, List, Sequence, Tuple
+
+
+def _find_project_root() -> Path:
+    here = Path(__file__).resolve()
+    for parent in (here.parent, *here.parents):
+        if (parent / "cross_encoder").is_dir():
+            return parent
+    return here.parent
+
+
+PROJECT_ROOT = _find_project_root()
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+# Local augmentation helper.
+try:
+    from cross_encoder.data_preparation.llm_distillation.augmentation import LLMDistillationAugmenter
+except Exception:
+    try:
+        from augmentation import LLMDistillationAugmenter  # type: ignore
+    except Exception:
+        LLMDistillationAugmenter = None  # type: ignore
+
+
+GRANT_DB_DEFAULT = "cross_encoder/dataset/source/grant_keywords_spec_keywords_db.json"
+FAC_DB_DEFAULT = "cross_encoder/dataset/source/fac_specs_db.json"
+PREFILTER_CACHE_DEFAULT = "cross_encoder/dataset/source/spec_facspec_sts_cache.jsonl"
+RAW_OUTPUT_DEFAULT = "cross_encoder/dataset/distill/llm_distill2_raw_scores.jsonl"
+PAIRWISE_OUTPUT_DEFAULT = "cross_encoder/dataset/distill/llm_distill2_pairwise.jsonl"
+LISTWISE_OUTPUT_DEFAULT = "cross_encoder/dataset/distill/llm_distill2_listwise.jsonl"
+MANIFEST_DEFAULT = "cross_encoder/dataset/distill/llm_distill2_manifest.json"
+STATS_DEFAULT = "cross_encoder/dataset/distill/llm_distill2_stats.json"
+DISTILL_RAW_DEFAULT = "cross_encoder/dataset/distill/llm_distill2_distill_raw_scores.jsonl"
+
+SCORE_MODEL_ID_DEFAULT = "Qwen/Qwen2.5-14B-Instruct"
+AUGMENT_MODEL_ID_DEFAULT = "Qwen/Qwen3-14B"
+MODEL_ID_DEFAULT = SCORE_MODEL_ID_DEFAULT
+BATCH_SIZE_DEFAULT = 256
+MAX_NEW_TOKENS_DEFAULT = 24
+TEMPERATURE_DEFAULT = 0.0
+SEED_DEFAULT = 42
+
+# Pairwise control defaults (minimal complexity, aligned with requested recipe).
+PAIR_MAX_PER_SPEC_DEFAULT = 80
+PAIR_MAX_DISAGREE_PER_SPEC_DEFAULT = 6
+PAIR_MAX_BOUNDARY_PER_SPEC_DEFAULT = 6
+PAIR_WEAK_MIN_DEFAULT = 10
+DISAGREE_TOP_PERCENTILE_DEFAULT = 0.20
+DISAGREE_LOW_SCORE_NORM_DEFAULT = 0.30
+DISAGREE_MIN_MARGIN_DEFAULT = 0.15
+BOUNDARY_MIN_MARGIN_DEFAULT = 0.05
+ALLOW_EXTRA_DISAGREE_FROM_UNSELECTED_DEFAULT = True
+
+# Post-score quality controls (fixed, keep code simple).
+COVERAGE_GATE_MIN_MID_HIGH_DEFAULT = 0.20
+AUGMENT_ENABLE_DEFAULT = True
+AUGMENT_MAX_ATTEMPTS_DEFAULT = 1
+AUGMENT_MAX_TRIES_PER_MISSING_DEFAULT = 1
+AUGMENT_BATCH_SIZE_DEFAULT = 256
+AUGMENT_MAX_NEW_TOKENS_DEFAULT = 512
+AUGMENT_VALIDATION_MAX_NEW_TOKENS_DEFAULT = 512
+
+# LLM score banding for real-candidate target assignment.
+HIGH_SCORE_MIN_DEFAULT = 0.70
+MID_SCORE_MIN_DEFAULT = 0.30
+MID_SCORE_MAX_DEFAULT = 0.69
+
+SYSTEM_PROMPT = """
+You are evaluating whether a candidate specialization satisfies a requirement.
+
+This is NOT general similarity - it is REQUIREMENT MATCHING.
+
+Return ONLY strict JSON:
+{"score": <float between 0.0 and 1.0>}
+
+Evaluation steps (IMPORTANT - follow strictly):
+
+1. Extract the core required concepts from the requirement text.
+   - Keep them short (2-6 key phrases)
+   - Do NOT invent new concepts
+
+2. For each extracted concept:
+   - Classify it as:
+     - CORE (central to the requirement)
+     - SUPPORTING (secondary detail)
+
+3. For each concept:
+   - Check if the candidate expresses it
+   - Mark as: FULL, PARTIAL, or MISSING
+
+4. Evaluate coverage with priority:
+   - First consider CORE concepts
+   - Missing a CORE concept should significantly reduce the score
+   - SUPPORTING concepts influence the score only after CORE coverage is considered
+
+5. Score based on coverage:
+   - All CORE = FULL -> 0.9-1.0
+   - CORE mostly FULL + minor gaps -> 0.75-0.9
+   - Some CORE PARTIAL/MISSING -> 0.5-0.75
+   - Most CORE MISSING but some SUPPORTING overlap -> 0.1-0.5
+   - No meaningful overlap -> 0.0-0.1
+
+IMPORTANT:
+- Only evaluate concepts present in the requirement
+- Do NOT penalize for unrelated missing topics
+- Avoid assigning identical scores when coverage differs
+- Prefer slightly different scores when candidates differ in which CORE concepts they satisfy
+- If a candidate covers the same broad domain but changes the main objective, method, or intended use,
+  treat it as a partial match and cap the score at 0.65 unless most CORE concepts are still satisfied.
+- A candidate that lacks one CORE concept should not receive the same score as a candidate that covers all CORE concepts partially.
+
+Do not output explanation text.
+""".strip()
+
+USER_PROMPT_TEMPLATE = """
+Grant specialization keyword:
+{spec_text}
+
+Faculty specialization:
+{fac_spec_text}
+""".strip()
+
+
+def _clean_text(value: Any) -> str:
+    return str(value or "").strip()
+
+
+def _resolve_path(value: Any) -> Path:
+    p = Path(_clean_text(value)).expanduser()
+    if not p.is_absolute():
+        p = PROJECT_ROOT / p
+    return p.resolve()
+
+
+def _safe_int(value: Any, *, default: int, minimum: int, maximum: int) -> int:
+    try:
+        parsed = int(value)
+    except Exception:
+        parsed = int(default)
+    if parsed < minimum:
+        return minimum
+    if parsed > maximum:
+        return maximum
+    return parsed
+
+
+def _safe_float(value: Any, *, default: float, minimum: float, maximum: float) -> float:
+    try:
+        parsed = float(value)
+    except Exception:
+        parsed = float(default)
+    if parsed < minimum:
+        return minimum
+    if parsed > maximum:
+        return maximum
+    return parsed
+
+
+def _clamp_score(value: Any) -> float:
+    try:
+        score = float(value)
+    except Exception:
+        score = 0.0
+    if score < 0.0:
+        return 0.0
+    if score > 1.0:
+        return 1.0
+    return score
+
+
+def _extract_score(raw_text: str) -> Tuple[float, bool]:
+    raw = _clean_text(raw_text)
+    if not raw:
+        return 0.0, False
+
+    if raw.startswith("{") and raw.count("{") > raw.count("}"):
+        raw = raw + ("}" * (raw.count("{") - raw.count("}")))
+
+    try:
+        obj = json.loads(raw)
+        if isinstance(obj, dict) and ("score" in obj):
+            return _clamp_score(obj.get("score")), True
+    except Exception:
+        pass
+
+    m = re.search(r"\{[\s\S]*\}", raw)
+    if m:
+        try:
+            obj = json.loads(m.group(0))
+            if isinstance(obj, dict) and ("score" in obj):
+                return _clamp_score(obj.get("score")), True
+        except Exception:
+            pass
+
+    n = re.search(r"[-+]?\d*\.?\d+", raw)
+    if n:
+        return _clamp_score(n.group(0)), False
+    return 0.0, False
+
+
+def _load_vllm_bundle(
+    *,
+    model_id: str,
+    max_new_tokens: int,
+    temperature: float,
+) -> Tuple[Any, Any, Any]:
+    try:
+        from vllm import LLM, SamplingParams
+    except Exception as exc:
+        raise RuntimeError(
+            "vLLM is required but not installed in this environment. Install `vllm` and rerun."
+        ) from exc
+
+    llm = LLM(
+        _clean_text(model_id),
+        tensor_parallel_size=1,
+        max_model_len=4096,
+        gpu_memory_utilization=0.9,
+    )
+    tokenizer = llm.get_tokenizer()
+    sampling_params = SamplingParams(
+        max_tokens=int(max(1, max_new_tokens)),
+        temperature=float(max(0.0, temperature)),
+    )
+    return llm, tokenizer, sampling_params
+
+
+def _release_vllm_bundle(llm: Any) -> None:
+    if llm is None:
+        return
+    for method_name in ("shutdown", "close"):
+        fn = getattr(llm, method_name, None)
+        if callable(fn):
+            try:
+                fn()
+            except Exception:
+                pass
+    try:
+        del llm
+    except Exception:
+        pass
+    gc.collect()
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except Exception:
+        pass
+
+
+def _load_json(path: Path) -> Dict[str, Any]:
+    try:
+        obj = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        raise RuntimeError(f"Failed to parse JSON: {path} ({type(exc).__name__}: {exc})") from exc
+    if not isinstance(obj, dict):
+        raise RuntimeError(f"Expected top-level JSON object in {path}")
+    return obj
+
+
+def _load_jsonl(path: Path) -> List[Dict[str, Any]]:
+    rows: List[Dict[str, Any]] = []
+    try:
+        with path.open("r", encoding="utf-8") as f:
+            for line_no, line in enumerate(f, start=1):
+                raw = _clean_text(line)
+                if not raw:
+                    continue
+                obj = json.loads(raw)
+                if not isinstance(obj, dict):
+                    raise RuntimeError(f"Expected object JSONL row at {path}:{line_no}")
+                rows.append(obj)
+    except Exception as exc:
+        raise RuntimeError(f"Failed to parse JSONL: {path} ({type(exc).__name__}: {exc})") from exc
+    return rows
+
+
+def _write_jsonl(path: Path, rows: Sequence[Dict[str, Any]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as f:
+        for row in rows:
+            f.write(json.dumps(row, ensure_ascii=False) + "\n")
+
+
+def _flatten_specs(grant_payload: Dict[str, Any]) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    for grant in list(grant_payload.get("grants") or []):
+        if not isinstance(grant, dict):
+            continue
+        grant_id = _clean_text(grant.get("grant_id"))
+        if not grant_id:
+            continue
+        for spec_idx, spec_text in enumerate(list(grant.get("grant_spec_keywords") or [])):
+            text_value = _clean_text(spec_text)
+            if not text_value:
+                continue
+            out.append(
+                {
+                    "grant_id": grant_id,
+                    "spec_idx": int(spec_idx),
+                    "spec_text": text_value,
+                }
+            )
+    return out
+
+
+def _flatten_fac_specs(fac_payload: Dict[str, Any]) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    for fac_spec in list(fac_payload.get("fac_specs") or []):
+        if not isinstance(fac_spec, dict):
+            continue
+        fac_id = _safe_int(fac_spec.get("fac_id"), default=0, minimum=0, maximum=2_147_483_647)
+        fac_spec_id = _safe_int(
+            fac_spec.get("fac_spec_id"),
+            default=0,
+            minimum=0,
+            maximum=9_223_372_036_854_775_807,
+        )
+        fac_spec_idx = _safe_int(fac_spec.get("fac_spec_idx"), default=0, minimum=0, maximum=1_000_000)
+        section = _clean_text(fac_spec.get("section")) or "unknown"
+        fac_spec_text = _clean_text(fac_spec.get("text"))
+        if fac_id <= 0 or fac_spec_id <= 0 or not fac_spec_text:
+            continue
+        out.append(
+            {
+                "fac_id": fac_id,
+                "fac_spec_id": fac_spec_id,
+                "fac_spec_idx": fac_spec_idx,
+                "section": section,
+                "fac_spec_text": fac_spec_text,
+            }
+        )
+    return out
+
+
+def _fac_spec_key(*, fac_id: int, section: str, fac_spec_id: int, fac_spec_idx: int) -> Tuple[int, str, int, int]:
+    return (int(fac_id), _clean_text(section) or "unknown", int(fac_spec_id), int(fac_spec_idx))
+
+
+def _load_prefilter_score_cache(
+    *,
+    cache_path: Path,
+    fac_specs: Sequence[Dict[str, Any]],
+) -> Dict[Tuple[str, int], List[int]]:
+    fac_spec_idx_by_key: Dict[Tuple[int, str, int, int], int] = {}
+    for idx, fac_spec in enumerate(fac_specs):
+        key = _fac_spec_key(
+            fac_id=int(fac_spec["fac_id"]),
+            section=_clean_text(fac_spec["section"]),
+            fac_spec_id=int(fac_spec["fac_spec_id"]),
+            fac_spec_idx=int(fac_spec["fac_spec_idx"]),
+        )
+        fac_spec_idx_by_key[key] = int(idx)
+
+    out: Dict[Tuple[str, int], List[int]] = {}
+    with cache_path.open("r", encoding="utf-8") as f:
+        for raw_line in f:
+            line = _clean_text(raw_line)
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+            except Exception:
+                continue
+            if not isinstance(obj, dict):
+                continue
+            grant_id = _clean_text(obj.get("grant_id"))
+            spec_idx = _safe_int(obj.get("spec_idx"), default=0, minimum=0, maximum=50_000_000)
+            if not grant_id:
+                continue
+
+            ranked: List[int] = []
+            seen_local = set()
+            for cand in list(obj.get("candidates") or []):
+                if not isinstance(cand, dict):
+                    continue
+                key = _fac_spec_key(
+                    fac_id=_safe_int(cand.get("fac_id"), default=0, minimum=0, maximum=2_147_483_647),
+                    section=_clean_text(cand.get("section")) or "unknown",
+                    fac_spec_id=_safe_int(cand.get("fac_spec_id"), default=0, minimum=0, maximum=9_223_372_036_854_775_807),
+                    fac_spec_idx=_safe_int(cand.get("fac_spec_idx"), default=0, minimum=0, maximum=1_000_000),
+                )
+                fac_idx = fac_spec_idx_by_key.get(key)
+                if fac_idx is None or fac_idx in seen_local:
+                    continue
+                seen_local.add(fac_idx)
+                ranked.append(int(fac_idx))
+
+            if ranked:
+                out[(grant_id, spec_idx)] = ranked
+    return out
+
+
+def _rng_for_spec(*, base_seed: int, grant_id: str, spec_idx: int) -> random.Random:
+    seed_text = f"{int(base_seed)}::{_clean_text(grant_id)}::{int(spec_idx)}"
+    digest = hashlib.sha1(seed_text.encode("utf-8")).hexdigest()[:16]
+    return random.Random(int(digest, 16))
+
+
+def _select_prefilter_buckets(
+    *,
+    total: int,
+    ranked_indices: Sequence[int],
+    high_k: int,
+    mid_k: int,
+    low_k: int,
+    rng: random.Random,
+) -> Tuple[List[int], List[int], List[int]]:
+    if total <= 0:
+        return [], [], []
+
+    ranked: List[int] = []
+    ranked_seen = set()
+    for raw_idx in ranked_indices:
+        idx = int(raw_idx)
+        if idx < 0 or idx >= total or idx in ranked_seen:
+            continue
+        ranked_seen.add(idx)
+        ranked.append(idx)
+
+    high: List[int] = []
+    high_set = set()
+    for idx in ranked[: min(len(ranked), int(high_k))]:
+        high.append(idx)
+        high_set.add(idx)
+
+    mid: List[int] = []
+    if int(mid_k) > 0:
+        non_top = ranked[min(len(ranked), int(high_k)) :]
+        if non_top:
+            start = len(non_top) // 3
+            end = (2 * len(non_top)) // 3
+            mid_pool = non_top[start:end] if end > start else non_top
+            mid_pool = [i for i in mid_pool if i not in high_set]
+            if mid_pool:
+                pick = min(int(mid_k), len(mid_pool))
+                mid = mid_pool if pick == len(mid_pool) else rng.sample(mid_pool, k=pick)
+
+    selected_set = set(high) | set(mid)
+    low: List[int] = []
+    if int(low_k) > 0:
+        pool = [i for i in range(total) if i not in selected_set]
+        if pool:
+            pick = min(int(low_k), len(pool))
+            low = pool if pick == len(pool) else rng.sample(pool, k=pick)
+    return high, mid, low
+
+
+def _build_prompt(tokenizer: Any, *, spec_text: str, fac_spec_text: str) -> str:
+    if not hasattr(tokenizer, "apply_chat_template"):
+        raise RuntimeError("Tokenizer does not support apply_chat_template().")
+    if not getattr(tokenizer, "chat_template", None):
+        raise RuntimeError("tokenizer.chat_template is missing for this model/tokenizer.")
+
+    user_prompt = USER_PROMPT_TEMPLATE.format(spec_text=spec_text, fac_spec_text=fac_spec_text)
+    messages = [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user", "content": user_prompt},
+    ]
+    return tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+
+
+def _chunked(items: Sequence[Any], batch_size: int) -> List[Sequence[Any]]:
+    size = max(1, int(batch_size))
+    return [items[i : i + size] for i in range(0, len(items), size)]
+
+
+def _score_prefiltered_candidates(
+    *,
+    llm: Any,
+    tokenizer: Any,
+    sampling_params: Any,
+    spec_text: str,
+    candidates: Sequence[Dict[str, Any]],
+    batch_size: int,
+) -> Tuple[List[Dict[str, Any]], int, int]:
+    out: List[Dict[str, Any]] = []
+    json_ok_count = 0
+    fallback_count = 0
+
+    for batch in _chunked(candidates, batch_size):
+        prompts = [
+            _build_prompt(tokenizer, spec_text=spec_text, fac_spec_text=_clean_text(c.get("fac_spec_text")))
+            for c in batch
+        ]
+        outputs = llm.generate(prompts, sampling_params, use_tqdm=False)
+        for cand, model_out in zip(batch, outputs):
+            raw_text = ""
+            if model_out and getattr(model_out, "outputs", None):
+                first = model_out.outputs[0] if model_out.outputs else None
+                raw_text = _clean_text(getattr(first, "text", ""))
+            score, is_json_ok = _extract_score(raw_text)
+            if is_json_ok:
+                json_ok_count += 1
+            else:
+                fallback_count += 1
+            row = dict(cand)
+            row["llm_score_raw"] = float(score)
+            out.append(row)
+    return out, json_ok_count, fallback_count
+
+
+def _normalize_llm_scores(candidates: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    out = [dict(c) for c in candidates]
+    if not out:
+        return out
+    vals = [float(c.get("llm_score_raw") or 0.0) for c in out]
+    mn = float(min(vals))
+    mx = float(max(vals))
+    denom = float(mx - mn)
+    for c in out:
+        raw = float(c.get("llm_score_raw") or 0.0)
+        if denom > 1e-12:
+            c["llm_score_norm"] = float((raw - mn) / denom)
+        else:
+            c["llm_score_norm"] = float(raw)
+    return out
+
+
+def _dedup_text_key(text: Any) -> str:
+    return re.sub(r"\s+", " ", _clean_text(text)).strip().lower()
+
+
+def _assign_target_clusters(
+    *,
+    candidates: Sequence[Dict[str, Any]],
+    target_high: int,
+    target_mid: int,
+    target_low: int,
+) -> Tuple[List[Dict[str, Any]], Dict[str, int]]:
+    out = [dict(c) for c in candidates]
+    for c in out:
+        c["llm_target_cluster"] = "unused"
+        c["selected_for_target"] = False
+
+    high_pool_idx = [
+        i for i, c in enumerate(out)
+        if float(c.get("llm_score_raw") or 0.0) >= float(HIGH_SCORE_MIN_DEFAULT)
+    ]
+    high_pool_idx.sort(key=lambda i: float(out[i].get("llm_score_raw") or 0.0), reverse=True)
+
+    mid_pool_idx = [
+        i for i, c in enumerate(out)
+        if float(MID_SCORE_MIN_DEFAULT) <= float(c.get("llm_score_raw") or 0.0) <= float(MID_SCORE_MAX_DEFAULT)
+    ]
+    mid_pool_idx.sort(key=lambda i: float(out[i].get("llm_score_raw") or 0.0), reverse=True)
+
+    low_pool_idx = [
+        i for i, c in enumerate(out)
+        if float(c.get("llm_score_raw") or 0.0) < float(MID_SCORE_MIN_DEFAULT)
+    ]
+    low_pool_idx.sort(key=lambda i: float(out[i].get("llm_score_raw") or 0.0))
+
+    sel_high_idx = high_pool_idx[: max(0, int(target_high))]
+    sel_mid_idx = mid_pool_idx[: max(0, int(target_mid))]
+    sel_low_idx = low_pool_idx[: max(0, int(target_low))]
+
+    selected_set = set(sel_high_idx) | set(sel_mid_idx) | set(sel_low_idx)
+    if len(sel_low_idx) < max(0, int(target_low)):
+        missing_low = int(max(0, int(target_low) - len(sel_low_idx)))
+        fallback_low = [i for i in range(len(out)) if i not in selected_set]
+        fallback_low.sort(key=lambda i: float(out[i].get("llm_score_raw") or 0.0))
+        for i in fallback_low[:missing_low]:
+            sel_low_idx.append(i)
+            selected_set.add(i)
+
+    for i in sel_high_idx:
+        out[i]["llm_target_cluster"] = "high"
+        out[i]["selected_for_target"] = True
+    for i in sel_mid_idx:
+        out[i]["llm_target_cluster"] = "mid"
+        out[i]["selected_for_target"] = True
+    for i in sel_low_idx:
+        out[i]["llm_target_cluster"] = "low"
+        out[i]["selected_for_target"] = True
+
+    sel_high = len(sel_high_idx)
+    sel_mid = len(sel_mid_idx)
+    sel_low = len(sel_low_idx)
+
+    info = {
+        "target_high": int(target_high),
+        "target_mid": int(target_mid),
+        "target_low": int(target_low),
+        "available_high": int(len(high_pool_idx)),
+        "available_mid": int(len(mid_pool_idx)),
+        "available_low": int(len(low_pool_idx)),
+        "selected_high": int(sel_high),
+        "selected_mid": int(sel_mid),
+        "selected_low": int(sel_low),
+        "missing_high": int(max(0, int(target_high) - int(sel_high))),
+        "missing_mid": int(max(0, int(target_mid) - int(sel_mid))),
+        "missing_low": int(max(0, int(target_low) - int(sel_low))),
+    }
+    info["selected_total"] = int(sel_high + sel_mid + sel_low)
+    info["missing_total"] = int(info["missing_high"] + info["missing_mid"] + info["missing_low"])
+    return out, info
+
+
+def _decide_adaptive_targets_with_args(
+    *,
+    candidates: Sequence[Dict[str, Any]],
+    requested_high: int,
+    requested_mid: int,
+    requested_low: int,
+) -> Dict[str, Any]:
+    high_avail = int(sum(1 for c in candidates if float(c.get("llm_score_raw") or 0.0) >= float(HIGH_SCORE_MIN_DEFAULT)))
+    mid_avail = int(
+        sum(
+            1
+            for c in candidates
+            if float(MID_SCORE_MIN_DEFAULT) <= float(c.get("llm_score_raw") or 0.0) <= float(MID_SCORE_MAX_DEFAULT)
+        )
+    )
+    low_avail = int(sum(1 for c in candidates if float(c.get("llm_score_raw") or 0.0) < float(MID_SCORE_MIN_DEFAULT)))
+
+    # Policy:
+    # - Try requested targets, but cap each by available real candidates when possible.
+    # - Keep at least 1/2/1 as minimum floor:
+    #   high>=1, mid>=2, low>=1.
+    # - If below the floor for high/mid, keep floor targets so augmentation can fill.
+    # - Drop only when no low exists.
+    req_high = max(1, int(requested_high))
+    req_mid = max(2, int(requested_mid))
+    req_low = max(1, int(requested_low))
+    target_high = int(req_high)
+    target_mid = int(req_mid)
+    target_low = int(req_low)
+    case_name = "A_requested_or_capped"
+    drop_no_low = bool(low_avail < 1)
+    if drop_no_low:
+        case_name = "D_drop_no_low"
+    else:
+        # high: cap if >=1 exists, otherwise keep floor(1) and let augmentation fill.
+        if high_avail >= 1:
+            target_high = int(min(req_high, high_avail))
+        else:
+            target_high = 1
+
+        # mid: cap when >=2 exists; if below floor, keep floor(2) and augment gap.
+        if mid_avail >= 2:
+            target_mid = int(min(req_mid, mid_avail))
+        else:
+            target_mid = 2
+
+        # low: cap to what exists (>=1 guaranteed here).
+        target_low = int(min(req_low, low_avail))
+
+        if target_high == req_high and target_mid == req_mid and target_low == req_low:
+            case_name = "A_requested_or_capped"
+        elif high_avail < 1 or mid_avail < 2:
+            case_name = "C_need_augmentation_to_floor"
+        else:
+            case_name = "B_capped_by_real_pool"
+
+    return {
+        "requested_high": int(req_high),
+        "requested_mid": int(req_mid),
+        "requested_low": int(req_low),
+        "target_high": int(target_high),
+        "target_mid": int(target_mid),
+        "target_low": int(target_low),
+        "available_high": int(high_avail),
+        "available_mid": int(mid_avail),
+        "available_low": int(low_avail),
+        "drop_no_low": bool(drop_no_low),
+        "policy_case": case_name,
+    }
+
+
+def _summarize_selected_clusters(
+    *,
+    candidates: Sequence[Dict[str, Any]],
+    target_high: int,
+    target_mid: int,
+    target_low: int,
+) -> Dict[str, int]:
+    selected = [c for c in candidates if bool(c.get("selected_for_target"))]
+    selected_high = sum(1 for c in selected if _clean_text(c.get("llm_target_cluster")) == "high")
+    selected_mid = sum(1 for c in selected if _clean_text(c.get("llm_target_cluster")) == "mid")
+    selected_low = sum(1 for c in selected if _clean_text(c.get("llm_target_cluster")) == "low")
+    out = {
+        "target_high": int(target_high),
+        "target_mid": int(target_mid),
+        "target_low": int(target_low),
+        "selected_high": int(selected_high),
+        "selected_mid": int(selected_mid),
+        "selected_low": int(selected_low),
+        "missing_high": int(max(0, int(target_high) - int(selected_high))),
+        "missing_mid": int(max(0, int(target_mid) - int(selected_mid))),
+        "missing_low": int(max(0, int(target_low) - int(selected_low))),
+    }
+    out["selected_total"] = int(selected_high + selected_mid + selected_low)
+    out["missing_total"] = int(out["missing_high"] + out["missing_mid"] + out["missing_low"])
+    return out
+
+
+def _coverage_ratio(actual: int, target: int) -> float:
+    t = int(target)
+    if t <= 0:
+        return 1.0
+    return float(max(0, int(actual)) / float(t))
+
+
+def _band_from_raw_score(raw_score: float) -> str:
+    s = float(raw_score)
+    if s >= float(HIGH_SCORE_MIN_DEFAULT):
+        return "strong"
+    if s >= float(MID_SCORE_MIN_DEFAULT):
+        return "boundary"
+    return "weak"
+
+
+def _augment_missing_high_mid_for_spec(
+    *,
+    augmenter: Any,
+    spec_text: str,
+    existing_candidates: Sequence[Dict[str, Any]],
+    missing_high: int,
+    missing_mid: int,
+    next_synthetic_id: int,
+) -> Tuple[List[Dict[str, Any]], Dict[str, int], int]:
+    synthetic_rows: List[Dict[str, Any]] = []
+    cursor = int(max(1, next_synthetic_id))
+
+    used_text = {_dedup_text_key(c.get("fac_spec_text")) for c in existing_candidates if _clean_text(c.get("fac_spec_text"))}
+    used_text = {k for k in used_text if k}
+
+    stats = {
+        "requested_high": int(max(0, int(missing_high))),
+        "requested_mid": int(max(0, int(missing_mid))),
+        "created_high": 0,
+        "created_mid": 0,
+        "attempts_total": 0,
+        "rejected_empty": 0,
+        "rejected_duplicate": 0,
+        "rejected_validation": 0,
+        "unfilled_high": 0,
+        "unfilled_mid": 0,
+    }
+
+    for cluster, required in (("high", int(max(0, int(missing_high)))), ("mid", int(max(0, int(missing_mid))))):
+        remaining_slots = list(range(int(required)))
+        max_tries = int(max(1, AUGMENT_MAX_TRIES_PER_MISSING_DEFAULT))
+        for _try in range(max_tries):
+            if not remaining_slots:
+                break
+            jobs = [{"query": spec_text, "target_cluster": cluster} for _ in remaining_slots]
+            stats["attempts_total"] += int(len(jobs))
+            outputs = augmenter.augment_batch(jobs, batch_size=int(AUGMENT_BATCH_SIZE_DEFAULT))
+            next_remaining: List[int] = []
+            for slot_id, out in zip(remaining_slots, outputs):
+                augmented_text = _clean_text((out or {}).get("augmented_text"))
+                if not augmented_text:
+                    stats["rejected_empty"] += 1
+                    next_remaining.append(slot_id)
+                    continue
+                key = _dedup_text_key(augmented_text)
+                if not key or key in used_text:
+                    stats["rejected_duplicate"] += 1
+                    next_remaining.append(slot_id)
+                    continue
+                validation = dict((out or {}).get("validation") or {})
+                if not bool(validation.get("pass_valid_range")):
+                    stats["rejected_validation"] += 1
+                    next_remaining.append(slot_id)
+                    continue
+                score = _clamp_score(validation.get("score"))
+                syn_id = int(cursor)
+                cursor += 1
+                synthetic_rows.append(
+                    {
+                        "fac_id": int(-syn_id),
+                        "fac_spec_id": int(-syn_id),
+                        "fac_spec_idx": int(-syn_id),
+                        "section": f"augmented_{cluster}",
+                        "fac_spec_text": augmented_text,
+                        "prefilter_bucket": f"augmented_{cluster}",
+                        "sts_rank": -1,
+                        "sts_rank_percentile": 1.0,
+                        "llm_score_raw": float(score),
+                        "llm_score_norm": float(score),
+                        "llm_target_cluster": cluster,
+                        "selected_for_target": True,
+                        "is_augmented": True,
+                    }
+                )
+                used_text.add(key)
+                stats[f"created_{cluster}"] += 1
+            remaining_slots = next_remaining
+        if remaining_slots:
+            stats[f"unfilled_{cluster}"] += int(len(remaining_slots))
+
+    return synthetic_rows, stats, cursor
+
+
+def _augment_missing_high_mid_global(
+    *,
+    augmenter: Any,
+    scored_spec_rows: Sequence[Dict[str, Any]],
+    next_synthetic_id: int,
+) -> Tuple[List[Dict[str, Any]], Dict[str, int], int]:
+    out_rows: List[Dict[str, Any]] = [dict(r) for r in scored_spec_rows]
+    cursor = int(max(1, next_synthetic_id))
+    per_spec_candidates: Dict[int, List[Dict[str, Any]]] = {}
+    used_text_per_spec: Dict[int, set[str]] = {}
+
+    stats = {
+        "requested_high": 0,
+        "requested_mid": 0,
+        "created_high": 0,
+        "created_mid": 0,
+        "attempts_total": 0,
+        "rejected_empty": 0,
+        "rejected_duplicate": 0,
+        "rejected_validation": 0,
+        "unfilled_high": 0,
+        "unfilled_mid": 0,
+    }
+
+    def _build_jobs(cluster: str) -> List[Dict[str, Any]]:
+        jobs: List[Dict[str, Any]] = []
+        for row_idx, row in enumerate(out_rows):
+            spec_text = _clean_text(row.get("spec_text"))
+            if not spec_text:
+                continue
+            candidates = list(row.get("scored_candidates") or [])
+            per_spec_candidates[row_idx] = candidates
+            if row_idx not in used_text_per_spec:
+                used = {_dedup_text_key(c.get("fac_spec_text")) for c in candidates if _clean_text(c.get("fac_spec_text"))}
+                used_text_per_spec[row_idx] = {k for k in used if k}
+            quota_info = dict(row.get("quota_info") or {})
+            missing_count = int(max(0, int(quota_info.get(f"missing_{cluster}", 0))))
+            if missing_count <= 0:
+                continue
+            for _ in range(missing_count):
+                jobs.append(
+                    {
+                        "row_idx": int(row_idx),
+                        "query": spec_text,
+                        "target_cluster": cluster,
+                    }
+                )
+        return jobs
+
+    max_tries = int(max(1, AUGMENT_MAX_TRIES_PER_MISSING_DEFAULT))
+    try:
+        from tqdm import tqdm as _tqdm  # type: ignore
+    except Exception:
+        _tqdm = None
+
+    for cluster in ("high", "mid"):
+        pending = _build_jobs(cluster=cluster)
+        stats[f"requested_{cluster}"] = int(len(pending))
+        total_slots = int(len(pending))
+        aug_bar = _tqdm(total=total_slots, desc=f"Augment {cluster}", leave=False) if (_tqdm is not None and total_slots > 0) else None
+        resolved_slots = 0
+        for _try in range(max_tries):
+            if not pending:
+                break
+            prompts = [{"query": p["query"], "target_cluster": cluster} for p in pending]
+            stats["attempts_total"] += int(len(prompts))
+            outputs = augmenter.augment_batch(prompts, batch_size=int(AUGMENT_BATCH_SIZE_DEFAULT))
+            next_pending: List[Dict[str, Any]] = []
+            for job, out in zip(pending, outputs):
+                row_idx = int(job["row_idx"])
+                candidates = per_spec_candidates.get(row_idx)
+                if candidates is None:
+                    candidates = list(out_rows[row_idx].get("scored_candidates") or [])
+                    per_spec_candidates[row_idx] = candidates
+                used_text = used_text_per_spec.setdefault(row_idx, set())
+
+                augmented_text = _clean_text((out or {}).get("augmented_text"))
+                if not augmented_text:
+                    stats["rejected_empty"] += 1
+                    next_pending.append(job)
+                    continue
+                key = _dedup_text_key(augmented_text)
+                if not key or key in used_text:
+                    stats["rejected_duplicate"] += 1
+                    next_pending.append(job)
+                    continue
+                validation = dict((out or {}).get("validation") or {})
+                if not bool(validation.get("pass_valid_range")):
+                    stats["rejected_validation"] += 1
+                    next_pending.append(job)
+                    continue
+                score = _clamp_score(validation.get("score"))
+                syn_id = int(cursor)
+                cursor += 1
+                candidates.append(
+                    {
+                        "fac_id": int(-syn_id),
+                        "fac_spec_id": int(-syn_id),
+                        "fac_spec_idx": int(-syn_id),
+                        "section": f"augmented_{cluster}",
+                        "fac_spec_text": augmented_text,
+                        "prefilter_bucket": f"augmented_{cluster}",
+                        "sts_rank": -1,
+                        "sts_rank_percentile": 1.0,
+                        "llm_score_raw": float(score),
+                        "llm_score_norm": float(score),
+                        "llm_target_cluster": cluster,
+                        "selected_for_target": True,
+                        "is_augmented": True,
+                    }
+                )
+                used_text.add(key)
+                stats[f"created_{cluster}"] += 1
+            pending = next_pending
+            newly_resolved = int(total_slots - len(pending) - resolved_slots)
+            if newly_resolved > 0 and aug_bar is not None:
+                aug_bar.update(newly_resolved)
+            resolved_slots += max(0, newly_resolved)
+            if (_tqdm is None) and total_slots > 0:
+                print(
+                    f"augment_{cluster}_progress="
+                    f"{min(total_slots, resolved_slots)}/{total_slots} "
+                    f"try={_try + 1}/{max_tries}"
+                )
+        if pending:
+            stats[f"unfilled_{cluster}"] += int(len(pending))
+        if aug_bar is not None:
+            if resolved_slots < total_slots:
+                aug_bar.update(int(total_slots - resolved_slots))
+            aug_bar.close()
+
+    for row_idx, row in enumerate(out_rows):
+        if row_idx in per_spec_candidates:
+            row["scored_candidates"] = per_spec_candidates[row_idx]
+    return out_rows, stats, cursor
+
+
+def _candidate_id(c: Dict[str, Any]) -> Tuple[int, int, int]:
+    return (
+        _safe_int(c.get("fac_id"), default=0, minimum=-2_147_483_648, maximum=2_147_483_647),
+        _safe_int(c.get("fac_spec_id"), default=0, minimum=-9_223_372_036_854_775_808, maximum=9_223_372_036_854_775_807),
+        _safe_int(c.get("fac_spec_idx"), default=0, minimum=-2_147_483_648, maximum=2_147_483_647),
+    )
+
+
+def _attach_sts_rank_percentile(candidates: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    out = [dict(c) for c in candidates]
+    ranked = [int(c.get("sts_rank", -1)) for c in out if int(c.get("sts_rank", -1)) >= 0]
+    uniq = sorted(set(ranked))
+    rank_to_pct: Dict[int, float] = {}
+    if uniq:
+        denom = float(max(1, len(uniq) - 1))
+        for i, val in enumerate(uniq):
+            rank_to_pct[int(val)] = float(i) / denom if len(uniq) > 1 else 0.0
+    for c in out:
+        r = int(c.get("sts_rank", -1))
+        c["sts_rank_percentile"] = float(rank_to_pct.get(r, 1.0))
+    return out
+
+
+def _is_disagreement_candidate(c: Dict[str, Any]) -> bool:
+    pct = float(c.get("sts_rank_percentile", 1.0))
+    score = float(c.get("llm_score_norm", 1.0))
+    return bool(pct <= float(DISAGREE_TOP_PERCENTILE_DEFAULT) and score <= float(DISAGREE_LOW_SCORE_NORM_DEFAULT))
+
+
+def _build_pair_row(
+    *,
+    grant_id: str,
+    spec_idx: int,
+    query_text: str,
+    pos: Dict[str, Any],
+    neg: Dict[str, Any],
+    pair_type: str,
+) -> Dict[str, Any]:
+    p_score = float(pos.get("llm_score_raw") or 0.0)
+    n_score = float(neg.get("llm_score_raw") or 0.0)
+    return {
+        "grant_id": grant_id,
+        "spec_idx": int(spec_idx),
+        "query_text": query_text,
+        "pair_type": pair_type,
+        "pos_text": _clean_text(pos.get("fac_spec_text")),
+        "neg_text": _clean_text(neg.get("fac_spec_text")),
+        "teacher_pos_score": float(p_score),
+        "teacher_neg_score": float(n_score),
+        "teacher_margin": float(p_score - n_score),
+        "pos_fac_id": int(pos.get("fac_id") or 0),
+        "pos_fac_spec_id": int(pos.get("fac_spec_id") or 0),
+        "pos_fac_spec_idx": int(pos.get("fac_spec_idx") or 0),
+        "pos_section": _clean_text(pos.get("section")) or "unknown",
+        "pos_sts_rank": int(pos.get("sts_rank", -1)),
+        "pos_sts_rank_percentile": float(pos.get("sts_rank_percentile", 1.0)),
+        "neg_fac_id": int(neg.get("fac_id") or 0),
+        "neg_fac_spec_id": int(neg.get("fac_spec_id") or 0),
+        "neg_fac_spec_idx": int(neg.get("fac_spec_idx") or 0),
+        "neg_section": _clean_text(neg.get("section")) or "unknown",
+        "neg_sts_rank": int(neg.get("sts_rank", -1)),
+        "neg_sts_rank_percentile": float(neg.get("sts_rank_percentile", 1.0)),
+    }
+
+
+def _build_controlled_pairwise_records(
+    *,
+    grant_id: str,
+    spec_idx: int,
+    query_text: str,
+    candidates: Sequence[Dict[str, Any]],
+) -> Tuple[List[Dict[str, Any]], Dict[str, int]]:
+    out: List[Dict[str, Any]] = []
+    emitted = set()
+
+    def _append(pos: Dict[str, Any], neg: Dict[str, Any], *, pair_type: str, min_margin: float = 0.0) -> bool:
+        pos_id = _candidate_id(pos)
+        neg_id = _candidate_id(neg)
+        if pos_id == neg_id:
+            return False
+        sig = (pair_type, pos_id, neg_id)
+        if sig in emitted:
+            return False
+        p_score = float(pos.get("llm_score_raw") or 0.0)
+        n_score = float(neg.get("llm_score_raw") or 0.0)
+        if (p_score - n_score) < float(min_margin):
+            return False
+        out.append(
+            _build_pair_row(
+                grant_id=grant_id,
+                spec_idx=spec_idx,
+                query_text=query_text,
+                pos=pos,
+                neg=neg,
+                pair_type=pair_type,
+            )
+        )
+        emitted.add(sig)
+        return True
+
+    selected = [c for c in candidates if bool(c.get("selected_for_target"))]
+    pos = sorted(
+        [c for c in selected if _clean_text(c.get("llm_target_cluster")) == "high"],
+        key=lambda x: float(x.get("llm_score_raw") or 0.0),
+        reverse=True,
+    )
+    mid = sorted(
+        [c for c in selected if _clean_text(c.get("llm_target_cluster")) == "mid"],
+        key=lambda x: float(x.get("llm_score_raw") or 0.0),
+    )
+    low = sorted(
+        [c for c in selected if _clean_text(c.get("llm_target_cluster")) == "low"],
+        key=lambda x: float(x.get("llm_score_raw") or 0.0),
+    )
+
+    if not pos:
+        return out, {
+            "pair_total": 0,
+            "pair_disagreement": 0,
+            "pair_strong_vs_boundary": 0,
+            "pair_strong_vs_weak": 0,
+            "pair_strong_vs_hard": 0,
+        }
+
+    max_pairs = int(max(1, PAIR_MAX_PER_SPEC_DEFAULT))
+    weak_target = int(min(max(0, PAIR_WEAK_MIN_DEFAULT), max_pairs, len(pos) * len(low)))
+    disagree_cap_base = int(min(max_pairs, PAIR_MAX_DISAGREE_PER_SPEC_DEFAULT, math.floor(0.3 * max_pairs)))
+    disagree_cap = int(min(disagree_cap_base, max(0, max_pairs - weak_target)))
+    boundary_cap_base = int(min(max_pairs, PAIR_MAX_BOUNDARY_PER_SPEC_DEFAULT, math.floor(0.3 * max_pairs)))
+    boundary_cap = int(min(boundary_cap_base, max(0, max_pairs - weak_target - disagree_cap)))
+
+    neg_selected = list(low) + list(mid)
+    dis_selected = [c for c in neg_selected if _is_disagreement_candidate(c)]
+    dis_selected.sort(key=lambda x: (float(x.get("llm_score_norm", 1.0)), float(x.get("sts_rank_percentile", 1.0))))
+
+    dis_negatives: List[Dict[str, Any]] = []
+    seen_neg = set()
+    for c in dis_selected:
+        cid = _candidate_id(c)
+        if cid in seen_neg:
+            continue
+        seen_neg.add(cid)
+        dis_negatives.append(c)
+
+    if ALLOW_EXTRA_DISAGREE_FROM_UNSELECTED_DEFAULT and len(dis_negatives) < disagree_cap:
+        dis_extra = [
+            c for c in candidates
+            if (not bool(c.get("selected_for_target"))) and _is_disagreement_candidate(c)
+        ]
+        dis_extra.sort(key=lambda x: (float(x.get("llm_score_norm", 1.0)), float(x.get("sts_rank_percentile", 1.0))))
+        for c in dis_extra:
+            cid = _candidate_id(c)
+            if cid in seen_neg:
+                continue
+            seen_neg.add(cid)
+            dis_negatives.append(c)
+            if len(dis_negatives) >= disagree_cap:
+                break
+
+    # 1) Disagreement pairs (bounded).
+    dis_added = 0
+    for p in pos:
+        for n in dis_negatives:
+            if len(out) >= max_pairs or dis_added >= disagree_cap:
+                break
+            if _append(p, n, pair_type="llm_disagreement", min_margin=DISAGREE_MIN_MARGIN_DEFAULT):
+                dis_added += 1
+        if len(out) >= max_pairs or dis_added >= disagree_cap:
+            break
+
+    # 2) Boundary negatives (bounded).
+    boundary_added = 0
+    for p in pos:
+        for n in mid:
+            if len(out) >= max_pairs or boundary_added >= boundary_cap:
+                break
+            if _append(p, n, pair_type="strong_vs_boundary", min_margin=BOUNDARY_MIN_MARGIN_DEFAULT):
+                boundary_added += 1
+        if len(out) >= max_pairs or boundary_added >= boundary_cap:
+            break
+
+    # 3) True weak negatives (minimum target if available).
+    weak_added = 0
+    for p in pos:
+        for n in low:
+            if len(out) >= max_pairs or weak_added >= weak_target:
+                break
+            if _append(p, n, pair_type="strong_vs_weak", min_margin=0.0):
+                weak_added += 1
+        if len(out) >= max_pairs or weak_added >= weak_target:
+            break
+
+    # 4) Fill remaining with hard negatives from selected mid/low.
+    hard_pool = sorted(neg_selected, key=lambda x: float(x.get("llm_score_raw") or 0.0), reverse=True)
+    for p in pos:
+        for n in hard_pool:
+            if len(out) >= max_pairs:
+                break
+            _append(p, n, pair_type="strong_vs_hard", min_margin=0.0)
+        if len(out) >= max_pairs:
+            break
+
+    info = {
+        "pair_total": int(len(out)),
+        "pair_disagreement": int(sum(1 for r in out if _clean_text(r.get("pair_type")) == "llm_disagreement")),
+        "pair_strong_vs_boundary": int(sum(1 for r in out if _clean_text(r.get("pair_type")) == "strong_vs_boundary")),
+        "pair_strong_vs_weak": int(sum(1 for r in out if _clean_text(r.get("pair_type")) == "strong_vs_weak")),
+        "pair_strong_vs_hard": int(sum(1 for r in out if _clean_text(r.get("pair_type")) == "strong_vs_hard")),
+    }
+    return out, info
+
+
+def main() -> int:
+    # ======================================================
+    # Step 1) Parse minimal args
+    # ======================================================
+    parser = argparse.ArgumentParser(
+        description=(
+            "Prefilter + LLM scoring + score-band target selection + "
+            "coverage-gate drop + high/mid augmentation recovery."
+        )
+    )
+    parser.add_argument(
+        "--prefilter-multiplier",
+        type=float,
+        default=30.0,
+        help=(
+            "Multiplier applied to each target cluster count to derive prefilter sizes. "
+            "Example: target high=5 with multiplier=3.0 -> prefilter high=15."
+        ),
+    )
+    parser.add_argument(
+        "--max-specs",
+        type=int,
+        default=0,
+        help="Limit number of query specs to process (0 = all).",
+    )
+    parser.add_argument(
+        "--run-mode",
+        type=str,
+        default="full",
+        choices=["full", "distill-only", "augment-only"],
+        help="full: distill+augment, distill-only: save raw scored file, augment-only: consume saved raw scored file.",
+    )
+    parser.add_argument(
+        "--distill-raw-path",
+        type=str,
+        default=DISTILL_RAW_DEFAULT,
+        help="Stage-A raw scored spec file (written by distill-only/full, read by augment-only).",
+    )
+    parser.add_argument("--target-high", type=int, default=1, help="Exact target high count per spec after LLM scoring.")
+    parser.add_argument("--target-mid", type=int, default=2, help="Exact target mid count per spec after LLM scoring.")
+    parser.add_argument("--target-low", type=int, default=1, help="Exact target low count per spec after LLM scoring.")
+    args = parser.parse_args()
+
+    prefilter_multiplier = _safe_float(args.prefilter_multiplier, default=10.0, minimum=0.0, maximum=100.0)
+    max_specs = _safe_int(args.max_specs, default=0, minimum=0, maximum=10_000_000)
+    run_mode = _clean_text(args.run_mode).lower()
+    target_high = _safe_int(args.target_high, default=1, minimum=0, maximum=100_000)
+    target_mid = _safe_int(args.target_mid, default=2, minimum=0, maximum=100_000)
+    target_low = _safe_int(args.target_low, default=1, minimum=0, maximum=100_000)
+    prefilter_high = int(max(target_high, math.ceil(float(target_high) * float(prefilter_multiplier)))) if target_high > 0 else 0
+    prefilter_mid = int(max(target_mid, math.ceil(float(target_mid) * float(prefilter_multiplier)))) if target_mid > 0 else 0
+    prefilter_low = int(max(target_low, math.ceil(float(target_low) * float(prefilter_multiplier)))) if target_low > 0 else 0
+
+    # ======================================================
+    # Step 2) Resolve fixed paths
+    # ======================================================
+    grant_db = _resolve_path(GRANT_DB_DEFAULT)
+    fac_db = _resolve_path(FAC_DB_DEFAULT)
+    prefilter_cache = _resolve_path(PREFILTER_CACHE_DEFAULT)
+    raw_output_path = _resolve_path(RAW_OUTPUT_DEFAULT)
+    pairwise_output_path = _resolve_path(PAIRWISE_OUTPUT_DEFAULT)
+    listwise_output_path = _resolve_path(LISTWISE_OUTPUT_DEFAULT)
+    manifest_path = _resolve_path(MANIFEST_DEFAULT)
+    stats_output_path = _resolve_path(STATS_DEFAULT)
+    distill_raw_path = _resolve_path(args.distill_raw_path)
+    distill_meta_path = distill_raw_path.with_suffix(".meta.json")
+
+    # ======================================================
+    # Step 3) Load datasets + STS cache (not needed for augment-only)
+    # ======================================================
+    specs: List[Dict[str, Any]] = []
+    fac_specs: List[Dict[str, Any]] = []
+    prefilter_map: Dict[Tuple[str, int], List[int]] = {}
+    full_spec_count = 0
+    if run_mode != "augment-only":
+        if not grant_db.exists():
+            raise RuntimeError(f"Grant DB not found: {grant_db}")
+        if not fac_db.exists():
+            raise RuntimeError(f"Faculty DB not found: {fac_db}")
+        if not prefilter_cache.exists():
+            raise RuntimeError(f"STS prefilter cache not found: {prefilter_cache}")
+
+        grant_payload = _load_json(grant_db)
+        fac_payload = _load_json(fac_db)
+        specs = _flatten_specs(grant_payload)
+        full_spec_count = int(len(specs))
+        if max_specs > 0:
+            specs = specs[: min(int(max_specs), len(specs))]
+        fac_specs = _flatten_fac_specs(fac_payload)
+        if not specs:
+            raise RuntimeError("No specs found in grant DB.")
+        if not fac_specs:
+            raise RuntimeError("No faculty specs found in faculty DB.")
+        prefilter_map = _load_prefilter_score_cache(cache_path=prefilter_cache, fac_specs=fac_specs)
+
+    # ======================================================
+    # Step 4) Setup counters and IO dirs
+    # ======================================================
+    raw_output_path.parent.mkdir(parents=True, exist_ok=True)
+    pairwise_output_path.parent.mkdir(parents=True, exist_ok=True)
+    listwise_output_path.parent.mkdir(parents=True, exist_ok=True)
+    manifest_path.parent.mkdir(parents=True, exist_ok=True)
+    stats_output_path.parent.mkdir(parents=True, exist_ok=True)
+    distill_raw_path.parent.mkdir(parents=True, exist_ok=True)
+
+    started = time.time()
+    total_prefilter_selected = 0
+    total_scored_candidates = 0
+    total_json_ok = 0
+    total_fallback = 0
+    kept_specs = 0
+    dropped_by_coverage_gate_specs = 0
+    dropped_after_augmentation_specs = 0
+    shortage_specs_pre = 0
+    shortage_specs_final = 0
+    missing_high_total_pre = 0
+    missing_mid_total_pre = 0
+    missing_low_total_pre = 0
+    missing_high_total_final = 0
+    missing_mid_total_final = 0
+    missing_low_total_final = 0
+    augment_requested_high_total = 0
+    augment_requested_mid_total = 0
+    augment_created_high_total = 0
+    augment_created_mid_total = 0
+    augment_attempts_total = 0
+    augment_rejected_empty_total = 0
+    augment_rejected_duplicate_total = 0
+    augment_rejected_validation_total = 0
+    total_pairwise_rows = 0
+    total_pair_disagreement = 0
+    total_pair_strong_vs_boundary = 0
+    total_pair_strong_vs_weak = 0
+    total_pair_strong_vs_hard = 0
+    target_requested_high_total_kept = 0
+    target_requested_mid_total_kept = 0
+    target_requested_low_total_kept = 0
+    target_selected_high_total_kept = 0
+    target_selected_mid_total_kept = 0
+    target_selected_low_total_kept = 0
+    total_disagreement_candidates = 0
+    total_strong_candidates = 0
+    total_boundary_candidates = 0
+    total_weak_candidates = 0
+    synthetic_id_cursor = 1
+    scored_spec_rows: List[Dict[str, Any]] = []
+    score_model_id = _clean_text(SCORE_MODEL_ID_DEFAULT) or _clean_text(MODEL_ID_DEFAULT)
+    augment_model_id = _clean_text(AUGMENT_MODEL_ID_DEFAULT) or score_model_id
+
+    try:
+        from tqdm import tqdm as _tqdm  # type: ignore
+    except Exception:
+        _tqdm = None
+
+    if run_mode != "augment-only":
+        # ======================================================
+        # Step 5) Stage A: prefilter -> score real -> pre-coverage gate
+        # ======================================================
+        llm, tokenizer, sampling_params = _load_vllm_bundle(
+            model_id=score_model_id,
+            max_new_tokens=MAX_NEW_TOKENS_DEFAULT,
+            temperature=TEMPERATURE_DEFAULT,
+        )
+
+        base_iter = enumerate(specs, start=1)
+        spec_iter = _tqdm(base_iter, total=len(specs), desc="Scoring specs") if _tqdm is not None else base_iter
+
+        for spec_rank, spec in spec_iter:
+            grant_id = _clean_text(spec.get("grant_id"))
+            spec_idx = _safe_int(spec.get("spec_idx"), default=0, minimum=0, maximum=50_000_000)
+            spec_text = _clean_text(spec.get("spec_text"))
+            ranked_indices = list(prefilter_map.get((grant_id, spec_idx)) or [])
+            rank_map = {int(idx): int(i) for i, idx in enumerate(ranked_indices)}
+
+            rng = _rng_for_spec(base_seed=SEED_DEFAULT, grant_id=grant_id, spec_idx=spec_idx)
+            high_indices, mid_indices, low_indices = _select_prefilter_buckets(
+                total=len(fac_specs),
+                ranked_indices=ranked_indices,
+                high_k=prefilter_high,
+                mid_k=prefilter_mid,
+                low_k=prefilter_low,
+                rng=rng,
+            )
+            high_index_set = set(high_indices)
+            mid_index_set = set(mid_indices)
+
+            prefilter_candidates: List[Dict[str, Any]] = []
+            for idx in list(high_indices) + list(mid_indices) + list(low_indices):
+                if idx < 0 or idx >= len(fac_specs):
+                    continue
+                fac = fac_specs[idx]
+                bucket = "low"
+                if idx in high_index_set:
+                    bucket = "high"
+                elif idx in mid_index_set:
+                    bucket = "mid"
+                prefilter_candidates.append(
+                    {
+                        "fac_id": int(fac["fac_id"]),
+                        "fac_spec_id": int(fac["fac_spec_id"]),
+                        "fac_spec_idx": int(fac["fac_spec_idx"]),
+                        "section": _clean_text(fac["section"]),
+                        "fac_spec_text": _clean_text(fac["fac_spec_text"]),
+                        "prefilter_bucket": bucket,
+                        "sts_rank": int(rank_map.get(int(idx), -1)),
+                    }
+                )
+
+            total_prefilter_selected += int(len(prefilter_candidates))
+
+            scored_candidates, json_ok, fallback = _score_prefiltered_candidates(
+                llm=llm,
+                tokenizer=tokenizer,
+                sampling_params=sampling_params,
+                spec_text=spec_text,
+                candidates=prefilter_candidates,
+                batch_size=BATCH_SIZE_DEFAULT,
+            )
+            total_scored_candidates += int(len(scored_candidates))
+            total_json_ok += int(json_ok)
+            total_fallback += int(fallback)
+
+            scored_candidates = _normalize_llm_scores(scored_candidates)
+            adaptive = _decide_adaptive_targets_with_args(
+                candidates=scored_candidates,
+                requested_high=target_high,
+                requested_mid=target_mid,
+                requested_low=target_low,
+            )
+            scored_candidates, quota_info = _assign_target_clusters(
+                candidates=scored_candidates,
+                target_high=int(adaptive.get("target_high", 1)),
+                target_mid=int(adaptive.get("target_mid", 2)),
+                target_low=int(adaptive.get("target_low", 1)),
+            )
+            quota_info["policy_case"] = _clean_text(adaptive.get("policy_case"))
+            quota_info["drop_no_low"] = bool(adaptive.get("drop_no_low", False))
+            missing_high_total_pre += int(quota_info["missing_high"])
+            missing_mid_total_pre += int(quota_info["missing_mid"])
+            missing_low_total_pre += int(quota_info["missing_low"])
+            if int(quota_info["missing_total"]) > 0:
+                shortage_specs_pre += 1
+
+            if bool(quota_info.get("drop_no_low", False)):
+                dropped_by_coverage_gate_specs += 1
+                continue
+
+            scored_spec_rows.append(
+                {
+                    "grant_id": grant_id,
+                    "spec_idx": int(spec_idx),
+                    "spec_text": spec_text,
+                    "scored_candidates": scored_candidates,
+                    "quota_info": quota_info,
+                }
+            )
+
+            if (_tqdm is None) and (spec_rank % 10 == 0 or spec_rank == len(specs)):
+                elapsed = max(1e-6, time.time() - started)
+                speed = float(total_scored_candidates / elapsed)
+                print(
+                    f"score_progress={spec_rank}/{len(specs)} "
+                    f"scored_candidates={total_scored_candidates} "
+                    f"gate_kept_specs={len(scored_spec_rows)} "
+                    f"speed={speed:.2f} cand/sec"
+                )
+
+        _release_vllm_bundle(llm)
+        llm = None
+        tokenizer = None
+        sampling_params = None
+
+        _write_jsonl(distill_raw_path, scored_spec_rows)
+        distill_meta = {
+            "created_at_utc": datetime.now(timezone.utc).isoformat(),
+            "run_mode": str(run_mode),
+            "score_model_id": score_model_id,
+            "prefilter_multiplier": float(prefilter_multiplier),
+            "prefilter_requested": {"high": int(prefilter_high), "mid": int(prefilter_mid), "low": int(prefilter_low)},
+            "target_requested": {"high": int(target_high), "mid": int(target_mid), "low": int(target_low)},
+            "spec_count_input_total": int(full_spec_count),
+            "spec_count_total": int(len(specs)),
+            "spec_count_stagea_kept": int(len(scored_spec_rows)),
+            "spec_count_dropped_by_coverage_gate": int(dropped_by_coverage_gate_specs),
+            "total_prefilter_selected_candidates": int(total_prefilter_selected),
+            "total_scored_candidates": int(total_scored_candidates),
+            "parsed_json_ok_count": int(total_json_ok),
+            "parsed_fallback_count": int(total_fallback),
+            "missing_high_total_pre": int(missing_high_total_pre),
+            "missing_mid_total_pre": int(missing_mid_total_pre),
+            "missing_low_total_pre": int(missing_low_total_pre),
+            "shortage_specs_pre": int(shortage_specs_pre),
+            "distill_raw_path": str(distill_raw_path),
+        }
+        distill_meta_path.write_text(json.dumps(distill_meta, ensure_ascii=False, indent=2), encoding="utf-8")
+
+        if run_mode == "distill-only":
+            elapsed = max(1e-6, time.time() - started)
+            print("done=true")
+            print(f"run_mode={run_mode}")
+            print(f"spec_count_input_total={full_spec_count}")
+            print(f"spec_count_total={len(specs)}")
+            print(f"spec_count_stagea_kept={len(scored_spec_rows)}")
+            print(f"spec_count_dropped_by_coverage_gate={dropped_by_coverage_gate_specs}")
+            print(f"total_prefilter_selected_candidates={total_prefilter_selected}")
+            print(f"total_scored_candidates={total_scored_candidates}")
+            print(f"target_missing_pairs_pre_augmentation=high:{missing_high_total_pre},mid:{missing_mid_total_pre},low:{missing_low_total_pre}")
+            print(f"target_shortage_specs_pre_augmentation={shortage_specs_pre}/{len(specs)}")
+            print(f"parsed_json_ok_count={total_json_ok}")
+            print(f"parsed_fallback_count={total_fallback}")
+            print(f"elapsed_seconds={elapsed:.2f}")
+            print(f"candidates_per_second={(total_scored_candidates / elapsed):.4f}")
+            print(f"distill_raw_output={distill_raw_path}")
+            print(f"distill_meta_output={distill_meta_path}")
+            return 0
+    else:
+        if not distill_raw_path.exists():
+            raise RuntimeError(
+                f"augment-only requires existing distill raw file: {distill_raw_path}. "
+                "Run with --run-mode distill-only or full first."
+            )
+        scored_spec_rows = _load_jsonl(distill_raw_path)
+        if not scored_spec_rows:
+            raise RuntimeError(f"No rows found in distill raw file: {distill_raw_path}")
+        if distill_meta_path.exists():
+            meta = _load_json(distill_meta_path)
+            full_spec_count = _safe_int(meta.get("spec_count_input_total"), default=full_spec_count, minimum=0, maximum=10_000_000)
+            total_prefilter_selected = _safe_int(meta.get("total_prefilter_selected_candidates"), default=0, minimum=0, maximum=2_000_000_000)
+            total_scored_candidates = _safe_int(meta.get("total_scored_candidates"), default=0, minimum=0, maximum=2_000_000_000)
+            total_json_ok = _safe_int(meta.get("parsed_json_ok_count"), default=0, minimum=0, maximum=2_000_000_000)
+            total_fallback = _safe_int(meta.get("parsed_fallback_count"), default=0, minimum=0, maximum=2_000_000_000)
+            dropped_by_coverage_gate_specs = _safe_int(meta.get("spec_count_dropped_by_coverage_gate"), default=0, minimum=0, maximum=10_000_000)
+            missing_high_total_pre = _safe_int(meta.get("missing_high_total_pre"), default=0, minimum=0, maximum=2_000_000_000)
+            missing_mid_total_pre = _safe_int(meta.get("missing_mid_total_pre"), default=0, minimum=0, maximum=2_000_000_000)
+            missing_low_total_pre = _safe_int(meta.get("missing_low_total_pre"), default=0, minimum=0, maximum=2_000_000_000)
+            shortage_specs_pre = _safe_int(meta.get("shortage_specs_pre"), default=0, minimum=0, maximum=10_000_000)
+        else:
+            total_scored_candidates = int(sum(len(list(r.get("scored_candidates") or [])) for r in scored_spec_rows))
+        specs = list(scored_spec_rows)
+
+    # ======================================================
+    # Step 6) Stage B: load augmentation model (if needed), finalize + write outputs
+    # ======================================================
+    augmenter = None
+    augment_llm = None
+    augment_needed = bool(
+        AUGMENT_ENABLE_DEFAULT
+        and any(
+            int((row.get("quota_info") or {}).get("missing_high", 0)) > 0
+            or int((row.get("quota_info") or {}).get("missing_mid", 0)) > 0
+            for row in scored_spec_rows
+        )
+    )
+    if augment_needed:
+        if LLMDistillationAugmenter is None:
+            raise RuntimeError("Augmentation is enabled but LLMDistillationAugmenter could not be imported.")
+        augment_llm, augment_tokenizer, _augment_sampling = _load_vllm_bundle(
+            model_id=augment_model_id,
+            max_new_tokens=AUGMENT_MAX_NEW_TOKENS_DEFAULT,
+            temperature=0.2,
+        )
+        augmenter = LLMDistillationAugmenter(
+            llm=augment_llm,
+            tokenizer=augment_tokenizer,
+            model_id=augment_model_id,
+            max_attempts=AUGMENT_MAX_ATTEMPTS_DEFAULT,
+            max_new_tokens=AUGMENT_MAX_NEW_TOKENS_DEFAULT,
+            temperature=0.2,
+            top_p=0.9,
+            enable_validation=True,
+            validation_max_new_tokens=AUGMENT_VALIDATION_MAX_NEW_TOKENS_DEFAULT,
+        )
+        scored_spec_rows, global_aug_stats, synthetic_id_cursor = _augment_missing_high_mid_global(
+            augmenter=augmenter,
+            scored_spec_rows=scored_spec_rows,
+            next_synthetic_id=synthetic_id_cursor,
+        )
+        augment_requested_high_total = int(global_aug_stats.get("requested_high", 0))
+        augment_requested_mid_total = int(global_aug_stats.get("requested_mid", 0))
+        augment_created_high_total = int(global_aug_stats.get("created_high", 0))
+        augment_created_mid_total = int(global_aug_stats.get("created_mid", 0))
+        augment_attempts_total = int(global_aug_stats.get("attempts_total", 0))
+        augment_rejected_empty_total = int(global_aug_stats.get("rejected_empty", 0))
+        augment_rejected_duplicate_total = int(global_aug_stats.get("rejected_duplicate", 0))
+        augment_rejected_validation_total = int(global_aug_stats.get("rejected_validation", 0))
+        # Augmentation is complete; release model before finalize/write to free GPU memory early.
+        _release_vllm_bundle(augment_llm)
+        augment_llm = None
+        augmenter = None
+
+    final_iter_base = enumerate(scored_spec_rows, start=1)
+    final_iter = _tqdm(final_iter_base, total=len(scored_spec_rows), desc="Finalize specs") if _tqdm is not None else final_iter_base
+    with (
+        raw_output_path.open("w", encoding="utf-8") as raw_f,
+        pairwise_output_path.open("w", encoding="utf-8") as pair_f,
+        listwise_output_path.open("w", encoding="utf-8") as list_f,
+    ):
+        for final_rank, row in final_iter:
+            grant_id = _clean_text(row.get("grant_id"))
+            spec_idx = _safe_int(row.get("spec_idx"), default=0, minimum=0, maximum=50_000_000)
+            spec_text = _clean_text(row.get("spec_text"))
+            scored_candidates = list(row.get("scored_candidates") or [])
+            quota_info = dict(row.get("quota_info") or {})
+
+            target_high_eff = _safe_int(quota_info.get("target_high"), default=target_high, minimum=0, maximum=100_000)
+            target_mid_eff = _safe_int(quota_info.get("target_mid"), default=target_mid, minimum=0, maximum=100_000)
+            target_low_eff = _safe_int(quota_info.get("target_low"), default=target_low, minimum=0, maximum=100_000)
+            final_quota_info = _summarize_selected_clusters(
+                candidates=scored_candidates,
+                target_high=target_high_eff,
+                target_mid=target_mid_eff,
+                target_low=target_low_eff,
+            )
+
+            # Lenient final drop: keep partially-complete specs.
+            # Drop only when both high and mid are completely absent.
+            if (
+                int(final_quota_info["selected_high"]) <= 0
+                and int(final_quota_info["selected_mid"]) <= 0
+            ):
+                dropped_after_augmentation_specs += 1
+                continue
+
+            missing_high_total_final += int(final_quota_info["missing_high"])
+            missing_mid_total_final += int(final_quota_info["missing_mid"])
+            missing_low_total_final += int(final_quota_info["missing_low"])
+            if int(final_quota_info["missing_total"]) > 0:
+                shortage_specs_final += 1
+
+            scored_candidates = _attach_sts_rank_percentile(scored_candidates)
+            for c in scored_candidates:
+                score_raw = float(c.get("llm_score_raw") or 0.0)
+                c["band"] = _band_from_raw_score(score_raw)
+                c["is_disagreement"] = bool(_is_disagreement_candidate(c))
+                c["type"] = "hard_negative" if bool(c["is_disagreement"]) else _clean_text(c["band"])
+
+            # Keep output docs focused on target-selected subset only.
+            # This avoids flooding listwise/raw with unselected low tails.
+            output_candidates = [c for c in scored_candidates if bool(c.get("selected_for_target"))]
+            if not output_candidates:
+                output_candidates = list(scored_candidates)
+
+            total_disagreement_candidates += int(sum(1 for c in output_candidates if bool(c.get("is_disagreement"))))
+            total_strong_candidates += int(sum(1 for c in output_candidates if _clean_text(c.get("band")) == "strong"))
+            total_boundary_candidates += int(sum(1 for c in output_candidates if _clean_text(c.get("band")) == "boundary"))
+            total_weak_candidates += int(sum(1 for c in output_candidates if _clean_text(c.get("band")) == "weak"))
+
+            pair_rows, pair_info = _build_controlled_pairwise_records(
+                grant_id=grant_id,
+                spec_idx=int(spec_idx),
+                query_text=spec_text,
+                candidates=scored_candidates,
+            )
+            for prow in pair_rows:
+                pair_f.write(json.dumps(prow, ensure_ascii=False) + "\n")
+            total_pairwise_rows += int(pair_info.get("pair_total", 0))
+            total_pair_disagreement += int(pair_info.get("pair_disagreement", 0))
+            total_pair_strong_vs_boundary += int(pair_info.get("pair_strong_vs_boundary", 0))
+            total_pair_strong_vs_weak += int(pair_info.get("pair_strong_vs_weak", 0))
+            total_pair_strong_vs_hard += int(pair_info.get("pair_strong_vs_hard", 0))
+            target_requested_high_total_kept += int(target_high_eff)
+            target_requested_mid_total_kept += int(target_mid_eff)
+            target_requested_low_total_kept += int(target_low_eff)
+            target_selected_high_total_kept += int(final_quota_info["selected_high"])
+            target_selected_mid_total_kept += int(final_quota_info["selected_mid"])
+            target_selected_low_total_kept += int(final_quota_info["selected_low"])
+
+            kept_specs += 1
+
+            sorted_candidates = sorted(
+                output_candidates,
+                key=lambda x: float(
+                    x.get("llm_score_norm")
+                    if x.get("llm_score_norm") is not None
+                    else x.get("llm_score_raw") or 0.0
+                ),
+                reverse=True,
+            )
+
+            ranked_docs: List[Dict[str, Any]] = []
+            for rank_idx, c in enumerate(sorted_candidates, start=1):
+                ranked_docs.append(
+                    {
+                        "rank": int(rank_idx),
+                        "text": _clean_text(c.get("fac_spec_text")),
+                        "teacher_score": float(
+                            c.get("llm_score_norm")
+                            if c.get("llm_score_norm") is not None
+                            else c.get("llm_score_raw") or 0.0
+                        ),
+                        "teacher_score_raw": float(c.get("llm_score_raw") or 0.0),
+                        "target_cluster": _clean_text(c.get("llm_target_cluster")) or "unused",
+                        "selected_for_target": bool(c.get("selected_for_target", False)),
+                        "fac_id": int(c.get("fac_id") or 0),
+                        "fac_spec_id": int(c.get("fac_spec_id") or 0),
+                        "fac_spec_idx": int(c.get("fac_spec_idx") or 0),
+                        "section": _clean_text(c.get("section")) or "unknown",
+                        "sts_rank": int(c.get("sts_rank", -1)),
+                        "band": _clean_text(c.get("band")) or "unknown",
+                        "type": _clean_text(c.get("type")) or "unknown",
+                        "is_disagreement": bool(c.get("is_disagreement", False)),
+                        "is_augmented": bool(c.get("is_augmented", False)),
+                        "augment_target_cluster": (
+                            _clean_text(c.get("llm_target_cluster")) if bool(c.get("is_augmented", False)) else ""
+                        ),
+                        "augment_validation_score": (
+                            float(c.get("llm_score_raw") or 0.0) if bool(c.get("is_augmented", False)) else None
+                        ),
+                        "augment_validation_pass": bool(c.get("is_augmented", False)),
+                    }
+                )
+
+            cluster_counts = {
+                "high": int(sum(1 for d in ranked_docs if _clean_text(d.get("target_cluster")) == "high")),
+                "mid": int(sum(1 for d in ranked_docs if _clean_text(d.get("target_cluster")) == "mid")),
+                "low": int(sum(1 for d in ranked_docs if _clean_text(d.get("target_cluster")) == "low")),
+            }
+
+            raw_obj = {
+                "grant_id": grant_id,
+                "spec_idx": int(spec_idx),
+                "query_text": spec_text,
+                "target_requested": {
+                    "high": int(target_high_eff),
+                    "mid": int(target_mid_eff),
+                    "low": int(target_low_eff),
+                },
+                "target_selected": {
+                    "high": int(final_quota_info["selected_high"]),
+                    "mid": int(final_quota_info["selected_mid"]),
+                    "low": int(final_quota_info["selected_low"]),
+                    "total": int(final_quota_info["selected_total"]),
+                },
+                "target_missing": {
+                    "high": int(final_quota_info["missing_high"]),
+                    "mid": int(final_quota_info["missing_mid"]),
+                    "low": int(final_quota_info["missing_low"]),
+                    "total": int(final_quota_info["missing_total"]),
+                },
+                "llm_score_bands": {
+                    "high_min": float(HIGH_SCORE_MIN_DEFAULT),
+                    "mid_min": float(MID_SCORE_MIN_DEFAULT),
+                    "mid_max": float(MID_SCORE_MAX_DEFAULT),
+                },
+                "cluster_counts": cluster_counts,
+                "ranked_docs": ranked_docs,
+            }
+            raw_f.write(json.dumps(raw_obj, ensure_ascii=False) + "\n")
+
+            listwise_obj = {
+                "grant_id": grant_id,
+                "spec_idx": int(spec_idx),
+                "query_text": spec_text,
+                "docs": [
+                    {
+                        "rank": int(doc.get("rank") or 0),
+                        "text": _clean_text(doc.get("text")),
+                        "teacher_score": float(doc.get("teacher_score") or 0.0),
+                        "teacher_score_raw": float(doc.get("teacher_score_raw") or 0.0),
+                        "fac_id": int(doc.get("fac_id") or 0),
+                        "fac_spec_id": int(doc.get("fac_spec_id") or 0),
+                        "fac_spec_idx": int(doc.get("fac_spec_idx") or 0),
+                        "section": _clean_text(doc.get("section")) or "unknown",
+                        "sts_rank": int(doc.get("sts_rank", -1)),
+                        "band": _clean_text(doc.get("band")) or "unknown",
+                        "type": _clean_text(doc.get("type")) or "unknown",
+                        "is_disagreement": bool(doc.get("is_disagreement", False)),
+                        "is_augmented": bool(doc.get("is_augmented", False)),
+                        "target_cluster": _clean_text(doc.get("target_cluster")) or "unused",
+                        "selected_for_target": bool(doc.get("selected_for_target", False)),
+                        "augment_target_cluster": _clean_text(doc.get("augment_target_cluster")),
+                        "augment_validation_score": doc.get("augment_validation_score"),
+                        "augment_validation_pass": bool(doc.get("augment_validation_pass", False)),
+                    }
+                    for doc in ranked_docs
+                ],
+            }
+            list_f.write(json.dumps(listwise_obj, ensure_ascii=False) + "\n")
+
+            if (_tqdm is None) and (final_rank % 10 == 0 or final_rank == len(scored_spec_rows)):
+                elapsed = max(1e-6, time.time() - started)
+                speed = float(total_scored_candidates / elapsed)
+                print(
+                    f"finalize_progress={final_rank}/{len(scored_spec_rows)} "
+                    f"scored_candidates={total_scored_candidates} "
+                    f"kept_specs={kept_specs} "
+                    f"speed={speed:.2f} cand/sec"
+                )
+
+    _release_vllm_bundle(augment_llm)
+    augment_llm = None
+
+    # ======================================================
+    # Step 7) Save manifest + print summary
+    # ======================================================
+    elapsed = max(1e-6, time.time() - started)
+    kept_candidate_band_total = int(total_strong_candidates + total_boundary_candidates + total_weak_candidates)
+    kept_target_selected_total = int(
+        target_selected_high_total_kept + target_selected_mid_total_kept + target_selected_low_total_kept
+    )
+
+    def _ratio(n: int, d: int) -> float:
+        den = int(d)
+        if den <= 0:
+            return 0.0
+        return float(max(0, int(n)) / float(den))
+
+    manifest = {
+        "created_at_utc": datetime.now(timezone.utc).isoformat(),
+        "run_mode": str(run_mode),
+        "grant_db": str(grant_db),
+        "fac_db": str(fac_db),
+        "prefilter_cache": str(prefilter_cache),
+        "distill_raw_input": str(distill_raw_path),
+        "distill_meta_input": str(distill_meta_path),
+        "raw_output": str(raw_output_path),
+        "pairwise_output_path": str(pairwise_output_path),
+        "pairwise_output": str(pairwise_output_path),
+        "listwise_output": str(listwise_output_path),
+        "manifest_output": str(manifest_path),
+        "stats_output": str(stats_output_path),
+        "output_path": str(raw_output_path),
+        "model_id": score_model_id,
+        "score_model_id": score_model_id,
+        "augment_model_id": augment_model_id if bool(AUGMENT_ENABLE_DEFAULT) else "",
+        "batch_size": int(BATCH_SIZE_DEFAULT),
+        "max_new_tokens": int(MAX_NEW_TOKENS_DEFAULT),
+        "temperature": float(TEMPERATURE_DEFAULT),
+        "prefilter_multiplier": float(prefilter_multiplier),
+        "max_specs": int(max_specs),
+        "prefilter_requested": {
+            "high": int(prefilter_high),
+            "mid": int(prefilter_mid),
+            "low": int(prefilter_low),
+        },
+        "target_requested": {
+            "high": int(target_high),
+            "mid": int(target_mid),
+            "low": int(target_low),
+        },
+        "spec_count_input_total": int(full_spec_count),
+        "spec_count_total": int(len(specs)),
+        "spec_count": int(len(specs)),
+        "spec_count_kept": int(kept_specs),
+        "spec_count_dropped_by_coverage_gate": int(dropped_by_coverage_gate_specs),
+        "spec_count_dropped_after_augmentation": int(dropped_after_augmentation_specs),
+        "fac_spec_count": int(len(fac_specs)),
+        "cache_spec_count": int(len(prefilter_map)),
+        "total_prefilter_selected_candidates": int(total_prefilter_selected),
+        "total_scored_candidates": int(total_scored_candidates),
+        "score_band_ranges": {
+            "high_min": float(HIGH_SCORE_MIN_DEFAULT),
+            "mid_min": float(MID_SCORE_MIN_DEFAULT),
+            "mid_max": float(MID_SCORE_MAX_DEFAULT),
+        },
+        "coverage_gate_min_mid_high": float(COVERAGE_GATE_MIN_MID_HIGH_DEFAULT),
+        "target_missing_high_total_pre_augmentation": int(missing_high_total_pre),
+        "target_missing_mid_total_pre_augmentation": int(missing_mid_total_pre),
+        "target_missing_low_total_pre_augmentation": int(missing_low_total_pre),
+        "target_shortage_specs_pre_augmentation": int(shortage_specs_pre),
+        "target_missing_high_total_final_kept": int(missing_high_total_final),
+        "target_missing_mid_total_final_kept": int(missing_mid_total_final),
+        "target_missing_low_total_final_kept": int(missing_low_total_final),
+        "target_shortage_specs_final_kept": int(shortage_specs_final),
+        "target_missing_high_total": int(missing_high_total_final),
+        "target_missing_mid_total": int(missing_mid_total_final),
+        "target_missing_low_total": int(missing_low_total_final),
+        "target_shortage_specs": int(shortage_specs_final),
+        "augmentation_enabled": bool(augmenter is not None),
+        "augmentation_needed": bool(augment_needed),
+        "augmentation_requested_high_total": int(augment_requested_high_total),
+        "augmentation_requested_mid_total": int(augment_requested_mid_total),
+        "augmentation_created_high_total": int(augment_created_high_total),
+        "augmentation_created_mid_total": int(augment_created_mid_total),
+        "augmentation_attempts_total": int(augment_attempts_total),
+        "augmentation_rejected_empty_total": int(augment_rejected_empty_total),
+        "augmentation_rejected_duplicate_total": int(augment_rejected_duplicate_total),
+        "augmentation_rejected_validation_total": int(augment_rejected_validation_total),
+        "pair_max_per_spec": int(PAIR_MAX_PER_SPEC_DEFAULT),
+        "pair_max_disagreement_per_spec": int(PAIR_MAX_DISAGREE_PER_SPEC_DEFAULT),
+        "pair_max_boundary_per_spec": int(PAIR_MAX_BOUNDARY_PER_SPEC_DEFAULT),
+        "pair_weak_min_per_spec": int(PAIR_WEAK_MIN_DEFAULT),
+        "pair_disagree_top_percentile": float(DISAGREE_TOP_PERCENTILE_DEFAULT),
+        "pair_disagree_low_score_norm_max": float(DISAGREE_LOW_SCORE_NORM_DEFAULT),
+        "pair_disagree_min_margin": float(DISAGREE_MIN_MARGIN_DEFAULT),
+        "pair_boundary_min_margin": float(BOUNDARY_MIN_MARGIN_DEFAULT),
+        "allow_extra_disagreement_from_unselected": bool(ALLOW_EXTRA_DISAGREE_FROM_UNSELECTED_DEFAULT),
+        "total_pairwise_rows": int(total_pairwise_rows),
+        "total_pair_disagreement": int(total_pair_disagreement),
+        "total_pair_strong_vs_boundary": int(total_pair_strong_vs_boundary),
+        "total_pair_strong_vs_weak": int(total_pair_strong_vs_weak),
+        "total_pair_strong_vs_hard": int(total_pair_strong_vs_hard),
+        "total_disagreement_candidates": int(total_disagreement_candidates),
+        "total_strong_candidates": int(total_strong_candidates),
+        "total_boundary_candidates": int(total_boundary_candidates),
+        "total_weak_candidates": int(total_weak_candidates),
+        "target_selected_high_total_kept": int(target_selected_high_total_kept),
+        "target_selected_mid_total_kept": int(target_selected_mid_total_kept),
+        "target_selected_low_total_kept": int(target_selected_low_total_kept),
+        "target_selected_total_kept": int(kept_target_selected_total),
+        "target_selected_portions_kept": {
+            "high": float(_ratio(target_selected_high_total_kept, kept_target_selected_total)),
+            "mid": float(_ratio(target_selected_mid_total_kept, kept_target_selected_total)),
+            "low": float(_ratio(target_selected_low_total_kept, kept_target_selected_total)),
+        },
+        "candidate_band_total_kept": int(kept_candidate_band_total),
+        "candidate_band_portions_kept": {
+            "high": float(_ratio(total_strong_candidates, kept_candidate_band_total)),
+            "mid": float(_ratio(total_boundary_candidates, kept_candidate_band_total)),
+            "low": float(_ratio(total_weak_candidates, kept_candidate_band_total)),
+        },
+        "parsed_json_ok_count": int(total_json_ok),
+        "parsed_fallback_count": int(total_fallback),
+        "elapsed_seconds": float(elapsed),
+        "candidates_per_second": float(total_scored_candidates / elapsed),
+    }
+    manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    stats = {
+        "created_at_utc": manifest["created_at_utc"],
+        "files": {
+            "distill_raw_input": str(distill_raw_path),
+            "distill_meta_input": str(distill_meta_path),
+            "raw_output": str(raw_output_path),
+            "pairwise_output": str(pairwise_output_path),
+            "listwise_output": str(listwise_output_path),
+            "manifest_output": str(manifest_path),
+            "stats_output": str(stats_output_path),
+        },
+        "specs": {
+            "input_total": int(full_spec_count),
+            "processed_total": int(len(specs)),
+            "kept_total": int(kept_specs),
+            "dropped_by_coverage_gate": int(dropped_by_coverage_gate_specs),
+            "dropped_after_augmentation": int(dropped_after_augmentation_specs),
+            "kept_ratio_vs_processed": float(_ratio(kept_specs, len(specs))),
+            "kept_ratio_vs_input": float(_ratio(kept_specs, full_spec_count)),
+        },
+        "target_selection_kept": {
+            "requested": {
+                "high": int(target_requested_high_total_kept),
+                "mid": int(target_requested_mid_total_kept),
+                "low": int(target_requested_low_total_kept),
+                "total": int(
+                    target_requested_high_total_kept + target_requested_mid_total_kept + target_requested_low_total_kept
+                ),
+            },
+            "selected": {
+                "high": int(target_selected_high_total_kept),
+                "mid": int(target_selected_mid_total_kept),
+                "low": int(target_selected_low_total_kept),
+                "total": int(kept_target_selected_total),
+            },
+            "selected_portions": {
+                "high": float(_ratio(target_selected_high_total_kept, kept_target_selected_total)),
+                "mid": float(_ratio(target_selected_mid_total_kept, kept_target_selected_total)),
+                "low": float(_ratio(target_selected_low_total_kept, kept_target_selected_total)),
+            },
+        },
+        "candidate_bands_kept": {
+            "high": int(total_strong_candidates),
+            "mid": int(total_boundary_candidates),
+            "low": int(total_weak_candidates),
+            "total": int(kept_candidate_band_total),
+            "portions": {
+                "high": float(_ratio(total_strong_candidates, kept_candidate_band_total)),
+                "mid": float(_ratio(total_boundary_candidates, kept_candidate_band_total)),
+                "low": float(_ratio(total_weak_candidates, kept_candidate_band_total)),
+            },
+        },
+        "pairwise_rows": {
+            "total": int(total_pairwise_rows),
+            "disagreement": int(total_pair_disagreement),
+            "strong_vs_boundary": int(total_pair_strong_vs_boundary),
+            "strong_vs_weak": int(total_pair_strong_vs_weak),
+            "strong_vs_hard": int(total_pair_strong_vs_hard),
+            "portions": {
+                "disagreement": float(_ratio(total_pair_disagreement, total_pairwise_rows)),
+                "strong_vs_boundary": float(_ratio(total_pair_strong_vs_boundary, total_pairwise_rows)),
+                "strong_vs_weak": float(_ratio(total_pair_strong_vs_weak, total_pairwise_rows)),
+                "strong_vs_hard": float(_ratio(total_pair_strong_vs_hard, total_pairwise_rows)),
+            },
+        },
+        "augmentation": {
+            "enabled": bool(augmenter is not None),
+            "requested_high": int(augment_requested_high_total),
+            "requested_mid": int(augment_requested_mid_total),
+            "created_high": int(augment_created_high_total),
+            "created_mid": int(augment_created_mid_total),
+            "attempts": int(augment_attempts_total),
+            "rejected_empty": int(augment_rejected_empty_total),
+            "rejected_duplicate": int(augment_rejected_duplicate_total),
+            "rejected_validation": int(augment_rejected_validation_total),
+        },
+        "timing": {
+            "elapsed_seconds": float(elapsed),
+            "candidates_per_second": float(total_scored_candidates / elapsed),
+        },
+    }
+    stats_output_path.write_text(json.dumps(stats, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    print(f"spec_count_input_total={full_spec_count}")
+    print(f"run_mode={run_mode}")
+    print(f"max_specs={max_specs}")
+    print(f"spec_count_total={len(specs)}")
+    print(f"spec_count_kept={kept_specs}")
+    print(f"spec_count_dropped_by_coverage_gate={dropped_by_coverage_gate_specs}")
+    print(f"spec_count_dropped_after_augmentation={dropped_after_augmentation_specs}")
+    print(f"fac_spec_count={len(fac_specs)}")
+    print(f"score_model_id={score_model_id}")
+    print(f"augment_model_id={augment_model_id if AUGMENT_ENABLE_DEFAULT else ''}")
+    print(f"prefilter_multiplier={prefilter_multiplier:.4f}")
+    print(f"prefilter_requested=high:{prefilter_high},mid:{prefilter_mid},low:{prefilter_low}")
+    print(f"target_requested=high:{target_high},mid:{target_mid},low:{target_low}")
+    print(
+        "score_band_ranges="
+        f"high:[{HIGH_SCORE_MIN_DEFAULT:.2f},1.00],"
+        f"mid:[{MID_SCORE_MIN_DEFAULT:.2f},{MID_SCORE_MAX_DEFAULT:.2f}],"
+        f"low:[0.00,{MID_SCORE_MIN_DEFAULT:.2f})"
+    )
+    print(f"coverage_gate_min_mid_high={COVERAGE_GATE_MIN_MID_HIGH_DEFAULT:.2f}")
+    print(f"cache_spec_count={len(prefilter_map)}")
+    print(f"total_prefilter_selected_candidates={total_prefilter_selected}")
+    print(f"total_scored_candidates={total_scored_candidates}")
+    print(
+        "pairwise_rows="
+        f"total:{total_pairwise_rows},"
+        f"disagreement:{total_pair_disagreement},"
+        f"strong_vs_boundary:{total_pair_strong_vs_boundary},"
+        f"strong_vs_weak:{total_pair_strong_vs_weak},"
+        f"strong_vs_hard:{total_pair_strong_vs_hard}"
+    )
+    print(f"total_disagreement_candidates={total_disagreement_candidates}")
+    print(
+        "candidate_bands="
+        f"high:{total_strong_candidates},"
+        f"mid:{total_boundary_candidates},"
+        f"low:{total_weak_candidates}"
+    )
+    print(
+        "target_missing_pairs_pre_augmentation="
+        f"high:{missing_high_total_pre},"
+        f"mid:{missing_mid_total_pre},"
+        f"low:{missing_low_total_pre}"
+    )
+    print(
+        "target_missing_pairs_final_kept="
+        f"high:{missing_high_total_final},"
+        f"mid:{missing_mid_total_final},"
+        f"low:{missing_low_total_final}"
+    )
+    print(f"target_shortage_specs_pre_augmentation={shortage_specs_pre}/{len(specs)}")
+    print(f"target_shortage_specs_final_kept={shortage_specs_final}/{max(1, kept_specs)}")
+    print(
+        "augmentation_totals="
+        f"requested_high:{augment_requested_high_total},"
+        f"requested_mid:{augment_requested_mid_total},"
+        f"created_high:{augment_created_high_total},"
+        f"created_mid:{augment_created_mid_total},"
+        f"attempts:{augment_attempts_total},"
+        f"rejected_empty:{augment_rejected_empty_total},"
+        f"rejected_duplicate:{augment_rejected_duplicate_total},"
+        f"rejected_validation:{augment_rejected_validation_total}"
+    )
+    print(f"parsed_json_ok_count={total_json_ok}")
+    print(f"parsed_fallback_count={total_fallback}")
+    print(f"elapsed_seconds={elapsed:.2f}")
+    print(f"candidates_per_second={(total_scored_candidates / elapsed):.4f}")
+    print(f"raw_output={raw_output_path}")
+    print(f"pairwise_output={pairwise_output_path}")
+    print(f"listwise_output={listwise_output_path}")
+    print(f"distill_raw_input={distill_raw_path}")
+    print(f"distill_meta_input={distill_meta_path}")
+    print(f"manifest={manifest_path}")
+    print(f"stats_output={stats_output_path}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

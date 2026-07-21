@@ -1,0 +1,403 @@
+{
+  "created_at": "2026-05-20 04:44:28",
+  "input": "/Users/kimwoonki/Desktop/OSU/Fall2025/Capstone/GrantFetcher/ce/dataset/distill/llm_ground_truth_requirement_common_test_listwise.jsonl",
+  "rows_total": 1681,
+  "finetuned_model": "/Users/kimwoonki/Desktop/OSU/Fall2025/Capstone/GrantFetcher/ce/models/stage2_epoch_14",
+  "base_model": "dleemiller/ModernCE-base-sts",
+  "weights": {
+    "domain": 0.5,
+    "method": 0.5
+  },
+  "thresholds": {
+    "high": 0.7,
+    "mid": 0.3,
+    "pair_eps": 0.01,
+    "hard_gap_max": 0.15
+  },
+  "alpha_search": {
+    "enabled": true,
+    "val_ratio": 0.5,
+    "seed": 42,
+    "alpha_min": 0.0,
+    "alpha_max": 1.0,
+    "alpha_step": 0.02,
+    "objective": "hybrid",
+    "oob_weights": {
+      "high": 1.0,
+      "mid": 1.0,
+      "low": 1.0
+    },
+    "hybrid_oob_scale": 0.5,
+    "split_meta": {
+      "queries_total": 426,
+      "val_queries": 213,
+      "test_queries": 213,
+      "val_rows": 828,
+      "test_rows": 853
+    },
+    "results": {
+      "finetuned": {
+        "best_alpha": 0.38,
+        "val_objective": 0.6548628229900437,
+        "val_mae": 0.16390848785512835,
+        "test_mae": 0.1700986617897907,
+        "test_pair_acc": 0.7643072289156626,
+        "test_mid_oob": 0.1025,
+        "test_low_oob": 0.36046511627906974,
+        "test_high_oob": 0.391304347826087,
+        "fixed_alpha": 0.5,
+        "fixed_test_mae": 0.17434207588294465,
+        "fixed_test_mid_oob": 0.115,
+        "fixed_test_low_oob": 0.3627906976744186,
+        "fixed_test_high_oob": 0.391304347826087,
+        "search": {
+          "best_alpha": 0.38,
+          "best_objective": 0.6548628229900437,
+          "best_mae": 0.16390848785512835,
+          "best_oob_objective": 0.9819086702698309,
+          "best_oob_rates": {
+            "high_rate": 0.5185185185185185,
+            "mid_rate": 0.1141439205955335,
+            "low_rate": 0.3492462311557789
+          },
+          "trials_top10": [
+            {
+              "alpha": 0.38,
+              "objective": 0.6548628229900437,
+              "mae": 0.16390848785512835,
+              "oob_objective": 0.9819086702698309,
+              "oob_high_rate": 0.5185185185185185,
+              "oob_mid_rate": 0.1141439205955335,
+              "oob_low_rate": 0.3492462311557789
+            },
+            {
+              "alpha": 0.4,
+              "objective": 0.6554527569938936,
+              "mae": 0.16449842185897817,
+              "oob_objective": 0.9819086702698309,
+              "oob_high_rate": 0.5185185185185185,
+              "oob_mid_rate": 0.1141439205955335,
+              "oob_low_rate": 0.3492462311557789
+            },
+            {
+              "alpha": 0.42,
+              "objective": 0.6560479536415621,
+              "mae": 0.16509361850664667,
+              "oob_objective": 0.9819086702698309,
+              "oob_high_rate": 0.5185185185185185,
+              "oob_mid_rate": 0.1141439205955335,
+              "oob_low_rate": 0.3492462311557789
+            },
+            {
+              "alpha": 0.44,
+              "objective": 0.6591351615533071,
+              "mae": 0.16569943684022787,
+              "oob_objective": 0.9868714494261585,
+              "oob_high_rate": 0.5185185185185185,
+              "oob_mid_rate": 0.11910669975186104,
+              "oob_low_rate": 0.3492462311557789
+            },
+            {
+              "alpha": 0.26,
+              "objective": 0.6613192497778919,
+              "mae": 0.16051567303007785,
+              "oob_objective": 1.0016071534956281,
+              "oob_high_rate": 0.5555555555555556,
+              "oob_mid_rate": 0.09429280397022333,
+              "oob_low_rate": 0.35175879396984927
+            },
+            {
+              "alpha": 0.46,
+              "objective": 0.6622348630089188,
+              "mae": 0.16631774871767577,
+              "oob_objective": 0.9918342285824859,
+              "oob_high_rate": 0.5185185185185185,
+              "oob_mid_rate": 0.12406947890818859,
+              "oob_low_rate": 0.3492462311557789
+            },
+            {
+              "alpha": 0.48,
+              "objective": 0.6628537101591123,
+              "mae": 0.16693659586786938,
+              "oob_objective": 0.9918342285824859,
+              "oob_high_rate": 0.5185185185185185,
+              "oob_mid_rate": 0.12406947890818859,
+              "oob_low_rate": 0.3492462311557789
+            },
+            {
+              "alpha": 0.5,
+              "objective": 0.6634732795333157,
+              "mae": 0.16755616524207276,
+              "oob_objective": 0.9918342285824859,
+              "oob_high_rate": 0.5185185185185185,
+              "oob_mid_rate": 0.12406947890818859,
+              "oob_low_rate": 0.3492462311557789
+            },
+            {
+              "alpha": 0.28,
+              "objective": 0.6643557987014329,
+              "mae": 0.16107083237545503,
+              "oob_objective": 1.0065699326519557,
+              "oob_high_rate": 0.5555555555555556,
+              "oob_mid_rate": 0.09925558312655088,
+              "oob_low_rate": 0.35175879396984927
+            },
+            {
+              "alpha": 0.52,
+              "objective": 0.6653190783197611,
+              "mae": 0.16817685585738956,
+              "oob_objective": 0.9942844449247432,
+              "oob_high_rate": 0.5185185185185185,
+              "oob_mid_rate": 0.12903225806451613,
+              "oob_low_rate": 0.34673366834170855
+            }
+          ],
+          "grid_count": 51
+        }
+      },
+      "base": {
+        "best_alpha": 0.58,
+        "val_objective": 0.7394934942108979,
+        "val_mae": 0.13990782115302514,
+        "test_mae": 0.14682824432059405,
+        "test_pair_acc": 0.7567771084337349,
+        "test_mid_oob": 0.055,
+        "test_low_oob": 0.3674418604651163,
+        "test_high_oob": 0.9565217391304348,
+        "fixed_alpha": 0.5,
+        "fixed_test_mae": 0.14699785023888384,
+        "fixed_test_mid_oob": 0.0525,
+        "fixed_test_low_oob": 0.36511627906976746,
+        "fixed_test_high_oob": 0.9565217391304348,
+        "search": {
+          "best_alpha": 0.58,
+          "best_objective": 0.7394934942108979,
+          "best_mae": 0.13990782115302514,
+          "best_oob_objective": 1.1991713461157456,
+          "best_oob_rates": {
+            "high_rate": 0.7777777777777778,
+            "mid_rate": 0.05707196029776675,
+            "low_rate": 0.36432160804020103
+          },
+          "trials_top10": [
+            {
+              "alpha": 0.58,
+              "objective": 0.7394934942108979,
+              "mae": 0.13990782115302514,
+              "oob_objective": 1.1991713461157456,
+              "oob_high_rate": 0.7777777777777778,
+              "oob_mid_rate": 0.05707196029776675,
+              "oob_low_rate": 0.36432160804020103
+            },
+            {
+              "alpha": 0.56,
+              "objective": 0.7395588566444724,
+              "mae": 0.1399731835865996,
+              "oob_objective": 1.1991713461157456,
+              "oob_high_rate": 0.7777777777777778,
+              "oob_mid_rate": 0.05707196029776675,
+              "oob_low_rate": 0.36432160804020103
+            },
+            {
+              "alpha": 0.54,
+              "objective": 0.7396255423342746,
+              "mae": 0.14003986927640177,
+              "oob_objective": 1.1991713461157456,
+              "oob_high_rate": 0.7777777777777778,
+              "oob_mid_rate": 0.05707196029776675,
+              "oob_low_rate": 0.36432160804020103
+            },
+            {
+              "alpha": 0.52,
+              "objective": 0.7396935859704957,
+              "mae": 0.1401079129126229,
+              "oob_objective": 1.1991713461157456,
+              "oob_high_rate": 0.7777777777777778,
+              "oob_mid_rate": 0.05707196029776675,
+              "oob_low_rate": 0.36432160804020103
+            },
+            {
+              "alpha": 0.5,
+              "objective": 0.7397628227506121,
+              "mae": 0.14017714969273926,
+              "oob_objective": 1.1991713461157456,
+              "oob_high_rate": 0.7777777777777778,
+              "oob_mid_rate": 0.05707196029776675,
+              "oob_low_rate": 0.36432160804020103
+            },
+            {
+              "alpha": 0.48,
+              "objective": 0.7398332273916004,
+              "mae": 0.14024755433372757,
+              "oob_objective": 1.1991713461157456,
+              "oob_high_rate": 0.7777777777777778,
+              "oob_mid_rate": 0.05707196029776675,
+              "oob_low_rate": 0.36432160804020103
+            },
+            {
+              "alpha": 0.46,
+              "objective": 0.7399036320325887,
+              "mae": 0.14031795897471588,
+              "oob_objective": 1.1991713461157456,
+              "oob_high_rate": 0.7777777777777778,
+              "oob_mid_rate": 0.05707196029776675,
+              "oob_low_rate": 0.36432160804020103
+            },
+            {
+              "alpha": 0.44,
+              "objective": 0.739974036673577,
+              "mae": 0.1403883636157042,
+              "oob_objective": 1.1991713461157456,
+              "oob_high_rate": 0.7777777777777778,
+              "oob_mid_rate": 0.05707196029776675,
+              "oob_low_rate": 0.36432160804020103
+            },
+            {
+              "alpha": 0.42,
+              "objective": 0.7400444413145653,
+              "mae": 0.1404587682566925,
+              "oob_objective": 1.1991713461157456,
+              "oob_high_rate": 0.7777777777777778,
+              "oob_mid_rate": 0.05707196029776675,
+              "oob_low_rate": 0.36432160804020103
+            },
+            {
+              "alpha": 0.74,
+              "objective": 0.7402285118423926,
+              "mae": 0.1394177306133912,
+              "oob_objective": 1.2016215624580027,
+              "oob_high_rate": 0.7777777777777778,
+              "oob_mid_rate": 0.062034739454094295,
+              "oob_low_rate": 0.36180904522613067
+            }
+          ],
+          "grid_count": 51
+        }
+      }
+    }
+  },
+  "model_stats": {
+    "finetuned": {
+      "regression": {
+        "count": 1681.0,
+        "mae": 0.17099958093312792,
+        "rmse": 0.2157932390848579,
+        "pearson": 0.7474230806754204
+      },
+      "band": {
+        "overall": {
+          "count": 1681.0,
+          "avg_gt": 0.25483640690065434,
+          "avg_pred": 0.4064821370903365,
+          "mae": 0.17099958093312792
+        },
+        "high": {
+          "count": 50.0,
+          "avg_gt": 0.7293999999999999,
+          "avg_pred": 0.6780206897854805,
+          "mae": 0.0956397470355034
+        },
+        "mid": {
+          "count": 803.0,
+          "avg_gt": 0.4222914072229141,
+          "avg_pred": 0.5345407716308258,
+          "mae": 0.14272774093437612
+        },
+        "low": {
+          "count": 828.0,
+          "avg_gt": 0.06378019323671498,
+          "avg_pred": 0.26589275161839193,
+          "mae": 0.20296851718177397
+        }
+      },
+      "oob": {
+        "low_out": 295.0,
+        "low_total": 828.0,
+        "low_rate": 0.35628019323671495,
+        "mid_out": 96.0,
+        "mid_total": 803.0,
+        "mid_rate": 0.11955168119551682,
+        "mid_low_out": 26.0,
+        "mid_low_rate": 0.0323785803237858,
+        "mid_high_out": 70.0,
+        "mid_high_rate": 0.08717310087173101,
+        "high_out": 23.0,
+        "high_total": 50.0,
+        "high_rate": 0.46
+      },
+      "order": {
+        "queries_total": 426.0,
+        "queries_with_2plus": 363.0,
+        "top1_acc": 0.7245179063360881,
+        "pair_acc": 0.7820658342792282,
+        "mean_margin": 0.18729666314351032,
+        "hard_acc": 0.6300738007380073,
+        "hard_margin": 0.05010172576949385,
+        "pair_count": 2643.0,
+        "hard_pair_count": 1084.0
+      }
+    },
+    "base": {
+      "regression": {
+        "count": 1681.0,
+        "mae": 0.14363821903590482,
+        "rmse": 0.18721425057849297,
+        "pearson": 0.7385256955328269
+      },
+      "band": {
+        "overall": {
+          "count": 1681.0,
+          "avg_gt": 0.25483640690065434,
+          "avg_pred": 0.36634957843062904,
+          "mae": 0.14363821903590482
+        },
+        "high": {
+          "count": 50.0,
+          "avg_gt": 0.7293999999999999,
+          "avg_pred": 0.5824505186080933,
+          "mae": 0.15091804494857786
+        },
+        "mid": {
+          "count": 803.0,
+          "avg_gt": 0.4222914072229141,
+          "avg_pred": 0.484099598473882,
+          "mae": 0.10911195710950888
+        },
+        "low": {
+          "count": 828.0,
+          "avg_gt": 0.06378019323671498,
+          "avg_pred": 0.23910523893352112,
+          "mae": 0.17668241834902354
+        }
+      },
+      "oob": {
+        "low_out": 302.0,
+        "low_total": 828.0,
+        "low_rate": 0.3647342995169082,
+        "mid_out": 44.0,
+        "mid_total": 803.0,
+        "mid_rate": 0.0547945205479452,
+        "mid_low_out": 35.0,
+        "mid_low_rate": 0.043586550435865505,
+        "mid_high_out": 9.0,
+        "mid_high_rate": 0.0112079701120797,
+        "high_out": 43.0,
+        "high_total": 50.0,
+        "high_rate": 0.86
+      },
+      "order": {
+        "queries_total": 426.0,
+        "queries_with_2plus": 363.0,
+        "top1_acc": 0.6556473829201102,
+        "pair_acc": 0.7665531592886871,
+        "mean_margin": 0.16084685549069502,
+        "hard_acc": 0.6107011070110702,
+        "hard_margin": 0.033264677194926574,
+        "pair_count": 2643.0,
+        "hard_pair_count": 1084.0
+      }
+    }
+  },
+  "elapsed_sec": 58.64188003540039,
+  "summary": "=== Weighted Domain+Method vs Ground Truth ===\nweights: domain=0.5000, method=0.5000 | thresholds: high>=0.70, mid>=0.30\n\nMODEL             MAE     RMSE  PEARSON     TOP1  PAIR_ACC  HARD_ACC   MID_OOB   LOW_OOB  HIGH_OOB\n--------------------------------------------------------------------------------------------------------\nfinetuned      0.1710   0.2158   0.7474   0.7245    0.7821    0.6301    0.1196    0.3563    0.4600\nbase           0.1436   0.1872   0.7385   0.6556    0.7666    0.6107    0.0548    0.3647    0.8600\n\n=== Out-Of-Band Percentages ===\nMODEL               LOW        MID    MID_LOW   MID_HIGH       HIGH\n----------------------------------------------------------------------\nfinetuned        35.63%     11.96%      3.24%      8.72%     46.00%\nbase             36.47%      5.48%      4.36%      1.12%     86.00%\n\n=== FINETUNED Band MAE ===\nBAND        COUNT     AVG_GT   AVG_PRED        MAE\n----------------------------------------------------\noverall      1681     0.2548     0.4065     0.1710\nhigh           50     0.7294     0.6780     0.0956\nmid           803     0.4223     0.5345     0.1427\nlow           828     0.0638     0.2659     0.2030\n\n=== BASE Band MAE ===\nBAND        COUNT     AVG_GT   AVG_PRED        MAE\n----------------------------------------------------\noverall      1681     0.2548     0.3663     0.1436\nhigh           50     0.7294     0.5825     0.1509\nmid           803     0.4223     0.4841     0.1091\nlow           828     0.0638     0.2391     0.1767\n\n=== In-Memory Alpha Search (Query-Group Split) ===\nqueries_total=426 val_queries=213 test_queries=213 val_rows=828 test_rows=853\nalpha_objective=hybrid\nMODEL          BEST_A    VAL_OBJ   VAL_MAE  TEST_MAE  TEST_PAIR  TEST_MID_OOB  TEST_LOW_OOB\n------------------------------------------------------------------------------------------------\nfinetuned       0.380     0.6549    0.1639    0.1701     0.7643        0.1025        0.3605\nbase            0.580     0.7395    0.1399    0.1468     0.7568        0.0550        0.3674"
+}

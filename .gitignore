@@ -19,4 +19,16 @@ __pycache__/
 
 /train_cross_encoder/dataset
 /train_cross_encoder/models
+/train_cross_encoder/eval_runs
 
+/finetune_supervision/dataset
+/finetune_supervision/models
+/finetune_supervision/eval_runs
+
+/finetune_cross_encoder/dataset
+
+/wandb
+
+# cross_encoder generated artifacts
+/cross_encoder/**/dataset/
+/cross_encoder/**/models/

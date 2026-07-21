@@ -1,0 +1,976 @@
+{
+  "created_at": "2026-05-20 05:10:43",
+  "input": "/Users/kimwoonki/Desktop/OSU/Fall2025/Capstone/GrantFetcher/ce/dataset/distill/llm_ground_truth_requirement_common_test_listwise.jsonl",
+  "rows_total": 1681,
+  "finetuned_model": "/Users/kimwoonki/Desktop/OSU/Fall2025/Capstone/GrantFetcher/ce/models/stage2_epoch_14",
+  "requirement_model": "/Users/kimwoonki/Desktop/OSU/Fall2025/Capstone/GrantFetcher/ce/models/stage2_epoch_10",
+  "base_model": "dleemiller/ModernCE-base-sts",
+  "weights": {
+    "domain": 0.5,
+    "method": 0.5,
+    "dmr_domain": 0.25,
+    "dmr_method": 0.25,
+    "dmr_requirement": 0.5
+  },
+  "thresholds": {
+    "high": 0.7,
+    "mid": 0.3,
+    "pair_eps": 0.01,
+    "hard_gap_max": 0.15
+  },
+  "alpha_search": {
+    "enabled": true,
+    "val_ratio": 0.5,
+    "seed": 42,
+    "alpha_min": 0.0,
+    "alpha_max": 1.0,
+    "alpha_step": 0.02,
+    "objective": "hybrid",
+    "oob_weights": {
+      "high": 1.0,
+      "mid": 1.0,
+      "low": 1.0
+    },
+    "hybrid_oob_scale": 0.5,
+    "split_meta": {
+      "queries_total": 426,
+      "val_queries": 213,
+      "test_queries": 213,
+      "val_rows": 828,
+      "test_rows": 853
+    },
+    "results": {
+      "finetuned": {
+        "best_alpha": 0.38,
+        "val_objective": 0.6548628229900437,
+        "val_mae": 0.16390848785512835,
+        "test_mae": 0.1700986617897907,
+        "test_pair_acc": 0.7643072289156626,
+        "test_mid_oob": 0.1025,
+        "test_mid_low_oob": 0.035,
+        "test_mid_high_oob": 0.0675,
+        "test_low_oob": 0.36046511627906974,
+        "test_high_oob": 0.391304347826087,
+        "fixed_alpha": 0.5,
+        "fixed_test_mae": 0.17434207588294465,
+        "fixed_test_mid_oob": 0.115,
+        "fixed_test_mid_low_oob": 0.035,
+        "fixed_test_mid_high_oob": 0.08,
+        "fixed_test_low_oob": 0.3627906976744186,
+        "fixed_test_high_oob": 0.391304347826087,
+        "search": {
+          "best_alpha": 0.38,
+          "best_objective": 0.6548628229900437,
+          "best_mae": 0.16390848785512835,
+          "best_oob_objective": 0.9819086702698309,
+          "best_oob_rates": {
+            "high_rate": 0.5185185185185185,
+            "mid_rate": 0.1141439205955335,
+            "mid_low_rate": 0.03225806451612903,
+            "mid_high_rate": 0.08188585607940446,
+            "low_rate": 0.3492462311557789
+          },
+          "trials_top10": [
+            {
+              "alpha": 0.38,
+              "objective": 0.6548628229900437,
+              "mae": 0.16390848785512835,
+              "oob_objective": 0.9819086702698309,
+              "oob_high_rate": 0.5185185185185185,
+              "oob_mid_rate": 0.1141439205955335,
+              "oob_mid_low_rate": 0.03225806451612903,
+              "oob_mid_high_rate": 0.08188585607940446,
+              "oob_low_rate": 0.3492462311557789
+            },
+            {
+              "alpha": 0.4,
+              "objective": 0.6554527569938936,
+              "mae": 0.16449842185897817,
+              "oob_objective": 0.9819086702698309,
+              "oob_high_rate": 0.5185185185185185,
+              "oob_mid_rate": 0.1141439205955335,
+              "oob_mid_low_rate": 0.03225806451612903,
+              "oob_mid_high_rate": 0.08188585607940446,
+              "oob_low_rate": 0.3492462311557789
+            },
+            {
+              "alpha": 0.42,
+              "objective": 0.6560479536415621,
+              "mae": 0.16509361850664667,
+              "oob_objective": 0.9819086702698309,
+              "oob_high_rate": 0.5185185185185185,
+              "oob_mid_rate": 0.1141439205955335,
+              "oob_mid_low_rate": 0.02977667493796526,
+              "oob_mid_high_rate": 0.08436724565756824,
+              "oob_low_rate": 0.3492462311557789
+            },
+            {
+              "alpha": 0.44,
+              "objective": 0.6591351615533071,
+              "mae": 0.16569943684022787,
+              "oob_objective": 0.9868714494261585,
+              "oob_high_rate": 0.5185185185185185,
+              "oob_mid_rate": 0.11910669975186104,
+              "oob_mid_low_rate": 0.02977667493796526,
+              "oob_mid_high_rate": 0.08933002481389578,
+              "oob_low_rate": 0.3492462311557789
+            },
+            {
+              "alpha": 0.26,
+              "objective": 0.6613192497778919,
+              "mae": 0.16051567303007785,
+              "oob_objective": 1.0016071534956281,
+              "oob_high_rate": 0.5555555555555556,
+              "oob_mid_rate": 0.09429280397022333,
+              "oob_mid_low_rate": 0.03225806451612903,
+              "oob_mid_high_rate": 0.062034739454094295,
+              "oob_low_rate": 0.35175879396984927
+            },
+            {
+              "alpha": 0.46,
+              "objective": 0.6622348630089188,
+              "mae": 0.16631774871767577,
+              "oob_objective": 0.9918342285824859,
+              "oob_high_rate": 0.5185185185185185,
+              "oob_mid_rate": 0.12406947890818859,
+              "oob_mid_low_rate": 0.02977667493796526,
+              "oob_mid_high_rate": 0.09429280397022333,
+              "oob_low_rate": 0.3492462311557789
+            },
+            {
+              "alpha": 0.48,
+              "objective": 0.6628537101591123,
+              "mae": 0.16693659586786938,
+              "oob_objective": 0.9918342285824859,
+              "oob_high_rate": 0.5185185185185185,
+              "oob_mid_rate": 0.12406947890818859,
+              "oob_mid_low_rate": 0.02977667493796526,
+              "oob_mid_high_rate": 0.09429280397022333,
+              "oob_low_rate": 0.3492462311557789
+            },
+            {
+              "alpha": 0.5,
+              "objective": 0.6634732795333157,
+              "mae": 0.16755616524207276,
+              "oob_objective": 0.9918342285824859,
+              "oob_high_rate": 0.5185185185185185,
+              "oob_mid_rate": 0.12406947890818859,
+              "oob_mid_low_rate": 0.02977667493796526,
+              "oob_mid_high_rate": 0.09429280397022333,
+              "oob_low_rate": 0.3492462311557789
+            },
+            {
+              "alpha": 0.28,
+              "objective": 0.6643557987014329,
+              "mae": 0.16107083237545503,
+              "oob_objective": 1.0065699326519557,
+              "oob_high_rate": 0.5555555555555556,
+              "oob_mid_rate": 0.09925558312655088,
+              "oob_mid_low_rate": 0.03225806451612903,
+              "oob_mid_high_rate": 0.06699751861042183,
+              "oob_low_rate": 0.35175879396984927
+            },
+            {
+              "alpha": 0.52,
+              "objective": 0.6653190783197611,
+              "mae": 0.16817685585738956,
+              "oob_objective": 0.9942844449247432,
+              "oob_high_rate": 0.5185185185185185,
+              "oob_mid_rate": 0.12903225806451613,
+              "oob_mid_low_rate": 0.02977667493796526,
+              "oob_mid_high_rate": 0.09925558312655088,
+              "oob_low_rate": 0.34673366834170855
+            }
+          ],
+          "grid_count": 51
+        }
+      },
+      "base": {
+        "best_alpha": 0.58,
+        "val_objective": 0.7394934942108979,
+        "val_mae": 0.13990782115302514,
+        "test_mae": 0.14682824432059405,
+        "test_pair_acc": 0.7567771084337349,
+        "test_mid_oob": 0.055,
+        "test_mid_low_oob": 0.0425,
+        "test_mid_high_oob": 0.0125,
+        "test_low_oob": 0.3674418604651163,
+        "test_high_oob": 0.9565217391304348,
+        "fixed_alpha": 0.5,
+        "fixed_test_mae": 0.14699785023888384,
+        "fixed_test_mid_oob": 0.0525,
+        "fixed_test_mid_low_oob": 0.0425,
+        "fixed_test_mid_high_oob": 0.01,
+        "fixed_test_low_oob": 0.36511627906976746,
+        "fixed_test_high_oob": 0.9565217391304348,
+        "search": {
+          "best_alpha": 0.58,
+          "best_objective": 0.7394934942108979,
+          "best_mae": 0.13990782115302514,
+          "best_oob_objective": 1.1991713461157456,
+          "best_oob_rates": {
+            "high_rate": 0.7777777777777778,
+            "mid_rate": 0.05707196029776675,
+            "mid_low_rate": 0.04466501240694789,
+            "mid_high_rate": 0.01240694789081886,
+            "low_rate": 0.36432160804020103
+          },
+          "trials_top10": [
+            {
+              "alpha": 0.58,
+              "objective": 0.7394934942108979,
+              "mae": 0.13990782115302514,
+              "oob_objective": 1.1991713461157456,
+              "oob_high_rate": 0.7777777777777778,
+              "oob_mid_rate": 0.05707196029776675,
+              "oob_mid_low_rate": 0.04466501240694789,
+              "oob_mid_high_rate": 0.01240694789081886,
+              "oob_low_rate": 0.36432160804020103
+            },
+            {
+              "alpha": 0.56,
+              "objective": 0.7395588566444724,
+              "mae": 0.1399731835865996,
+              "oob_objective": 1.1991713461157456,
+              "oob_high_rate": 0.7777777777777778,
+              "oob_mid_rate": 0.05707196029776675,
+              "oob_mid_low_rate": 0.04466501240694789,
+              "oob_mid_high_rate": 0.01240694789081886,
+              "oob_low_rate": 0.36432160804020103
+            },
+            {
+              "alpha": 0.54,
+              "objective": 0.7396255423342746,
+              "mae": 0.14003986927640177,
+              "oob_objective": 1.1991713461157456,
+              "oob_high_rate": 0.7777777777777778,
+              "oob_mid_rate": 0.05707196029776675,
+              "oob_mid_low_rate": 0.04466501240694789,
+              "oob_mid_high_rate": 0.01240694789081886,
+              "oob_low_rate": 0.36432160804020103
+            },
+            {
+              "alpha": 0.52,
+              "objective": 0.7396935859704957,
+              "mae": 0.1401079129126229,
+              "oob_objective": 1.1991713461157456,
+              "oob_high_rate": 0.7777777777777778,
+              "oob_mid_rate": 0.05707196029776675,
+              "oob_mid_low_rate": 0.04466501240694789,
+              "oob_mid_high_rate": 0.01240694789081886,
+              "oob_low_rate": 0.36432160804020103
+            },
+            {
+              "alpha": 0.5,
+              "objective": 0.7397628227506121,
+              "mae": 0.14017714969273926,
+              "oob_objective": 1.1991713461157456,
+              "oob_high_rate": 0.7777777777777778,
+              "oob_mid_rate": 0.05707196029776675,
+              "oob_mid_low_rate": 0.04466501240694789,
+              "oob_mid_high_rate": 0.01240694789081886,
+              "oob_low_rate": 0.36432160804020103
+            },
+            {
+              "alpha": 0.48,
+              "objective": 0.7398332273916004,
+              "mae": 0.14024755433372757,
+              "oob_objective": 1.1991713461157456,
+              "oob_high_rate": 0.7777777777777778,
+              "oob_mid_rate": 0.05707196029776675,
+              "oob_mid_low_rate": 0.04466501240694789,
+              "oob_mid_high_rate": 0.01240694789081886,
+              "oob_low_rate": 0.36432160804020103
+            },
+            {
+              "alpha": 0.46,
+              "objective": 0.7399036320325887,
+              "mae": 0.14031795897471588,
+              "oob_objective": 1.1991713461157456,
+              "oob_high_rate": 0.7777777777777778,
+              "oob_mid_rate": 0.05707196029776675,
+              "oob_mid_low_rate": 0.04466501240694789,
+              "oob_mid_high_rate": 0.01240694789081886,
+              "oob_low_rate": 0.36432160804020103
+            },
+            {
+              "alpha": 0.44,
+              "objective": 0.739974036673577,
+              "mae": 0.1403883636157042,
+              "oob_objective": 1.1991713461157456,
+              "oob_high_rate": 0.7777777777777778,
+              "oob_mid_rate": 0.05707196029776675,
+              "oob_mid_low_rate": 0.04466501240694789,
+              "oob_mid_high_rate": 0.01240694789081886,
+              "oob_low_rate": 0.36432160804020103
+            },
+            {
+              "alpha": 0.42,
+              "objective": 0.7400444413145653,
+              "mae": 0.1404587682566925,
+              "oob_objective": 1.1991713461157456,
+              "oob_high_rate": 0.7777777777777778,
+              "oob_mid_rate": 0.05707196029776675,
+              "oob_mid_low_rate": 0.04466501240694789,
+              "oob_mid_high_rate": 0.01240694789081886,
+              "oob_low_rate": 0.36432160804020103
+            },
+            {
+              "alpha": 0.74,
+              "objective": 0.7402285118423926,
+              "mae": 0.1394177306133912,
+              "oob_objective": 1.2016215624580027,
+              "oob_high_rate": 0.7777777777777778,
+              "oob_mid_rate": 0.062034739454094295,
+              "oob_mid_low_rate": 0.04962779156327544,
+              "oob_mid_high_rate": 0.01240694789081886,
+              "oob_low_rate": 0.36180904522613067
+            }
+          ],
+          "grid_count": 51
+        }
+      }
+    }
+  },
+  "three_way_search": {
+    "enabled": true,
+    "step": 0.05,
+    "split_meta": {
+      "queries_total": 426,
+      "val_queries": 213,
+      "test_queries": 213,
+      "val_rows": 828,
+      "test_rows": 853
+    },
+    "results": {
+      "finetuned": {
+        "best_domain_weight": 0.1,
+        "best_method_weight": 0.05,
+        "best_requirement_weight": 0.85,
+        "val_objective": 0.5752527874609332,
+        "val_mae": 0.15603626555353764,
+        "test_mae": 0.1645595403955452,
+        "test_pair_acc": 0.7786144578313253,
+        "test_mid_oob": 0.2875,
+        "test_mid_low_oob": 0.0825,
+        "test_mid_high_oob": 0.205,
+        "test_low_oob": 0.3209302325581395,
+        "test_high_oob": 0.43478260869565216,
+        "search": {
+          "best_domain_weight": 0.1,
+          "best_method_weight": 0.05,
+          "best_requirement_weight": 0.85,
+          "best_objective": 0.5752527874609332,
+          "best_mae": 0.15603626555353764,
+          "best_oob_objective": 0.8384330438147912,
+          "best_oob_rates": {
+            "high_rate": 0.25925925925925924,
+            "mid_rate": 0.2977667493796526,
+            "mid_low_rate": 0.08933002481389578,
+            "mid_high_rate": 0.20843672456575682,
+            "low_rate": 0.2814070351758794
+          },
+          "trials_top10": [
+            {
+              "domain_weight": 0.1,
+              "method_weight": 0.05,
+              "requirement_weight": 0.85,
+              "objective": 0.5752527874609332,
+              "mae": 0.15603626555353764,
+              "oob_objective": 0.8384330438147912,
+              "oob_high_rate": 0.25925925925925924,
+              "oob_mid_rate": 0.2977667493796526,
+              "oob_mid_low_rate": 0.08933002481389578,
+              "oob_mid_high_rate": 0.20843672456575682,
+              "oob_low_rate": 0.2814070351758794
+            },
+            {
+              "domain_weight": 0.15,
+              "method_weight": 0.0,
+              "requirement_weight": 0.85,
+              "objective": 0.5815069596543875,
+              "mae": 0.15731207197271105,
+              "oob_objective": 0.8483897753633529,
+              "oob_high_rate": 0.25925925925925924,
+              "oob_mid_rate": 0.3052109181141439,
+              "oob_mid_low_rate": 0.08933002481389578,
+              "oob_mid_high_rate": 0.21588089330024815,
+              "oob_low_rate": 0.28391959798994976
+            },
+            {
+              "domain_weight": 0.2,
+              "method_weight": 0.05,
+              "requirement_weight": 0.75,
+              "objective": 0.5852617704627958,
+              "mae": 0.1561804203245483,
+              "oob_objective": 0.8581627002764951,
+              "oob_high_rate": 0.2962962962962963,
+              "oob_mid_rate": 0.27543424317617865,
+              "oob_mid_low_rate": 0.0794044665012407,
+              "oob_mid_high_rate": 0.19602977667493796,
+              "oob_low_rate": 0.2864321608040201
+            },
+            {
+              "domain_weight": 0.15,
+              "method_weight": 0.1,
+              "requirement_weight": 0.75,
+              "objective": 0.5864031199199784,
+              "mae": 0.15480920696766048,
+              "oob_objective": 0.8631878259046357,
+              "oob_high_rate": 0.2962962962962963,
+              "oob_mid_rate": 0.27543424317617865,
+              "oob_mid_low_rate": 0.08188585607940446,
+              "oob_mid_high_rate": 0.1935483870967742,
+              "oob_low_rate": 0.2914572864321608
+            },
+            {
+              "domain_weight": 0.1,
+              "method_weight": 0.1,
+              "requirement_weight": 0.8,
+              "objective": 0.5887331377317442,
+              "mae": 0.1546890084371691,
+              "oob_objective": 0.8680882585891501,
+              "oob_high_rate": 0.2962962962962963,
+              "oob_mid_rate": 0.2853598014888337,
+              "oob_mid_low_rate": 0.08684863523573201,
+              "oob_mid_high_rate": 0.19851116625310175,
+              "oob_low_rate": 0.2864321608040201
+            },
+            {
+              "domain_weight": 0.25,
+              "method_weight": 0.0,
+              "requirement_weight": 0.75,
+              "objective": 0.5903994318520494,
+              "mae": 0.15759599734655613,
+              "oob_objective": 0.8656068690109864,
+              "oob_high_rate": 0.2962962962962963,
+              "oob_mid_rate": 0.28287841191067,
+              "oob_mid_low_rate": 0.0794044665012407,
+              "oob_mid_high_rate": 0.20347394540942929,
+              "oob_low_rate": 0.2864321608040201
+            },
+            {
+              "domain_weight": 0.1,
+              "method_weight": 0.0,
+              "requirement_weight": 0.9,
+              "objective": 0.5904499900181494,
+              "mae": 0.15760141204880632,
+              "oob_objective": 0.8656971559386861,
+              "oob_high_rate": 0.25925925925925924,
+              "oob_mid_rate": 0.32754342431761785,
+              "oob_mid_low_rate": 0.10173697270471464,
+              "oob_mid_high_rate": 0.22580645161290322,
+              "oob_low_rate": 0.27889447236180903
+            },
+            {
+              "domain_weight": 0.15,
+              "method_weight": 0.05,
+              "requirement_weight": 0.8,
+              "objective": 0.5925011141037224,
+              "mae": 0.15597559523098353,
+              "oob_objective": 0.8730510377454777,
+              "oob_high_rate": 0.2962962962962963,
+              "oob_mid_rate": 0.2903225806451613,
+              "oob_mid_low_rate": 0.08684863523573201,
+              "oob_mid_high_rate": 0.20347394540942929,
+              "oob_low_rate": 0.2864321608040201
+            },
+            {
+              "domain_weight": 0.0,
+              "method_weight": 0.15,
+              "requirement_weight": 0.85,
+              "objective": 0.5938703090233252,
+              "mae": 0.1536538790192473,
+              "oob_objective": 0.8804328600081558,
+              "oob_high_rate": 0.2962962962962963,
+              "oob_mid_rate": 0.3027295285359802,
+              "oob_mid_low_rate": 0.0967741935483871,
+              "oob_mid_high_rate": 0.20595533498759305,
+              "oob_low_rate": 0.2814070351758794
+            },
+            {
+              "domain_weight": 0.05,
+              "method_weight": 0.1,
+              "requirement_weight": 0.85,
+              "objective": 0.5962800987312877,
+              "mae": 0.15482297393812794,
+              "oob_objective": 0.8829142495863196,
+              "oob_high_rate": 0.2962962962962963,
+              "oob_mid_rate": 0.3052109181141439,
+              "oob_mid_low_rate": 0.0967741935483871,
+              "oob_mid_high_rate": 0.20843672456575682,
+              "oob_low_rate": 0.2814070351758794
+            }
+          ],
+          "grid_count": 231
+        }
+      },
+      "base": {
+        "best_domain_weight": 0.0,
+        "best_method_weight": 0.15,
+        "best_requirement_weight": 0.85,
+        "val_objective": 0.6025856280516366,
+        "val_mae": 0.15135719473534465,
+        "test_mae": 0.15960715198747435,
+        "test_pair_acc": 0.7710843373493976,
+        "test_mid_oob": 0.2775,
+        "test_mid_low_oob": 0.0875,
+        "test_mid_high_oob": 0.19,
+        "test_low_oob": 0.313953488372093,
+        "test_high_oob": 0.43478260869565216,
+        "search": {
+          "best_domain_weight": 0.0,
+          "best_method_weight": 0.15,
+          "best_requirement_weight": 0.85,
+          "best_objective": 0.6025856280516366,
+          "best_mae": 0.15135719473534465,
+          "best_oob_objective": 0.9024568666325838,
+          "best_oob_rates": {
+            "high_rate": 0.3333333333333333,
+            "mid_rate": 0.2977667493796526,
+            "mid_low_rate": 0.10918114143920596,
+            "mid_high_rate": 0.18858560794044665,
+            "low_rate": 0.271356783919598
+          },
+          "trials_top10": [
+            {
+              "domain_weight": 0.0,
+              "method_weight": 0.15,
+              "requirement_weight": 0.85,
+              "objective": 0.6025856280516366,
+              "mae": 0.15135719473534465,
+              "oob_objective": 0.9024568666325838,
+              "oob_high_rate": 0.3333333333333333,
+              "oob_mid_rate": 0.2977667493796526,
+              "oob_mid_low_rate": 0.10918114143920596,
+              "oob_mid_high_rate": 0.18858560794044665,
+              "oob_low_rate": 0.271356783919598
+            },
+            {
+              "domain_weight": 0.15,
+              "method_weight": 0.0,
+              "requirement_weight": 0.85,
+              "objective": 0.6057246912288738,
+              "mae": 0.15077417354533618,
+              "oob_objective": 0.9099010353670753,
+              "oob_high_rate": 0.3333333333333333,
+              "oob_mid_rate": 0.3052109181141439,
+              "oob_mid_low_rate": 0.1141439205955335,
+              "oob_mid_high_rate": 0.19106699751861042,
+              "oob_low_rate": 0.271356783919598
+            },
+            {
+              "domain_weight": 0.1,
+              "method_weight": 0.05,
+              "requirement_weight": 0.85,
+              "objective": 0.605915606404079,
+              "mae": 0.15096508872054137,
+              "oob_objective": 0.9099010353670753,
+              "oob_high_rate": 0.3333333333333333,
+              "oob_mid_rate": 0.3052109181141439,
+              "oob_mid_low_rate": 0.1141439205955335,
+              "oob_mid_high_rate": 0.19106699751861042,
+              "oob_low_rate": 0.271356783919598
+            },
+            {
+              "domain_weight": 0.05,
+              "method_weight": 0.1,
+              "requirement_weight": 0.85,
+              "objective": 0.6061079776422911,
+              "mae": 0.1511574599587534,
+              "oob_objective": 0.9099010353670753,
+              "oob_high_rate": 0.3333333333333333,
+              "oob_mid_rate": 0.3052109181141439,
+              "oob_mid_low_rate": 0.1141439205955335,
+              "oob_mid_high_rate": 0.19106699751861042,
+              "oob_low_rate": 0.271356783919598
+            },
+            {
+              "domain_weight": 0.1,
+              "method_weight": 0.0,
+              "requirement_weight": 0.9,
+              "objective": 0.6144891802723269,
+              "mae": 0.15335077526133312,
+              "oob_objective": 0.9222768100219875,
+              "oob_high_rate": 0.3333333333333333,
+              "oob_mid_rate": 0.3200992555831266,
+              "oob_mid_low_rate": 0.1141439205955335,
+              "oob_mid_high_rate": 0.20595533498759305,
+              "oob_low_rate": 0.26884422110552764
+            },
+            {
+              "domain_weight": 0.0,
+              "method_weight": 0.1,
+              "requirement_weight": 0.9,
+              "objective": 0.6149009182644058,
+              "mae": 0.1537469266354588,
+              "oob_objective": 0.9223079832578942,
+              "oob_high_rate": 0.3333333333333333,
+              "oob_mid_rate": 0.3176178660049628,
+              "oob_mid_low_rate": 0.11166253101736973,
+              "oob_mid_high_rate": 0.20595533498759305,
+              "oob_low_rate": 0.271356783919598
+            },
+            {
+              "domain_weight": 0.05,
+              "method_weight": 0.05,
+              "requirement_weight": 0.9,
+              "objective": 0.6171946375155366,
+              "mae": 0.1535436696904725,
+              "oob_objective": 0.9273019356501282,
+              "oob_high_rate": 0.3333333333333333,
+              "oob_mid_rate": 0.3200992555831266,
+              "oob_mid_low_rate": 0.1141439205955335,
+              "oob_mid_high_rate": 0.20595533498759305,
+              "oob_low_rate": 0.27386934673366836
+            },
+            {
+              "domain_weight": 0.0,
+              "method_weight": 0.0,
+              "requirement_weight": 1.0,
+              "objective": 0.6201980904559561,
+              "mae": 0.15896778212725254,
+              "oob_objective": 0.9224606166574071,
+              "oob_high_rate": 0.2962962962962963,
+              "oob_mid_rate": 0.3573200992555831,
+              "oob_mid_low_rate": 0.12655086848635236,
+              "oob_mid_high_rate": 0.23076923076923078,
+              "oob_low_rate": 0.26884422110552764
+            },
+            {
+              "domain_weight": 0.05,
+              "method_weight": 0.15,
+              "requirement_weight": 0.8,
+              "objective": 0.6236086579641371,
+              "mae": 0.14897524367275555,
+              "oob_objective": 0.949266828582763,
+              "oob_high_rate": 0.4074074074074074,
+              "oob_mid_rate": 0.2679900744416873,
+              "oob_mid_low_rate": 0.09181141439205956,
+              "oob_mid_high_rate": 0.1761786600496278,
+              "oob_low_rate": 0.27386934673366836
+            },
+            {
+              "domain_weight": 0.0,
+              "method_weight": 0.2,
+              "requirement_weight": 0.8,
+              "objective": 0.6238122256901167,
+              "mae": 0.14917881139873526,
+              "oob_objective": 0.949266828582763,
+              "oob_high_rate": 0.4074074074074074,
+              "oob_mid_rate": 0.2679900744416873,
+              "oob_mid_low_rate": 0.09181141439205956,
+              "oob_mid_high_rate": 0.1761786600496278,
+              "oob_low_rate": 0.27386934673366836
+            }
+          ],
+          "grid_count": 231
+        }
+      }
+    }
+  },
+  "model_stats": {
+    "finetuned": {
+      "regression": {
+        "count": 1681.0,
+        "mae": 0.17099958093312792,
+        "rmse": 0.2157932390848579,
+        "pearson": 0.7474230806754204
+      },
+      "band": {
+        "overall": {
+          "count": 1681.0,
+          "avg_gt": 0.25483640690065434,
+          "avg_pred": 0.4064821370903365,
+          "mae": 0.17099958093312792
+        },
+        "high": {
+          "count": 50.0,
+          "avg_gt": 0.7293999999999999,
+          "avg_pred": 0.6780206897854805,
+          "mae": 0.0956397470355034
+        },
+        "mid": {
+          "count": 803.0,
+          "avg_gt": 0.4222914072229141,
+          "avg_pred": 0.5345407716308258,
+          "mae": 0.14272774093437612
+        },
+        "low": {
+          "count": 828.0,
+          "avg_gt": 0.06378019323671498,
+          "avg_pred": 0.26589275161839193,
+          "mae": 0.20296851718177397
+        }
+      },
+      "oob": {
+        "low_out": 295.0,
+        "low_total": 828.0,
+        "low_rate": 0.35628019323671495,
+        "mid_out": 96.0,
+        "mid_total": 803.0,
+        "mid_rate": 0.11955168119551682,
+        "mid_low_out": 26.0,
+        "mid_low_rate": 0.0323785803237858,
+        "mid_high_out": 70.0,
+        "mid_high_rate": 0.08717310087173101,
+        "high_out": 23.0,
+        "high_total": 50.0,
+        "high_rate": 0.46
+      },
+      "order": {
+        "queries_total": 426.0,
+        "queries_with_2plus": 363.0,
+        "top1_acc": 0.7245179063360881,
+        "pair_acc": 0.7820658342792282,
+        "mean_margin": 0.18729666314351032,
+        "hard_acc": 0.6300738007380073,
+        "hard_margin": 0.05010172576949385,
+        "pair_count": 2643.0,
+        "hard_pair_count": 1084.0
+      }
+    },
+    "base": {
+      "regression": {
+        "count": 1681.0,
+        "mae": 0.14363821903590482,
+        "rmse": 0.18721425057849297,
+        "pearson": 0.7385256955328269
+      },
+      "band": {
+        "overall": {
+          "count": 1681.0,
+          "avg_gt": 0.25483640690065434,
+          "avg_pred": 0.36634957843062904,
+          "mae": 0.14363821903590482
+        },
+        "high": {
+          "count": 50.0,
+          "avg_gt": 0.7293999999999999,
+          "avg_pred": 0.5824505186080933,
+          "mae": 0.15091804494857786
+        },
+        "mid": {
+          "count": 803.0,
+          "avg_gt": 0.4222914072229141,
+          "avg_pred": 0.484099598473882,
+          "mae": 0.10911195710950888
+        },
+        "low": {
+          "count": 828.0,
+          "avg_gt": 0.06378019323671498,
+          "avg_pred": 0.23910523893352112,
+          "mae": 0.17668241834902354
+        }
+      },
+      "oob": {
+        "low_out": 302.0,
+        "low_total": 828.0,
+        "low_rate": 0.3647342995169082,
+        "mid_out": 44.0,
+        "mid_total": 803.0,
+        "mid_rate": 0.0547945205479452,
+        "mid_low_out": 35.0,
+        "mid_low_rate": 0.043586550435865505,
+        "mid_high_out": 9.0,
+        "mid_high_rate": 0.0112079701120797,
+        "high_out": 43.0,
+        "high_total": 50.0,
+        "high_rate": 0.86
+      },
+      "order": {
+        "queries_total": 426.0,
+        "queries_with_2plus": 363.0,
+        "top1_acc": 0.6556473829201102,
+        "pair_acc": 0.7665531592886871,
+        "mean_margin": 0.16084685549069502,
+        "hard_acc": 0.6107011070110702,
+        "hard_margin": 0.033264677194926574,
+        "pair_count": 2643.0,
+        "hard_pair_count": 1084.0
+      }
+    },
+    "requirement": {
+      "regression": {
+        "count": 1681.0,
+        "mae": 0.16262091563756376,
+        "rmse": 0.22229930053235902,
+        "pearson": 0.7281004893409884
+      },
+      "band": {
+        "overall": {
+          "count": 1681.0,
+          "avg_gt": 0.25483640690065434,
+          "avg_pred": 0.3855653127909132,
+          "mae": 0.16262091563756376
+        },
+        "high": {
+          "count": 50.0,
+          "avg_gt": 0.7293999999999999,
+          "avg_pred": 0.7222139710187911,
+          "mae": 0.0964930189371109
+        },
+        "mid": {
+          "count": 803.0,
+          "avg_gt": 0.4222914072229141,
+          "avg_pred": 0.5376887541742135,
+          "mae": 0.1692561600996578
+        },
+        "low": {
+          "count": 828.0,
+          "avg_gt": 0.06378019323671498,
+          "avg_pred": 0.21770594522788905,
+          "mae": 0.16017924115925594
+        }
+      },
+      "oob": {
+        "low_out": 236.0,
+        "low_total": 828.0,
+        "low_rate": 0.28502415458937197,
+        "mid_out": 287.0,
+        "mid_total": 803.0,
+        "mid_rate": 0.3574097135740971,
+        "mid_low_out": 96.0,
+        "mid_low_rate": 0.11955168119551682,
+        "mid_high_out": 191.0,
+        "mid_high_rate": 0.23785803237858033,
+        "high_out": 18.0,
+        "high_total": 50.0,
+        "high_rate": 0.36
+      },
+      "order": {
+        "queries_total": 426.0,
+        "queries_with_2plus": 363.0,
+        "top1_acc": 0.6942148760330579,
+        "pair_acc": 0.783957623912221,
+        "mean_margin": 0.2187411460773177,
+        "hard_acc": 0.6060885608856088,
+        "hard_margin": 0.058815959456112114,
+        "pair_count": 2643.0,
+        "hard_pair_count": 1084.0
+      }
+    },
+    "dm+req": {
+      "regression": {
+        "count": 1681.0,
+        "mae": 0.1594320687301045,
+        "rmse": 0.20890227094241107,
+        "pearson": 0.7628357959419706
+      },
+      "band": {
+        "overall": {
+          "count": 1681.0,
+          "avg_gt": 0.25483640690065434,
+          "avg_pred": 0.3960237249406249,
+          "mae": 0.1594320687301045
+        },
+        "high": {
+          "count": 50.0,
+          "avg_gt": 0.7293999999999999,
+          "avg_pred": 0.7001173304021359,
+          "mae": 0.07704458613991737
+        },
+        "mid": {
+          "count": 803.0,
+          "avg_gt": 0.4222914072229141,
+          "avg_pred": 0.5361147629025196,
+          "mae": 0.1434726742305242
+        },
+        "low": {
+          "count": 828.0,
+          "avg_gt": 0.06378019323671498,
+          "avg_pred": 0.2417993484231405,
+          "mae": 0.17988468698212418
+        }
+      },
+      "oob": {
+        "low_out": 280.0,
+        "low_total": 828.0,
+        "low_rate": 0.33816425120772947,
+        "mid_out": 135.0,
+        "mid_total": 803.0,
+        "mid_rate": 0.16811955168119552,
+        "mid_low_out": 35.0,
+        "mid_low_rate": 0.043586550435865505,
+        "mid_high_out": 100.0,
+        "mid_high_rate": 0.12453300124533001,
+        "high_out": 23.0,
+        "high_total": 50.0,
+        "high_rate": 0.46
+      },
+      "order": {
+        "queries_total": 426.0,
+        "queries_with_2plus": 363.0,
+        "top1_acc": 0.7024793388429752,
+        "pair_acc": 0.7998486568293606,
+        "mean_margin": 0.20301890461041402,
+        "hard_acc": 0.6392988929889298,
+        "hard_margin": 0.05445884261280298,
+        "pair_count": 2643.0,
+        "hard_pair_count": 1084.0
+      }
+    },
+    "base+req": {
+      "regression": {
+        "count": 1681.0,
+        "mae": 0.14434739905105354,
+        "rmse": 0.1912918168422401,
+        "pearson": 0.7668886321845216
+      },
+      "band": {
+        "overall": {
+          "count": 1681.0,
+          "avg_gt": 0.25483640690065434,
+          "avg_pred": 0.3759574456107711,
+          "mae": 0.14434739905105354
+        },
+        "high": {
+          "count": 50.0,
+          "avg_gt": 0.7293999999999999,
+          "avg_pred": 0.6523322448134422,
+          "mae": 0.09852691766023636
+        },
+        "mid": {
+          "count": 803.0,
+          "avg_gt": 0.4222914072229141,
+          "avg_pred": 0.5108941763240478,
+          "mae": 0.1245282690349507
+        },
+        "low": {
+          "count": 828.0,
+          "avg_gt": 0.06378019323671498,
+          "avg_pred": 0.22840559208070507,
+          "mae": 0.16633506266514947
+        }
+      },
+      "oob": {
+        "low_out": 271.0,
+        "low_total": 828.0,
+        "low_rate": 0.3272946859903382,
+        "mid_out": 89.0,
+        "mid_total": 803.0,
+        "mid_rate": 0.11083437110834371,
+        "mid_low_out": 43.0,
+        "mid_low_rate": 0.053549190535491904,
+        "mid_high_out": 46.0,
+        "mid_high_rate": 0.057285180572851806,
+        "high_out": 35.0,
+        "high_total": 50.0,
+        "high_rate": 0.7
+      },
+      "order": {
+        "queries_total": 426.0,
+        "queries_with_2plus": 363.0,
+        "top1_acc": 0.6914600550964187,
+        "pair_acc": 0.7922814982973894,
+        "mean_margin": 0.18979400078400638,
+        "hard_acc": 0.6226937269372693,
+        "hard_margin": 0.046040318325519344,
+        "pair_count": 2643.0,
+        "hard_pair_count": 1084.0
+      }
+    }
+  },
+  "elapsed_sec": 70.65251588821411,
+  "summary": "=== Weighted Domain+Method(+Requirement) vs Ground Truth ===\ndm_weights: domain=0.5000, method=0.5000 | dmr_weights: domain=0.2500, method=0.2500, requirement=0.5000 | thresholds: high>=0.70, mid>=0.30\n\nMODEL             MAE     RMSE  PEARSON     TOP1  PAIR_ACC  HARD_ACC   MID_OOB   LOW_OOB  HIGH_OOB\n--------------------------------------------------------------------------------------------------------\nfinetuned      0.1710   0.2158   0.7474   0.7245    0.7821    0.6301    0.1196    0.3563    0.4600\nbase           0.1436   0.1872   0.7385   0.6556    0.7666    0.6107    0.0548    0.3647    0.8600\nrequirement    0.1626   0.2223   0.7281   0.6942    0.7840    0.6061    0.3574    0.2850    0.3600\ndm+req         0.1594   0.2089   0.7628   0.7025    0.7998    0.6393    0.1681    0.3382    0.4600\nbase+req       0.1443   0.1913   0.7669   0.6915    0.7923    0.6227    0.1108    0.3273    0.7000\n\n=== Out-Of-Band Percentages ===\nMODEL               LOW        MID    MID_LOW   MID_HIGH       HIGH\n----------------------------------------------------------------------\nfinetuned        35.63%     11.96%      3.24%      8.72%     46.00%\nbase             36.47%      5.48%      4.36%      1.12%     86.00%\nrequirement      28.50%     35.74%     11.96%     23.79%     36.00%\ndm+req           33.82%     16.81%      4.36%     12.45%     46.00%\nbase+req         32.73%     11.08%      5.35%      5.73%     70.00%\n\n=== FINETUNED Band MAE ===\nBAND        COUNT     AVG_GT   AVG_PRED        MAE\n----------------------------------------------------\noverall      1681     0.2548     0.4065     0.1710\nhigh           50     0.7294     0.6780     0.0956\nmid           803     0.4223     0.5345     0.1427\nlow           828     0.0638     0.2659     0.2030\n\n=== BASE Band MAE ===\nBAND        COUNT     AVG_GT   AVG_PRED        MAE\n----------------------------------------------------\noverall      1681     0.2548     0.3663     0.1436\nhigh           50     0.7294     0.5825     0.1509\nmid           803     0.4223     0.4841     0.1091\nlow           828     0.0638     0.2391     0.1767\n\n=== REQUIREMENT Band MAE ===\nBAND        COUNT     AVG_GT   AVG_PRED        MAE\n----------------------------------------------------\noverall      1681     0.2548     0.3856     0.1626\nhigh           50     0.7294     0.7222     0.0965\nmid           803     0.4223     0.5377     0.1693\nlow           828     0.0638     0.2177     0.1602\n\n=== DM+REQ Band MAE ===\nBAND        COUNT     AVG_GT   AVG_PRED        MAE\n----------------------------------------------------\noverall      1681     0.2548     0.3960     0.1594\nhigh           50     0.7294     0.7001     0.0770\nmid           803     0.4223     0.5361     0.1435\nlow           828     0.0638     0.2418     0.1799\n\n=== BASE+REQ Band MAE ===\nBAND        COUNT     AVG_GT   AVG_PRED        MAE\n----------------------------------------------------\noverall      1681     0.2548     0.3760     0.1443\nhigh           50     0.7294     0.6523     0.0985\nmid           803     0.4223     0.5109     0.1245\nlow           828     0.0638     0.2284     0.1663\n\n=== In-Memory Alpha Search (Query-Group Split) ===\nqueries_total=426 val_queries=213 test_queries=213 val_rows=828 test_rows=853\nalpha_objective=hybrid\nMODEL          BEST_A    VAL_OBJ   VAL_MAE  TEST_MAE  TEST_PAIR  TEST_MID_OOB  TEST_LOW_OOB\n------------------------------------------------------------------------------------------------\nfinetuned       0.380     0.6549    0.1639    0.1701     0.7643        0.1025        0.3605\nbase            0.580     0.7395    0.1399    0.1468     0.7568        0.0550        0.3674\n\n=== Best-Alpha Out-Of-Band Percentages ===\nMODEL               LOW        MID    MID_LOW   MID_HIGH       HIGH\n----------------------------------------------------------------------\nfinetuned        36.05%     10.25%      3.50%      6.75%     39.13%\nbase             36.74%      5.50%      4.25%      1.25%     95.65%\n\n=== In-Memory Three-Way Search (Domain+Method+Requirement) ===\nqueries_total=426 val_queries=213 test_queries=213 val_rows=828 test_rows=853\nobjective=hybrid\nMODEL            D_W     M_W     R_W    VAL_OBJ   VAL_MAE  TEST_MAE  TEST_PAIR\n----------------------------------------------------------------------------------------\nfinetuned      0.100   0.050   0.850     0.5753    0.1560    0.1646     0.7786\nbase           0.000   0.150   0.850     0.6026    0.1514    0.1596     0.7711\n\n=== Best Three-Way Out-Of-Band Percentages ===\nMODEL               LOW        MID    MID_LOW   MID_HIGH       HIGH\n----------------------------------------------------------------------\nfinetuned        32.09%     28.75%      8.25%     20.50%     43.48%\nbase             31.40%     27.75%      8.75%     19.00%     43.48%"
+}

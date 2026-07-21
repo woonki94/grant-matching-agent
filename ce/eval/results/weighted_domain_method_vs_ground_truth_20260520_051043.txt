@@ -1,0 +1,87 @@
+=== Weighted Domain+Method(+Requirement) vs Ground Truth ===
+dm_weights: domain=0.5000, method=0.5000 | dmr_weights: domain=0.2500, method=0.2500, requirement=0.5000 | thresholds: high>=0.70, mid>=0.30
+
+MODEL             MAE     RMSE  PEARSON     TOP1  PAIR_ACC  HARD_ACC   MID_OOB   LOW_OOB  HIGH_OOB
+--------------------------------------------------------------------------------------------------------
+finetuned      0.1710   0.2158   0.7474   0.7245    0.7821    0.6301    0.1196    0.3563    0.4600
+base           0.1436   0.1872   0.7385   0.6556    0.7666    0.6107    0.0548    0.3647    0.8600
+requirement    0.1626   0.2223   0.7281   0.6942    0.7840    0.6061    0.3574    0.2850    0.3600
+dm+req         0.1594   0.2089   0.7628   0.7025    0.7998    0.6393    0.1681    0.3382    0.4600
+base+req       0.1443   0.1913   0.7669   0.6915    0.7923    0.6227    0.1108    0.3273    0.7000
+
+=== Out-Of-Band Percentages ===
+MODEL               LOW        MID    MID_LOW   MID_HIGH       HIGH
+----------------------------------------------------------------------
+finetuned        35.63%     11.96%      3.24%      8.72%     46.00%
+base             36.47%      5.48%      4.36%      1.12%     86.00%
+requirement      28.50%     35.74%     11.96%     23.79%     36.00%
+dm+req           33.82%     16.81%      4.36%     12.45%     46.00%
+base+req         32.73%     11.08%      5.35%      5.73%     70.00%
+
+=== FINETUNED Band MAE ===
+BAND        COUNT     AVG_GT   AVG_PRED        MAE
+----------------------------------------------------
+overall      1681     0.2548     0.4065     0.1710
+high           50     0.7294     0.6780     0.0956
+mid           803     0.4223     0.5345     0.1427
+low           828     0.0638     0.2659     0.2030
+
+=== BASE Band MAE ===
+BAND        COUNT     AVG_GT   AVG_PRED        MAE
+----------------------------------------------------
+overall      1681     0.2548     0.3663     0.1436
+high           50     0.7294     0.5825     0.1509
+mid           803     0.4223     0.4841     0.1091
+low           828     0.0638     0.2391     0.1767
+
+=== REQUIREMENT Band MAE ===
+BAND        COUNT     AVG_GT   AVG_PRED        MAE
+----------------------------------------------------
+overall      1681     0.2548     0.3856     0.1626
+high           50     0.7294     0.7222     0.0965
+mid           803     0.4223     0.5377     0.1693
+low           828     0.0638     0.2177     0.1602
+
+=== DM+REQ Band MAE ===
+BAND        COUNT     AVG_GT   AVG_PRED        MAE
+----------------------------------------------------
+overall      1681     0.2548     0.3960     0.1594
+high           50     0.7294     0.7001     0.0770
+mid           803     0.4223     0.5361     0.1435
+low           828     0.0638     0.2418     0.1799
+
+=== BASE+REQ Band MAE ===
+BAND        COUNT     AVG_GT   AVG_PRED        MAE
+----------------------------------------------------
+overall      1681     0.2548     0.3760     0.1443
+high           50     0.7294     0.6523     0.0985
+mid           803     0.4223     0.5109     0.1245
+low           828     0.0638     0.2284     0.1663
+
+=== In-Memory Alpha Search (Query-Group Split) ===
+queries_total=426 val_queries=213 test_queries=213 val_rows=828 test_rows=853
+alpha_objective=hybrid
+MODEL          BEST_A    VAL_OBJ   VAL_MAE  TEST_MAE  TEST_PAIR  TEST_MID_OOB  TEST_LOW_OOB
+------------------------------------------------------------------------------------------------
+finetuned       0.380     0.6549    0.1639    0.1701     0.7643        0.1025        0.3605
+base            0.580     0.7395    0.1399    0.1468     0.7568        0.0550        0.3674
+
+=== Best-Alpha Out-Of-Band Percentages ===
+MODEL               LOW        MID    MID_LOW   MID_HIGH       HIGH
+----------------------------------------------------------------------
+finetuned        36.05%     10.25%      3.50%      6.75%     39.13%
+base             36.74%      5.50%      4.25%      1.25%     95.65%
+
+=== In-Memory Three-Way Search (Domain+Method+Requirement) ===
+queries_total=426 val_queries=213 test_queries=213 val_rows=828 test_rows=853
+objective=hybrid
+MODEL            D_W     M_W     R_W    VAL_OBJ   VAL_MAE  TEST_MAE  TEST_PAIR
+----------------------------------------------------------------------------------------
+finetuned      0.100   0.050   0.850     0.5753    0.1560    0.1646     0.7786
+base           0.000   0.150   0.850     0.6026    0.1514    0.1596     0.7711
+
+=== Best Three-Way Out-Of-Band Percentages ===
+MODEL               LOW        MID    MID_LOW   MID_HIGH       HIGH
+----------------------------------------------------------------------
+finetuned        32.09%     28.75%      8.25%     20.50%     43.48%
+base             31.40%     27.75%      8.75%     19.00%     43.48%
