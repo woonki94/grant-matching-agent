@@ -49,6 +49,7 @@ playwright
 
 # Cross-encoder specialization matching
 transformers>=4.51.0
+sentence-transformers>=5.3.0,<6.0.0
 huggingface-hub>=0.30.0,<1.0
 torch
 

@@ -27,6 +27,15 @@ __pycache__/
 
 /finetune_cross_encoder/dataset
 
+# CE training artifacts
+/ce*/dataset/
+/ce*/datasets/
+/ce*/models/
+/ce/eval/results/
+
+# Temporary workspace files
+/tmp/
+
 /wandb
 
 # cross_encoder generated artifacts
