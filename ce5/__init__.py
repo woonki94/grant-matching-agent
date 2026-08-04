@@ -5,7 +5,6 @@ from ce5.model import (
     LatentHeadConfig,
     LatentHeadOutput,
     ModernCELatentHeadModel,
-    pairwise_ranking_loss,
 )
 
 __all__ = [
@@ -13,5 +12,4 @@ __all__ = [
     "LatentHeadConfig",
     "LatentHeadOutput",
     "ModernCELatentHeadModel",
-    "pairwise_ranking_loss",
 ]

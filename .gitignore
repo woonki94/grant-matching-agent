@@ -41,3 +41,4 @@ __pycache__/
 # cross_encoder generated artifacts
 /cross_encoder/**/dataset/
 /cross_encoder/**/models/
+/build/

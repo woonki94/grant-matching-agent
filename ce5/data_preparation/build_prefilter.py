@@ -5,9 +5,11 @@ specialization.  The scores are divided into per-grant quantile bands and a
 small, faculty-diverse sample is retained from each band for later LLM judging.
 
 After the grant-faculty pass completes, the script also generates every unique
-pair of specialization keywords belonging to the same faculty owner.  Those
-pairs are scored in flat H100-friendly batches and assigned global high/mid/low
-rank bands.  They are written separately because they have no grant record.
+pair of specialization keywords belonging to the same faculty owner and every
+unique pair belonging to the same grant owner.  Those same-side pairs are
+scored in flat H100-friendly batches and assigned global high/mid/low rank
+bands.  Each pair type is written separately from the product-directional
+grant-faculty records.
 
 The bands are candidate-selection strata, not training labels.  A ``high``
 ModernCE score still needs an LLM or human capability-coverage judgment.
@@ -44,6 +46,9 @@ DEFAULT_GRANT_DB = SOURCE_DIR / "grant_specialization_keyword_db.json"
 DEFAULT_FACULTY_DB = SOURCE_DIR / "faculty_specialization_keywords_db.json"
 DEFAULT_OUTPUT = SOURCE_DIR / "prefilter_candidates.jsonl"
 DEFAULT_MANIFEST = SOURCE_DIR / "prefilter_candidates.manifest.json"
+DEFAULT_GRANT_PAIR_OUTPUT = SOURCE_DIR / "grant_pair_candidates.jsonl"
+DEFAULT_GRANT_PAIR_SCORE_CACHE = SOURCE_DIR / "grant_pair_scores.jsonl"
+DEFAULT_GRANT_PAIR_MANIFEST = SOURCE_DIR / "grant_pair_candidates.manifest.json"
 DEFAULT_FACULTY_PAIR_OUTPUT = SOURCE_DIR / "faculty_pair_candidates.jsonl"
 DEFAULT_FACULTY_PAIR_SCORE_CACHE = SOURCE_DIR / "faculty_pair_scores.jsonl"
 DEFAULT_FACULTY_PAIR_MANIFEST = SOURCE_DIR / "faculty_pair_candidates.manifest.json"
@@ -51,6 +56,8 @@ DEFAULT_CE_MODEL = "dleemiller/ModernCE-base-sts"
 SCHEMA_VERSION = 2
 FACULTY_PAIR_SCHEMA_VERSION = "ce5.faculty-pair-prefilter.v1"
 FACULTY_PAIR_SCORE_SCHEMA_VERSION = "ce5.faculty-pair-score.v1"
+GRANT_PAIR_SCHEMA_VERSION = "ce5.grant-pair-prefilter.v1"
+GRANT_PAIR_SCORE_SCHEMA_VERSION = "ce5.grant-pair-score.v1"
 BANDS = ("high", "mid", "low")
 
 
@@ -71,9 +78,9 @@ class ScoredResult:
 
 
 @dataclass(frozen=True)
-class FacultyKeywordPair:
+class WithinOwnerKeywordPair:
     pair_id: str
-    faculty_id: str | int
+    owner_id: str | int
     left: Specialization
     right: Specialization
 
@@ -280,14 +287,16 @@ def _sample_items(
     return [items[index] for index in selected_indices]
 
 
-def _build_faculty_keyword_pairs(
-    faculty: Sequence[Specialization],
-) -> list[FacultyKeywordPair]:
+def _build_within_owner_keyword_pairs(
+    items: Sequence[Specialization],
+    *,
+    pair_id_prefix: str,
+) -> list[WithinOwnerKeywordPair]:
     by_owner: dict[str | int, list[Specialization]] = defaultdict(list)
-    for item in faculty:
+    for item in items:
         by_owner[item.owner_id].append(item)
 
-    pairs: list[FacultyKeywordPair] = []
+    pairs: list[WithinOwnerKeywordPair] = []
     for owner_id in sorted(by_owner, key=lambda value: str(value)):
         owner_items = sorted(
             by_owner[owner_id],
@@ -296,14 +305,14 @@ def _build_faculty_keyword_pairs(
         for left_index, left in enumerate(owner_items):
             for right in owner_items[left_index + 1 :]:
                 pairs.append(
-                    FacultyKeywordPair(
+                    WithinOwnerKeywordPair(
                         pair_id=_stable_id(
                             owner_id,
                             left.item_id,
                             right.item_id,
-                            prefix="faculty_pair",
+                            prefix=pair_id_prefix,
                         ),
-                        faculty_id=owner_id,
+                        owner_id=owner_id,
                         left=left,
                         right=right,
                     )
@@ -488,10 +497,12 @@ def _read_existing_rows(
     return completed, candidate_count, band_counts, pool_sizes
 
 
-def _read_faculty_pair_score_cache(
+def _read_pair_score_cache(
     cache_path: Path,
     *,
     expected_fingerprint: str,
+    score_schema_version: str,
+    pair_label: str,
 ) -> dict[str, tuple[float, float]]:
     scores: dict[str, tuple[float, float]] = {}
     if not cache_path.exists():
@@ -505,17 +516,17 @@ def _read_faculty_pair_score_cache(
                 row = json.loads(line)
             except json.JSONDecodeError as exc:
                 raise RuntimeError(
-                    f"Invalid faculty-pair score cache at {cache_path}:{line_number}. "
+                    f"Invalid {pair_label} score cache at {cache_path}:{line_number}. "
                     "Repair it or rerun with --overwrite."
                 ) from exc
-            if row.get("schema_version") != FACULTY_PAIR_SCORE_SCHEMA_VERSION:
+            if row.get("schema_version") != score_schema_version:
                 raise RuntimeError(
-                    "Existing faculty-pair score cache has an incompatible schema; "
+                    f"Existing {pair_label} score cache has an incompatible schema; "
                     "rerun with --overwrite."
                 )
             if row.get("config_fingerprint") != expected_fingerprint:
                 raise RuntimeError(
-                    "Existing faculty-pair score cache was built with a different "
+                    f"Existing {pair_label} score cache was built with a different "
                     "configuration; rerun with --overwrite."
                 )
             pair_id = _clean_text(row.get("pair_id"))
@@ -528,18 +539,21 @@ def _read_faculty_pair_score_cache(
     return scores
 
 
-def _faculty_pair_candidate_rows(
-    pairs: Sequence[FacultyKeywordPair],
+def _pair_candidate_rows(
+    pairs: Sequence[WithinOwnerKeywordPair],
     *,
     scores_by_pair_id: Mapping[str, tuple[float, float]],
     config_fingerprint: str,
     low_quantile: float,
     high_quantile: float,
+    candidate_schema_version: str,
+    pair_type: str,
+    owner_id_field: str,
 ) -> tuple[list[dict[str, Any]], dict[str, float], Counter[str]]:
     missing = [pair.pair_id for pair in pairs if pair.pair_id not in scores_by_pair_id]
     if missing:
         raise RuntimeError(
-            f"Cannot finalize faculty pairs: {len(missing)} pairs have no CE-STS score"
+            f"Cannot finalize {pair_type} pairs: {len(missing)} pairs have no CE-STS score"
         )
 
     scored_results = [
@@ -591,11 +605,11 @@ def _faculty_pair_candidate_rows(
         )
         rows.append(
             {
-                "schema_version": FACULTY_PAIR_SCHEMA_VERSION,
+                "schema_version": candidate_schema_version,
                 "config_fingerprint": config_fingerprint,
                 "pair_id": pair.pair_id,
-                "pair_type": "faculty_faculty",
-                "faculty_id": pair.faculty_id,
+                "pair_type": pair_type,
+                owner_id_field: pair.owner_id,
                 "left_item_id": pair.left.item_id,
                 "left_keyword_index": pair.left.keyword_index,
                 "left_text": pair.left.text,
@@ -666,13 +680,29 @@ def build_parser() -> argparse.ArgumentParser:
         description=(
             "Score every grant/faculty specialization pair with CE-STS and "
             "retain high, mid, and low relevance candidate sets, then score "
-            "all within-faculty keyword pairs into global relevance bands."
+            "all within-grant and within-faculty keyword pairs into global "
+            "relevance bands."
         )
     )
     parser.add_argument("--grant-db", type=Path, default=DEFAULT_GRANT_DB)
     parser.add_argument("--faculty-db", type=Path, default=DEFAULT_FACULTY_DB)
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
     parser.add_argument("--manifest", type=Path, default=DEFAULT_MANIFEST)
+    parser.add_argument(
+        "--grant-pair-output",
+        type=Path,
+        default=DEFAULT_GRANT_PAIR_OUTPUT,
+    )
+    parser.add_argument(
+        "--grant-pair-score-cache",
+        type=Path,
+        default=DEFAULT_GRANT_PAIR_SCORE_CACHE,
+    )
+    parser.add_argument(
+        "--grant-pair-manifest",
+        type=Path,
+        default=DEFAULT_GRANT_PAIR_MANIFEST,
+    )
     parser.add_argument(
         "--faculty-pair-output",
         type=Path,
@@ -734,9 +764,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="Require the CE model to already exist in the Hugging Face cache.",
     )
     parser.add_argument(
+        "--skip-grant-pairs",
+        action="store_true",
+        help="Skip the within-grant keyword-pair phase.",
+    )
+    parser.add_argument(
         "--skip-faculty-pairs",
         action="store_true",
-        help="Run only the existing grant-faculty prefilter phase.",
+        help="Skip the within-faculty keyword-pair phase.",
     )
     parser.add_argument(
         "--overwrite",
@@ -758,19 +793,31 @@ def main() -> int:
     faculty_db = _resolve_path(args.faculty_db)
     output_path = _resolve_path(args.output)
     manifest_path = _resolve_path(args.manifest)
+    grant_pair_output_path = _resolve_path(args.grant_pair_output)
+    grant_pair_score_cache_path = _resolve_path(args.grant_pair_score_cache)
+    grant_pair_manifest_path = _resolve_path(args.grant_pair_manifest)
     faculty_pair_output_path = _resolve_path(args.faculty_pair_output)
     faculty_pair_score_cache_path = _resolve_path(args.faculty_pair_score_cache)
     faculty_pair_manifest_path = _resolve_path(args.faculty_pair_manifest)
+    configured_paths = [output_path, manifest_path]
+    if not args.skip_grant_pairs:
+        configured_paths.extend(
+            (
+                grant_pair_output_path,
+                grant_pair_score_cache_path,
+                grant_pair_manifest_path,
+            )
+        )
     if not args.skip_faculty_pairs:
-        distinct_paths = {
-            output_path,
-            manifest_path,
-            faculty_pair_output_path,
-            faculty_pair_score_cache_path,
-            faculty_pair_manifest_path,
-        }
-        if len(distinct_paths) != 5:
-            raise ValueError("Grant-faculty and faculty-pair output paths must be distinct")
+        configured_paths.extend(
+            (
+                faculty_pair_output_path,
+                faculty_pair_score_cache_path,
+                faculty_pair_manifest_path,
+            )
+        )
+    if len(set(configured_paths)) != len(configured_paths):
+        raise ValueError("All enabled prefilter output paths must be distinct")
     for required in (grant_db, faculty_db):
         if not required.exists():
             raise FileNotFoundError(f"Input file not found: {required}")
@@ -821,6 +868,20 @@ def main() -> int:
     }
     fingerprint = _config_fingerprint(configuration)
 
+    grant_pair_configuration = {
+        "schema_version": GRANT_PAIR_SCHEMA_VERSION,
+        "score_schema_version": GRANT_PAIR_SCORE_SCHEMA_VERSION,
+        "grant_db_sha256": grant_sha256,
+        "seed": args.seed,
+        "max_grant_keywords": args.max_grant_keywords,
+        "low_quantile": args.low_quantile,
+        "high_quantile": args.high_quantile,
+        "ce_model": args.ce_model,
+        "ce_max_length": args.ce_max_length,
+        "dtype": args.dtype,
+        "attn_implementation": args.attn_implementation or "model_default",
+    }
+    grant_pair_fingerprint = _config_fingerprint(grant_pair_configuration)
     faculty_pair_configuration = {
         "schema_version": FACULTY_PAIR_SCHEMA_VERSION,
         "score_schema_version": FACULTY_PAIR_SCORE_SCHEMA_VERSION,
@@ -835,8 +896,21 @@ def main() -> int:
         "attn_implementation": args.attn_implementation or "model_default",
     }
     faculty_pair_fingerprint = _config_fingerprint(faculty_pair_configuration)
+    grant_pairs = (
+        []
+        if args.skip_grant_pairs
+        else _build_within_owner_keyword_pairs(
+            grants,
+            pair_id_prefix="grant_pair",
+        )
+    )
     faculty_pairs = (
-        [] if args.skip_faculty_pairs else _build_faculty_keyword_pairs(faculty)
+        []
+        if args.skip_faculty_pairs
+        else _build_within_owner_keyword_pairs(
+            faculty,
+            pair_id_prefix="faculty_pair",
+        )
     )
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -853,9 +927,31 @@ def main() -> int:
         )
         output_mode = "a"
 
+    if args.skip_grant_pairs:
+        grant_pair_scores: dict[str, tuple[float, float]] = {}
+        pending_grant_pairs: list[WithinOwnerKeywordPair] = []
+        grant_pair_cache_mode = "a"
+    elif args.overwrite:
+        grant_pair_scores = {}
+        pending_grant_pairs = list(grant_pairs)
+        grant_pair_score_cache_path.parent.mkdir(parents=True, exist_ok=True)
+        grant_pair_score_cache_path.write_text("", encoding="utf-8")
+        grant_pair_cache_mode = "a"
+    else:
+        grant_pair_scores = _read_pair_score_cache(
+            grant_pair_score_cache_path,
+            expected_fingerprint=grant_pair_fingerprint,
+            score_schema_version=GRANT_PAIR_SCORE_SCHEMA_VERSION,
+            pair_label="grant-pair",
+        )
+        pending_grant_pairs = [
+            pair for pair in grant_pairs if pair.pair_id not in grant_pair_scores
+        ]
+        grant_pair_cache_mode = "a"
+
     if args.skip_faculty_pairs:
         faculty_pair_scores: dict[str, tuple[float, float]] = {}
-        pending_faculty_pairs: list[FacultyKeywordPair] = []
+        pending_faculty_pairs: list[WithinOwnerKeywordPair] = []
         faculty_pair_cache_mode = "a"
     elif args.overwrite:
         faculty_pair_scores = {}
@@ -864,9 +960,11 @@ def main() -> int:
         faculty_pair_score_cache_path.write_text("", encoding="utf-8")
         faculty_pair_cache_mode = "a"
     else:
-        faculty_pair_scores = _read_faculty_pair_score_cache(
+        faculty_pair_scores = _read_pair_score_cache(
             faculty_pair_score_cache_path,
             expected_fingerprint=faculty_pair_fingerprint,
+            score_schema_version=FACULTY_PAIR_SCORE_SCHEMA_VERSION,
+            pair_label="faculty-pair",
         )
         pending_faculty_pairs = [
             pair for pair in faculty_pairs if pair.pair_id not in faculty_pair_scores
@@ -881,7 +979,7 @@ def main() -> int:
         unit="grant item",
     )
     scorer = None
-    if remaining_grants or pending_faculty_pairs:
+    if remaining_grants or pending_grant_pairs or pending_faculty_pairs:
         scorer = CrossEncoderScorer(
             model_id=args.ce_model,
             device=device,
@@ -989,6 +1087,95 @@ def main() -> int:
         encoding="utf-8",
     )
 
+    grant_pair_elapsed = 0.0
+    grant_pair_scored_this_run = 0
+    if not args.skip_grant_pairs:
+        grant_pair_started = time.time()
+        grant_pair_score_cache_path.parent.mkdir(parents=True, exist_ok=True)
+        grant_progress = _try_progress(
+            len(pending_grant_pairs),
+            description="CE5 within-grant CE-STS",
+            unit="pair",
+        )
+        with grant_pair_score_cache_path.open(
+            grant_pair_cache_mode,
+            encoding="utf-8",
+        ) as cache_handle:
+            for batch in _chunks(pending_grant_pairs, args.ce_batch_size):
+                if scorer is None:
+                    raise RuntimeError("CE-STS scorer was not initialized")
+                batch_scores = scorer.score_pairs(
+                    [pair.left.text for pair in batch],
+                    [pair.right.text for pair in batch],
+                )
+                for pair, (logit, score) in zip(batch, batch_scores, strict=True):
+                    cache_handle.write(
+                        json.dumps(
+                            {
+                                "schema_version": GRANT_PAIR_SCORE_SCHEMA_VERSION,
+                                "config_fingerprint": grant_pair_fingerprint,
+                                "pair_id": pair.pair_id,
+                                "ce_sts_logit": float(logit),
+                                "ce_sts_score": float(score),
+                            },
+                            ensure_ascii=False,
+                        )
+                        + "\n"
+                    )
+                    grant_pair_scores[pair.pair_id] = (
+                        float(logit),
+                        float(score),
+                    )
+                cache_handle.flush()
+                grant_pair_scored_this_run += len(batch)
+                if grant_progress is not None:
+                    grant_progress.update(len(batch))
+        if grant_progress is not None:
+            grant_progress.close()
+
+        grant_pair_rows, grant_pair_thresholds, grant_pair_band_counts = (
+            _pair_candidate_rows(
+                grant_pairs,
+                scores_by_pair_id=grant_pair_scores,
+                config_fingerprint=grant_pair_fingerprint,
+                low_quantile=args.low_quantile,
+                high_quantile=args.high_quantile,
+                candidate_schema_version=GRANT_PAIR_SCHEMA_VERSION,
+                pair_type="grant_grant",
+                owner_id_field="grant_id",
+            )
+        )
+        _write_jsonl_atomically(grant_pair_output_path, grant_pair_rows)
+        grant_pair_elapsed = time.time() - grant_pair_started
+        grant_pair_manifest = {
+            "schema_version": GRANT_PAIR_SCHEMA_VERSION,
+            "created_at_utc": datetime.now(timezone.utc).isoformat(),
+            "complete": len(grant_pair_scores) >= len(grant_pairs),
+            "config_fingerprint": grant_pair_fingerprint,
+            "grant_db": str(grant_db),
+            "grant_db_sha256": grant_sha256,
+            "score_cache": str(grant_pair_score_cache_path),
+            "output": str(grant_pair_output_path),
+            "device": device,
+            "configuration": grant_pair_configuration,
+            "grant_owners_loaded": len({item.owner_id for item in grants}),
+            "grant_keywords_loaded": len(grants),
+            "grant_pairs_generated": len(grant_pairs),
+            "grant_pairs_scored": sum(
+                pair.pair_id in grant_pair_scores for pair in grant_pairs
+            ),
+            "grant_pairs_scored_this_run": grant_pair_scored_this_run,
+            "band_method": "global_ce_sts_rank_quantiles",
+            "band_thresholds": grant_pair_thresholds,
+            "band_counts": dict(sorted(grant_pair_band_counts.items())),
+            "elapsed_seconds_this_run": grant_pair_elapsed,
+        }
+        grant_pair_manifest_path.parent.mkdir(parents=True, exist_ok=True)
+        grant_pair_manifest_path.write_text(
+            json.dumps(grant_pair_manifest, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+
     faculty_pair_elapsed = 0.0
     faculty_pair_scored_this_run = 0
     if not args.skip_faculty_pairs:
@@ -1036,12 +1223,15 @@ def main() -> int:
             faculty_progress.close()
 
         faculty_pair_rows, faculty_pair_thresholds, faculty_pair_band_counts = (
-            _faculty_pair_candidate_rows(
+            _pair_candidate_rows(
                 faculty_pairs,
                 scores_by_pair_id=faculty_pair_scores,
                 config_fingerprint=faculty_pair_fingerprint,
                 low_quantile=args.low_quantile,
                 high_quantile=args.high_quantile,
+                candidate_schema_version=FACULTY_PAIR_SCHEMA_VERSION,
+                pair_type="faculty_faculty",
+                owner_id_field="faculty_id",
             )
         )
         _write_jsonl_atomically(faculty_pair_output_path, faculty_pair_rows)
@@ -1082,6 +1272,12 @@ def main() -> int:
     print(f"faculty_keywords={len(faculty)}")
     print(f"grant_faculty_cartesian_pairs={len(grants) * len(faculty)}")
     print(f"grant_faculty_candidates_written={candidates_written}")
+    if not args.skip_grant_pairs:
+        print(f"grant_pair_output={grant_pair_output_path}")
+        print(f"grant_pair_manifest={grant_pair_manifest_path}")
+        print(f"grant_pairs_generated={len(grant_pairs)}")
+        print(f"grant_pairs_scored_this_run={grant_pair_scored_this_run}")
+        print(f"grant_pair_elapsed_seconds={grant_pair_elapsed:.2f}")
     if not args.skip_faculty_pairs:
         print(f"faculty_pair_output={faculty_pair_output_path}")
         print(f"faculty_pair_manifest={faculty_pair_manifest_path}")
