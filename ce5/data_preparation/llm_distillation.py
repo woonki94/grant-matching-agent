@@ -1,11 +1,13 @@
 """Score CE5 prefilter candidates with a local instruction-tuned LLM.
 
-This is the offline teacher stage.  It reads the high/mid/low candidate sets
-created by ``build_prefilter.py``, builds one independent prompt per pair, and
-uses vLLM to produce continuous capability-coverage judgments.
+This is the offline teacher stage.  It reads grant-faculty, grant-grant, and
+faculty-faculty high/mid/low candidate sets created by ``build_prefilter.py``,
+builds one independent prompt per directed pair, and uses vLLM to produce
+continuous capability-coverage judgments.
 
 CE-STS scores, ranks, and selection bands are deliberately excluded from the
-teacher prompt so they cannot anchor the LLM's judgment.  Output is append-only
+teacher prompt.  Pair provenance and same-owner status are also hidden so the
+teacher must judge only the two capability statements.  Output is append-only
 and resumable.  Invalid generations are retried once and then written to a
 separate error file; they are never silently converted to zero-score labels.
 """
@@ -21,6 +23,7 @@ import math
 import re
 import sys
 import time
+from collections import Counter
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -33,34 +36,54 @@ if str(REPO_ROOT) not in sys.path:
 
 
 DATASET_DIR = REPO_ROOT / "ce5" / "dataset"
-DEFAULT_PREFILTER = DATASET_DIR / "source" / "prefilter_candidates.jsonl"
-DEFAULT_OUTPUT = DATASET_DIR / "judgments" / "teacher_judgments.jsonl"
-DEFAULT_ERRORS = DATASET_DIR / "judgments" / "teacher_judgment_errors.jsonl"
-DEFAULT_MANIFEST = DATASET_DIR / "judgments" / "teacher_judgments.manifest.json"
+SOURCE_DIR = DATASET_DIR / "source"
+DEFAULT_GRANT_FACULTY_PREFILTER = SOURCE_DIR / "prefilter_candidates.jsonl"
+DEFAULT_GRANT_GRANT_PREFILTER = SOURCE_DIR / "grant_pair_candidates.jsonl"
+DEFAULT_FACULTY_FACULTY_PREFILTER = SOURCE_DIR / "faculty_pair_candidates.jsonl"
+DEFAULT_OUTPUT = DATASET_DIR / "judgments" / "teacher_judgments_v2.jsonl"
+DEFAULT_ERRORS = DATASET_DIR / "judgments" / "teacher_judgment_errors_v2.jsonl"
+DEFAULT_MANIFEST = DATASET_DIR / "judgments" / "teacher_judgments_v2.manifest.json"
 DEFAULT_TEACHER_MODEL = "Qwen/Qwen3-14B"
-PREFILTER_SCHEMA_VERSION = 2
-JUDGMENT_SCHEMA_VERSION = "ce5.judgment.v1"
-ERROR_SCHEMA_VERSION = "ce5.judgment-error.v1"
-PROMPT_VERSION = "capability-coverage-v1"
+GRANT_FACULTY_PREFILTER_SCHEMA_VERSION = 2
+GRANT_GRANT_PREFILTER_SCHEMA_VERSION = "ce5.grant-pair-prefilter.v1"
+FACULTY_FACULTY_PREFILTER_SCHEMA_VERSION = "ce5.faculty-pair-prefilter.v1"
+JUDGMENT_SCHEMA_VERSION = "ce5.judgment.v2"
+ERROR_SCHEMA_VERSION = "ce5.judgment-error.v2"
+PROMPT_VERSION = "directed-capability-coverage-v2"
 BANDS = ("high", "mid", "low")
+PAIR_TYPES = ("grant_faculty", "grant_grant", "faculty_faculty")
 
 
 SYSTEM_PROMPT = """
-You are a strict evaluator for matching grant requirements to faculty capabilities.
+You are a strict evaluator of directed coverage between two capability statements.
 
 Your task is directional:
-Determine how strongly the FACULTY CAPABILITY provides evidence that the faculty can satisfy the GRANT REQUIREMENT.
+Determine how completely the CANDIDATE CAPABILITY would satisfy or cover the TARGET CAPABILITY.
 
-This is not ordinary semantic similarity. Do not give a high score merely because both statements mention the same topic, domain, population, technology, or broad goal. The faculty statement must demonstrate a relevant capability, method, expertise, experience, or transferable ability that covers the requirement.
+Treat both statements as normalized descriptions of capabilities. Judge only
+their meanings. Do not infer anything from their source, owner, wording style,
+or possible relationship outside the text.
 
-Do not assume important capabilities that are not supported by the faculty statement. Closely related or transferable capability may receive partial credit, but missing essential requirements must reduce the score.
+This is not ordinary semantic similarity. Do not give a high score merely
+because both statements mention the same topic, domain, population,
+technology, or broad goal. The candidate must contain a relevant method,
+expertise, experience, system, or transferable ability that covers the target.
 
-Use a continuous score from 0.00 to 1.00:
-- 0.00: unrelated, contradictory, or no evidence of the required capability
-- 0.25: topical connection but little evidence that the requirement can be satisfied
-- 0.50: partial or plausibly transferable capability with substantial gaps
-- 0.75: substantial capability coverage with a meaningful remaining gap
-- 1.00: direct, specific, and strong evidence that the requirement can be satisfied
+Do not assume important capabilities that are absent from the candidate.
+Closely related or transferable capability may receive partial credit, but
+missing essential parts of the target must reduce the score. Coverage may be
+asymmetric: the score for candidate B covering target A need not equal the
+score for candidate A covering target B.
+
+Use a genuinely continuous score from 0.00 to 1.00. Do not quantize scores to
+fixed increments such as 0.25. Choose the value that best reflects the degree
+of coverage:
+- 0.00: unrelated, contradictory, or no useful capability coverage
+- 0.01-0.24: only a weak topical or transferable connection
+- 0.25-0.49: limited coverage with major missing capabilities
+- 0.50-0.74: meaningful partial coverage with important gaps
+- 0.75-0.94: strong coverage with a smaller but real gap
+- 0.95-1.00: direct and essentially complete coverage
 
 Confidence describes confidence in your judgment, not match strength:
 - 0.00: the texts are too vague or ambiguous to judge reliably
@@ -78,11 +101,11 @@ Do not output markdown, analysis, aspect scores, a categorical band, or any text
 
 
 USER_PROMPT_TEMPLATE = """
-GRANT REQUIREMENT:
-{grant_text}
+TARGET CAPABILITY:
+{target_text}
 
-FACULTY CAPABILITY:
-{faculty_text}
+CANDIDATE CAPABILITY:
+{candidate_text}
 """.strip()
 
 
@@ -94,15 +117,19 @@ Your previous response did not match the required JSON schema. Return only one v
 @dataclass(frozen=True)
 class CandidatePair:
     pair_id: str
-    grant_item_id: str
-    grant_id: str | int
-    grant_keyword_index: int
-    grant_text: str
-    faculty_item_id: str
-    faculty_id: str | int
-    faculty_keyword_index: int
-    faculty_text: str
+    source_pair_id: str
+    pair_type: str
+    direction: str
+    target_item_id: str
+    target_owner_id: str | int
+    target_keyword_index: int
+    target_text: str
+    candidate_item_id: str
+    candidate_owner_id: str | int
+    candidate_keyword_index: int
+    candidate_text: str
     prefilter_band: str
+    prefilter_score_direction: str
     ce_sts_score: float
     ce_sts_logit: float
     ce_sts_rank: int
@@ -158,13 +185,77 @@ def _parse_bands(value: str) -> tuple[str, ...]:
     return tuple(dict.fromkeys(requested))
 
 
-def _load_candidate_pairs(
+def _parse_pair_types(value: str) -> tuple[str, ...]:
+    requested = tuple(
+        token.strip().lower().replace("-", "_")
+        for token in value.split(",")
+        if token.strip()
+    )
+    invalid = sorted(set(requested) - set(PAIR_TYPES))
+    if invalid:
+        raise argparse.ArgumentTypeError(
+            f"Unsupported pair type(s): {', '.join(invalid)}; "
+            "use grant_faculty,grant_grant,faculty_faculty"
+        )
+    if not requested:
+        raise argparse.ArgumentTypeError("At least one pair type is required")
+    return tuple(dict.fromkeys(requested))
+
+
+def _directed_pair(
+    *,
+    source_pair_id: str,
+    pair_type: str,
+    direction: str,
+    target_item_id: str,
+    target_owner_id: str | int,
+    target_keyword_index: int,
+    target_text: str,
+    candidate_item_id: str,
+    candidate_owner_id: str | int,
+    candidate_keyword_index: int,
+    candidate_text: str,
+    prefilter_band: str,
+    prefilter_score_direction: str,
+    ce_sts_score: float,
+    ce_sts_logit: float,
+    ce_sts_rank: int,
+    ce_sts_rank_percentile: float,
+) -> CandidatePair:
+    pair_id = _stable_id(
+        pair_type,
+        target_item_id,
+        candidate_item_id,
+        prefix="directed_pair",
+    )
+    return CandidatePair(
+        pair_id=pair_id,
+        source_pair_id=source_pair_id,
+        pair_type=pair_type,
+        direction=direction,
+        target_item_id=target_item_id,
+        target_owner_id=target_owner_id,
+        target_keyword_index=target_keyword_index,
+        target_text=target_text,
+        candidate_item_id=candidate_item_id,
+        candidate_owner_id=candidate_owner_id,
+        candidate_keyword_index=candidate_keyword_index,
+        candidate_text=candidate_text,
+        prefilter_band=prefilter_band,
+        prefilter_score_direction=prefilter_score_direction,
+        ce_sts_score=ce_sts_score,
+        ce_sts_logit=ce_sts_logit,
+        ce_sts_rank=ce_sts_rank,
+        ce_sts_rank_percentile=ce_sts_rank_percentile,
+    )
+
+
+def _load_grant_faculty_pairs(
     path: Path,
     *,
     bands: Sequence[str],
     per_query_counts: Mapping[str, int],
     seed: int,
-    maximum: int,
 ) -> list[CandidatePair]:
     if not path.exists():
         raise FileNotFoundError(f"Prefilter output not found: {path}")
@@ -183,7 +274,7 @@ def _load_candidate_pairs(
                 raise RuntimeError(f"Invalid JSONL at {path}:{line_number}") from exc
             if not isinstance(row, Mapping):
                 raise RuntimeError(f"Expected an object at {path}:{line_number}")
-            if row.get("schema_version") != PREFILTER_SCHEMA_VERSION:
+            if row.get("schema_version") != GRANT_FACULTY_PREFILTER_SCHEMA_VERSION:
                 raise RuntimeError(
                     f"Unsupported prefilter schema at {path}:{line_number}: "
                     f"{row.get('schema_version')}"
@@ -244,30 +335,39 @@ def _load_candidate_pairs(
                     faculty_text = _clean_text(candidate.get("faculty_text"))
                     if not faculty_item_id or not faculty_text:
                         continue
-                    pair_id = _stable_id(
+                    source_pair_id = _stable_id(
                         grant_item_id,
                         faculty_item_id,
                         prefix="pair",
+                    )
+                    pair_id = _stable_id(
+                        "grant_faculty",
+                        grant_item_id,
+                        faculty_item_id,
+                        prefix="directed_pair",
                     )
                     if pair_id in seen_pair_ids:
                         continue
                     seen_pair_ids.add(pair_id)
                     output.append(
-                        CandidatePair(
-                            pair_id=pair_id,
-                            grant_item_id=grant_item_id,
-                            grant_id=row.get("grant_id", ""),
-                            grant_keyword_index=int(
+                        _directed_pair(
+                            source_pair_id=source_pair_id,
+                            pair_type="grant_faculty",
+                            direction="grant_to_faculty",
+                            target_item_id=grant_item_id,
+                            target_owner_id=row.get("grant_id", ""),
+                            target_keyword_index=int(
                                 row.get("grant_keyword_index", -1) or 0
                             ),
-                            grant_text=grant_text,
-                            faculty_item_id=faculty_item_id,
-                            faculty_id=candidate.get("faculty_id", ""),
-                            faculty_keyword_index=int(
+                            target_text=grant_text,
+                            candidate_item_id=faculty_item_id,
+                            candidate_owner_id=candidate.get("faculty_id", ""),
+                            candidate_keyword_index=int(
                                 candidate.get("faculty_keyword_index", -1) or 0
                             ),
-                            faculty_text=faculty_text,
+                            candidate_text=faculty_text,
                             prefilter_band=band,
+                            prefilter_score_direction="grant_to_faculty",
                             ce_sts_score=float(candidate.get("ce_sts_score", 0.0)),
                             ce_sts_logit=float(candidate.get("ce_sts_logit", 0.0)),
                             ce_sts_rank=int(candidate.get("ce_sts_rank", -1)),
@@ -276,9 +376,112 @@ def _load_candidate_pairs(
                             ),
                         )
                     )
-                    if maximum > 0 and len(output) >= maximum:
-                        return output
     return output
+
+
+def _load_same_side_pairs(
+    path: Path,
+    *,
+    pair_type: str,
+    schema_version: str,
+    owner_id_field: str,
+    bands: Sequence[str],
+    both_directions: bool,
+) -> list[CandidatePair]:
+    if not path.exists():
+        raise FileNotFoundError(f"Prefilter output not found: {path}")
+    allowed_bands = set(bands)
+    output: list[CandidatePair] = []
+    seen_pair_ids: set[str] = set()
+    with path.open("r", encoding="utf-8") as handle:
+        for line_number, raw_line in enumerate(handle, start=1):
+            line = raw_line.strip()
+            if not line:
+                continue
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError as exc:
+                raise RuntimeError(f"Invalid JSONL at {path}:{line_number}") from exc
+            if not isinstance(row, Mapping):
+                raise RuntimeError(f"Expected an object at {path}:{line_number}")
+            if row.get("schema_version") != schema_version:
+                raise RuntimeError(
+                    f"Unsupported prefilter schema at {path}:{line_number}: "
+                    f"{row.get('schema_version')}"
+                )
+
+            source_pair_id = _clean_text(row.get("pair_id"))
+            owner_id = row.get(owner_id_field, "")
+            left_item_id = _clean_text(row.get("left_item_id"))
+            left_text = _clean_text(row.get("left_text"))
+            right_item_id = _clean_text(row.get("right_item_id"))
+            right_text = _clean_text(row.get("right_text"))
+            band = _clean_text(row.get("prefilter_band")).lower()
+            if (
+                not source_pair_id
+                or not left_item_id
+                or not left_text
+                or not right_item_id
+                or not right_text
+            ):
+                raise RuntimeError(
+                    f"Incomplete {pair_type} prefilter record at {path}:{line_number}"
+                )
+            if band not in allowed_bands:
+                continue
+
+            common = {
+                "source_pair_id": source_pair_id,
+                "pair_type": pair_type,
+                "target_owner_id": owner_id,
+                "candidate_owner_id": owner_id,
+                "prefilter_band": band,
+                # build_prefilter.py scored only the stored left-to-right order.
+                # Reverse teacher judgments retain that discovery score solely
+                # as provenance; it is never shown to the teacher.
+                "prefilter_score_direction": "left_to_right",
+                "ce_sts_score": float(row.get("ce_sts_score", 0.0)),
+                "ce_sts_logit": float(row.get("ce_sts_logit", 0.0)),
+                "ce_sts_rank": int(row.get("ce_sts_global_rank", -1)),
+                "ce_sts_rank_percentile": float(
+                    row.get("ce_sts_rank_percentile", 0.0)
+                ),
+            }
+            directions = [
+                _directed_pair(
+                    **common,
+                    direction="left_to_right",
+                    target_item_id=left_item_id,
+                    target_keyword_index=int(row.get("left_keyword_index", -1)),
+                    target_text=left_text,
+                    candidate_item_id=right_item_id,
+                    candidate_keyword_index=int(row.get("right_keyword_index", -1)),
+                    candidate_text=right_text,
+                )
+            ]
+            if both_directions:
+                directions.append(
+                    _directed_pair(
+                        **common,
+                        direction="right_to_left",
+                        target_item_id=right_item_id,
+                        target_keyword_index=int(row.get("right_keyword_index", -1)),
+                        target_text=right_text,
+                        candidate_item_id=left_item_id,
+                        candidate_keyword_index=int(row.get("left_keyword_index", -1)),
+                        candidate_text=left_text,
+                    )
+                )
+            for candidate in directions:
+                if candidate.pair_id in seen_pair_ids:
+                    continue
+                seen_pair_ids.add(candidate.pair_id)
+                output.append(candidate)
+    return output
+
+
+def _candidate_counts(candidates: Sequence[CandidatePair]) -> dict[str, int]:
+    return dict(sorted(Counter(candidate.pair_type for candidate in candidates).items()))
 
 
 def _extract_json_object(raw_text: str) -> Optional[dict[str, Any]]:
@@ -348,8 +551,8 @@ def _apply_chat_template(
     invalid_response: str = "",
 ) -> str:
     user_prompt = USER_PROMPT_TEMPLATE.format(
-        grant_text=candidate.grant_text,
-        faculty_text=candidate.faculty_text,
+        target_text=candidate.target_text,
+        candidate_text=candidate.candidate_text,
     )
     messages: list[dict[str, str]] = [
         {"role": "system", "content": SYSTEM_PROMPT},
@@ -377,7 +580,11 @@ def _apply_chat_template(
         return tokenizer.apply_chat_template(messages, **kwargs)
 
 
-def _load_completed_judgment_ids(path: Path) -> set[str]:
+def _load_completed_judgment_ids(
+    path: Path,
+    *,
+    generation_fingerprint: str,
+) -> set[str]:
     completed: set[str] = set()
     if not path.exists():
         return completed
@@ -392,6 +599,18 @@ def _load_completed_judgment_ids(path: Path) -> set[str]:
                 raise RuntimeError(
                     f"Invalid existing judgment JSONL at {path}:{line_number}"
                 ) from exc
+            if row.get("schema_version") != JUDGMENT_SCHEMA_VERSION:
+                raise RuntimeError(
+                    f"Existing output at {path}:{line_number} uses schema "
+                    f"{row.get('schema_version')!r}; use --overwrite or choose a "
+                    "different --output for the v2 source-neutral judgments."
+                )
+            if row.get("generation_fingerprint") != generation_fingerprint:
+                raise RuntimeError(
+                    f"Existing output at {path}:{line_number} was generated with "
+                    "different teacher settings; use --overwrite or choose a "
+                    "different --output."
+                )
             judgment_id = _clean_text(row.get("judgment_id"))
             if judgment_id:
                 completed.add(judgment_id)
@@ -469,11 +688,69 @@ def _positive_unit_float(value: str) -> float:
     return parsed
 
 
+def _interleave_pair_types(
+    candidates_by_type: Mapping[str, Sequence[CandidatePair]],
+) -> list[CandidatePair]:
+    """Combine pair types without placing one entire source before the others."""
+    positions = {pair_type: 0 for pair_type in PAIR_TYPES}
+    output: list[CandidatePair] = []
+    while True:
+        added = False
+        for pair_type in PAIR_TYPES:
+            candidates = candidates_by_type.get(pair_type, ())
+            position = positions[pair_type]
+            if position >= len(candidates):
+                continue
+            output.append(candidates[position])
+            positions[pair_type] += 1
+            added = True
+        if not added:
+            return output
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Score CE5 prefilter candidates with a local vLLM teacher."
     )
-    parser.add_argument("--prefilter", type=Path, default=DEFAULT_PREFILTER)
+    parser.add_argument(
+        "--grant-faculty-prefilter",
+        "--prefilter",
+        dest="grant_faculty_prefilter",
+        type=Path,
+        default=DEFAULT_GRANT_FACULTY_PREFILTER,
+        help=(
+            "Grant-faculty prefilter JSONL. --prefilter remains as a backward-"
+            "compatible alias."
+        ),
+    )
+    parser.add_argument(
+        "--grant-grant-prefilter",
+        type=Path,
+        default=DEFAULT_GRANT_GRANT_PREFILTER,
+    )
+    parser.add_argument(
+        "--faculty-faculty-prefilter",
+        type=Path,
+        default=DEFAULT_FACULTY_FACULTY_PREFILTER,
+    )
+    parser.add_argument(
+        "--pair-types",
+        type=_parse_pair_types,
+        default=PAIR_TYPES,
+        help=(
+            "Comma-separated inputs to distill (default: "
+            "grant_faculty,grant_grant,faculty_faculty)."
+        ),
+    )
+    parser.add_argument(
+        "--same-side-directions",
+        choices=("both", "forward"),
+        default="both",
+        help=(
+            "Distill both directed orders of G-G/F-F pairs, or only the "
+            "prefilter's left-to-right order (default: both)."
+        ),
+    )
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
     parser.add_argument("--errors", type=Path, default=DEFAULT_ERRORS)
     parser.add_argument("--manifest", type=Path, default=DEFAULT_MANIFEST)
@@ -509,8 +786,8 @@ def build_parser() -> argparse.ArgumentParser:
         type=_nonnegative_int,
         default=0,
         help=(
-            "Optional final cap after per-query sampling; 0 scores every selected "
-            "pair (default: 0)."
+            "Optional final cap after loading and interleaving all selected pair "
+            "types; 0 scores every selected pair (default: 0)."
         ),
     )
     parser.add_argument("--batch-size", type=_positive_int, default=256)
@@ -553,7 +830,12 @@ def build_parser() -> argparse.ArgumentParser:
 def main() -> int:
     args = build_parser().parse_args()
     started = time.time()
-    prefilter_path = _resolve_path(args.prefilter)
+    pair_types = tuple(args.pair_types)
+    prefilter_paths = {
+        "grant_faculty": _resolve_path(args.grant_faculty_prefilter),
+        "grant_grant": _resolve_path(args.grant_grant_prefilter),
+        "faculty_faculty": _resolve_path(args.faculty_faculty_prefilter),
+    }
     output_path = _resolve_path(args.output)
     error_path = _resolve_path(args.errors)
     manifest_path = _resolve_path(args.manifest)
@@ -563,18 +845,46 @@ def main() -> int:
         "mid": args.mid_per_query,
         "low": args.low_per_query,
     }
-    if not any(per_query_counts[band] > 0 for band in bands):
+    if (
+        "grant_faculty" in pair_types
+        and not any(per_query_counts[band] > 0 for band in bands)
+    ):
         raise ValueError(
             "At least one selected band must have a positive per-query count"
         )
 
-    candidates = _load_candidate_pairs(
-        prefilter_path,
-        bands=bands,
-        per_query_counts=per_query_counts,
-        seed=args.seed,
-        maximum=args.max_pairs,
-    )
+    candidates_by_type: dict[str, list[CandidatePair]] = {}
+    if "grant_faculty" in pair_types:
+        candidates_by_type["grant_faculty"] = _load_grant_faculty_pairs(
+            prefilter_paths["grant_faculty"],
+            bands=bands,
+            per_query_counts=per_query_counts,
+            seed=args.seed,
+        )
+    if "grant_grant" in pair_types:
+        candidates_by_type["grant_grant"] = _load_same_side_pairs(
+            prefilter_paths["grant_grant"],
+            pair_type="grant_grant",
+            schema_version=GRANT_GRANT_PREFILTER_SCHEMA_VERSION,
+            owner_id_field="grant_id",
+            bands=bands,
+            both_directions=args.same_side_directions == "both",
+        )
+    if "faculty_faculty" in pair_types:
+        candidates_by_type["faculty_faculty"] = _load_same_side_pairs(
+            prefilter_paths["faculty_faculty"],
+            pair_type="faculty_faculty",
+            schema_version=FACULTY_FACULTY_PREFILTER_SCHEMA_VERSION,
+            owner_id_field="faculty_id",
+            bands=bands,
+            both_directions=args.same_side_directions == "both",
+        )
+    loaded_candidate_counts = {
+        pair_type: len(values) for pair_type, values in candidates_by_type.items()
+    }
+    candidates = _interleave_pair_types(candidates_by_type)
+    if args.max_pairs > 0:
+        candidates = candidates[: args.max_pairs]
     if not candidates:
         raise RuntimeError("No candidate pairs were loaded from the selected bands")
 
@@ -604,20 +914,36 @@ def main() -> int:
     }
 
     if args.dry_run:
-        print(f"prefilter={prefilter_path}")
+        for pair_type in pair_types:
+            print(f"{pair_type}_prefilter={prefilter_paths[pair_type]}")
         print(f"candidate_pairs={len(candidates)}")
+        print(f"candidate_counts={_candidate_counts(candidates)}")
         print(f"bands={','.join(bands)}")
         print(
             "per_query_counts="
             + ",".join(f"{band}:{per_query_counts[band]}" for band in BANDS)
         )
         print(f"model_id={model_id}")
-        for index, candidate in enumerate(candidates[: args.dry_run_limit], start=1):
-            print(f"--- pair {index}: {candidate.pair_id} ---")
-            print(USER_PROMPT_TEMPLATE.format(
-                grant_text=candidate.grant_text,
-                faculty_text=candidate.faculty_text,
-            ))
+        examples_printed = 0
+        for pair_type in pair_types:
+            type_candidates = [
+                candidate
+                for candidate in candidates
+                if candidate.pair_type == pair_type
+            ]
+            for candidate in type_candidates[: args.dry_run_limit]:
+                examples_printed += 1
+                print(
+                    f"--- pair {examples_printed}: {candidate.pair_id} "
+                    f"(stored type={candidate.pair_type}, "
+                    f"direction={candidate.direction}) ---"
+                )
+                print(
+                    USER_PROMPT_TEMPLATE.format(
+                        target_text=candidate.target_text,
+                        candidate_text=candidate.candidate_text,
+                    )
+                )
         return 0
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -629,7 +955,10 @@ def main() -> int:
     else:
         output_mode = "a"
         error_mode = "a"
-        completed_ids = _load_completed_judgment_ids(output_path)
+        completed_ids = _load_completed_judgment_ids(
+            output_path,
+            generation_fingerprint=generation_fingerprint,
+        )
     pending = [
         candidate
         for candidate in candidates
@@ -746,6 +1075,9 @@ def main() -> int:
                                 "schema_version": ERROR_SCHEMA_VERSION,
                                 "judgment_id": judgment_id,
                                 "pair_id": candidate.pair_id,
+                                "source_pair_id": candidate.source_pair_id,
+                                "pair_type": candidate.pair_type,
+                                "direction": candidate.direction,
                                 "teacher_model": model_id,
                                 "prompt_version": PROMPT_VERSION,
                                 "parse_error": parse_error,
@@ -787,12 +1119,18 @@ def main() -> int:
         progress.close()
 
     elapsed = time.time() - started
+    selected_prefilters = {
+        pair_type: {
+            "path": str(prefilter_paths[pair_type]),
+            "sha256": _file_sha256(prefilter_paths[pair_type]),
+        }
+        for pair_type in pair_types
+    }
     manifest = {
-        "schema_version": 1,
+        "schema_version": 2,
         "created_at_utc": _utc_now(),
         "run_id": run_id,
-        "prefilter": str(prefilter_path),
-        "prefilter_sha256": _file_sha256(prefilter_path),
+        "prefilters": selected_prefilters,
         "output": str(output_path),
         "errors": str(error_path),
         "teacher_model": model_id,
@@ -800,8 +1138,10 @@ def main() -> int:
         "generation_fingerprint": generation_fingerprint,
         "configuration": {
             **generation_identity,
+            "pair_types": list(pair_types),
+            "same_side_directions": args.same_side_directions,
             "bands": list(bands),
-            "per_query_counts": per_query_counts,
+            "grant_faculty_per_query_counts": per_query_counts,
             "max_pairs": args.max_pairs,
             "batch_size": args.batch_size,
             "max_new_tokens": args.max_new_tokens,
@@ -811,6 +1151,11 @@ def main() -> int:
             "dtype": args.dtype,
         },
         "candidate_pairs_loaded": len(candidates),
+        "candidate_pairs_loaded_before_global_cap": sum(
+            loaded_candidate_counts.values()
+        ),
+        "candidate_counts_before_global_cap": loaded_candidate_counts,
+        "candidate_counts_selected": _candidate_counts(candidates),
         "already_completed": len(candidates) - len(pending),
         "attempted_this_run": len(pending),
         "accepted_this_run": accepted_this_run,
