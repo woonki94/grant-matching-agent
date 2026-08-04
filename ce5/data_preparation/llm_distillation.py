@@ -37,6 +37,7 @@ DEFAULT_PREFILTER = DATASET_DIR / "source" / "prefilter_candidates.jsonl"
 DEFAULT_OUTPUT = DATASET_DIR / "judgments" / "teacher_judgments.jsonl"
 DEFAULT_ERRORS = DATASET_DIR / "judgments" / "teacher_judgment_errors.jsonl"
 DEFAULT_MANIFEST = DATASET_DIR / "judgments" / "teacher_judgments.manifest.json"
+DEFAULT_TEACHER_MODEL = "Qwen/Qwen3-14B"
 PREFILTER_SCHEMA_VERSION = 2
 JUDGMENT_SCHEMA_VERSION = "ce5.judgment.v1"
 ERROR_SCHEMA_VERSION = "ce5.judgment-error.v1"
@@ -442,8 +443,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--manifest", type=Path, default=DEFAULT_MANIFEST)
     parser.add_argument(
         "--model-id",
-        required=True,
-        help="Hugging Face model ID or local path for the instruction-tuned teacher.",
+        default=DEFAULT_TEACHER_MODEL,
+        help=(
+            "Hugging Face model ID or local teacher path "
+            f"(default: {DEFAULT_TEACHER_MODEL})."
+        ),
     )
     parser.add_argument("--bands", type=_parse_bands, default=BANDS)
     parser.add_argument("--max-pairs", type=_nonnegative_int, default=0)
