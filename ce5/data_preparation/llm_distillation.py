@@ -162,6 +162,8 @@ def _load_candidate_pairs(
     path: Path,
     *,
     bands: Sequence[str],
+    per_query_counts: Mapping[str, int],
+    seed: int,
     maximum: int,
 ) -> list[CandidatePair]:
     if not path.exists():
@@ -201,7 +203,41 @@ def _load_candidate_pairs(
                 candidates = relevance_sets.get(band)
                 if not isinstance(candidates, list):
                     continue
-                for candidate in candidates:
+                requested_count = per_query_counts.get(band, 0)
+                if requested_count <= 0:
+                    continue
+
+                valid_candidates = [
+                    candidate
+                    for candidate in candidates
+                    if isinstance(candidate, Mapping)
+                    and _clean_text(candidate.get("faculty_item_id"))
+                    and _clean_text(candidate.get("faculty_text"))
+                ]
+                if band == "high":
+                    # Mine the strongest CE-prefiltered candidates first.  The
+                    # teacher still receives no CE score or band information.
+                    valid_candidates.sort(
+                        key=lambda candidate: (
+                            -float(candidate.get("ce_sts_score", 0.0)),
+                            int(candidate.get("ce_sts_rank", -1)),
+                            _clean_text(candidate.get("faculty_item_id")),
+                        )
+                    )
+                else:
+                    # Mid/low candidates were already sampled by the prefilter.
+                    # Hash ordering avoids repeatedly choosing just a band edge
+                    # while remaining reproducible across machines and resumes.
+                    valid_candidates.sort(
+                        key=lambda candidate: hashlib.sha256(
+                            (
+                                f"{seed}\x1f{grant_item_id}\x1f{band}\x1f"
+                                f"{_clean_text(candidate.get('faculty_item_id'))}"
+                            ).encode("utf-8")
+                        ).digest()
+                    )
+
+                for candidate in valid_candidates[:requested_count]:
                     if not isinstance(candidate, Mapping):
                         continue
                     faculty_item_id = _clean_text(candidate.get("faculty_item_id"))
@@ -450,7 +486,33 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument("--bands", type=_parse_bands, default=BANDS)
-    parser.add_argument("--max-pairs", type=_nonnegative_int, default=0)
+    parser.add_argument(
+        "--high-per-query",
+        type=_nonnegative_int,
+        default=8,
+        help="Maximum CE-high candidates selected per grant keyword (default: 8).",
+    )
+    parser.add_argument(
+        "--mid-per-query",
+        type=_nonnegative_int,
+        default=2,
+        help="Maximum CE-mid candidates selected per grant keyword (default: 2).",
+    )
+    parser.add_argument(
+        "--low-per-query",
+        type=_nonnegative_int,
+        default=1,
+        help="Maximum CE-low candidates selected per grant keyword (default: 1).",
+    )
+    parser.add_argument(
+        "--max-pairs",
+        type=_nonnegative_int,
+        default=0,
+        help=(
+            "Optional final cap after per-query sampling; 0 scores every selected "
+            "pair (default: 0)."
+        ),
+    )
     parser.add_argument("--batch-size", type=_positive_int, default=256)
     parser.add_argument("--max-new-tokens", type=_positive_int, default=128)
     parser.add_argument("--temperature", type=_unit_float, default=0.0)
@@ -496,10 +558,21 @@ def main() -> int:
     error_path = _resolve_path(args.errors)
     manifest_path = _resolve_path(args.manifest)
     bands = tuple(args.bands)
+    per_query_counts = {
+        "high": args.high_per_query,
+        "mid": args.mid_per_query,
+        "low": args.low_per_query,
+    }
+    if not any(per_query_counts[band] > 0 for band in bands):
+        raise ValueError(
+            "At least one selected band must have a positive per-query count"
+        )
 
     candidates = _load_candidate_pairs(
         prefilter_path,
         bands=bands,
+        per_query_counts=per_query_counts,
+        seed=args.seed,
         maximum=args.max_pairs,
     )
     if not candidates:
@@ -534,6 +607,10 @@ def main() -> int:
         print(f"prefilter={prefilter_path}")
         print(f"candidate_pairs={len(candidates)}")
         print(f"bands={','.join(bands)}")
+        print(
+            "per_query_counts="
+            + ",".join(f"{band}:{per_query_counts[band]}" for band in BANDS)
+        )
         print(f"model_id={model_id}")
         for index, candidate in enumerate(candidates[: args.dry_run_limit], start=1):
             print(f"--- pair {index}: {candidate.pair_id} ---")
@@ -724,6 +801,8 @@ def main() -> int:
         "configuration": {
             **generation_identity,
             "bands": list(bands),
+            "per_query_counts": per_query_counts,
+            "max_pairs": args.max_pairs,
             "batch_size": args.batch_size,
             "max_new_tokens": args.max_new_tokens,
             "tensor_parallel_size": args.tensor_parallel_size,
