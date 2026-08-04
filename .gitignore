@@ -31,7 +31,7 @@ __pycache__/
 /ce*/dataset/
 /ce*/datasets/
 /ce*/models/
-/ce/eval/results/
+/ce*/eval/results/
 
 # Temporary workspace files
 /tmp/
