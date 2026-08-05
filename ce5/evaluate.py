@@ -1167,6 +1167,12 @@ def build_parser() -> argparse.ArgumentParser:
         default="test",
         help="Dataset partition to evaluate (default: held-out test).",
     )
+    parser.add_argument(
+        "--pair-type",
+        choices=("all", "grant_faculty", "grant_grant", "faculty_faculty"),
+        default="all",
+        help="Evaluate only one pair type after verifying the complete split.",
+    )
     parser.add_argument("--validation-ratio", type=_unit_float)
     parser.add_argument("--test-ratio", type=_unit_float)
     parser.add_argument(
@@ -1344,6 +1350,13 @@ def main() -> int:
             manifest_path=split_manifest_path,
             allow_unverified=args.skip_split_verification,
         )
+    verified_split_examples = len(evaluation_examples)
+    if args.pair_type != "all":
+        evaluation_examples = [
+            example
+            for example in evaluation_examples
+            if example.pair_type == args.pair_type
+        ]
     if args.limit_evaluation > 0:
         evaluation_examples = evaluation_examples[: args.limit_evaluation]
     if not evaluation_examples:
@@ -1504,7 +1517,12 @@ def main() -> int:
         size=args.audit_sample_size,
         seed=seed + 101,
     )
-    predictions_path = output_dir / f"{args.evaluation_split}_predictions.jsonl"
+    prediction_scope = (
+        args.evaluation_split
+        if args.pair_type == "all"
+        else f"{args.evaluation_split}_{args.pair_type}"
+    )
+    predictions_path = output_dir / f"{prediction_scope}_predictions.jsonl"
     summary = {
         "schema_version": "ce5.evaluation.v2",
         "created_at_utc": _utc_now(),
@@ -1518,6 +1536,7 @@ def main() -> int:
         "architecture": architecture,
         "configuration": {
             "evaluation_split": args.evaluation_split,
+            "pair_type": args.pair_type,
             "validation_ratio": validation_ratio,
             "test_ratio": test_ratio,
             "split_group": split_group,
@@ -1539,6 +1558,7 @@ def main() -> int:
             "train_examples": len(train_examples),
             "validation_examples": len(validation_examples),
             "test_examples": len(test_examples),
+            "verified_split_examples_before_pair_type_filter": verified_split_examples,
             "evaluated_examples": len(evaluation_examples),
             "split_verification": split_verification,
         },
@@ -1559,7 +1579,7 @@ def main() -> int:
     _write_jsonl(output_dir / "human_audit_sample.jsonl", audit_records)
 
     _print_console_summary(
-        split_name=args.evaluation_split,
+        split_name=prediction_scope,
         examples=len(evaluation_examples),
         split_verified=bool(split_verification["verified"]),
         ce5_result=ce5_diagnostics,
