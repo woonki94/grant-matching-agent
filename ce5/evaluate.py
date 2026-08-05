@@ -1,6 +1,6 @@
 """Evaluate a CE5 latent-head checkpoint and inspect what its experts learned.
 
-The evaluator reproduces the grouped split used by ``ce5/train.py``.  It
+The evaluator reproduces the three-way grouped split used by ``ce5/train.py``.  It
 reports ordinary teacher-imitation metrics, but also measures expert variance,
 expert correlations, gate behavior, weighted logit contributions, and latent
 attention overlap.  The untouched ModernCE checkpoint can be evaluated on the
@@ -9,7 +9,7 @@ same examples as a speed and quality baseline.
 Generated files are JSON/JSONL so later analysis is not coupled to W&B:
 
 * ``evaluation_summary.json`` -- aggregate metrics and latent diagnostics
-* ``validation_predictions.jsonl`` -- one record per evaluated pair
+* ``<split>_predictions.jsonl`` -- one record per evaluated pair
 * ``attention_examples.jsonl`` -- high-gate and high-error explanations
 * ``human_audit_sample.jsonl`` -- score-stratified examples for manual review
 """
@@ -45,10 +45,10 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 DEFAULT_JUDGMENTS = (
-    REPO_ROOT / "ce5" / "dataset" / "judgments" / "teacher_judgments.jsonl"
+    REPO_ROOT / "ce5" / "dataset" / "judgments" / "teacher_judgments_v2.jsonl"
 )
-DEFAULT_CHECKPOINT = REPO_ROOT / "ce5" / "models" / "latent_head_distilled" / "best.pt"
-DEFAULT_OUTPUT_DIR = REPO_ROOT / "ce5" / "eval" / "results" / "latent_head_distilled"
+DEFAULT_CHECKPOINT = REPO_ROOT / "ce5" / "models" / "latent_head_distilled_v2" / "best.pt"
+DEFAULT_OUTPUT_DIR = REPO_ROOT / "ce5" / "eval" / "results" / "latent_head_distilled_v2"
 DEFAULT_BASELINE_MODEL = "dleemiller/ModernCE-base-sts"
 SCORE_BINS = (
     ("0.00-0.25", 0.00, 0.25, False),
@@ -107,6 +107,55 @@ def _file_sha256(path: Path) -> str:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _pair_id_sha256(examples: Sequence[Any]) -> str:
+    digest = hashlib.sha256()
+    for pair_id in sorted(str(example.pair_id) for example in examples):
+        digest.update(pair_id.encode("utf-8"))
+        digest.update(b"\n")
+    return digest.hexdigest()
+
+
+def _verify_split_manifest(
+    examples: Sequence[Any],
+    *,
+    split_name: str,
+    manifest_path: Path,
+    allow_unverified: bool,
+) -> dict[str, Any]:
+    manifest = _load_json(manifest_path)
+    manifest_entry = manifest.get(split_name)
+    expected_hash = (
+        _clean_text(manifest_entry.get("pair_id_sha256"))
+        if isinstance(manifest_entry, Mapping)
+        else ""
+    )
+    actual_hash = _pair_id_sha256(examples)
+    result: dict[str, Any] = {
+        "manifest": str(manifest_path),
+        "required": not allow_unverified,
+        "verified": False,
+        "expected_pair_id_sha256": expected_hash or None,
+        "actual_pair_id_sha256": actual_hash,
+        "examples_before_limit": len(examples),
+    }
+    if not expected_hash:
+        if not allow_unverified:
+            raise RuntimeError(
+                f"Cannot verify the {split_name} split: missing {manifest_path}. "
+                "Re-run training or use --skip-split-verification only for a "
+                "legacy checkpoint."
+            )
+        return result
+    if actual_hash != expected_hash:
+        raise RuntimeError(
+            f"The reconstructed {split_name} split does not match {manifest_path}: "
+            f"expected {expected_hash}, got {actual_hash}. Check the judgments "
+            "file and training split arguments."
+        )
+    result["verified"] = True
+    return result
 
 
 def _positive_int(value: str) -> int:
@@ -240,10 +289,37 @@ def _metrics(
     query_ids: Sequence[str],
     *,
     min_score_gap: float,
-) -> dict[str, float | int]:
+) -> dict[str, Any]:
     if not predictions or len(predictions) != len(targets):
         raise ValueError("Predictions and targets must be non-empty and equally sized")
     errors = [prediction - target for prediction, target in zip(predictions, targets, strict=True)]
+    band_counts = {
+        name: {"examples": 0, "out_of_band": 0}
+        for name in ("low", "mid", "high")
+    }
+    out_of_score_band = 0
+    for prediction, target in zip(predictions, targets, strict=True):
+        teacher_band = _oob_score_band(target)
+        is_out_of_band = (
+            prediction < 0.0
+            or prediction > 1.0
+            or _oob_score_band(prediction) != teacher_band
+        )
+        band_counts[teacher_band]["examples"] += 1
+        band_counts[teacher_band]["out_of_band"] += int(is_out_of_band)
+        out_of_score_band += int(is_out_of_band)
+    out_of_band_by_teacher_band = {
+        name: {
+            **counts,
+            "ratio": counts["out_of_band"] / counts["examples"]
+            if counts["examples"]
+            else None,
+        }
+        for name, counts in band_counts.items()
+    }
+    outside_unit_interval = sum(
+        prediction < 0.0 or prediction > 1.0 for prediction in predictions
+    )
     mse = _mean([error * error for error in errors])
     pairwise, pair_count = _pairwise_accuracy(
         predictions,
@@ -265,6 +341,9 @@ def _metrics(
         "target_mean": _mean(targets),
         "target_std": _std(targets),
         "mean_error": _mean(errors),
+        "out_of_score_band_ratio": out_of_score_band / len(predictions),
+        "out_of_score_band_by_teacher_band": out_of_band_by_teacher_band,
+        "outside_unit_interval_ratio": outside_unit_interval / len(predictions),
     }
 
 
@@ -273,6 +352,14 @@ def _score_bin(score: float) -> str:
         if score >= lower and (score <= upper if include_upper else score < upper):
             return name
     return SCORE_BINS[-1][0]
+
+
+def _oob_score_band(score: float) -> str:
+    if score < 0.25:
+        return "low"
+    if score < 0.75:
+        return "mid"
+    return "high"
 
 
 def _correlation_matrix(
@@ -962,6 +1049,109 @@ def _comparison_delta(
     return output
 
 
+def _print_console_summary(
+    *,
+    split_name: str,
+    examples: int,
+    split_verified: bool,
+    ce5_result: Mapping[str, Any],
+    comparisons: Mapping[str, Any],
+    summary_path: Path,
+) -> None:
+    methods: list[tuple[str, Mapping[str, Any]]] = []
+    if "untouched_modernce" in comparisons:
+        methods.append(("Untouched STS", comparisons["untouched_modernce"]))
+    if "fine_tuned_single_head" in comparisons:
+        methods.append(("Fine-tuned CE", comparisons["fine_tuned_single_head"]))
+    methods.append(("CE5 latent-head", ce5_result))
+
+    columns = (
+        ("Method", 17),
+        ("MAE", 8),
+        ("RMSE", 8),
+        ("Pearson", 9),
+        ("Spearman", 9),
+        ("PairAcc", 9),
+        ("Low OOB", 9),
+        ("Mid OOB", 9),
+        ("High OOB", 9),
+        ("Ex/s", 9),
+    )
+    header = "  ".join(label.ljust(width) for label, width in columns)
+    print("\n=== CE5 evaluation ===")
+    verification = "VERIFIED" if split_verified else "NOT VERIFIED"
+    print(f"Split: {split_name} | examples: {examples:,} | manifest: {verification}")
+    print(header)
+    print("  ".join("-" * width for _, width in columns))
+    for method_name, result in methods:
+        metrics = result["metrics"]
+        runtime = result.get("runtime", {})
+        oob_by_band = metrics["out_of_score_band_by_teacher_band"]
+
+        def format_oob(name: str, width: int) -> str:
+            ratio = oob_by_band[name]["ratio"]
+            return (
+                "n/a" if ratio is None else f"{100.0 * float(ratio):.2f}%"
+            ).rjust(width)
+
+        values = (
+            method_name.ljust(columns[0][1]),
+            f"{float(metrics['mae']):.4f}".rjust(columns[1][1]),
+            f"{float(metrics['rmse']):.4f}".rjust(columns[2][1]),
+            f"{float(metrics['pearson']):.4f}".rjust(columns[3][1]),
+            f"{float(metrics['spearman']):.4f}".rjust(columns[4][1]),
+            f"{100.0 * float(metrics['pairwise_accuracy']):.2f}%".rjust(columns[5][1]),
+            format_oob("low", columns[6][1]),
+            format_oob("mid", columns[7][1]),
+            format_oob("high", columns[8][1]),
+            f"{float(runtime.get('examples_per_second_model', 0.0)):,.0f}".rjust(columns[9][1]),
+        )
+        print("  ".join(values))
+
+    for comparison_name, label in (
+        ("untouched_modernce", "untouched STS"),
+        ("fine_tuned_single_head", "fine-tuned CE"),
+    ):
+        comparison = comparisons.get(comparison_name)
+        if not isinstance(comparison, Mapping):
+            continue
+        baseline = comparison["metrics"]
+        ce5_metrics = ce5_result["metrics"]
+        mae_change = 100.0 * (
+            float(ce5_metrics["mae"]) / max(float(baseline["mae"]), 1e-12) - 1.0
+        )
+        rmse_change = 100.0 * (
+            float(ce5_metrics["rmse"]) / max(float(baseline["rmse"]), 1e-12) - 1.0
+        )
+        pearson_change = float(ce5_metrics["pearson"]) - float(baseline["pearson"])
+        spearman_change = float(ce5_metrics["spearman"]) - float(baseline["spearman"])
+        pairwise_change = 100.0 * (
+            float(ce5_metrics["pairwise_accuracy"])
+            - float(baseline["pairwise_accuracy"])
+        )
+        print(
+            f"CE5 vs {label}: MAE {mae_change:+.2f}%, "
+            f"RMSE {rmse_change:+.2f}%, Pearson {pearson_change:+.4f}, "
+            f"Spearman {spearman_change:+.4f}, PairAcc {pairwise_change:+.2f} pp"
+        )
+        ce5_oob = ce5_metrics["out_of_score_band_by_teacher_band"]
+        baseline_oob = baseline["out_of_score_band_by_teacher_band"]
+        band_changes: list[str] = []
+        for band_name in ("low", "mid", "high"):
+            ce5_ratio = ce5_oob[band_name]["ratio"]
+            baseline_ratio = baseline_oob[band_name]["ratio"]
+            if ce5_ratio is None or baseline_ratio is None:
+                band_changes.append(f"{band_name} n/a")
+            else:
+                change = 100.0 * (float(ce5_ratio) - float(baseline_ratio))
+                band_changes.append(f"{band_name} {change:+.2f} pp")
+        print(f"OOB change vs {label}: " + ", ".join(band_changes))
+    print(
+        "OOB bands by teacher score: low [0,.25), mid [.25,.75), high [.75,1]."
+    )
+    print(f"Full report: {summary_path}\n")
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Evaluate CE5 and diagnose latent expert behavior."
@@ -971,11 +1161,31 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
     parser.add_argument("--training-config", type=Path)
     parser.add_argument("--tokenizer", default="")
-    parser.add_argument("--evaluation-split", choices=("validation", "train", "all"), default="validation")
+    parser.add_argument(
+        "--evaluation-split",
+        choices=("test", "validation", "train", "all"),
+        default="test",
+        help="Dataset partition to evaluate (default: held-out test).",
+    )
     parser.add_argument("--validation-ratio", type=_unit_float)
+    parser.add_argument("--test-ratio", type=_unit_float)
     parser.add_argument(
         "--split-group",
-        choices=("grant_id", "grant_item_id", "faculty_id", "faculty_item_id", "pair_id"),
+        choices=(
+            "owner",
+            "target_owner_id",
+            "target_item_id",
+            "grant_id",
+            "grant_item_id",
+            "faculty_id",
+            "faculty_item_id",
+            "pair_id",
+        ),
+    )
+    parser.add_argument(
+        "--skip-split-verification",
+        action="store_true",
+        help="Allow evaluation without matching the training split manifest (legacy only).",
     )
     parser.add_argument("--seed", type=int)
     parser.add_argument("--min-confidence", type=_unit_float)
@@ -1046,7 +1256,10 @@ def main() -> int:
     validation_ratio = float(
         _setting(args.validation_ratio, training_arguments, "validation_ratio", 0.1)
     )
-    split_group = str(_setting(args.split_group, training_arguments, "split_group", "grant_id"))
+    test_ratio = float(
+        _setting(args.test_ratio, training_arguments, "test_ratio", 0.1)
+    )
+    split_group = str(_setting(args.split_group, training_arguments, "split_group", "owner"))
     seed = int(_setting(args.seed, training_arguments, "seed", 42))
     min_confidence = float(
         _setting(args.min_confidence, training_arguments, "min_confidence", 0.0)
@@ -1073,7 +1286,11 @@ def main() -> int:
     )
 
     from ce5.model import ModernCELatentHeadModel
-    from ce5.train import load_judgments, split_examples
+    from ce5.train import (
+        _mix_training_examples,
+        load_judgments,
+        split_examples_three_way,
+    )
     from transformers import AutoModelForSequenceClassification, AutoTokenizer
 
     examples, loading_stats = load_judgments(
@@ -1082,18 +1299,51 @@ def main() -> int:
         duplicate_policy=duplicate_policy,
         max_examples=max_examples,
     )
-    train_examples, validation_examples = split_examples(
+    train_pool, validation_examples, test_examples = split_examples_three_way(
         examples,
         validation_ratio=validation_ratio,
+        test_ratio=test_ratio,
         split_group=split_group,
         seed=seed,
     )
-    if args.evaluation_split == "validation":
+    use_all_training_pairs = bool(training_arguments.get("use_all_training_pairs", False))
+    training_pair_mix = training_arguments.get(
+        "training_pair_mix",
+        {"grant_faculty": 0.8, "grant_grant": 0.1, "faculty_faculty": 0.1},
+    )
+    if use_all_training_pairs:
+        train_examples = list(train_pool)
+    elif isinstance(training_pair_mix, Mapping):
+        train_examples = _mix_training_examples(
+            train_pool,
+            ratios={str(key): float(value) for key, value in training_pair_mix.items()},
+            seed=seed,
+        )
+    else:
+        raise RuntimeError("training_pair_mix in run_config.json must be an object")
+
+    if args.evaluation_split == "test":
+        evaluation_examples = test_examples
+    elif args.evaluation_split == "validation":
         evaluation_examples = validation_examples
     elif args.evaluation_split == "train":
         evaluation_examples = train_examples
     else:
         evaluation_examples = examples
+
+    split_manifest_path = checkpoint_path.parent / "split_manifest.json"
+    split_verification: dict[str, Any] = {
+        "manifest": str(split_manifest_path),
+        "required": False,
+        "verified": False,
+    }
+    if args.evaluation_split != "all":
+        split_verification = _verify_split_manifest(
+            evaluation_examples,
+            split_name=args.evaluation_split,
+            manifest_path=split_manifest_path,
+            allow_unverified=args.skip_split_verification,
+        )
     if args.limit_evaluation > 0:
         evaluation_examples = evaluation_examples[: args.limit_evaluation]
     if not evaluation_examples:
@@ -1254,8 +1504,9 @@ def main() -> int:
         size=args.audit_sample_size,
         seed=seed + 101,
     )
+    predictions_path = output_dir / f"{args.evaluation_split}_predictions.jsonl"
     summary = {
-        "schema_version": "ce5.evaluation.v1",
+        "schema_version": "ce5.evaluation.v2",
         "created_at_utc": _utc_now(),
         "checkpoint": str(checkpoint_path),
         "checkpoint_sha256": _file_sha256(checkpoint_path),
@@ -1268,6 +1519,7 @@ def main() -> int:
         "configuration": {
             "evaluation_split": args.evaluation_split,
             "validation_ratio": validation_ratio,
+            "test_ratio": test_ratio,
             "split_group": split_group,
             "seed": seed,
             "min_confidence": min_confidence,
@@ -1283,14 +1535,17 @@ def main() -> int:
         "data": {
             "loading": loading_stats,
             "all_examples": len(examples),
+            "train_pool_examples": len(train_pool),
             "train_examples": len(train_examples),
             "validation_examples": len(validation_examples),
+            "test_examples": len(test_examples),
             "evaluated_examples": len(evaluation_examples),
+            "split_verification": split_verification,
         },
         "ce5": ce5_diagnostics,
         "comparisons": comparisons,
         "outputs": {
-            "predictions": str(output_dir / "validation_predictions.jsonl"),
+            "predictions": str(predictions_path),
             "attention_examples": str(output_dir / "attention_examples.jsonl"),
             "human_audit_sample": str(output_dir / "human_audit_sample.jsonl"),
         },
@@ -1299,25 +1554,17 @@ def main() -> int:
     output_dir.mkdir(parents=True, exist_ok=True)
     summary_path = output_dir / "evaluation_summary.json"
     _write_json(summary_path, summary)
-    _write_jsonl(output_dir / "validation_predictions.jsonl", prediction_records)
+    _write_jsonl(predictions_path, prediction_records)
     _write_jsonl(output_dir / "attention_examples.jsonl", attention_examples)
     _write_jsonl(output_dir / "human_audit_sample.jsonl", audit_records)
 
-    print(
-        json.dumps(
-            {
-                "summary": str(summary_path),
-                "ce5_metrics": ce5_diagnostics["metrics"],
-                "comparison_metrics": {
-                    name: result["metrics"] for name, result in comparisons.items()
-                },
-                "evaluated_examples": len(evaluation_examples),
-                "attention_examples": len(attention_examples),
-                "audit_examples": len(audit_records),
-            },
-            ensure_ascii=False,
-            indent=2,
-        )
+    _print_console_summary(
+        split_name=args.evaluation_split,
+        examples=len(evaluation_examples),
+        split_verified=bool(split_verification["verified"]),
+        ce5_result=ce5_diagnostics,
+        comparisons=comparisons,
+        summary_path=summary_path,
     )
     return 0
 
