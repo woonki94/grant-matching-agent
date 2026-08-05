@@ -1212,6 +1212,14 @@ def build_parser() -> argparse.ArgumentParser:
             "same-side rows are deterministically sampled."
         ),
     )
+    parser.add_argument(
+        "--use-all-training-pairs",
+        action="store_true",
+        help=(
+            "Use every row assigned to the training split. This overrides "
+            "--training-pair-mix and preserves the raw pair-type distribution."
+        ),
+    )
     parser.add_argument("--seed", type=int, default=42)
 
     parser.add_argument("--num-latent-heads", type=_positive_int, default=6)
@@ -1294,11 +1302,16 @@ def main() -> int:
         split_group=args.split_group,
         seed=args.seed,
     )
-    train_examples = _mix_training_examples(
-        train_pool,
-        ratios=args.training_pair_mix,
-        seed=args.seed,
-    )
+    if args.use_all_training_pairs:
+        train_examples = list(train_pool)
+        training_mix_mode = "all"
+    else:
+        train_examples = _mix_training_examples(
+            train_pool,
+            ratios=args.training_pair_mix,
+            seed=args.seed,
+        )
+        training_mix_mode = "sampled_ratio"
     data_summary = {
         "loading": loading_stats,
         "all": _dataset_summary(examples),
@@ -1309,6 +1322,7 @@ def main() -> int:
         "split_group": args.split_group,
         "validation_ratio": args.validation_ratio,
         "test_ratio": args.test_ratio,
+        "training_mix_mode": training_mix_mode,
         "training_pair_mix_requested": args.training_pair_mix,
     }
     if args.dry_run:
@@ -1326,6 +1340,7 @@ def main() -> int:
             "split_group": args.split_group,
             "validation_ratio": args.validation_ratio,
             "test_ratio": args.test_ratio,
+            "training_mix_mode": training_mix_mode,
             "training_pair_mix_requested": args.training_pair_mix,
             "train_before_pair_mix": _split_manifest_entry(
                 train_pool,
@@ -1469,6 +1484,7 @@ def main() -> int:
             "ranking_max_pairs_per_batch": args.ranking_max_pairs_per_batch,
             "diversity_loss_weight": args.diversity_loss_weight,
             "gate_balance_loss_weight": args.gate_balance_loss_weight,
+            "training_mix_mode": training_mix_mode,
             "training_pair_mix_requested": args.training_pair_mix,
         },
         "parameter_counts_at_start": _parameter_counts(model),
