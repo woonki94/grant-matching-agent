@@ -1,24 +1,27 @@
 """Train the CE5 multi-latent-head cross encoder from LLM judgments.
 
-The trainer consumes ``ce5.judgment.v1`` JSONL records written by
+The trainer consumes ``ce5.judgment.v2`` JSONL records written by
 ``ce5/data_preparation/llm_distillation.py``.  It optimizes continuous
 capability-coverage scores, optionally weighted by teacher confidence, and adds
-an in-batch ranking objective for candidates that share a grant requirement.
+an in-batch ranking objective for candidates that share a target capability.
 
-The default validation split is grouped by grant ID.  Consequently, keywords
-from one grant cannot be divided between training and validation by accident.
+The default train/validation/test split keeps each source owner together and
+approximately preserves every pair-type/teacher-score stratum.  The held-out
+test set is recorded but never evaluated during training.
 """
 
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import random
 import sys
 import time
+from collections import Counter, defaultdict
 from contextlib import nullcontext
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable, Iterator, Mapping, Optional, Sequence
@@ -39,34 +42,66 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-JUDGMENT_SCHEMA_VERSION = "ce5.judgment.v1"
+JUDGMENT_SCHEMA_VERSION = "ce5.judgment.v2"
+LEGACY_JUDGMENT_SCHEMA_VERSION = "ce5.judgment.v1"
 DEFAULT_MODEL_ID = "dleemiller/ModernCE-base-sts"
-DEFAULT_JUDGMENTS = REPO_ROOT / "ce5" / "dataset" / "judgments" / "teacher_judgments.jsonl"
-DEFAULT_OUTPUT_DIR = REPO_ROOT / "ce5" / "models" / "latent_head_distilled"
+DEFAULT_JUDGMENTS = REPO_ROOT / "ce5" / "dataset" / "judgments" / "teacher_judgments_v2.jsonl"
+DEFAULT_OUTPUT_DIR = REPO_ROOT / "ce5" / "models" / "latent_head_distilled_v2"
+PAIR_TYPES = ("grant_faculty", "grant_grant", "faculty_faculty")
+SPLIT_NAMES = ("train", "validation", "test")
 
 
 @dataclass(frozen=True)
 class JudgmentExample:
     pair_id: str
-    grant_item_id: str
-    grant_id: str
-    faculty_item_id: str
-    faculty_id: str
-    grant_text: str
-    faculty_text: str
+    pair_type: str
+    direction: str
+    target_item_id: str
+    target_owner_id: str
+    target_text: str
+    candidate_item_id: str
+    candidate_owner_id: str
+    candidate_text: str
     score: float
     confidence: float
     prefilter_band: str
     judgment_id: str
 
+    # Compatibility aliases keep the existing evaluator usable for legacy G-F
+    # checkpoints while the internal representation is source-neutral.
+    @property
+    def grant_item_id(self) -> str:
+        return self.target_item_id
+
+    @property
+    def grant_id(self) -> str:
+        return self.target_owner_id
+
+    @property
+    def grant_text(self) -> str:
+        return self.target_text
+
+    @property
+    def faculty_item_id(self) -> str:
+        return self.candidate_item_id
+
+    @property
+    def faculty_id(self) -> str:
+        return self.candidate_owner_id
+
+    @property
+    def faculty_text(self) -> str:
+        return self.candidate_text
+
     def split_value(self, field: str) -> str:
+        if field == "owner":
+            owner_kind = (
+                "faculty" if self.pair_type == "faculty_faculty" else "grant"
+            )
+            return f"{owner_kind}:{self.target_owner_id or self.target_item_id}"
         value = getattr(self, field, "")
         if value:
             return str(value)
-        if field == "grant_id":
-            return self.grant_item_id
-        if field == "faculty_id":
-            return self.faculty_item_id
         return self.pair_id
 
 
@@ -88,8 +123,8 @@ class JudgmentCollator:
 
     def __call__(self, examples: Sequence[JudgmentExample]) -> dict[str, Any]:
         encoded = self.tokenizer(
-            [example.grant_text for example in examples],
-            [example.faculty_text for example in examples],
+            [example.target_text for example in examples],
+            [example.candidate_text for example in examples],
             padding=True,
             truncation=True,
             max_length=self.max_length,
@@ -103,8 +138,9 @@ class JudgmentCollator:
             "confidences": torch.tensor(
                 [example.confidence for example in examples], dtype=torch.float32
             ),
-            "query_ids": [example.grant_item_id for example in examples],
+            "query_ids": [example.target_item_id for example in examples],
             "pair_ids": [example.pair_id for example in examples],
+            "pair_types": [example.pair_type for example in examples],
         }
 
 
@@ -123,7 +159,7 @@ class GroupedBatchSampler(Sampler[list[int]]):
             raise ValueError("batch_size must be positive")
         grouped: dict[str, list[int]] = {}
         for index, example in enumerate(examples):
-            grouped.setdefault(example.grant_item_id, []).append(index)
+            grouped.setdefault(example.target_item_id, []).append(index)
         self.groups = list(grouped.values())
         self.batch_size = int(batch_size)
         self.shuffle = bool(shuffle)
@@ -204,22 +240,85 @@ def _positive_float(value: str) -> float:
     return parsed
 
 
-def _parse_judgment(row: Mapping[str, Any], *, path: Path, line_number: int) -> JudgmentExample:
-    if row.get("schema_version") != JUDGMENT_SCHEMA_VERSION:
-        raise RuntimeError(
-            f"Unsupported schema at {path}:{line_number}: {row.get('schema_version')!r}"
+def _parse_training_pair_mix(value: str) -> dict[str, float]:
+    parsed = {pair_type: 0.0 for pair_type in PAIR_TYPES}
+    for raw_part in value.split(","):
+        part = raw_part.strip()
+        if not part:
+            continue
+        if "=" not in part:
+            raise argparse.ArgumentTypeError(
+                "pair mix must use pair_type=ratio entries"
+            )
+        raw_name, raw_ratio = part.split("=", 1)
+        name = raw_name.strip().lower().replace("-", "_")
+        if name not in parsed:
+            raise argparse.ArgumentTypeError(
+                f"unsupported pair type {name!r}; use {','.join(PAIR_TYPES)}"
+            )
+        try:
+            ratio = float(raw_ratio)
+        except ValueError as exc:
+            raise argparse.ArgumentTypeError(
+                f"invalid ratio for {name}: {raw_ratio!r}"
+            ) from exc
+        if ratio < 0.0:
+            raise argparse.ArgumentTypeError("pair mix ratios cannot be negative")
+        parsed[name] = ratio
+    total = sum(parsed.values())
+    if not math.isclose(total, 1.0, rel_tol=0.0, abs_tol=1e-6):
+        raise argparse.ArgumentTypeError(
+            f"pair mix ratios must sum to 1.0; received {total:.6f}"
         )
-    required_text = {
-        "pair_id": _clean_text(row.get("pair_id")),
-        "grant_item_id": _clean_text(row.get("grant_item_id")),
-        "faculty_item_id": _clean_text(row.get("faculty_item_id")),
-        "grant_text": _clean_text(row.get("grant_text")),
-        "faculty_text": _clean_text(row.get("faculty_text")),
-    }
+    if parsed["grant_faculty"] <= 0.0:
+        raise argparse.ArgumentTypeError(
+            "grant_faculty must have a positive training ratio"
+        )
+    return parsed
+
+
+def _parse_judgment(row: Mapping[str, Any], *, path: Path, line_number: int) -> JudgmentExample:
+    schema_version = row.get("schema_version")
+    if schema_version not in {
+        JUDGMENT_SCHEMA_VERSION,
+        LEGACY_JUDGMENT_SCHEMA_VERSION,
+    }:
+        raise RuntimeError(
+            f"Unsupported schema at {path}:{line_number}: {schema_version!r}"
+        )
+    if schema_version == LEGACY_JUDGMENT_SCHEMA_VERSION:
+        required_text = {
+            "pair_id": _clean_text(row.get("pair_id")),
+            "target_item_id": _clean_text(row.get("grant_item_id")),
+            "target_text": _clean_text(row.get("grant_text")),
+            "candidate_item_id": _clean_text(row.get("faculty_item_id")),
+            "candidate_text": _clean_text(row.get("faculty_text")),
+        }
+        pair_type = "grant_faculty"
+        direction = "grant_to_faculty"
+        target_owner_id = _clean_text(row.get("grant_id"))
+        candidate_owner_id = _clean_text(row.get("faculty_id"))
+    else:
+        required_text = {
+            "pair_id": _clean_text(row.get("pair_id")),
+            "target_item_id": _clean_text(row.get("target_item_id")),
+            "target_text": _clean_text(row.get("target_text")),
+            "candidate_item_id": _clean_text(row.get("candidate_item_id")),
+            "candidate_text": _clean_text(row.get("candidate_text")),
+        }
+        pair_type = _clean_text(row.get("pair_type"))
+        direction = _clean_text(row.get("direction"))
+        target_owner_id = _clean_text(row.get("target_owner_id"))
+        candidate_owner_id = _clean_text(row.get("candidate_owner_id"))
     missing = [name for name, value in required_text.items() if not value]
     if missing:
         raise RuntimeError(
             f"Missing required field(s) at {path}:{line_number}: {', '.join(missing)}"
+        )
+    if pair_type not in PAIR_TYPES:
+        raise RuntimeError(
+            f"Unsupported pair_type at {path}:{line_number}: "
+            f"{pair_type!r}"
         )
     try:
         score = float(row["score"])
@@ -234,8 +333,10 @@ def _parse_judgment(row: Mapping[str, Any], *, path: Path, line_number: int) -> 
         raise RuntimeError(f"Confidence outside [0,1] at {path}:{line_number}")
     return JudgmentExample(
         **required_text,
-        grant_id=_clean_text(row.get("grant_id")),
-        faculty_id=_clean_text(row.get("faculty_id")),
+        pair_type=pair_type,
+        direction=direction,
+        target_owner_id=target_owner_id,
+        candidate_owner_id=candidate_owner_id,
         score=score,
         confidence=confidence,
         prefilter_band=_clean_text(row.get("prefilter_band")).lower(),
@@ -296,6 +397,130 @@ def load_judgments(
     return examples, stats
 
 
+def _score_bin(score: float) -> str:
+    if score < 0.25:
+        return "0.00-0.24"
+    if score < 0.50:
+        return "0.25-0.49"
+    if score < 0.75:
+        return "0.50-0.74"
+    return "0.75-1.00"
+
+
+def _stable_tiebreak(seed: int, value: str) -> bytes:
+    return hashlib.sha256(f"{seed}\x1f{value}".encode("utf-8")).digest()
+
+
+def split_examples_three_way(
+    examples: Sequence[JudgmentExample],
+    *,
+    validation_ratio: float,
+    test_ratio: float,
+    split_group: str,
+    seed: int,
+) -> tuple[list[JudgmentExample], list[JudgmentExample], list[JudgmentExample]]:
+    if validation_ratio + test_ratio >= 1.0:
+        raise ValueError("validation_ratio + test_ratio must be smaller than 1")
+    if validation_ratio <= 0.0 and test_ratio <= 0.0:
+        return list(examples), [], []
+    grouped: dict[str, list[JudgmentExample]] = {}
+    for example in examples:
+        grouped.setdefault(example.split_value(split_group), []).append(example)
+    required_splits = 1 + int(validation_ratio > 0.0) + int(test_ratio > 0.0)
+    if len(grouped) < required_splits:
+        raise RuntimeError(
+            f"Grouped splitting requires at least {required_splits} distinct "
+            f"{split_group} values"
+        )
+
+    ratios = {"validation": validation_ratio, "test": test_ratio}
+    held_out_splits = [name for name in ("validation", "test") if ratios[name] > 0.0]
+    feature_totals: Counter[tuple[str, str]] = Counter(
+        (example.pair_type, _score_bin(example.score)) for example in examples
+    )
+    target_rows = {name: len(examples) * ratios[name] for name in held_out_splits}
+    target_features = {
+        name: {
+            feature: count * ratios[name]
+            for feature, count in feature_totals.items()
+        }
+        for name in held_out_splits
+    }
+    current_rows = {name: 0 for name in held_out_splits}
+    current_features = {
+        name: Counter() for name in held_out_splits
+    }
+    assignments: dict[str, str] = {}
+
+    group_features = {
+        key: Counter(
+            (example.pair_type, _score_bin(example.score)) for example in values
+        )
+        for key, values in grouped.items()
+    }
+    ordered_keys = sorted(
+        grouped,
+        key=lambda key: (
+            -len(grouped[key]),
+            _stable_tiebreak(seed, key),
+        ),
+    )
+
+    for key in ordered_keys:
+        row_count = len(grouped[key])
+        features = group_features[key]
+        best_split = "train"
+        best_gain = 0.0
+        best_tiebreak = b""
+        for split_name in held_out_splits:
+            row_target = max(1.0, target_rows[split_name])
+            before_penalty = (
+                (current_rows[split_name] - row_target) / row_target
+            ) ** 2
+            after_penalty = (
+                (current_rows[split_name] + row_count - row_target) / row_target
+            ) ** 2
+            for feature, feature_count in features.items():
+                feature_target = max(1.0, target_features[split_name][feature])
+                before_penalty += (
+                    (current_features[split_name][feature] - feature_target)
+                    / feature_target
+                ) ** 2
+                after_penalty += (
+                    (
+                        current_features[split_name][feature]
+                        + feature_count
+                        - feature_target
+                    ) / feature_target
+                ) ** 2
+            gain = before_penalty - after_penalty
+            tiebreak = _stable_tiebreak(seed, f"{key}\x1f{split_name}")
+            if gain > best_gain or (
+                math.isclose(gain, best_gain) and gain > 0.0 and tiebreak < best_tiebreak
+            ):
+                best_gain = gain
+                best_split = split_name
+                best_tiebreak = tiebreak
+        assignments[key] = best_split
+        if best_split != "train":
+            current_rows[best_split] += row_count
+            current_features[best_split].update(features)
+
+    split_values: dict[str, list[JudgmentExample]] = {
+        name: [] for name in SPLIT_NAMES
+    }
+    for key, values in grouped.items():
+        split_values[assignments[key]].extend(values)
+    for split_name in ("train", *held_out_splits):
+        if not split_values[split_name]:
+            raise RuntimeError(f"The grouped split produced an empty {split_name} set")
+    return (
+        split_values["train"],
+        split_values["validation"],
+        split_values["test"],
+    )
+
+
 def split_examples(
     examples: Sequence[JudgmentExample],
     *,
@@ -303,6 +528,7 @@ def split_examples(
     split_group: str,
     seed: int,
 ) -> tuple[list[JudgmentExample], list[JudgmentExample]]:
+    """Reproduce the original V1 two-way split used by legacy evaluations."""
     if validation_ratio <= 0.0:
         return list(examples), []
     grouped: dict[str, list[JudgmentExample]] = {}
@@ -312,7 +538,6 @@ def split_examples(
         raise RuntimeError(
             f"Grouped validation requires at least two distinct {split_group} values"
         )
-
     group_keys = sorted(grouped)
     random.Random(seed).shuffle(group_keys)
     validation_target = max(1, round(len(examples) * validation_ratio))
@@ -338,22 +563,67 @@ def split_examples(
     return train, validation
 
 
-def _dataset_summary(examples: Sequence[JudgmentExample]) -> dict[str, Any]:
-    scores = [example.score for example in examples]
-    bands: dict[str, int] = {}
+def _mix_training_examples(
+    examples: Sequence[JudgmentExample],
+    *,
+    ratios: Mapping[str, float],
+    seed: int,
+) -> list[JudgmentExample]:
+    """Keep every G-F row and sample auxiliary pair types to requested ratios."""
+    by_type: dict[str, list[JudgmentExample]] = defaultdict(list)
     for example in examples:
-        bands[example.prefilter_band or "unknown"] = bands.get(
-            example.prefilter_band or "unknown", 0
-        ) + 1
+        by_type[example.pair_type].append(example)
+    grant_faculty_ratio = ratios.get("grant_faculty", 0.0)
+    if grant_faculty_ratio <= 0.0:
+        raise ValueError("The training mix must assign a positive grant_faculty ratio")
+    if not by_type["grant_faculty"]:
+        raise RuntimeError("The training split contains no grant_faculty examples")
+
+    target_total = len(by_type["grant_faculty"]) / grant_faculty_ratio
+    selected = list(by_type["grant_faculty"])
+    for pair_type in ("grant_grant", "faculty_faculty"):
+        requested = round(target_total * ratios.get(pair_type, 0.0))
+        available = sorted(
+            by_type[pair_type],
+            key=lambda example: _stable_tiebreak(seed, example.pair_id),
+        )
+        selected.extend(available[:requested])
+    random.Random(seed).shuffle(selected)
+    return selected
+
+
+def _dataset_summary(examples: Sequence[JudgmentExample]) -> dict[str, Any]:
+    if not examples:
+        return {
+            "examples": 0,
+            "pair_types": {},
+            "score_bins": {},
+            "bands": {},
+        }
+    scores = [example.score for example in examples]
     return {
         "examples": len(examples),
-        "grant_ids": len({example.grant_id for example in examples if example.grant_id}),
-        "grant_items": len({example.grant_item_id for example in examples}),
-        "faculty_ids": len({example.faculty_id for example in examples if example.faculty_id}),
+        "target_owners": len(
+            {example.target_owner_id for example in examples if example.target_owner_id}
+        ),
+        "target_items": len({example.target_item_id for example in examples}),
+        "candidate_owners": len(
+            {
+                example.candidate_owner_id
+                for example in examples
+                if example.candidate_owner_id
+            }
+        ),
+        "pair_types": dict(sorted(Counter(example.pair_type for example in examples).items())),
+        "score_bins": dict(sorted(Counter(_score_bin(example.score) for example in examples).items())),
         "score_min": min(scores),
         "score_mean": sum(scores) / len(scores),
         "score_max": max(scores),
-        "bands": bands,
+        "bands": dict(
+            sorted(
+                Counter(example.prefilter_band or "unknown" for example in examples).items()
+            )
+        ),
     }
 
 
@@ -639,6 +909,40 @@ def _pairwise_accuracy(
     return (correct / count if count else 0.0), count
 
 
+def _prediction_metrics(
+    predictions: Sequence[float],
+    targets: Sequence[float],
+    query_ids: Sequence[str],
+    *,
+    min_score_gap: float,
+) -> dict[str, float | int]:
+    if not predictions:
+        return {}
+    errors = [
+        prediction - target
+        for prediction, target in zip(predictions, targets, strict=True)
+    ]
+    mse = sum(error * error for error in errors) / len(errors)
+    pair_accuracy, pair_count = _pairwise_accuracy(
+        predictions,
+        targets,
+        query_ids,
+        min_score_gap=min_score_gap,
+    )
+    return {
+        "examples": len(predictions),
+        "mae": sum(abs(error) for error in errors) / len(errors),
+        "mse": mse,
+        "rmse": math.sqrt(mse),
+        "pearson": _pearson(predictions, targets),
+        "spearman": _pearson(_average_ranks(predictions), _average_ranks(targets)),
+        "pairwise_accuracy": pair_accuracy,
+        "pairwise_comparisons": pair_count,
+        "prediction_mean": sum(predictions) / len(predictions),
+        "target_mean": sum(targets) / len(targets),
+    }
+
+
 @torch.no_grad()
 def evaluate(
     model: ModernCELatentHeadModel,
@@ -651,6 +955,7 @@ def evaluate(
     predictions: list[float] = []
     targets: list[float] = []
     query_ids: list[str] = []
+    pair_types: list[str] = []
     loss_sums = {name: 0.0 for name in ("total", "pointwise", "ranking", "diversity", "gate_balance")}
     gate_sum: Optional[Tensor] = None
     head_score_sum: Optional[Tensor] = None
@@ -665,6 +970,7 @@ def evaluate(
         predictions.extend(output.scores.detach().float().cpu().tolist())
         targets.extend(batch["labels"].tolist())
         query_ids.extend(batch["query_ids"])
+        pair_types.extend(batch["pair_types"])
         current_gate = output.gate_weights.detach().float().sum(dim=0).cpu()
         current_heads = output.head_scores.detach().float().sum(dim=0).cpu()
         gate_sum = current_gate if gate_sum is None else gate_sum + current_gate
@@ -673,27 +979,31 @@ def evaluate(
         ranking_pairs += batch_rank_pairs
     if example_count == 0:
         return {}
-    errors = [prediction - target for prediction, target in zip(predictions, targets, strict=True)]
-    mse = sum(error * error for error in errors) / len(errors)
-    pair_accuracy, pair_count = _pairwise_accuracy(
+    overall_metrics = _prediction_metrics(
         predictions,
         targets,
         query_ids,
         min_score_gap=args.ranking_min_score_gap,
     )
+    by_pair_type: dict[str, dict[str, float | int]] = {}
+    for pair_type in PAIR_TYPES:
+        indices = [
+            index for index, value in enumerate(pair_types) if value == pair_type
+        ]
+        if not indices:
+            continue
+        by_pair_type[pair_type] = _prediction_metrics(
+            [predictions[index] for index in indices],
+            [targets[index] for index in indices],
+            [query_ids[index] for index in indices],
+            min_score_gap=args.ranking_min_score_gap,
+        )
     expert_names = model.expert_names
     return {
         "loss": {name: total / example_count for name, total in loss_sums.items()},
-        "mae": sum(abs(error) for error in errors) / len(errors),
-        "mse": mse,
-        "rmse": math.sqrt(mse),
-        "pearson": _pearson(predictions, targets),
-        "spearman": _pearson(_average_ranks(predictions), _average_ranks(targets)),
-        "pairwise_accuracy": pair_accuracy,
-        "pairwise_comparisons": pair_count,
+        **overall_metrics,
+        "by_pair_type": by_pair_type,
         "ranking_pairs_in_batches": ranking_pairs,
-        "prediction_mean": sum(predictions) / len(predictions),
-        "target_mean": sum(targets) / len(targets),
         "gate_usage": {
             name: float(gate_sum[index].item() / example_count)
             for index, name in enumerate(expert_names)
@@ -795,6 +1105,27 @@ def _write_json(path: Path, payload: Mapping[str, Any]) -> None:
     path.write_text(json.dumps(payload, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
 
 
+def _pair_id_sha256(examples: Sequence[JudgmentExample]) -> str:
+    digest = hashlib.sha256()
+    for pair_id in sorted(example.pair_id for example in examples):
+        digest.update(pair_id.encode("utf-8"))
+        digest.update(b"\n")
+    return digest.hexdigest()
+
+
+def _split_manifest_entry(
+    examples: Sequence[JudgmentExample],
+    *,
+    split_group: str,
+) -> dict[str, Any]:
+    return {
+        "examples": len(examples),
+        "pair_id_sha256": _pair_id_sha256(examples),
+        "groups": sorted({example.split_value(split_group) for example in examples}),
+        "summary": _dataset_summary(examples),
+    }
+
+
 def _flatten_numeric_metrics(prefix: str, value: Any) -> dict[str, float]:
     if isinstance(value, Mapping):
         flattened: dict[str, float] = {}
@@ -857,10 +1188,29 @@ def build_parser() -> argparse.ArgumentParser:
         default="highest-confidence",
     )
     parser.add_argument("--validation-ratio", type=_unit_interval, default=0.1)
+    parser.add_argument("--test-ratio", type=_unit_interval, default=0.1)
     parser.add_argument(
         "--split-group",
-        choices=("grant_id", "grant_item_id", "faculty_id", "faculty_item_id", "pair_id"),
-        default="grant_id",
+        choices=("owner", "target_owner_id", "target_item_id", "pair_id"),
+        default="owner",
+        help=(
+            "Grouping unit kept wholly in one split. owner keeps G-F/G-G by "
+            "grant owner and F-F by faculty owner (default: owner)."
+        ),
+    )
+    parser.add_argument(
+        "--training-pair-mix",
+        type=_parse_training_pair_mix,
+        default={
+            "grant_faculty": 0.8,
+            "grant_grant": 0.1,
+            "faculty_faculty": 0.1,
+        },
+        help=(
+            "Training-only ratios, e.g. grant_faculty=0.8,grant_grant=0.1,"
+            "faculty_faculty=0.1. Every training G-F row is retained and "
+            "same-side rows are deterministically sampled."
+        ),
     )
     parser.add_argument("--seed", type=int, default=42)
 
@@ -937,23 +1287,64 @@ def main() -> int:
         duplicate_policy=args.duplicate_policy,
         max_examples=args.max_examples,
     )
-    train_examples, validation_examples = split_examples(
+    train_pool, validation_examples, test_examples = split_examples_three_way(
         examples,
         validation_ratio=args.validation_ratio,
+        test_ratio=args.test_ratio,
         split_group=args.split_group,
+        seed=args.seed,
+    )
+    train_examples = _mix_training_examples(
+        train_pool,
+        ratios=args.training_pair_mix,
         seed=args.seed,
     )
     data_summary = {
         "loading": loading_stats,
         "all": _dataset_summary(examples),
+        "train_before_pair_mix": _dataset_summary(train_pool),
         "train": _dataset_summary(train_examples),
         "validation": _dataset_summary(validation_examples) if validation_examples else None,
+        "test": _dataset_summary(test_examples) if test_examples else None,
         "split_group": args.split_group,
         "validation_ratio": args.validation_ratio,
+        "test_ratio": args.test_ratio,
+        "training_pair_mix_requested": args.training_pair_mix,
     }
     if args.dry_run:
         print(json.dumps(data_summary, indent=2, ensure_ascii=False))
         return 0
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    _write_json(
+        output_dir / "split_manifest.json",
+        {
+            "schema_version": "ce5.split-manifest.v1",
+            "created_at_utc": _utc_now(),
+            "judgments": str(judgment_path),
+            "seed": args.seed,
+            "split_group": args.split_group,
+            "validation_ratio": args.validation_ratio,
+            "test_ratio": args.test_ratio,
+            "training_pair_mix_requested": args.training_pair_mix,
+            "train_before_pair_mix": _split_manifest_entry(
+                train_pool,
+                split_group=args.split_group,
+            ),
+            "train": _split_manifest_entry(
+                train_examples,
+                split_group=args.split_group,
+            ),
+            "validation": _split_manifest_entry(
+                validation_examples,
+                split_group=args.split_group,
+            ),
+            "test": _split_manifest_entry(
+                test_examples,
+                split_group=args.split_group,
+            ),
+        },
+    )
 
     from transformers import (
         AutoTokenizer,
@@ -1055,10 +1446,9 @@ def main() -> int:
     )
     scaler = torch.amp.GradScaler("cuda", enabled=device.type == "cuda" and precision == torch.float16)
 
-    output_dir.mkdir(parents=True, exist_ok=True)
     tokenizer.save_pretrained(output_dir / "tokenizer")
     run_config = {
-        "schema_version": "ce5.training-run.v1",
+        "schema_version": "ce5.training-run.v2",
         "created_at_utc": _utc_now(),
         "judgments": str(judgment_path),
         "output_dir": str(output_dir),
@@ -1079,6 +1469,7 @@ def main() -> int:
             "ranking_max_pairs_per_batch": args.ranking_max_pairs_per_batch,
             "diversity_loss_weight": args.diversity_loss_weight,
             "gate_balance_loss_weight": args.gate_balance_loss_weight,
+            "training_pair_mix_requested": args.training_pair_mix,
         },
         "parameter_counts_at_start": _parameter_counts(model),
         "device": str(device),
@@ -1121,7 +1512,17 @@ def main() -> int:
         history.append(epoch_record)
         _write_json(output_dir / "history.json", {"epochs": history})
         model.save_checkpoint(output_dir / "last.pt")
-        current_rmse = float(validation_metrics.get("rmse", train_metrics["pointwise"]))
+        grant_faculty_validation = (
+            validation_metrics.get("by_pair_type", {}).get("grant_faculty", {})
+            if validation_metrics
+            else {}
+        )
+        current_rmse = float(
+            grant_faculty_validation.get(
+                "rmse",
+                validation_metrics.get("rmse", train_metrics["pointwise"]),
+            )
+        )
         if current_rmse < best_rmse:
             best_rmse = current_rmse
             model.save_checkpoint(output_dir / "best.pt")
@@ -1148,6 +1549,7 @@ def main() -> int:
         "epochs": args.epochs,
         "global_step": global_step,
         "best_validation_rmse": best_rmse,
+        "best_metric": "validation/by_pair_type/grant_faculty/rmse",
         "best_checkpoint": str(output_dir / "best.pt"),
         "last_checkpoint": str(output_dir / "last.pt"),
     }
