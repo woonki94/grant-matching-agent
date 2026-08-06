@@ -8,6 +8,8 @@ Architecture files:
 
 - `independent_latent_heads.py`: the original CE5 model and control baseline.
 - `directional_latent_matcher.py`: directional, interacting-latent architecture.
+- `directional_private_experts.py`: the same directional refinement with a
+  separate output scorer for each latent.
 - `registry.py`: reconstructs the correct architecture from checkpoint metadata.
 
 The compatibility module `ce5/model.py` continues to export the original model

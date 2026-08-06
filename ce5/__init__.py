@@ -11,6 +11,9 @@ from ce5.modeling.directional_latent_matcher import (
     DirectionalLatentMatcherOutput,
     ModernCEDirectionalLatentMatcher,
 )
+from ce5.modeling.directional_private_experts import (
+    ModernCEDirectionalPrivateExperts,
+)
 
 __all__ = [
     "DEFAULT_MODEL_ID",
@@ -20,4 +23,5 @@ __all__ = [
     "DirectionalLatentMatcherConfig",
     "DirectionalLatentMatcherOutput",
     "ModernCEDirectionalLatentMatcher",
+    "ModernCEDirectionalPrivateExperts",
 ]

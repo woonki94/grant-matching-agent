@@ -50,8 +50,12 @@ DEFAULT_OUTPUT_DIR = REPO_ROOT / "ce5" / "models" / "latent_head_distilled_v2"
 DEFAULT_DIRECTIONAL_OUTPUT_DIR = (
     REPO_ROOT / "ce5" / "models" / "directional_latent_matcher_v1"
 )
+DEFAULT_DIRECTIONAL_PRIVATE_OUTPUT_DIR = (
+    REPO_ROOT / "ce5" / "models" / "directional_private_experts_v1"
+)
 INDEPENDENT_ARCHITECTURE_TYPE = "independent_latent_heads"
 DIRECTIONAL_ARCHITECTURE_TYPE = "directional_latent_matcher"
+DIRECTIONAL_PRIVATE_ARCHITECTURE_TYPE = "directional_private_experts"
 PAIR_TYPES = ("grant_faculty", "grant_grant", "faculty_faculty")
 SPLIT_NAMES = ("train", "validation", "test")
 
@@ -1260,9 +1264,14 @@ def build_parser(
     if architecture_type not in {
         INDEPENDENT_ARCHITECTURE_TYPE,
         DIRECTIONAL_ARCHITECTURE_TYPE,
+        DIRECTIONAL_PRIVATE_ARCHITECTURE_TYPE,
     }:
         raise ValueError(f"Unsupported training architecture: {architecture_type!r}")
-    directional = architecture_type == DIRECTIONAL_ARCHITECTURE_TYPE
+    directional = architecture_type in {
+        DIRECTIONAL_ARCHITECTURE_TYPE,
+        DIRECTIONAL_PRIVATE_ARCHITECTURE_TYPE,
+    }
+    private_experts = architecture_type == DIRECTIONAL_PRIVATE_ARCHITECTURE_TYPE
     parser = argparse.ArgumentParser(
         description=(
             "Train the CE5 directional latent matcher from continuous LLM judgments."
@@ -1274,7 +1283,13 @@ def build_parser(
     parser.add_argument(
         "--output-dir",
         type=Path,
-        default=DEFAULT_DIRECTIONAL_OUTPUT_DIR if directional else DEFAULT_OUTPUT_DIR,
+        default=(
+            DEFAULT_DIRECTIONAL_PRIVATE_OUTPUT_DIR
+            if private_experts
+            else DEFAULT_DIRECTIONAL_OUTPUT_DIR
+            if directional
+            else DEFAULT_OUTPUT_DIR
+        ),
     )
     parser.add_argument("--model-id", default=DEFAULT_MODEL_ID)
     parser.add_argument("--resume-checkpoint", type=Path)
@@ -1398,7 +1413,9 @@ def build_parser(
     parser.add_argument(
         "--wandb-tags",
         default=(
-            "ce5,distillation,directional-latent-matcher"
+            "ce5,distillation,directional-private-experts"
+            if private_experts
+            else "ce5,distillation,directional-latent-matcher"
             if directional
             else "ce5,distillation,latent-heads"
         ),
@@ -1500,7 +1517,11 @@ def main(
         get_linear_schedule_with_warmup,
     )
 
-    if architecture_type == DIRECTIONAL_ARCHITECTURE_TYPE:
+    if architecture_type == DIRECTIONAL_PRIVATE_ARCHITECTURE_TYPE:
+        from ce5.modeling.directional_private_experts import (
+            ModernCEDirectionalPrivateExperts as ModelClass,
+        )
+    elif architecture_type == DIRECTIONAL_ARCHITECTURE_TYPE:
         from ce5.modeling.directional_latent_matcher import (
             ModernCEDirectionalLatentMatcher as ModelClass,
         )
@@ -1529,7 +1550,10 @@ def main(
             trust_remote_code=args.trust_remote_code,
         )
         tokenizer_model_id = model.architecture_config.backbone_model_id
-    elif architecture_type == DIRECTIONAL_ARCHITECTURE_TYPE:
+    elif architecture_type in {
+        DIRECTIONAL_ARCHITECTURE_TYPE,
+        DIRECTIONAL_PRIVATE_ARCHITECTURE_TYPE,
+    }:
         model = ModelClass.from_pretrained(
             args.model_id,
             num_latent_heads=args.num_latent_heads,
@@ -1573,7 +1597,11 @@ def main(
 
     collator_class = (
         DirectionalJudgmentCollator
-        if architecture_type == DIRECTIONAL_ARCHITECTURE_TYPE
+        if architecture_type
+        in {
+            DIRECTIONAL_ARCHITECTURE_TYPE,
+            DIRECTIONAL_PRIVATE_ARCHITECTURE_TYPE,
+        }
         else JudgmentCollator
     )
     collator = collator_class(tokenizer, max_length=args.max_length)

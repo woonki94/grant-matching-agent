@@ -1576,9 +1576,8 @@ def main() -> int:
         torch_dtype=precision,
         trust_remote_code=args.trust_remote_code,
     )
-    is_directional_matcher = (
-        getattr(model, "architecture_type", "") == "directional_latent_matcher"
-    )
+    is_directional_matcher = bool(getattr(model, "requires_pair_masks", False))
+    evaluated_architecture_type = str(getattr(model, "architecture_type", ""))
     tokenizer_reference = _clean_text(args.tokenizer)
     if not tokenizer_reference:
         saved_tokenizer = checkpoint_path.parent / "tokenizer"
@@ -1792,7 +1791,11 @@ def main() -> int:
         split_verified=bool(split_verification["verified"]),
         ce5_result=ce5_diagnostics,
         ce5_method_name=(
-            "CE5 directional" if is_directional_matcher else "CE5 latent-head"
+            "CE5 dir-private"
+            if evaluated_architecture_type == "directional_private_experts"
+            else "CE5 directional"
+            if is_directional_matcher
+            else "CE5 latent-head"
         ),
         comparisons=comparisons,
         summary_path=summary_path,

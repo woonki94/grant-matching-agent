@@ -4,6 +4,8 @@ This package contains the trainer implementations and their shared components:
 
 - `train_independent_latent_heads.py`: original CE5 latent-head trainer;
 - `train_directional_latent_matcher.py`: directional interacting-latent trainer;
+- `train_directional_private_experts.py`: directional trainer with private
+  per-latent scorers;
 - `train_plain_ce.py`: controlled plain single-head CE baseline trainer;
 
 - dataset loading and batching;

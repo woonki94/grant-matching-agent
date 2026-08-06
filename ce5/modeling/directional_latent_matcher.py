@@ -171,6 +171,7 @@ class ModernCEDirectionalLatentMatcher(nn.Module):
     """ModernCE plus a lightweight directional latent reasoning module."""
 
     architecture_type = ARCHITECTURE_TYPE
+    requires_pair_masks = True
 
     def __init__(
         self,
@@ -320,6 +321,11 @@ class ModernCEDirectionalLatentMatcher(nn.Module):
             ~keep, torch.finfo(importance_logits.dtype).min
         )
 
+    def _score_latent_deltas(self, latents: Tensor) -> Tensor:
+        """Map refined latent states to per-latent logit corrections."""
+
+        return self.delta_scorer(latents).squeeze(-1)
+
     def forward(
         self,
         input_ids: Tensor,
@@ -374,7 +380,7 @@ class ModernCEDirectionalLatentMatcher(nn.Module):
             candidate_attentions.append(candidate_attention)
 
         latents = self.output_norm(latents)
-        delta_logits = self.delta_scorer(latents).squeeze(-1)
+        delta_logits = self._score_latent_deltas(latents)
         importance_logits = self.importance_scorer(latents).squeeze(-1)
         importance_logits = self._apply_latent_dropout(importance_logits)
         routing_weights = torch.softmax(importance_logits, dim=-1)
@@ -465,9 +471,9 @@ class ModernCEDirectionalLatentMatcher(nn.Module):
         if not isinstance(payload, dict):
             raise RuntimeError("Invalid directional matcher checkpoint")
         architecture_type = payload.get("architecture_type")
-        if architecture_type != ARCHITECTURE_TYPE:
+        if architecture_type != cls.architecture_type:
             raise RuntimeError(
-                f"Expected {ARCHITECTURE_TYPE!r}, found {architecture_type!r}"
+                f"Expected {cls.architecture_type!r}, found {architecture_type!r}"
             )
         version = int(payload.get("format_version", 0))
         if version != CHECKPOINT_FORMAT_VERSION:
