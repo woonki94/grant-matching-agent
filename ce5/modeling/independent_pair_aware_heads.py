@@ -343,7 +343,7 @@ class ModernCEIndependentPairAwareModel(nn.Module):
             base_logit = self.base_sts_expert(cls_state).reshape(-1, 1)
             expert_logits = torch.cat((base_logit, latent_logits), dim=-1)
 
-        gate_logits = self.gate(self.gate_norm(cls_state))
+        gate_logits = self._compute_gate_logits(cls_state, expert_logits)
         gate_logits = self._apply_head_dropout(gate_logits)
         gate_weights = torch.softmax(gate_logits, dim=-1)
         logits = torch.sum(gate_weights * expert_logits, dim=-1)
@@ -357,6 +357,16 @@ class ModernCEIndependentPairAwareModel(nn.Module):
             target_attention_weights=target_attention_weights,
             candidate_attention_weights=candidate_attention_weights,
         )
+
+    def _compute_gate_logits(
+        self,
+        cls_state: Tensor,
+        expert_logits: Tensor,
+    ) -> Tensor:
+        """Return router logits; subclasses may add input-aware corrections."""
+
+        del expert_logits
+        return self.gate(self.gate_norm(cls_state))
 
     def _apply_head_dropout(self, gate_logits: Tensor) -> Tensor:
         probability = self.architecture_config.head_dropout

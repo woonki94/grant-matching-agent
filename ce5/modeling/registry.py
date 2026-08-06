@@ -16,6 +16,10 @@ from ce5.modeling.independent_pair_aware_heads import (
     ARCHITECTURE_TYPE as INDEPENDENT_PAIR_AWARE_ARCHITECTURE_TYPE,
     ModernCEIndependentPairAwareModel,
 )
+from ce5.modeling.logit_aware_router import (
+    ARCHITECTURE_TYPE as LOGIT_AWARE_ROUTER_ARCHITECTURE_TYPE,
+    ModernCELogitAwareRouterModel,
+)
 from ce5.modeling.directional_private_experts import (
     ARCHITECTURE_TYPE as DIRECTIONAL_PRIVATE_ARCHITECTURE_TYPE,
     ModernCEDirectionalPrivateExperts,
@@ -69,6 +73,12 @@ def load_model_from_checkpoint(
         )
     if architecture_type == INDEPENDENT_PAIR_AWARE_ARCHITECTURE_TYPE:
         return ModernCEIndependentPairAwareModel.from_checkpoint(
+            checkpoint_path,
+            map_location=map_location,
+            **pretrained_kwargs,
+        )
+    if architecture_type == LOGIT_AWARE_ROUTER_ARCHITECTURE_TYPE:
+        return ModernCELogitAwareRouterModel.from_checkpoint(
             checkpoint_path,
             map_location=map_location,
             **pretrained_kwargs,

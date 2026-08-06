@@ -19,6 +19,10 @@ from ce5.modeling.independent_pair_aware_heads import (
     IndependentPairAwareOutput,
     ModernCEIndependentPairAwareModel,
 )
+from ce5.modeling.logit_aware_router import (
+    LogitAwareRouterConfig,
+    ModernCELogitAwareRouterModel,
+)
 
 __all__ = [
     "DEFAULT_MODEL_ID",
@@ -32,4 +36,6 @@ __all__ = [
     "IndependentPairAwareConfig",
     "IndependentPairAwareOutput",
     "ModernCEIndependentPairAwareModel",
+    "LogitAwareRouterConfig",
+    "ModernCELogitAwareRouterModel",
 ]

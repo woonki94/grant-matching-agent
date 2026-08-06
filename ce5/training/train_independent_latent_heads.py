@@ -56,8 +56,12 @@ DEFAULT_DIRECTIONAL_PRIVATE_OUTPUT_DIR = (
 DEFAULT_INDEPENDENT_PAIR_AWARE_OUTPUT_DIR = (
     REPO_ROOT / "ce5" / "models" / "independent_pair_aware_v2"
 )
+DEFAULT_LOGIT_AWARE_ROUTER_OUTPUT_DIR = (
+    REPO_ROOT / "ce5" / "models" / "independent_v2_logit_router"
+)
 INDEPENDENT_ARCHITECTURE_TYPE = "independent_latent_heads"
 INDEPENDENT_PAIR_AWARE_ARCHITECTURE_TYPE = "independent_pair_aware_heads"
+LOGIT_AWARE_ROUTER_ARCHITECTURE_TYPE = "independent_logit_aware_router"
 DIRECTIONAL_ARCHITECTURE_TYPE = "directional_latent_matcher"
 DIRECTIONAL_PRIVATE_ARCHITECTURE_TYPE = "directional_private_experts"
 PAIR_TYPES = ("grant_faculty", "grant_grant", "faculty_faculty")
@@ -877,6 +881,8 @@ def _parameter_groups(
         (False, False): [],
     }
     for name, parameter in model.named_parameters():
+        if not parameter.requires_grad:
+            continue
         is_encoder = name.startswith("encoder.")
         use_decay = parameter.ndim > 1 and not name.endswith("bias")
         groups[(is_encoder, use_decay)].append(parameter)
@@ -1170,7 +1176,8 @@ def _train_epoch(
                         "train/epoch": epoch + 1,
                         "train/ranking_pairs": step_ranking_pairs,
                         "train/encoder_frozen": float(
-                            epoch < args.frozen_encoder_epochs
+                            getattr(args, "router_only_training", False)
+                            or epoch < args.frozen_encoder_epochs
                         ),
                     }
                 )
@@ -1272,6 +1279,7 @@ def build_parser(
     if architecture_type not in {
         INDEPENDENT_ARCHITECTURE_TYPE,
         INDEPENDENT_PAIR_AWARE_ARCHITECTURE_TYPE,
+        LOGIT_AWARE_ROUTER_ARCHITECTURE_TYPE,
         DIRECTIONAL_ARCHITECTURE_TYPE,
         DIRECTIONAL_PRIVATE_ARCHITECTURE_TYPE,
     }:
@@ -1284,12 +1292,16 @@ def build_parser(
     independent_pair_aware = (
         architecture_type == INDEPENDENT_PAIR_AWARE_ARCHITECTURE_TYPE
     )
+    logit_aware_router = architecture_type == LOGIT_AWARE_ROUTER_ARCHITECTURE_TYPE
+    pair_aware_independent = independent_pair_aware or logit_aware_router
     parser = argparse.ArgumentParser(
         description=(
             "Train the CE5 directional latent matcher from continuous LLM judgments."
             if directional
+            else "Train a logit-aware router on top of a CE5 independent-v2 checkpoint."
+            if logit_aware_router
             else "Train CE5 independent-v2 pair-aware experts from continuous LLM judgments."
-            if independent_pair_aware
+            if pair_aware_independent
             else "Train CE5 from continuous LLM judgments."
         )
     )
@@ -1304,6 +1316,8 @@ def build_parser(
             if directional
             else DEFAULT_INDEPENDENT_PAIR_AWARE_OUTPUT_DIR
             if independent_pair_aware
+            else DEFAULT_LOGIT_AWARE_ROUTER_OUTPUT_DIR
+            if logit_aware_router
             else DEFAULT_OUTPUT_DIR
         ),
     )
@@ -1370,7 +1384,7 @@ def build_parser(
     else:
         parser.add_argument("--attention-dim", type=_positive_int, default=128)
         parser.add_argument("--head-dim", type=_positive_int, default=192)
-        if independent_pair_aware:
+        if pair_aware_independent:
             parser.add_argument(
                 "--num-queries-per-side",
                 type=_positive_int,
@@ -1382,6 +1396,30 @@ def build_parser(
                 type=_positive_int,
                 default=384,
                 help="Hidden width of each private pair-interaction scorer.",
+            )
+        if logit_aware_router:
+            parser.add_argument(
+                "--initialize-from-v2-checkpoint",
+                type=Path,
+                help=(
+                    "Independent-v2 checkpoint whose encoder, experts, and "
+                    "existing gate initialize this router experiment."
+                ),
+            )
+            parser.add_argument("--router-hidden-dim", type=_positive_int, default=128)
+            parser.add_argument("--router-dropout", type=_unit_interval, default=0.1)
+            parser.add_argument(
+                "--router-logit-clip",
+                type=_positive_float,
+                default=12.0,
+            )
+            parser.add_argument(
+                "--train-all-parameters",
+                action="store_true",
+                help=(
+                    "Jointly fine-tune the full model. By default this controlled "
+                    "experiment trains only the old and new router modules."
+                ),
             )
         parser.add_argument("--head-dropout", type=_unit_interval, default=0.0)
         parser.add_argument("--base-sts-gate-bias", type=float, default=4.0)
@@ -1448,6 +1486,8 @@ def build_parser(
             if directional
             else "ce5,distillation,independent-pair-aware-v2"
             if independent_pair_aware
+            else "ce5,distillation,logit-aware-router,router-only"
+            if logit_aware_router
             else "ce5,distillation,latent-heads"
         ),
         help="Comma-separated W&B tags.",
@@ -1548,7 +1588,11 @@ def main(
         get_linear_schedule_with_warmup,
     )
 
-    if architecture_type == INDEPENDENT_PAIR_AWARE_ARCHITECTURE_TYPE:
+    if architecture_type == LOGIT_AWARE_ROUTER_ARCHITECTURE_TYPE:
+        from ce5.modeling.logit_aware_router import (
+            ModernCELogitAwareRouterModel as ModelClass,
+        )
+    elif architecture_type == INDEPENDENT_PAIR_AWARE_ARCHITECTURE_TYPE:
         from ce5.modeling.independent_pair_aware_heads import (
             ModernCEIndependentPairAwareModel as ModelClass,
         )
@@ -1570,6 +1614,17 @@ def main(
     if device.type == "cuda":
         torch.backends.cuda.matmul.allow_tf32 = True
     resume_path = _resolve_path(args.resume_checkpoint) if args.resume_checkpoint else None
+    initialize_v2_path = (
+        _resolve_path(args.initialize_from_v2_checkpoint)
+        if architecture_type == LOGIT_AWARE_ROUTER_ARCHITECTURE_TYPE
+        and args.initialize_from_v2_checkpoint
+        else None
+    )
+    if resume_path is not None and initialize_v2_path is not None:
+        raise RuntimeError(
+            "Use either --resume-checkpoint or --initialize-from-v2-checkpoint, "
+            "not both"
+        )
     if resume_path is not None:
         from ce5.modeling.registry import checkpoint_architecture_type
 
@@ -1581,6 +1636,30 @@ def main(
             )
         model = ModelClass.from_checkpoint(
             resume_path,
+            torch_dtype=precision,
+            trust_remote_code=args.trust_remote_code,
+        )
+        tokenizer_model_id = model.architecture_config.backbone_model_id
+    elif architecture_type == LOGIT_AWARE_ROUTER_ARCHITECTURE_TYPE:
+        if initialize_v2_path is None:
+            raise RuntimeError(
+                "Logit-aware router training requires "
+                "--initialize-from-v2-checkpoint"
+            )
+        from ce5.modeling.registry import checkpoint_architecture_type
+
+        source_architecture = checkpoint_architecture_type(initialize_v2_path)
+        if source_architecture != INDEPENDENT_PAIR_AWARE_ARCHITECTURE_TYPE:
+            raise RuntimeError(
+                "--initialize-from-v2-checkpoint must identify an "
+                f"{INDEPENDENT_PAIR_AWARE_ARCHITECTURE_TYPE!r} checkpoint, "
+                f"found {source_architecture!r}"
+            )
+        model = ModelClass.from_independent_v2_checkpoint(
+            initialize_v2_path,
+            router_hidden_dim=args.router_hidden_dim,
+            router_dropout=args.router_dropout,
+            router_logit_clip=args.router_logit_clip,
             torch_dtype=precision,
             trust_remote_code=args.trust_remote_code,
         )
@@ -1651,6 +1730,7 @@ def main(
         if architecture_type
         in {
             INDEPENDENT_PAIR_AWARE_ARCHITECTURE_TYPE,
+            LOGIT_AWARE_ROUTER_ARCHITECTURE_TYPE,
             DIRECTIONAL_ARCHITECTURE_TYPE,
             DIRECTIONAL_PRIVATE_ARCHITECTURE_TYPE,
         }
@@ -1684,7 +1764,14 @@ def main(
             pin_memory=device.type == "cuda",
         )
 
-    if args.frozen_encoder_epochs > 0:
+    router_only_training = (
+        architecture_type == LOGIT_AWARE_ROUTER_ARCHITECTURE_TYPE
+        and not args.train_all_parameters
+    )
+    args.router_only_training = router_only_training
+    if router_only_training:
+        model.set_router_trainable_only()
+    elif args.frozen_encoder_epochs > 0:
         _set_encoder_trainable(model, False)
     optimizer = AdamW(
         _parameter_groups(
@@ -1718,10 +1805,19 @@ def main(
         "judgments": str(judgment_path),
         "output_dir": str(output_dir),
         "architecture_type": architecture_type,
+        "training_mode": "router_only" if router_only_training else "joint",
+        "initialized_from_checkpoint": (
+            str(initialize_v2_path) if initialize_v2_path is not None else None
+        ),
         "arguments": vars(args) | {
             "judgments": str(args.judgments),
             "output_dir": str(args.output_dir),
             "resume_checkpoint": str(args.resume_checkpoint) if args.resume_checkpoint else None,
+            "initialize_from_v2_checkpoint": (
+                str(args.initialize_from_v2_checkpoint)
+                if getattr(args, "initialize_from_v2_checkpoint", None)
+                else None
+            ),
         },
         "data": data_summary,
         "model_architecture": model.architecture_dict(),
@@ -1750,8 +1846,54 @@ def main(
     history: list[dict[str, Any]] = []
     best_rmse = math.inf
     global_step = 0
+    if router_only_training and validation_loader is not None:
+        initial_validation_metrics = evaluate(
+            model,
+            validation_loader,
+            device,
+            precision,
+            args,
+        )
+        initial_record = {
+            "epoch": 0,
+            "global_step": 0,
+            "encoder_frozen": True,
+            "initialization_baseline": True,
+            "train": {},
+            "validation": initial_validation_metrics,
+        }
+        history.append(initial_record)
+        model.save_checkpoint(output_dir / "initialized.pt")
+        grant_faculty_initial = initial_validation_metrics.get(
+            "by_pair_type",
+            {},
+        ).get("grant_faculty", {})
+        best_rmse = float(
+            grant_faculty_initial.get(
+                "rmse",
+                initial_validation_metrics.get("rmse", math.inf),
+            )
+        )
+        model.save_checkpoint(output_dir / "best.pt")
+        _write_json(output_dir / "best_metrics.json", initial_record)
+        _write_json(output_dir / "history.json", {"epochs": history})
+        if wandb_run is not None:
+            initial_log = {
+                "trainer/global_step": 0,
+                "train_epoch/epoch": 0,
+                "train_epoch/encoder_frozen": 1.0,
+                "train_epoch/initialization_baseline": 1.0,
+            }
+            initial_log.update(
+                _flatten_numeric_metrics(
+                    "validation",
+                    initial_validation_metrics,
+                )
+            )
+            wandb_run.log(initial_log)
+        print(json.dumps(initial_record, ensure_ascii=False))
     for epoch in range(args.epochs):
-        if epoch == args.frozen_encoder_epochs:
+        if not router_only_training and epoch == args.frozen_encoder_epochs:
             _set_encoder_trainable(model, True)
         train_metrics, global_step = _train_epoch(
             model,
@@ -1774,7 +1916,9 @@ def main(
         epoch_record = {
             "epoch": epoch + 1,
             "global_step": global_step,
-            "encoder_frozen": epoch < args.frozen_encoder_epochs,
+            "encoder_frozen": not any(
+                parameter.requires_grad for parameter in model.encoder.parameters()
+            ),
             "train": train_metrics,
             "validation": validation_metrics,
         }
@@ -1801,7 +1945,10 @@ def main(
                 "trainer/global_step": global_step,
                 "train_epoch/epoch": epoch + 1,
                 "train_epoch/encoder_frozen": float(
-                    epoch < args.frozen_encoder_epochs
+                    not any(
+                        parameter.requires_grad
+                        for parameter in model.encoder.parameters()
+                    )
                 ),
             }
             epoch_log.update(_flatten_numeric_metrics("train_epoch", train_metrics))

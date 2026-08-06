@@ -2187,6 +2187,8 @@ def main() -> int:
             if evaluated_architecture_type == "directional_private_experts"
             else "CE5 independent-v2"
             if evaluated_architecture_type == "independent_pair_aware_heads"
+            else "CE5 logit-router"
+            if evaluated_architecture_type == "independent_logit_aware_router"
             else "CE5 directional"
             if is_directional_matcher
             else "CE5 latent-head"
