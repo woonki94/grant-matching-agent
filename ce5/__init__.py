@@ -14,6 +14,11 @@ from ce5.modeling.directional_latent_matcher import (
 from ce5.modeling.directional_private_experts import (
     ModernCEDirectionalPrivateExperts,
 )
+from ce5.modeling.independent_pair_aware_heads import (
+    IndependentPairAwareConfig,
+    IndependentPairAwareOutput,
+    ModernCEIndependentPairAwareModel,
+)
 
 __all__ = [
     "DEFAULT_MODEL_ID",
@@ -24,4 +29,7 @@ __all__ = [
     "DirectionalLatentMatcherOutput",
     "ModernCEDirectionalLatentMatcher",
     "ModernCEDirectionalPrivateExperts",
+    "IndependentPairAwareConfig",
+    "IndependentPairAwareOutput",
+    "ModernCEIndependentPairAwareModel",
 ]

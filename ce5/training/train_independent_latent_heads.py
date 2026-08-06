@@ -53,7 +53,11 @@ DEFAULT_DIRECTIONAL_OUTPUT_DIR = (
 DEFAULT_DIRECTIONAL_PRIVATE_OUTPUT_DIR = (
     REPO_ROOT / "ce5" / "models" / "directional_private_experts_v1"
 )
+DEFAULT_INDEPENDENT_PAIR_AWARE_OUTPUT_DIR = (
+    REPO_ROOT / "ce5" / "models" / "independent_pair_aware_v2"
+)
 INDEPENDENT_ARCHITECTURE_TYPE = "independent_latent_heads"
+INDEPENDENT_PAIR_AWARE_ARCHITECTURE_TYPE = "independent_pair_aware_heads"
 DIRECTIONAL_ARCHITECTURE_TYPE = "directional_latent_matcher"
 DIRECTIONAL_PRIVATE_ARCHITECTURE_TYPE = "directional_private_experts"
 PAIR_TYPES = ("grant_faculty", "grant_grant", "faculty_faculty")
@@ -153,7 +157,7 @@ class JudgmentCollator:
         }
 
 
-class DirectionalJudgmentCollator(JudgmentCollator):
+class PairAwareJudgmentCollator(JudgmentCollator):
     """Tokenize pairs while retaining first-side and second-side token masks."""
 
     def __call__(self, examples: Sequence[JudgmentExample]) -> dict[str, Any]:
@@ -162,6 +166,10 @@ class DirectionalJudgmentCollator(JudgmentCollator):
 
         add_pair_sequence_masks(batch["encoded"], self.tokenizer)
         return batch
+
+
+# Compatibility name retained for existing imports and directional experiments.
+DirectionalJudgmentCollator = PairAwareJudgmentCollator
 
 
 class GroupedBatchSampler(Sampler[list[int]]):
@@ -1263,6 +1271,7 @@ def build_parser(
 ) -> argparse.ArgumentParser:
     if architecture_type not in {
         INDEPENDENT_ARCHITECTURE_TYPE,
+        INDEPENDENT_PAIR_AWARE_ARCHITECTURE_TYPE,
         DIRECTIONAL_ARCHITECTURE_TYPE,
         DIRECTIONAL_PRIVATE_ARCHITECTURE_TYPE,
     }:
@@ -1272,10 +1281,15 @@ def build_parser(
         DIRECTIONAL_PRIVATE_ARCHITECTURE_TYPE,
     }
     private_experts = architecture_type == DIRECTIONAL_PRIVATE_ARCHITECTURE_TYPE
+    independent_pair_aware = (
+        architecture_type == INDEPENDENT_PAIR_AWARE_ARCHITECTURE_TYPE
+    )
     parser = argparse.ArgumentParser(
         description=(
             "Train the CE5 directional latent matcher from continuous LLM judgments."
             if directional
+            else "Train CE5 independent-v2 pair-aware experts from continuous LLM judgments."
+            if independent_pair_aware
             else "Train CE5 from continuous LLM judgments."
         )
     )
@@ -1288,6 +1302,8 @@ def build_parser(
             if private_experts
             else DEFAULT_DIRECTIONAL_OUTPUT_DIR
             if directional
+            else DEFAULT_INDEPENDENT_PAIR_AWARE_OUTPUT_DIR
+            if independent_pair_aware
             else DEFAULT_OUTPUT_DIR
         ),
     )
@@ -1354,6 +1370,19 @@ def build_parser(
     else:
         parser.add_argument("--attention-dim", type=_positive_int, default=128)
         parser.add_argument("--head-dim", type=_positive_int, default=192)
+        if independent_pair_aware:
+            parser.add_argument(
+                "--num-queries-per-side",
+                type=_positive_int,
+                default=2,
+                help="Private learned attention queries per pair side and expert.",
+            )
+            parser.add_argument(
+                "--expert-ffn-dim",
+                type=_positive_int,
+                default=384,
+                help="Hidden width of each private pair-interaction scorer.",
+            )
         parser.add_argument("--head-dropout", type=_unit_interval, default=0.0)
         parser.add_argument("--base-sts-gate-bias", type=float, default=4.0)
     parser.add_argument("--score-loss", choices=("smooth_l1", "mse", "bce"), default="smooth_l1")
@@ -1417,6 +1446,8 @@ def build_parser(
             if private_experts
             else "ce5,distillation,directional-latent-matcher"
             if directional
+            else "ce5,distillation,independent-pair-aware-v2"
+            if independent_pair_aware
             else "ce5,distillation,latent-heads"
         ),
         help="Comma-separated W&B tags.",
@@ -1517,7 +1548,11 @@ def main(
         get_linear_schedule_with_warmup,
     )
 
-    if architecture_type == DIRECTIONAL_PRIVATE_ARCHITECTURE_TYPE:
+    if architecture_type == INDEPENDENT_PAIR_AWARE_ARCHITECTURE_TYPE:
+        from ce5.modeling.independent_pair_aware_heads import (
+            ModernCEIndependentPairAwareModel as ModelClass,
+        )
+    elif architecture_type == DIRECTIONAL_PRIVATE_ARCHITECTURE_TYPE:
         from ce5.modeling.directional_private_experts import (
             ModernCEDirectionalPrivateExperts as ModelClass,
         )
@@ -1550,6 +1585,22 @@ def main(
             trust_remote_code=args.trust_remote_code,
         )
         tokenizer_model_id = model.architecture_config.backbone_model_id
+    elif architecture_type == INDEPENDENT_PAIR_AWARE_ARCHITECTURE_TYPE:
+        model = ModelClass.from_pretrained(
+            args.model_id,
+            num_latent_heads=args.num_latent_heads,
+            num_queries_per_side=args.num_queries_per_side,
+            attention_dim=args.attention_dim,
+            head_dim=args.head_dim,
+            expert_ffn_dim=args.expert_ffn_dim,
+            dropout=args.dropout,
+            head_dropout=args.head_dropout,
+            use_base_sts_expert=not args.no_base_sts_expert,
+            base_sts_gate_bias=args.base_sts_gate_bias,
+            torch_dtype=precision,
+            trust_remote_code=args.trust_remote_code,
+        )
+        tokenizer_model_id = args.model_id
     elif architecture_type in {
         DIRECTIONAL_ARCHITECTURE_TYPE,
         DIRECTIONAL_PRIVATE_ARCHITECTURE_TYPE,
@@ -1596,9 +1647,10 @@ def main(
         enable_checkpointing()
 
     collator_class = (
-        DirectionalJudgmentCollator
+        PairAwareJudgmentCollator
         if architecture_type
         in {
+            INDEPENDENT_PAIR_AWARE_ARCHITECTURE_TYPE,
             DIRECTIONAL_ARCHITECTURE_TYPE,
             DIRECTIONAL_PRIVATE_ARCHITECTURE_TYPE,
         }

@@ -7,6 +7,8 @@ Git.
 Architecture files:
 
 - `independent_latent_heads.py`: the original CE5 model and control baseline.
+- `independent_pair_aware_heads.py`: independent-v2 experts with separate
+  target/candidate attention, explicit pair interactions, and private scorers.
 - `directional_latent_matcher.py`: directional, interacting-latent architecture.
 - `directional_private_experts.py`: the same directional refinement with a
   separate output scorer for each latent.

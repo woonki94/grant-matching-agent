@@ -794,6 +794,22 @@ def _evaluate_latent_model(
         batch_gates = output.gate_weights.detach().float().cpu()
         batch_contributions = batch_gates * batch_head_logits
         batch_attention = output.attention_weights.detach().float().cpu()
+        output_target_attention = getattr(output, "target_attention_weights", None)
+        batch_target_attention = (
+            output_target_attention.detach().float().cpu()
+            if output_target_attention is not None
+            else None
+        )
+        output_candidate_attention = getattr(
+            output,
+            "candidate_attention_weights",
+            None,
+        )
+        batch_candidate_attention = (
+            output_candidate_attention.detach().float().cpu()
+            if output_candidate_attention is not None
+            else None
+        )
         output_routing = getattr(output, "routing_weights", None)
         batch_routing = (
             output_routing.detach().float().cpu()
@@ -890,6 +906,36 @@ def _evaluate_latent_model(
                             maximum=top_attention_tokens,
                         ),
                     }
+                    if (
+                        batch_target_attention is not None
+                        and batch_candidate_attention is not None
+                    ):
+                        attention_record["top_target_attention_tokens"] = (
+                            _top_attention_tokens(
+                                tokenizer,
+                                ids,
+                                mask,
+                                batch_target_attention[
+                                    row_index,
+                                    latent_index,
+                                ].tolist(),
+                                types,
+                                maximum=top_attention_tokens,
+                            )
+                        )
+                        attention_record["top_candidate_attention_tokens"] = (
+                            _top_attention_tokens(
+                                tokenizer,
+                                ids,
+                                mask,
+                                batch_candidate_attention[
+                                    row_index,
+                                    latent_index,
+                                ].tolist(),
+                                types,
+                                maximum=top_attention_tokens,
+                            )
+                        )
                     _push_top(
                         heap,
                         key=gate_value,
@@ -919,6 +965,38 @@ def _evaluate_latent_model(
                         for latent_index, latent_name in enumerate(latent_names)
                     },
                 }
+                if (
+                    batch_target_attention is not None
+                    and batch_candidate_attention is not None
+                ):
+                    error_record["target_attention_by_latent"] = {
+                        latent_name: _top_attention_tokens(
+                            tokenizer,
+                            ids,
+                            mask,
+                            batch_target_attention[
+                                row_index,
+                                latent_index,
+                            ].tolist(),
+                            types,
+                            maximum=top_attention_tokens,
+                        )
+                        for latent_index, latent_name in enumerate(latent_names)
+                    }
+                    error_record["candidate_attention_by_latent"] = {
+                        latent_name: _top_attention_tokens(
+                            tokenizer,
+                            ids,
+                            mask,
+                            batch_candidate_attention[
+                                row_index,
+                                latent_index,
+                            ].tolist(),
+                            types,
+                            maximum=top_attention_tokens,
+                        )
+                        for latent_index, latent_name in enumerate(latent_names)
+                    }
                 _push_top(
                     error_heap,
                     key=absolute_error,
@@ -1793,6 +1871,8 @@ def main() -> int:
         ce5_method_name=(
             "CE5 dir-private"
             if evaluated_architecture_type == "directional_private_experts"
+            else "CE5 independent-v2"
+            if evaluated_architecture_type == "independent_pair_aware_heads"
             else "CE5 directional"
             if is_directional_matcher
             else "CE5 latent-head"

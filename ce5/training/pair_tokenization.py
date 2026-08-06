@@ -30,7 +30,7 @@ def add_pair_sequence_masks(encoded: MutableMapping[str, Tensor], tokenizer: Any
     sequence_ids_method = getattr(encoded, "sequence_ids", None)
     if not callable(sequence_ids_method):
         raise RuntimeError(
-            "The directional latent matcher requires a fast tokenizer that "
+            "Pair-aware CE5 architectures require a fast tokenizer that "
             "exposes BatchEncoding.sequence_ids()."
         )
 

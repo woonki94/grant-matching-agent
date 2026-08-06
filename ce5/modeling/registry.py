@@ -12,6 +12,10 @@ from ce5.modeling.directional_latent_matcher import (
     ModernCEDirectionalLatentMatcher,
 )
 from ce5.modeling.independent_latent_heads import ModernCELatentHeadModel
+from ce5.modeling.independent_pair_aware_heads import (
+    ARCHITECTURE_TYPE as INDEPENDENT_PAIR_AWARE_ARCHITECTURE_TYPE,
+    ModernCEIndependentPairAwareModel,
+)
 from ce5.modeling.directional_private_experts import (
     ARCHITECTURE_TYPE as DIRECTIONAL_PRIVATE_ARCHITECTURE_TYPE,
     ModernCEDirectionalPrivateExperts,
@@ -59,6 +63,12 @@ def load_model_from_checkpoint(
         )
     if architecture_type == DIRECTIONAL_PRIVATE_ARCHITECTURE_TYPE:
         return ModernCEDirectionalPrivateExperts.from_checkpoint(
+            checkpoint_path,
+            map_location=map_location,
+            **pretrained_kwargs,
+        )
+    if architecture_type == INDEPENDENT_PAIR_AWARE_ARCHITECTURE_TYPE:
+        return ModernCEIndependentPairAwareModel.from_checkpoint(
             checkpoint_path,
             map_location=map_location,
             **pretrained_kwargs,

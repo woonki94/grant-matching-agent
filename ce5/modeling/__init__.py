@@ -19,6 +19,13 @@ from ce5.modeling.directional_private_experts import (
     ModernCEDirectionalPrivateExperts,
     PrivateDeltaScorer,
 )
+from ce5.modeling.independent_pair_aware_heads import (
+    IndependentPairAwareConfig,
+    IndependentPairAwareExpert,
+    IndependentPairAwareOutput,
+    ModernCEIndependentPairAwareModel,
+    PrivateSidePooler,
+)
 
 __all__ = [
     "DEFAULT_MODEL_ID",
@@ -30,4 +37,9 @@ __all__ = [
     "ModernCEDirectionalLatentMatcher",
     "ModernCEDirectionalPrivateExperts",
     "PrivateDeltaScorer",
+    "IndependentPairAwareConfig",
+    "IndependentPairAwareExpert",
+    "IndependentPairAwareOutput",
+    "ModernCEIndependentPairAwareModel",
+    "PrivateSidePooler",
 ]
