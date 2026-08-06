@@ -652,6 +652,7 @@ def _base_prediction_record(
     prediction: float,
     expert_names: Sequence[str],
     expert_scores: Sequence[float],
+    expert_logits: Sequence[float],
     gates: Sequence[float],
     contributions: Sequence[float],
 ) -> dict[str, Any]:
@@ -673,6 +674,7 @@ def _base_prediction_record(
         "gate_winner": expert_names[max(range(len(gates)), key=gates.__getitem__)],
         "gate_weights": dict(zip(expert_names, gates, strict=True)),
         "expert_scores": dict(zip(expert_names, expert_scores, strict=True)),
+        "expert_logits": dict(zip(expert_names, expert_logits, strict=True)),
         "weighted_logit_contributions": dict(
             zip(expert_names, contributions, strict=True)
         ),
@@ -839,6 +841,7 @@ def _evaluate_latent_model(
         for row_index, example in enumerate(batch["examples"]):
             prediction = float(batch_scores[row_index].item())
             expert_score_values = batch_head_scores[row_index].tolist()
+            expert_logit_values = batch_head_logits[row_index].tolist()
             gate_values = batch_gates[row_index].tolist()
             contribution_values = batch_contributions[row_index].tolist()
             record = _base_prediction_record(
@@ -846,6 +849,7 @@ def _evaluate_latent_model(
                 prediction=prediction,
                 expert_names=expert_names,
                 expert_scores=expert_score_values,
+                expert_logits=expert_logit_values,
                 gates=gate_values,
                 contributions=contribution_values,
             )
@@ -1125,6 +1129,165 @@ def _evaluate_latent_model(
             for name, values in latent_routing.items()
         }
     return diagnostics, records, attention_examples
+
+
+@torch.inference_mode()
+def _mean_gate_weights(
+    model: Any,
+    loader: DataLoader[Any],
+    device: torch.device,
+    precision: torch.dtype,
+    *,
+    no_progress: bool,
+) -> dict[str, float]:
+    """Estimate fixed deployment weights without reading teacher labels."""
+
+    model.eval()
+    gate_sum: Optional[Tensor] = None
+    example_count = 0
+    progress: Iterable[Any] = loader
+    if tqdm is not None and not no_progress:
+        progress = tqdm(
+            loader,
+            desc="Validation gates for static-router ablation",
+            dynamic_ncols=True,
+        )
+    for batch in progress:
+        encoded = _move_encoded(batch["encoded"], device)
+        with _autocast(device, precision):
+            output = model(**encoded)
+        batch_gates = output.gate_weights.detach().float().sum(dim=0).cpu()
+        gate_sum = batch_gates if gate_sum is None else gate_sum + batch_gates
+        example_count += int(output.gate_weights.shape[0])
+    if gate_sum is None or example_count == 0:
+        raise RuntimeError("Static-router calibration split is empty")
+    weights = gate_sum / example_count
+    return {
+        name: float(weights[index].item())
+        for index, name in enumerate(model.expert_names)
+    }
+
+
+def _sigmoid_scalar(logit: float) -> float:
+    if logit >= 0.0:
+        return 1.0 / (1.0 + math.exp(-logit))
+    exponential = math.exp(logit)
+    return exponential / (1.0 + exponential)
+
+
+def _router_ablation_diagnostics(
+    records: Sequence[dict[str, Any]],
+    *,
+    expert_names: Sequence[str],
+    static_gate_weights: Mapping[str, float],
+    min_score_gap: float,
+) -> dict[str, Any]:
+    """Score counterfactual routers from one set of cached expert logits."""
+
+    if not records:
+        raise ValueError("Router ablations require prediction records")
+    if set(static_gate_weights) != set(expert_names):
+        raise ValueError("Static gate weights do not match checkpoint experts")
+    static_total = sum(float(static_gate_weights[name]) for name in expert_names)
+    if static_total <= 0.0:
+        raise ValueError("Static gate weights must have positive total mass")
+    normalized_static = {
+        name: float(static_gate_weights[name]) / static_total
+        for name in expert_names
+    }
+    uniform_weight = 1.0 / len(expert_names)
+    prediction_lists: dict[str, list[float]] = {
+        "dynamic_router": [],
+        "static_validation_mean": [],
+        "uniform": [],
+    }
+    if "base_sts" in expert_names:
+        prediction_lists["base_sts_only"] = []
+    for name in expert_names:
+        if name != "base_sts":
+            prediction_lists[f"expert_{name}"] = []
+    prediction_lists["oracle_best_expert"] = []
+    oracle_selections = {name: 0 for name in expert_names}
+
+    targets: list[float] = []
+    query_ids: list[str] = []
+    for record in records:
+        raw_logits = record.get("expert_logits")
+        if not isinstance(raw_logits, Mapping):
+            raise RuntimeError("Prediction record is missing expert logits")
+        logits = {name: float(raw_logits[name]) for name in expert_names}
+        target = float(record["teacher_score"])
+        dynamic_score = float(record["ce5_score"])
+        static_logit = sum(
+            normalized_static[name] * logits[name] for name in expert_names
+        )
+        uniform_logit = uniform_weight * sum(logits.values())
+        expert_scores = {
+            name: _sigmoid_scalar(logits[name]) for name in expert_names
+        }
+        oracle_name = min(
+            expert_names,
+            key=lambda name: abs(expert_scores[name] - target),
+        )
+        oracle_selections[oracle_name] += 1
+        ablation_scores: dict[str, float] = {
+            "dynamic_router": dynamic_score,
+            "static_validation_mean": _sigmoid_scalar(static_logit),
+            "uniform": _sigmoid_scalar(uniform_logit),
+            "oracle_best_expert": expert_scores[oracle_name],
+        }
+        if "base_sts" in expert_names:
+            ablation_scores["base_sts_only"] = expert_scores["base_sts"]
+        for name in expert_names:
+            if name != "base_sts":
+                ablation_scores[f"expert_{name}"] = expert_scores[name]
+        record["router_ablation_scores"] = ablation_scores
+        record["oracle_best_expert"] = oracle_name
+        for method_name, score in ablation_scores.items():
+            prediction_lists[method_name].append(score)
+        targets.append(target)
+        query_ids.append(str(record["grant_item_id"]))
+
+    methods = {
+        method_name: {
+            "metrics": _metrics(
+                predictions,
+                targets,
+                query_ids,
+                min_score_gap=min_score_gap,
+            )
+        }
+        for method_name, predictions in prediction_lists.items()
+    }
+    dynamic_metrics = methods["dynamic_router"]["metrics"]
+    for method_name, result in methods.items():
+        if method_name == "dynamic_router":
+            continue
+        method_metrics = result["metrics"]
+        result["delta_vs_dynamic"] = {
+            metric: float(method_metrics[metric]) - float(dynamic_metrics[metric])
+            for metric in (
+                "mae",
+                "rmse",
+                "pearson",
+                "spearman",
+                "pairwise_accuracy",
+            )
+        }
+    return {
+        "mixture_space": "logit",
+        "static_gate_weights": normalized_static,
+        "methods": methods,
+        "oracle": {
+            "teacher_aware": True,
+            "deployable": False,
+            "selection_counts": oracle_selections,
+            "selection_fractions": {
+                name: count / len(records)
+                for name, count in oracle_selections.items()
+            },
+        },
+    }
 
 
 @torch.inference_mode()
@@ -1434,6 +1597,95 @@ def _print_console_summary(
     print(f"Full report: {summary_path}\n")
 
 
+def _print_router_ablation_summary(diagnostics: Mapping[str, Any]) -> None:
+    methods = diagnostics.get("methods")
+    if not isinstance(methods, Mapping):
+        return
+    method_labels = {
+        "dynamic_router": "Dynamic router",
+        "static_validation_mean": "Static validation mean",
+        "uniform": "Uniform weights",
+        "base_sts_only": "Base STS only",
+        "oracle_best_expert": "Oracle best expert*",
+    }
+    ordered_names = [
+        name
+        for name in (
+            "dynamic_router",
+            "static_validation_mean",
+            "uniform",
+            "base_sts_only",
+        )
+        if name in methods
+    ]
+    ordered_names.extend(
+        sorted(name for name in methods if name.startswith("expert_latent_"))
+    )
+    if "oracle_best_expert" in methods:
+        ordered_names.append("oracle_best_expert")
+
+    columns = (
+        ("Router/expert", 24),
+        ("MAE", 8),
+        ("RMSE", 8),
+        ("Pearson", 9),
+        ("Spearman", 9),
+        ("PairAcc", 9),
+        ("Low OOB", 9),
+        ("Mid OOB", 9),
+        ("High OOB", 9),
+    )
+    print("\n=== Router counterfactuals ===")
+    print("  ".join(label.ljust(width) for label, width in columns))
+    print("  ".join("-" * width for _, width in columns))
+    for method_name in ordered_names:
+        result = methods[method_name]
+        metrics = result["metrics"]
+        oob = metrics["out_of_score_band_by_teacher_band"]
+
+        def format_oob(name: str, width: int) -> str:
+            ratio = oob[name]["ratio"]
+            return (
+                "n/a" if ratio is None else f"{100.0 * float(ratio):.2f}%"
+            ).rjust(width)
+
+        label = method_labels.get(
+            method_name,
+            method_name.removeprefix("expert_") + " only",
+        )
+        values = (
+            label.ljust(columns[0][1]),
+            f"{float(metrics['mae']):.4f}".rjust(columns[1][1]),
+            f"{float(metrics['rmse']):.4f}".rjust(columns[2][1]),
+            f"{float(metrics['pearson']):.4f}".rjust(columns[3][1]),
+            f"{float(metrics['spearman']):.4f}".rjust(columns[4][1]),
+            f"{100.0 * float(metrics['pairwise_accuracy']):.2f}%".rjust(
+                columns[5][1]
+            ),
+            format_oob("low", columns[6][1]),
+            format_oob("mid", columns[7][1]),
+            format_oob("high", columns[8][1]),
+        )
+        print("  ".join(values))
+
+    static_weights = diagnostics.get("static_gate_weights", {})
+    if isinstance(static_weights, Mapping):
+        rendered_weights = ", ".join(
+            f"{name}={float(weight):.3f}"
+            for name, weight in static_weights.items()
+        )
+        print(f"Static weights from validation: {rendered_weights}")
+    if "base_sts_only" in methods:
+        print(
+            "Base STS only is the checkpoint's trained base expert, not the "
+            "untouched external STS baseline."
+        )
+    print(
+        "* Oracle chooses the closest individual expert using each test teacher "
+        "label. It is an upper bound, not a deployable method."
+    )
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Evaluate CE5 and diagnose latent expert behavior."
@@ -1495,6 +1747,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--num-workers", type=_nonnegative_int, default=0)
     parser.add_argument("--trust-remote-code", action="store_true")
     parser.add_argument("--no-progress", action="store_true")
+    parser.add_argument(
+        "--router-ablations",
+        action="store_true",
+        help=(
+            "On the held-out test split, compare the dynamic router with "
+            "validation-derived static weights, uniform weights, individual "
+            "experts, and a teacher-aware oracle."
+        ),
+    )
     parser.add_argument("--skip-baseline", action="store_true")
     parser.add_argument("--baseline-model-id", default=DEFAULT_BASELINE_MODEL)
     parser.add_argument(
@@ -1523,6 +1784,11 @@ def _setting(
 
 def main() -> int:
     args = build_parser().parse_args()
+    if args.router_ablations and args.evaluation_split != "test":
+        raise ValueError(
+            "--router-ablations requires --evaluation-split test so static "
+            "weights can be estimated on validation and applied to held-out data"
+        )
     started = time.time()
     checkpoint_path = _resolve_path(args.checkpoint)
     judgment_path = _resolve_path(args.judgments)
@@ -1690,6 +1956,53 @@ def main() -> int:
         top_attention_tokens=args.top_attention_tokens,
         no_progress=args.no_progress,
     )
+    if args.router_ablations:
+        validation_verification = _verify_split_manifest(
+            validation_examples,
+            split_name="validation",
+            manifest_path=split_manifest_path,
+            allow_unverified=args.skip_split_verification,
+        )
+        static_gate_examples = list(validation_examples)
+        if args.pair_type != "all":
+            static_gate_examples = [
+                example
+                for example in static_gate_examples
+                if example.pair_type == args.pair_type
+            ]
+        if not static_gate_examples:
+            raise RuntimeError(
+                "The validation split has no examples for static-router calibration"
+            )
+        static_gate_loader = _make_loader(
+            static_gate_examples,
+            tokenizer,
+            batch_size=args.batch_size,
+            max_length=max_length,
+            num_workers=args.num_workers,
+            device=device,
+            include_pair_masks=is_directional_matcher,
+        )
+        static_gate_weights = _mean_gate_weights(
+            model,
+            static_gate_loader,
+            device,
+            precision,
+            no_progress=args.no_progress,
+        )
+        router_ablations = _router_ablation_diagnostics(
+            prediction_records,
+            expert_names=model.expert_names,
+            static_gate_weights=static_gate_weights,
+            min_score_gap=ranking_min_score_gap,
+        )
+        router_ablations["static_gate_source"] = {
+            "split": "validation",
+            "pair_type": args.pair_type,
+            "examples": len(static_gate_examples),
+            "split_verification": validation_verification,
+        }
+        ce5_diagnostics["router_ablations"] = router_ablations
     architecture = model.architecture_dict()
     del model
     gc.collect()
@@ -1833,6 +2146,7 @@ def main() -> int:
             "batch_size": args.batch_size,
             "max_length": max_length,
             "ranking_min_score_gap": ranking_min_score_gap,
+            "router_ablations": bool(args.router_ablations),
             "device": str(device),
             "precision": str(precision).replace("torch.", ""),
         },
@@ -1880,6 +2194,9 @@ def main() -> int:
         comparisons=comparisons,
         summary_path=summary_path,
     )
+    router_diagnostics = ce5_diagnostics.get("router_ablations")
+    if isinstance(router_diagnostics, Mapping):
+        _print_router_ablation_summary(router_diagnostics)
     return 0
 
 
