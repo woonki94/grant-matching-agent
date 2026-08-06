@@ -38,7 +38,7 @@ except Exception:  # pragma: no cover - tqdm is optional at runtime
     tqdm = None  # type: ignore[assignment]
 
 
-REPO_ROOT = Path(__file__).resolve().parents[1]
+REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
@@ -47,6 +47,11 @@ LEGACY_JUDGMENT_SCHEMA_VERSION = "ce5.judgment.v1"
 DEFAULT_MODEL_ID = "dleemiller/ModernCE-base-sts"
 DEFAULT_JUDGMENTS = REPO_ROOT / "ce5" / "dataset" / "judgments" / "teacher_judgments_v2.jsonl"
 DEFAULT_OUTPUT_DIR = REPO_ROOT / "ce5" / "models" / "latent_head_distilled_v2"
+DEFAULT_DIRECTIONAL_OUTPUT_DIR = (
+    REPO_ROOT / "ce5" / "models" / "directional_latent_matcher_v1"
+)
+INDEPENDENT_ARCHITECTURE_TYPE = "independent_latent_heads"
+DIRECTIONAL_ARCHITECTURE_TYPE = "directional_latent_matcher"
 PAIR_TYPES = ("grant_faculty", "grant_grant", "faculty_faculty")
 SPLIT_NAMES = ("train", "validation", "test")
 
@@ -142,6 +147,17 @@ class JudgmentCollator:
             "pair_ids": [example.pair_id for example in examples],
             "pair_types": [example.pair_type for example in examples],
         }
+
+
+class DirectionalJudgmentCollator(JudgmentCollator):
+    """Tokenize pairs while retaining first-side and second-side token masks."""
+
+    def __call__(self, examples: Sequence[JudgmentExample]) -> dict[str, Any]:
+        batch = super().__call__(examples)
+        from ce5.training.pair_tokenization import add_pair_sequence_masks
+
+        add_pair_sequence_masks(batch["encoded"], self.tokenizer)
+        return batch
 
 
 class GroupedBatchSampler(Sampler[list[int]]):
@@ -818,7 +834,8 @@ def _batch_losses(
         max_pairs=args.ranking_max_pairs_per_batch,
     )
     diversity = _attention_diversity_loss(output.attention_weights)
-    gate_balance = _gate_balance_loss(output.gate_weights)
+    routing_weights = getattr(output, "routing_weights", output.gate_weights)
+    gate_balance = _gate_balance_loss(routing_weights)
     total = (
         pointwise
         + args.ranking_loss_weight * ranking
@@ -990,6 +1007,9 @@ def evaluate(
     loss_sums = {name: 0.0 for name in ("total", "pointwise", "ranking", "diversity", "gate_balance")}
     gate_sum: Optional[Tensor] = None
     head_score_sum: Optional[Tensor] = None
+    routing_sum: Optional[Tensor] = None
+    latent_contribution_sum = 0.0
+    latent_contribution_count = 0
     example_count = 0
     ranking_pairs = 0
     for batch in loader:
@@ -1006,6 +1026,20 @@ def evaluate(
         current_heads = output.head_scores.detach().float().sum(dim=0).cpu()
         gate_sum = current_gate if gate_sum is None else gate_sum + current_gate
         head_score_sum = current_heads if head_score_sum is None else head_score_sum + current_heads
+        current_routing = getattr(output, "routing_weights", None)
+        if current_routing is not None:
+            routing_batch_sum = current_routing.detach().float().sum(dim=0).cpu()
+            routing_sum = (
+                routing_batch_sum
+                if routing_sum is None
+                else routing_sum + routing_batch_sum
+            )
+        current_latent_contribution = getattr(output, "latent_contribution", None)
+        if current_latent_contribution is not None:
+            latent_contribution_sum += float(
+                current_latent_contribution.detach().float().sum().cpu().item()
+            )
+            latent_contribution_count += int(current_latent_contribution.numel())
         example_count += batch_size
         ranking_pairs += batch_rank_pairs
     if example_count == 0:
@@ -1030,7 +1064,7 @@ def evaluate(
             min_score_gap=args.ranking_min_score_gap,
         )
     expert_names = model.expert_names
-    return {
+    result = {
         "loss": {name: total / example_count for name, total in loss_sums.items()},
         **overall_metrics,
         "by_pair_type": by_pair_type,
@@ -1044,6 +1078,20 @@ def evaluate(
             for index, name in enumerate(expert_names)
         },
     }
+    if routing_sum is not None:
+        latent_names = tuple(
+            f"latent_{index}"
+            for index in range(model.architecture_config.num_latent_heads)
+        )
+        result["latent_routing_usage"] = {
+            name: float(routing_sum[index].item() / example_count)
+            for index, name in enumerate(latent_names)
+        }
+    if latent_contribution_count:
+        result["latent_contribution_mean"] = (
+            latent_contribution_sum / latent_contribution_count
+        )
+    return result
 
 
 def _train_epoch(
@@ -1205,10 +1253,29 @@ def _init_wandb(
     return run
 
 
-def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Train CE5 from continuous LLM judgments.")
+def build_parser(
+    *,
+    architecture_type: str = INDEPENDENT_ARCHITECTURE_TYPE,
+) -> argparse.ArgumentParser:
+    if architecture_type not in {
+        INDEPENDENT_ARCHITECTURE_TYPE,
+        DIRECTIONAL_ARCHITECTURE_TYPE,
+    }:
+        raise ValueError(f"Unsupported training architecture: {architecture_type!r}")
+    directional = architecture_type == DIRECTIONAL_ARCHITECTURE_TYPE
+    parser = argparse.ArgumentParser(
+        description=(
+            "Train the CE5 directional latent matcher from continuous LLM judgments."
+            if directional
+            else "Train CE5 from continuous LLM judgments."
+        )
+    )
     parser.add_argument("--judgments", type=Path, default=DEFAULT_JUDGMENTS)
-    parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
+    parser.add_argument(
+        "--output-dir",
+        type=Path,
+        default=DEFAULT_DIRECTIONAL_OUTPUT_DIR if directional else DEFAULT_OUTPUT_DIR,
+    )
     parser.add_argument("--model-id", default=DEFAULT_MODEL_ID)
     parser.add_argument("--resume-checkpoint", type=Path)
     parser.add_argument("--max-examples", type=_nonnegative_int, default=0)
@@ -1254,12 +1321,26 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--seed", type=int, default=42)
 
     parser.add_argument("--num-latent-heads", type=_positive_int, default=6)
-    parser.add_argument("--attention-dim", type=_positive_int, default=128)
-    parser.add_argument("--head-dim", type=_positive_int, default=192)
     parser.add_argument("--dropout", type=_unit_interval, default=0.1)
-    parser.add_argument("--head-dropout", type=_unit_interval, default=0.0)
     parser.add_argument("--no-base-sts-expert", action="store_true")
-    parser.add_argument("--base-sts-gate-bias", type=float, default=4.0)
+    if directional:
+        parser.add_argument("--latent-dim", type=_positive_int, default=256)
+        parser.add_argument("--num-refinement-blocks", type=_positive_int, default=2)
+        parser.add_argument("--cross-attention-heads", type=_positive_int, default=8)
+        parser.add_argument("--self-attention-heads", type=_positive_int, default=4)
+        parser.add_argument("--ffn-dim", type=_positive_int, default=768)
+        parser.add_argument("--latent-dropout", type=_unit_interval, default=0.1)
+        parser.add_argument(
+            "--initial-latent-contribution",
+            type=_unit_interval,
+            default=0.1,
+            help="Initial fraction of the final logit assigned to latent corrections.",
+        )
+    else:
+        parser.add_argument("--attention-dim", type=_positive_int, default=128)
+        parser.add_argument("--head-dim", type=_positive_int, default=192)
+        parser.add_argument("--head-dropout", type=_unit_interval, default=0.0)
+        parser.add_argument("--base-sts-gate-bias", type=float, default=4.0)
     parser.add_argument("--score-loss", choices=("smooth_l1", "mse", "bce"), default="smooth_l1")
     parser.add_argument("--diversity-loss-weight", type=_nonnegative_float, default=0.01)
     parser.add_argument("--gate-balance-loss-weight", type=_nonnegative_float, default=0.0)
@@ -1316,7 +1397,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--wandb-run-name", default="")
     parser.add_argument(
         "--wandb-tags",
-        default="ce5,distillation,latent-heads",
+        default=(
+            "ce5,distillation,directional-latent-matcher"
+            if directional
+            else "ce5,distillation,latent-heads"
+        ),
         help="Comma-separated W&B tags.",
     )
     parser.add_argument("--wandb-log-every-steps", type=_positive_int, default=1)
@@ -1328,8 +1413,11 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def main() -> int:
-    args = build_parser().parse_args()
+def main(
+    *,
+    architecture_type: str = INDEPENDENT_ARCHITECTURE_TYPE,
+) -> int:
+    args = build_parser(architecture_type=architecture_type).parse_args()
     started = time.time()
     _set_seed(args.seed)
     judgment_path = _resolve_path(args.judgments)
@@ -1412,7 +1500,14 @@ def main() -> int:
         get_linear_schedule_with_warmup,
     )
 
-    from ce5.model import ModernCELatentHeadModel
+    if architecture_type == DIRECTIONAL_ARCHITECTURE_TYPE:
+        from ce5.modeling.directional_latent_matcher import (
+            ModernCEDirectionalLatentMatcher as ModelClass,
+        )
+    else:
+        from ce5.modeling.independent_latent_heads import (
+            ModernCELatentHeadModel as ModelClass,
+        )
 
     device = _resolve_device(args.device)
     precision = _resolve_precision(args.precision, device)
@@ -1420,14 +1515,39 @@ def main() -> int:
         torch.backends.cuda.matmul.allow_tf32 = True
     resume_path = _resolve_path(args.resume_checkpoint) if args.resume_checkpoint else None
     if resume_path is not None:
-        model = ModernCELatentHeadModel.from_checkpoint(
+        from ce5.modeling.registry import checkpoint_architecture_type
+
+        checkpoint_type = checkpoint_architecture_type(resume_path)
+        if checkpoint_type != architecture_type:
+            raise RuntimeError(
+                f"Cannot resume {architecture_type!r} training from a "
+                f"{checkpoint_type!r} checkpoint"
+            )
+        model = ModelClass.from_checkpoint(
             resume_path,
             torch_dtype=precision,
             trust_remote_code=args.trust_remote_code,
         )
         tokenizer_model_id = model.architecture_config.backbone_model_id
+    elif architecture_type == DIRECTIONAL_ARCHITECTURE_TYPE:
+        model = ModelClass.from_pretrained(
+            args.model_id,
+            num_latent_heads=args.num_latent_heads,
+            latent_dim=args.latent_dim,
+            num_refinement_blocks=args.num_refinement_blocks,
+            cross_attention_heads=args.cross_attention_heads,
+            self_attention_heads=args.self_attention_heads,
+            ffn_dim=args.ffn_dim,
+            dropout=args.dropout,
+            latent_dropout=args.latent_dropout,
+            use_base_sts_expert=not args.no_base_sts_expert,
+            initial_latent_contribution=args.initial_latent_contribution,
+            torch_dtype=precision,
+            trust_remote_code=args.trust_remote_code,
+        )
+        tokenizer_model_id = args.model_id
     else:
-        model = ModernCELatentHeadModel.from_pretrained(
+        model = ModelClass.from_pretrained(
             args.model_id,
             num_latent_heads=args.num_latent_heads,
             attention_dim=args.attention_dim,
@@ -1451,7 +1571,12 @@ def main() -> int:
             raise RuntimeError("The selected encoder does not support gradient checkpointing")
         enable_checkpointing()
 
-    collator = JudgmentCollator(tokenizer, max_length=args.max_length)
+    collator_class = (
+        DirectionalJudgmentCollator
+        if architecture_type == DIRECTIONAL_ARCHITECTURE_TYPE
+        else JudgmentCollator
+    )
+    collator = collator_class(tokenizer, max_length=args.max_length)
     train_loader = DataLoader(
         JudgmentDataset(train_examples),
         batch_sampler=GroupedBatchSampler(
@@ -1512,6 +1637,7 @@ def main() -> int:
         "created_at_utc": _utc_now(),
         "judgments": str(judgment_path),
         "output_dir": str(output_dir),
+        "architecture_type": architecture_type,
         "arguments": vars(args) | {
             "judgments": str(args.judgments),
             "output_dir": str(args.output_dir),

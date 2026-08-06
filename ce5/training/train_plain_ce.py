@@ -27,11 +27,11 @@ try:
 except Exception:  # pragma: no cover - tqdm is optional at runtime
     tqdm = None  # type: ignore[assignment]
 
-REPO_ROOT = Path(__file__).resolve().parents[1]
+REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from ce5.train import (
+from ce5.training.train_independent_latent_heads import (
     DEFAULT_JUDGMENTS,
     DEFAULT_MODEL_ID,
     GroupedBatchSampler,

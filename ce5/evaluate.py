@@ -1,6 +1,7 @@
-"""Evaluate a CE5 latent-head checkpoint and inspect what its experts learned.
+"""Evaluate a CE5 checkpoint and inspect what its latent experts learned.
 
-The evaluator reproduces the three-way grouped split used by ``ce5/train.py``.  It
+The evaluator reproduces the three-way grouped split used by
+``ce5/training/train_independent_latent_heads.py``. It
 reports ordinary teacher-imitation metrics, but also measures expert variance,
 expert correlations, gate behavior, weighted logit contributions, and latent
 attention overlap.  The untouched ModernCE checkpoint can be evaluated on the
@@ -70,9 +71,16 @@ class ExampleDataset(Dataset[Any]):
 
 
 class EvaluationCollator:
-    def __init__(self, tokenizer: Any, *, max_length: int) -> None:
+    def __init__(
+        self,
+        tokenizer: Any,
+        *,
+        max_length: int,
+        include_pair_masks: bool = False,
+    ) -> None:
         self.tokenizer = tokenizer
         self.max_length = int(max_length)
+        self.include_pair_masks = bool(include_pair_masks)
 
     def __call__(self, examples: Sequence[Any]) -> dict[str, Any]:
         encoded = self.tokenizer(
@@ -83,6 +91,10 @@ class EvaluationCollator:
             max_length=self.max_length,
             return_tensors="pt",
         )
+        if self.include_pair_masks:
+            from ce5.training.pair_tokenization import add_pair_sequence_masks
+
+            add_pair_sequence_masks(encoded, self.tokenizer)
         return {"encoded": encoded, "examples": list(examples)}
 
 
@@ -552,12 +564,17 @@ def _make_loader(
     max_length: int,
     num_workers: int,
     device: torch.device,
+    include_pair_masks: bool = False,
 ) -> DataLoader[Any]:
     return DataLoader(
         ExampleDataset(examples),
         batch_size=batch_size,
         shuffle=False,
-        collate_fn=EvaluationCollator(tokenizer, max_length=max_length),
+        collate_fn=EvaluationCollator(
+            tokenizer,
+            max_length=max_length,
+            include_pair_masks=include_pair_masks,
+        ),
         num_workers=num_workers,
         pin_memory=device.type == "cuda",
     )
@@ -741,6 +758,8 @@ def _evaluate_latent_model(
     head_scores: dict[str, list[float]] = {name: [] for name in expert_names}
     gates: dict[str, list[float]] = {name: [] for name in expert_names}
     contributions: dict[str, list[float]] = {name: [] for name in expert_names}
+    latent_routing: dict[str, list[float]] = {name: [] for name in latent_names}
+    latent_contributions: list[float] = []
     gate_entropies: list[float] = []
     normalized_gate_entropies: list[float] = []
     attention_similarity_sum = torch.zeros(
@@ -775,6 +794,18 @@ def _evaluate_latent_model(
         batch_gates = output.gate_weights.detach().float().cpu()
         batch_contributions = batch_gates * batch_head_logits
         batch_attention = output.attention_weights.detach().float().cpu()
+        output_routing = getattr(output, "routing_weights", None)
+        batch_routing = (
+            output_routing.detach().float().cpu()
+            if output_routing is not None
+            else None
+        )
+        output_latent_contribution = getattr(output, "latent_contribution", None)
+        batch_latent_contribution = (
+            output_latent_contribution.detach().float().cpu()
+            if output_latent_contribution is not None
+            else None
+        )
         attention_mask = encoded_cpu["attention_mask"].cpu()
         input_ids = encoded_cpu["input_ids"].cpu()
         token_types = encoded_cpu.get("token_type_ids")
@@ -802,6 +833,19 @@ def _evaluate_latent_model(
                 gates=gate_values,
                 contributions=contribution_values,
             )
+            if batch_routing is not None:
+                routing_values = batch_routing[row_index].tolist()
+                record["latent_routing_weights"] = dict(
+                    zip(latent_names, routing_values, strict=True)
+                )
+                for latent_index, latent_name in enumerate(latent_names):
+                    latent_routing[latent_name].append(
+                        float(routing_values[latent_index])
+                    )
+            if batch_latent_contribution is not None:
+                contribution = float(batch_latent_contribution[row_index].item())
+                record["latent_contribution"] = contribution
+                latent_contributions.append(contribution)
             records.append(record)
             for expert_index, expert_name in enumerate(expert_names):
                 head_scores[expert_name].append(float(expert_score_values[expert_index]))
@@ -993,6 +1037,15 @@ def _evaluate_latent_model(
             **_memory_summary(device),
         },
     }
+    if latent_contributions:
+        diagnostics["latent_contribution"] = _summarize_values(
+            latent_contributions
+        )
+    if any(latent_routing.values()):
+        diagnostics["latent_routing_weights"] = {
+            name: _summarize_values(values)
+            for name, values in latent_routing.items()
+        }
     return diagnostics, records, attention_examples
 
 
@@ -1162,6 +1215,7 @@ def _print_console_summary(
     examples: int,
     split_verified: bool,
     ce5_result: Mapping[str, Any],
+    ce5_method_name: str = "CE5 latent-head",
     comparisons: Mapping[str, Any],
     summary_path: Path,
 ) -> None:
@@ -1170,7 +1224,7 @@ def _print_console_summary(
         methods.append(("Untouched STS", comparisons["untouched_modernce"]))
     if "fine_tuned_single_head" in comparisons:
         methods.append(("Fine-tuned CE", comparisons["fine_tuned_single_head"]))
-    methods.append(("CE5 latent-head", ce5_result))
+    methods.append((ce5_method_name, ce5_result))
 
     columns = (
         ("Method", 17),
@@ -1441,12 +1495,12 @@ def main() -> int:
         )
     )
 
-    from ce5.model import ModernCELatentHeadModel
-    from ce5.train import (
+    from ce5.training.train_independent_latent_heads import (
         _mix_training_examples,
         load_judgments,
         split_examples_three_way,
     )
+    from ce5.modeling.registry import load_model_from_checkpoint
     from transformers import AutoModelForSequenceClassification, AutoTokenizer
 
     examples, loading_stats = load_judgments(
@@ -1517,10 +1571,13 @@ def main() -> int:
     if device.type == "cuda":
         torch.backends.cuda.matmul.allow_tf32 = True
 
-    model = ModernCELatentHeadModel.from_checkpoint(
+    model = load_model_from_checkpoint(
         checkpoint_path,
         torch_dtype=precision,
         trust_remote_code=args.trust_remote_code,
+    )
+    is_directional_matcher = (
+        getattr(model, "architecture_type", "") == "directional_latent_matcher"
     )
     tokenizer_reference = _clean_text(args.tokenizer)
     if not tokenizer_reference:
@@ -1542,6 +1599,7 @@ def main() -> int:
         max_length=max_length,
         num_workers=args.num_workers,
         device=device,
+        include_pair_masks=is_directional_matcher,
     )
     ce5_diagnostics, prediction_records, attention_examples = _evaluate_latent_model(
         model,
@@ -1733,6 +1791,9 @@ def main() -> int:
         examples=len(evaluation_examples),
         split_verified=bool(split_verification["verified"]),
         ce5_result=ce5_diagnostics,
+        ce5_method_name=(
+            "CE5 directional" if is_directional_matcher else "CE5 latent-head"
+        ),
         comparisons=comparisons,
         summary_path=summary_path,
     )

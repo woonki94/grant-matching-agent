@@ -1,6 +1,10 @@
-"""CE5 experiments."""
+"""Source model architectures for CE5 experiments.
 
-from ce5.model import (
+This package is deliberately named ``modeling``.  The sibling ``ce5/models``
+directory is reserved for generated checkpoints and is ignored by Git.
+"""
+
+from ce5.modeling.independent_latent_heads import (
     DEFAULT_MODEL_ID,
     LatentHeadConfig,
     LatentHeadOutput,
