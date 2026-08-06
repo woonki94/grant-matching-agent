@@ -293,21 +293,67 @@ def _metrics(
     if not predictions or len(predictions) != len(targets):
         raise ValueError("Predictions and targets must be non-empty and equally sized")
     errors = [prediction - target for prediction, target in zip(predictions, targets, strict=True)]
+    band_names = ("low", "mid", "high")
     band_counts = {
-        name: {"examples": 0, "out_of_band": 0}
-        for name in ("low", "mid", "high")
+        name: {"examples": 0, "out_of_band": 0} for name in band_names
+    }
+    confusion_counts = {
+        teacher_band: {
+            predicted_band: 0
+            for predicted_band in (*band_names, "outside_[0,1]")
+        }
+        for teacher_band in band_names
+    }
+    missed_predictions: dict[str, list[float]] = {name: [] for name in band_names}
+    missed_boundary_gaps: dict[str, list[float]] = {
+        name: [] for name in band_names
+    }
+    missed_destinations = {
+        teacher_band: {
+            predicted_band: 0
+            for predicted_band in (*band_names, "outside_[0,1]")
+        }
+        for teacher_band in band_names
+    }
+    high_miss_bins = {
+        "below_0.25": 0,
+        "0.25-0.50": 0,
+        "0.50-0.65": 0,
+        "0.65-0.75": 0,
+        "outside_[0,1]": 0,
     }
     out_of_score_band = 0
     for prediction, target in zip(predictions, targets, strict=True):
         teacher_band = _oob_score_band(target)
-        is_out_of_band = (
-            prediction < 0.0
-            or prediction > 1.0
-            or _oob_score_band(prediction) != teacher_band
+        outside_unit_interval = prediction < 0.0 or prediction > 1.0
+        predicted_band = (
+            "outside_[0,1]"
+            if outside_unit_interval
+            else _oob_score_band(prediction)
         )
+        is_out_of_band = outside_unit_interval or predicted_band != teacher_band
         band_counts[teacher_band]["examples"] += 1
         band_counts[teacher_band]["out_of_band"] += int(is_out_of_band)
+        confusion_counts[teacher_band][predicted_band] += 1
         out_of_score_band += int(is_out_of_band)
+        if not is_out_of_band:
+            continue
+        missed_predictions[teacher_band].append(float(prediction))
+        missed_destinations[teacher_band][predicted_band] += 1
+        missed_boundary_gaps[teacher_band].append(
+            _distance_to_score_band(prediction, teacher_band)
+        )
+        if teacher_band == "high":
+            if outside_unit_interval:
+                high_miss_bins["outside_[0,1]"] += 1
+            elif prediction < 0.25:
+                high_miss_bins["below_0.25"] += 1
+            elif prediction < 0.50:
+                high_miss_bins["0.25-0.50"] += 1
+            elif prediction < 0.65:
+                high_miss_bins["0.50-0.65"] += 1
+            else:
+                high_miss_bins["0.65-0.75"] += 1
     out_of_band_by_teacher_band = {
         name: {
             **counts,
@@ -316,6 +362,48 @@ def _metrics(
             else None,
         }
         for name, counts in band_counts.items()
+    }
+    score_band_confusion = {
+        teacher_band: {
+            "teacher_examples": band_counts[teacher_band]["examples"],
+            "counts": confusion_counts[teacher_band],
+            "ratios": {
+                predicted_band: count / band_counts[teacher_band]["examples"]
+                if band_counts[teacher_band]["examples"]
+                else None
+                for predicted_band, count in confusion_counts[teacher_band].items()
+            },
+        }
+        for teacher_band in band_names
+    }
+    oob_placement = {
+        teacher_band: {
+            "teacher_examples": band_counts[teacher_band]["examples"],
+            "out_of_band_examples": band_counts[teacher_band]["out_of_band"],
+            "destination_counts": missed_destinations[teacher_band],
+            "destination_ratios_of_teacher_band": {
+                predicted_band: count / band_counts[teacher_band]["examples"]
+                if band_counts[teacher_band]["examples"]
+                else None
+                for predicted_band, count in missed_destinations[teacher_band].items()
+            },
+            "missed_prediction_summary": _summarize_values(
+                missed_predictions[teacher_band]
+            ),
+            "distance_to_nearest_correct_band": _summarize_values(
+                missed_boundary_gaps[teacher_band]
+            ),
+        }
+        for teacher_band in band_names
+    }
+    high_examples = band_counts["high"]["examples"]
+    high_oob_placement = {
+        "teacher_examples": high_examples,
+        "counts": high_miss_bins,
+        "ratios_of_teacher_high": {
+            name: count / high_examples if high_examples else None
+            for name, count in high_miss_bins.items()
+        },
     }
     outside_unit_interval = sum(
         prediction < 0.0 or prediction > 1.0 for prediction in predictions
@@ -343,6 +431,9 @@ def _metrics(
         "mean_error": _mean(errors),
         "out_of_score_band_ratio": out_of_score_band / len(predictions),
         "out_of_score_band_by_teacher_band": out_of_band_by_teacher_band,
+        "score_band_confusion": score_band_confusion,
+        "oob_placement_by_teacher_band": oob_placement,
+        "high_oob_placement": high_oob_placement,
         "outside_unit_interval_ratio": outside_unit_interval / len(predictions),
     }
 
@@ -360,6 +451,22 @@ def _oob_score_band(score: float) -> str:
     if score < 0.75:
         return "mid"
     return "high"
+
+
+def _distance_to_score_band(score: float, band: str) -> float:
+    if band == "low":
+        if score < 0.0:
+            return -score
+        return max(0.0, score - 0.25)
+    if band == "mid":
+        if score < 0.25:
+            return 0.25 - score
+        return max(0.0, score - 0.75)
+    if band == "high":
+        if score > 1.0:
+            return score - 1.0
+        return max(0.0, 0.75 - score)
+    raise ValueError(f"Unsupported score band: {band}")
 
 
 def _correlation_matrix(
@@ -1108,6 +1215,45 @@ def _print_console_summary(
         )
         print("  ".join(values))
 
+    print("\nHigh-OOB placement (% of all teacher-high examples)")
+    print(
+        "Method             <0.25     0.25-.50  0.50-.65  0.65-.75  "
+        "Miss p50  Gap p50"
+    )
+    print(
+        "-----------------  --------  --------  --------  --------  "
+        "--------  -------"
+    )
+    for method_name, result in methods:
+        metrics = result["metrics"]
+        placement = metrics["high_oob_placement"]
+        ratios = placement["ratios_of_teacher_high"]
+        high_oob = metrics["oob_placement_by_teacher_band"]["high"]
+        missed_count = int(high_oob["out_of_band_examples"])
+
+        def placement_percent(name: str) -> str:
+            ratio = ratios[name]
+            return "n/a" if ratio is None else f"{100.0 * float(ratio):.2f}%"
+
+        missed_median = (
+            f"{float(high_oob['missed_prediction_summary']['median']):.3f}"
+            if missed_count
+            else "n/a"
+        )
+        gap_median = (
+            f"{float(high_oob['distance_to_nearest_correct_band']['median']):.3f}"
+            if missed_count
+            else "n/a"
+        )
+        print(
+            f"{method_name:<17}  "
+            f"{placement_percent('below_0.25'):>8}  "
+            f"{placement_percent('0.25-0.50'):>8}  "
+            f"{placement_percent('0.50-0.65'):>8}  "
+            f"{placement_percent('0.65-0.75'):>8}  "
+            f"{missed_median:>8}  {gap_median:>7}"
+        )
+
     for comparison_name, label in (
         ("untouched_modernce", "untouched STS"),
         ("fine_tuned_single_head", "fine-tuned CE"),
@@ -1148,6 +1294,10 @@ def _print_console_summary(
         print(f"OOB change vs {label}: " + ", ".join(band_changes))
     print(
         "OOB bands by teacher score: low [0,.25), mid [.25,.75), high [.75,1]."
+    )
+    print(
+        "Miss p50 is the median prediction among missed highs; Gap p50 is its "
+        "median distance below 0.75."
     )
     print(f"Full report: {summary_path}\n")
 
