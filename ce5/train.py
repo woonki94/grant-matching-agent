@@ -669,6 +669,30 @@ def _confidence_weights(confidences: Tensor, *, floor: float, power: float) -> T
     return confidences.clamp(min=floor, max=1.0).pow(power)
 
 
+def _grant_faculty_high_score_weights(
+    targets: Tensor,
+    pair_types: Sequence[str],
+    *,
+    high_score_threshold: float,
+    high_score_weight: float,
+) -> Tensor:
+    """Weight scarce high G-F regression targets without weighting same-side highs."""
+
+    if len(pair_types) != int(targets.numel()):
+        raise ValueError("pair_types and targets must have the same length")
+    is_grant_faculty = torch.tensor(
+        [pair_type == "grant_faculty" for pair_type in pair_types],
+        dtype=torch.bool,
+        device=targets.device,
+    )
+    is_high = targets >= high_score_threshold
+    return torch.where(
+        is_grant_faculty & is_high,
+        torch.full_like(targets, high_score_weight),
+        torch.ones_like(targets),
+    )
+
+
 def _pointwise_loss(
     logits: Tensor,
     scores: Tensor,
@@ -764,23 +788,30 @@ def _batch_losses(
     encoded = _move_encoded(batch["encoded"], device)
     targets = batch["labels"].to(device)
     confidences = batch["confidences"].to(device)
-    weights = _confidence_weights(
+    confidence_weights = _confidence_weights(
         confidences,
         floor=args.confidence_weight_floor,
         power=args.confidence_weight_power,
     )
+    score_weights = _grant_faculty_high_score_weights(
+        targets,
+        batch["pair_types"],
+        high_score_threshold=args.high_score_threshold,
+        high_score_weight=args.grant_faculty_high_weight,
+    )
+    pointwise_weights = confidence_weights * score_weights
     output = model(**encoded)
     pointwise = _pointwise_loss(
         output.logits,
         output.scores,
         targets,
-        weights,
+        pointwise_weights,
         loss_name=args.score_loss,
     )
     ranking, rank_pairs = _ranking_loss(
         output.logits,
         targets,
-        weights,
+        confidence_weights,
         batch["query_ids"],
         min_score_gap=args.ranking_min_score_gap,
         margin=args.ranking_margin,
@@ -1246,6 +1277,20 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-grad-norm", type=_positive_float, default=1.0)
     parser.add_argument("--confidence-weight-floor", type=_unit_interval, default=0.25)
     parser.add_argument("--confidence-weight-power", type=_nonnegative_float, default=1.0)
+    parser.add_argument(
+        "--grant-faculty-high-weight",
+        type=_positive_float,
+        default=1.0,
+        help=(
+            "Pointwise-loss multiplier for G-F targets at or above "
+            "--high-score-threshold. Same-side high pairs are not upweighted."
+        ),
+    )
+    parser.add_argument(
+        "--high-score-threshold",
+        type=_unit_interval,
+        default=0.75,
+    )
     parser.add_argument("--ranking-loss-weight", type=_nonnegative_float, default=0.2)
     parser.add_argument("--ranking-min-score-gap", type=_unit_interval, default=0.1)
     parser.add_argument("--ranking-margin", type=_nonnegative_float, default=0.0)
@@ -1478,6 +1523,8 @@ def main() -> int:
             "score_loss": args.score_loss,
             "confidence_weight_floor": args.confidence_weight_floor,
             "confidence_weight_power": args.confidence_weight_power,
+            "grant_faculty_high_weight": args.grant_faculty_high_weight,
+            "high_score_threshold": args.high_score_threshold,
             "ranking_loss_weight": args.ranking_loss_weight,
             "ranking_min_score_gap": args.ranking_min_score_gap,
             "ranking_margin": args.ranking_margin,

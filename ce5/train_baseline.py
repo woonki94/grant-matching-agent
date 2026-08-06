@@ -41,6 +41,7 @@ from ce5.train import (
     _confidence_weights,
     _dataset_summary,
     _flatten_numeric_metrics,
+    _grant_faculty_high_score_weights,
     _init_wandb,
     _mix_training_examples,
     _move_encoded,
@@ -77,11 +78,18 @@ def _batch_losses(
     encoded = _move_encoded(batch["encoded"], device)
     targets = batch["labels"].to(device)
     confidences = batch["confidences"].to(device)
-    weights = _confidence_weights(
+    confidence_weights = _confidence_weights(
         confidences,
         floor=args.confidence_weight_floor,
         power=args.confidence_weight_power,
     )
+    score_weights = _grant_faculty_high_score_weights(
+        targets,
+        batch["pair_types"],
+        high_score_threshold=args.high_score_threshold,
+        high_score_weight=args.grant_faculty_high_weight,
+    )
+    pointwise_weights = confidence_weights * score_weights
     output = model(**encoded, return_dict=True)
     logits = output.logits.reshape(-1)
     scores = torch.sigmoid(logits)
@@ -89,13 +97,13 @@ def _batch_losses(
         logits,
         scores,
         targets,
-        weights,
+        pointwise_weights,
         loss_name=args.score_loss,
     )
     ranking, ranking_pairs = _ranking_loss(
         logits,
         targets,
-        weights,
+        confidence_weights,
         batch["query_ids"],
         min_score_gap=args.ranking_min_score_gap,
         margin=args.ranking_margin,
@@ -366,6 +374,20 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-grad-norm", type=_positive_float, default=1.0)
     parser.add_argument("--confidence-weight-floor", type=_unit_interval, default=0.25)
     parser.add_argument("--confidence-weight-power", type=_nonnegative_float, default=1.0)
+    parser.add_argument(
+        "--grant-faculty-high-weight",
+        type=_positive_float,
+        default=1.0,
+        help=(
+            "Pointwise-loss multiplier for G-F targets at or above "
+            "--high-score-threshold. Same-side high pairs are not upweighted."
+        ),
+    )
+    parser.add_argument(
+        "--high-score-threshold",
+        type=_unit_interval,
+        default=0.75,
+    )
     parser.add_argument("--ranking-loss-weight", type=_nonnegative_float, default=0.2)
     parser.add_argument("--ranking-min-score-gap", type=_unit_interval, default=0.1)
     parser.add_argument("--ranking-margin", type=_nonnegative_float, default=0.0)
@@ -593,6 +615,8 @@ def main() -> int:
             "score_loss": args.score_loss,
             "confidence_weight_floor": args.confidence_weight_floor,
             "confidence_weight_power": args.confidence_weight_power,
+            "grant_faculty_high_weight": args.grant_faculty_high_weight,
+            "high_score_threshold": args.high_score_threshold,
             "ranking_loss_weight": args.ranking_loss_weight,
             "ranking_min_score_gap": args.ranking_min_score_gap,
             "ranking_margin": args.ranking_margin,
