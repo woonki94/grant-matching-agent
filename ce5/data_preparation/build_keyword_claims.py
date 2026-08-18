@@ -122,7 +122,16 @@ REPAIR_PROMPT = """
 Your previous response was invalid. Return only one JSON object with a nonempty
 claims array and numeric confidence in [0,1]. Every claim needs a nonempty claim
 and a source_span copied exactly as one contiguous substring of SOURCE KEYWORD.
-Do not include markdown or additional text.
+
+Do not manufacture a source_span by deleting a conjunction or intervening
+words. In coordinated phrases such as "A and B of C", neither "A of C" nor
+"B of C" is a contiguous source span. When separately grounded claims would
+require that rewrite, merge the coordinated elements into one composite claim
+and use the complete relevant source phrase—up to the entire SOURCE KEYWORD—as
+its exact source_span.
+
+Return fewer claims when necessary to preserve exact grounding. Do not include
+markdown or additional text.
 """.strip()
 
 
