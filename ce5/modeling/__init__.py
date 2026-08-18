@@ -35,6 +35,11 @@ from ce5.modeling.reliability_aware_router import (
     ReliabilityAwareRouterConfig,
     ReliabilityAwareRouterOutput,
 )
+from ce5.modeling.structured_requirement_matcher import (
+    ModernCEStructuredRequirementMatcher,
+    StructuredRequirementMatcherConfig,
+    StructuredRequirementMatcherOutput,
+)
 
 __all__ = [
     "DEFAULT_MODEL_ID",
@@ -56,4 +61,7 @@ __all__ = [
     "ReliabilityAwareRouterConfig",
     "ReliabilityAwareRouterOutput",
     "ModernCEReliabilityAwareRouterModel",
+    "StructuredRequirementMatcherConfig",
+    "StructuredRequirementMatcherOutput",
+    "ModernCEStructuredRequirementMatcher",
 ]

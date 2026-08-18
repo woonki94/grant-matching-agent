@@ -23,6 +23,11 @@ from ce5.modeling.logit_aware_router import (
     LogitAwareRouterConfig,
     ModernCELogitAwareRouterModel,
 )
+from ce5.modeling.structured_requirement_matcher import (
+    ModernCEStructuredRequirementMatcher,
+    StructuredRequirementMatcherConfig,
+    StructuredRequirementMatcherOutput,
+)
 
 __all__ = [
     "DEFAULT_MODEL_ID",
@@ -38,4 +43,7 @@ __all__ = [
     "ModernCEIndependentPairAwareModel",
     "LogitAwareRouterConfig",
     "ModernCELogitAwareRouterModel",
+    "StructuredRequirementMatcherConfig",
+    "StructuredRequirementMatcherOutput",
+    "ModernCEStructuredRequirementMatcher",
 ]
