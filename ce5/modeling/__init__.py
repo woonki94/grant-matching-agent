@@ -30,6 +30,11 @@ from ce5.modeling.logit_aware_router import (
     LogitAwareRouterConfig,
     ModernCELogitAwareRouterModel,
 )
+from ce5.modeling.reliability_aware_router import (
+    ModernCEReliabilityAwareRouterModel,
+    ReliabilityAwareRouterConfig,
+    ReliabilityAwareRouterOutput,
+)
 
 __all__ = [
     "DEFAULT_MODEL_ID",
@@ -48,4 +53,7 @@ __all__ = [
     "PrivateSidePooler",
     "LogitAwareRouterConfig",
     "ModernCELogitAwareRouterModel",
+    "ReliabilityAwareRouterConfig",
+    "ReliabilityAwareRouterOutput",
+    "ModernCEReliabilityAwareRouterModel",
 ]

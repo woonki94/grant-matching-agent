@@ -760,6 +760,14 @@ def _evaluate_latent_model(
     head_scores: dict[str, list[float]] = {name: [] for name in expert_names}
     gates: dict[str, list[float]] = {name: [] for name in expert_names}
     contributions: dict[str, list[float]] = {name: [] for name in expert_names}
+    predicted_expert_errors: dict[str, list[float]] = {
+        name: [] for name in expert_names
+    }
+    actual_expert_errors: dict[str, list[float]] = {
+        name: [] for name in expert_names
+    }
+    reliability_top1_correct = 0
+    reliability_examples = 0
     latent_routing: dict[str, list[float]] = {name: [] for name in latent_names}
     latent_contributions: list[float] = []
     gate_entropies: list[float] = []
@@ -795,6 +803,16 @@ def _evaluate_latent_model(
         batch_head_logits = output.head_logits.detach().float().cpu()
         batch_gates = output.gate_weights.detach().float().cpu()
         batch_contributions = batch_gates * batch_head_logits
+        output_predicted_errors = getattr(
+            output,
+            "predicted_expert_errors",
+            None,
+        )
+        batch_predicted_errors = (
+            output_predicted_errors.detach().float().cpu()
+            if output_predicted_errors is not None
+            else None
+        )
         batch_attention = output.attention_weights.detach().float().cpu()
         output_target_attention = getattr(output, "target_attention_weights", None)
         batch_target_attention = (
@@ -853,6 +871,37 @@ def _evaluate_latent_model(
                 gates=gate_values,
                 contributions=contribution_values,
             )
+            if batch_predicted_errors is not None:
+                predicted_error_values = batch_predicted_errors[
+                    row_index
+                ].tolist()
+                actual_error_values = [
+                    abs(float(score) - float(example.score))
+                    for score in expert_score_values
+                ]
+                record["predicted_expert_errors"] = dict(
+                    zip(expert_names, predicted_error_values, strict=True)
+                )
+                record["actual_expert_errors"] = dict(
+                    zip(expert_names, actual_error_values, strict=True)
+                )
+                predicted_winner = min(
+                    range(len(expert_names)),
+                    key=predicted_error_values.__getitem__,
+                )
+                oracle_winner = min(
+                    range(len(expert_names)),
+                    key=actual_error_values.__getitem__,
+                )
+                reliability_top1_correct += int(predicted_winner == oracle_winner)
+                reliability_examples += 1
+                for expert_index, expert_name in enumerate(expert_names):
+                    predicted_expert_errors[expert_name].append(
+                        float(predicted_error_values[expert_index])
+                    )
+                    actual_expert_errors[expert_name].append(
+                        float(actual_error_values[expert_index])
+                    )
             if batch_routing is not None:
                 routing_values = batch_routing[row_index].tolist()
                 record["latent_routing_weights"] = dict(
@@ -1035,6 +1084,33 @@ def _evaluate_latent_model(
             )
             / len(records),
         }
+        if predicted_expert_errors[expert_name]:
+            reliability_residuals = [
+                predicted - actual
+                for predicted, actual in zip(
+                    predicted_expert_errors[expert_name],
+                    actual_expert_errors[expert_name],
+                    strict=True,
+                )
+            ]
+            expert_diagnostics[expert_name]["reliability"] = {
+                "predicted_error": _summarize_values(
+                    predicted_expert_errors[expert_name]
+                ),
+                "actual_error": _summarize_values(
+                    actual_expert_errors[expert_name]
+                ),
+                "mae": _mean([abs(value) for value in reliability_residuals]),
+                "bias": _mean(reliability_residuals),
+                "pearson": _pearson(
+                    predicted_expert_errors[expert_name],
+                    actual_expert_errors[expert_name],
+                ),
+                "spearman": _spearman(
+                    predicted_expert_errors[expert_name],
+                    actual_expert_errors[expert_name],
+                ),
+            }
 
     absolute_sums = [
         sum(abs(float(value)) for value in record["weighted_logit_contributions"].values())
@@ -1127,6 +1203,13 @@ def _evaluate_latent_model(
         diagnostics["latent_routing_weights"] = {
             name: _summarize_values(values)
             for name, values in latent_routing.items()
+        }
+    if reliability_examples:
+        diagnostics["reliability_routing"] = {
+            "examples": reliability_examples,
+            "predicted_lowest_error_matches_oracle_fraction": (
+                reliability_top1_correct / reliability_examples
+            ),
         }
     return diagnostics, records, attention_examples
 
@@ -2189,6 +2272,9 @@ def main() -> int:
             if evaluated_architecture_type == "independent_pair_aware_heads"
             else "CE5 logit-router"
             if evaluated_architecture_type == "independent_logit_aware_router"
+            else "CE5 reliability-router"
+            if evaluated_architecture_type
+            == "independent_reliability_aware_router"
             else "CE5 directional"
             if is_directional_matcher
             else "CE5 latent-head"

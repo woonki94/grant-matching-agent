@@ -20,6 +20,10 @@ from ce5.modeling.logit_aware_router import (
     ARCHITECTURE_TYPE as LOGIT_AWARE_ROUTER_ARCHITECTURE_TYPE,
     ModernCELogitAwareRouterModel,
 )
+from ce5.modeling.reliability_aware_router import (
+    ARCHITECTURE_TYPE as RELIABILITY_AWARE_ROUTER_ARCHITECTURE_TYPE,
+    ModernCEReliabilityAwareRouterModel,
+)
 from ce5.modeling.directional_private_experts import (
     ARCHITECTURE_TYPE as DIRECTIONAL_PRIVATE_ARCHITECTURE_TYPE,
     ModernCEDirectionalPrivateExperts,
@@ -79,6 +83,12 @@ def load_model_from_checkpoint(
         )
     if architecture_type == LOGIT_AWARE_ROUTER_ARCHITECTURE_TYPE:
         return ModernCELogitAwareRouterModel.from_checkpoint(
+            checkpoint_path,
+            map_location=map_location,
+            **pretrained_kwargs,
+        )
+    if architecture_type == RELIABILITY_AWARE_ROUTER_ARCHITECTURE_TYPE:
+        return ModernCEReliabilityAwareRouterModel.from_checkpoint(
             checkpoint_path,
             map_location=map_location,
             **pretrained_kwargs,

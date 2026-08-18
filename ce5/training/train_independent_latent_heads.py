@@ -59,9 +59,15 @@ DEFAULT_INDEPENDENT_PAIR_AWARE_OUTPUT_DIR = (
 DEFAULT_LOGIT_AWARE_ROUTER_OUTPUT_DIR = (
     REPO_ROOT / "ce5" / "models" / "independent_v2_logit_router"
 )
+DEFAULT_RELIABILITY_AWARE_ROUTER_OUTPUT_DIR = (
+    REPO_ROOT / "ce5" / "models" / "independent_v2_reliability_router"
+)
 INDEPENDENT_ARCHITECTURE_TYPE = "independent_latent_heads"
 INDEPENDENT_PAIR_AWARE_ARCHITECTURE_TYPE = "independent_pair_aware_heads"
 LOGIT_AWARE_ROUTER_ARCHITECTURE_TYPE = "independent_logit_aware_router"
+RELIABILITY_AWARE_ROUTER_ARCHITECTURE_TYPE = (
+    "independent_reliability_aware_router"
+)
 DIRECTIONAL_ARCHITECTURE_TYPE = "directional_latent_matcher"
 DIRECTIONAL_PRIVATE_ARCHITECTURE_TYPE = "directional_private_experts"
 PAIR_TYPES = ("grant_faculty", "grant_grant", "faculty_faculty")
@@ -768,6 +774,54 @@ def _gate_balance_loss(gate_weights: Tensor) -> Tensor:
     return torch.sum(average_usage * torch.log(average_usage * num_experts))
 
 
+def _reliability_routing_losses(
+    output: Any,
+    targets: Tensor,
+    weights: Tensor,
+    *,
+    oracle_temperature: float,
+) -> tuple[Tensor, Tensor]:
+    """Supervise expert error prediction and soft teacher-derived routing.
+
+    Teacher labels form targets only inside this training/evaluation loss.  The
+    model forward pass receives neither labels nor score-band metadata.
+    """
+
+    predicted_errors = getattr(output, "predicted_expert_errors", None)
+    if predicted_errors is None:
+        zero = output.logits.sum() * 0.0
+        return zero, zero
+    if predicted_errors.shape != output.head_scores.shape:
+        raise RuntimeError(
+            "predicted_expert_errors must match the expert score matrix"
+        )
+    actual_errors = torch.abs(
+        output.head_scores.detach() - targets.unsqueeze(-1)
+    )
+    reliability_per_example = F.smooth_l1_loss(
+        predicted_errors,
+        actual_errors,
+        reduction="none",
+    ).mean(dim=-1)
+    reliability = torch.sum(reliability_per_example * weights) / weights.sum().clamp_min(
+        1e-8
+    )
+
+    oracle_targets = torch.softmax(
+        -actual_errors / oracle_temperature,
+        dim=-1,
+    ).detach()
+    routing_per_example = F.kl_div(
+        output.gate_weights.clamp_min(1e-8).log(),
+        oracle_targets,
+        reduction="none",
+    ).sum(dim=-1)
+    routing_distillation = torch.sum(
+        routing_per_example * weights
+    ) / weights.sum().clamp_min(1e-8)
+    return reliability, routing_distillation
+
+
 def _ranking_loss(
     logits: Tensor,
     targets: Tensor,
@@ -852,11 +906,20 @@ def _batch_losses(
     diversity = _attention_diversity_loss(output.attention_weights)
     routing_weights = getattr(output, "routing_weights", output.gate_weights)
     gate_balance = _gate_balance_loss(routing_weights)
+    reliability, routing_distillation = _reliability_routing_losses(
+        output,
+        targets,
+        pointwise_weights,
+        oracle_temperature=getattr(args, "oracle_temperature", 0.1),
+    )
     total = (
         pointwise
         + args.ranking_loss_weight * ranking
         + args.diversity_loss_weight * diversity
         + args.gate_balance_loss_weight * gate_balance
+        + getattr(args, "reliability_loss_weight", 0.0) * reliability
+        + getattr(args, "routing_distillation_weight", 0.0)
+        * routing_distillation
     )
     return {
         "total": total,
@@ -864,6 +927,8 @@ def _batch_losses(
         "ranking": ranking,
         "diversity": diversity,
         "gate_balance": gate_balance,
+        "reliability": reliability,
+        "routing_distillation": routing_distillation,
     }, output, rank_pairs
 
 
@@ -1022,7 +1087,18 @@ def evaluate(
     targets: list[float] = []
     query_ids: list[str] = []
     pair_types: list[str] = []
-    loss_sums = {name: 0.0 for name in ("total", "pointwise", "ranking", "diversity", "gate_balance")}
+    loss_sums = {
+        name: 0.0
+        for name in (
+            "total",
+            "pointwise",
+            "ranking",
+            "diversity",
+            "gate_balance",
+            "reliability",
+            "routing_distillation",
+        )
+    }
     gate_sum: Optional[Tensor] = None
     head_score_sum: Optional[Tensor] = None
     routing_sum: Optional[Tensor] = None
@@ -1128,7 +1204,18 @@ def _train_epoch(
 ) -> tuple[dict[str, float], int]:
     model.train()
     optimizer.zero_grad(set_to_none=True)
-    totals = {name: 0.0 for name in ("total", "pointwise", "ranking", "diversity", "gate_balance")}
+    totals = {
+        name: 0.0
+        for name in (
+            "total",
+            "pointwise",
+            "ranking",
+            "diversity",
+            "gate_balance",
+            "reliability",
+            "routing_distillation",
+        )
+    }
     example_count = 0
     ranking_pairs = 0
     step_totals = {name: 0.0 for name in totals}
@@ -1280,6 +1367,7 @@ def build_parser(
         INDEPENDENT_ARCHITECTURE_TYPE,
         INDEPENDENT_PAIR_AWARE_ARCHITECTURE_TYPE,
         LOGIT_AWARE_ROUTER_ARCHITECTURE_TYPE,
+        RELIABILITY_AWARE_ROUTER_ARCHITECTURE_TYPE,
         DIRECTIONAL_ARCHITECTURE_TYPE,
         DIRECTIONAL_PRIVATE_ARCHITECTURE_TYPE,
     }:
@@ -1293,11 +1381,21 @@ def build_parser(
         architecture_type == INDEPENDENT_PAIR_AWARE_ARCHITECTURE_TYPE
     )
     logit_aware_router = architecture_type == LOGIT_AWARE_ROUTER_ARCHITECTURE_TYPE
-    pair_aware_independent = independent_pair_aware or logit_aware_router
+    reliability_aware_router = (
+        architecture_type == RELIABILITY_AWARE_ROUTER_ARCHITECTURE_TYPE
+    )
+    pair_aware_independent = (
+        independent_pair_aware or logit_aware_router or reliability_aware_router
+    )
     parser = argparse.ArgumentParser(
         description=(
             "Train the CE5 directional latent matcher from continuous LLM judgments."
             if directional
+            else (
+                "Train a reliability-aware residual router on frozen CE5 "
+                "independent-v2 experts."
+            )
+            if reliability_aware_router
             else "Train a logit-aware router on top of a CE5 independent-v2 checkpoint."
             if logit_aware_router
             else "Train CE5 independent-v2 pair-aware experts from continuous LLM judgments."
@@ -1316,6 +1414,8 @@ def build_parser(
             if directional
             else DEFAULT_INDEPENDENT_PAIR_AWARE_OUTPUT_DIR
             if independent_pair_aware
+            else DEFAULT_RELIABILITY_AWARE_ROUTER_OUTPUT_DIR
+            if reliability_aware_router
             else DEFAULT_LOGIT_AWARE_ROUTER_OUTPUT_DIR
             if logit_aware_router
             else DEFAULT_OUTPUT_DIR
@@ -1397,7 +1497,7 @@ def build_parser(
                 default=384,
                 help="Hidden width of each private pair-interaction scorer.",
             )
-        if logit_aware_router:
+        if logit_aware_router or reliability_aware_router:
             parser.add_argument(
                 "--initialize-from-v2-checkpoint",
                 type=Path,
@@ -1413,6 +1513,33 @@ def build_parser(
                 type=_positive_float,
                 default=12.0,
             )
+        if reliability_aware_router:
+            parser.add_argument(
+                "--router-attention-heads",
+                type=_positive_int,
+                default=4,
+            )
+            parser.add_argument("--router-ffn-dim", type=_positive_int, default=256)
+            parser.add_argument(
+                "--oracle-temperature",
+                type=_positive_float,
+                default=0.1,
+                help=(
+                    "Temperature for soft targets derived from each frozen "
+                    "expert's absolute teacher error."
+                ),
+            )
+            parser.add_argument(
+                "--routing-distillation-weight",
+                type=_nonnegative_float,
+                default=0.05,
+            )
+            parser.add_argument(
+                "--reliability-loss-weight",
+                type=_nonnegative_float,
+                default=0.1,
+            )
+        if logit_aware_router:
             parser.add_argument(
                 "--train-all-parameters",
                 action="store_true",
@@ -1486,6 +1613,8 @@ def build_parser(
             if directional
             else "ce5,distillation,independent-pair-aware-v2"
             if independent_pair_aware
+            else "ce5,distillation,reliability-aware-router,router-only"
+            if reliability_aware_router
             else "ce5,distillation,logit-aware-router,router-only"
             if logit_aware_router
             else "ce5,distillation,latent-heads"
@@ -1588,7 +1717,11 @@ def main(
         get_linear_schedule_with_warmup,
     )
 
-    if architecture_type == LOGIT_AWARE_ROUTER_ARCHITECTURE_TYPE:
+    if architecture_type == RELIABILITY_AWARE_ROUTER_ARCHITECTURE_TYPE:
+        from ce5.modeling.reliability_aware_router import (
+            ModernCEReliabilityAwareRouterModel as ModelClass,
+        )
+    elif architecture_type == LOGIT_AWARE_ROUTER_ARCHITECTURE_TYPE:
         from ce5.modeling.logit_aware_router import (
             ModernCELogitAwareRouterModel as ModelClass,
         )
@@ -1616,7 +1749,11 @@ def main(
     resume_path = _resolve_path(args.resume_checkpoint) if args.resume_checkpoint else None
     initialize_v2_path = (
         _resolve_path(args.initialize_from_v2_checkpoint)
-        if architecture_type == LOGIT_AWARE_ROUTER_ARCHITECTURE_TYPE
+        if architecture_type
+        in {
+            LOGIT_AWARE_ROUTER_ARCHITECTURE_TYPE,
+            RELIABILITY_AWARE_ROUTER_ARCHITECTURE_TYPE,
+        }
         and args.initialize_from_v2_checkpoint
         else None
     )
@@ -1640,10 +1777,13 @@ def main(
             trust_remote_code=args.trust_remote_code,
         )
         tokenizer_model_id = model.architecture_config.backbone_model_id
-    elif architecture_type == LOGIT_AWARE_ROUTER_ARCHITECTURE_TYPE:
+    elif architecture_type in {
+        LOGIT_AWARE_ROUTER_ARCHITECTURE_TYPE,
+        RELIABILITY_AWARE_ROUTER_ARCHITECTURE_TYPE,
+    }:
         if initialize_v2_path is None:
             raise RuntimeError(
-                "Logit-aware router training requires "
+                "Router training requires "
                 "--initialize-from-v2-checkpoint"
             )
         from ce5.modeling.registry import checkpoint_architecture_type
@@ -1655,11 +1795,21 @@ def main(
                 f"{INDEPENDENT_PAIR_AWARE_ARCHITECTURE_TYPE!r} checkpoint, "
                 f"found {source_architecture!r}"
             )
+        router_kwargs = {
+            "router_hidden_dim": args.router_hidden_dim,
+            "router_dropout": args.router_dropout,
+            "router_logit_clip": args.router_logit_clip,
+        }
+        if architecture_type == RELIABILITY_AWARE_ROUTER_ARCHITECTURE_TYPE:
+            router_kwargs.update(
+                {
+                    "router_attention_heads": args.router_attention_heads,
+                    "router_ffn_dim": args.router_ffn_dim,
+                }
+            )
         model = ModelClass.from_independent_v2_checkpoint(
             initialize_v2_path,
-            router_hidden_dim=args.router_hidden_dim,
-            router_dropout=args.router_dropout,
-            router_logit_clip=args.router_logit_clip,
+            **router_kwargs,
             torch_dtype=precision,
             trust_remote_code=args.trust_remote_code,
         )
@@ -1731,6 +1881,7 @@ def main(
         in {
             INDEPENDENT_PAIR_AWARE_ARCHITECTURE_TYPE,
             LOGIT_AWARE_ROUTER_ARCHITECTURE_TYPE,
+            RELIABILITY_AWARE_ROUTER_ARCHITECTURE_TYPE,
             DIRECTIONAL_ARCHITECTURE_TYPE,
             DIRECTIONAL_PRIVATE_ARCHITECTURE_TYPE,
         }
@@ -1765,11 +1916,16 @@ def main(
         )
 
     router_only_training = (
-        architecture_type == LOGIT_AWARE_ROUTER_ARCHITECTURE_TYPE
-        and not args.train_all_parameters
+        architecture_type == RELIABILITY_AWARE_ROUTER_ARCHITECTURE_TYPE
+        or (
+            architecture_type == LOGIT_AWARE_ROUTER_ARCHITECTURE_TYPE
+            and not args.train_all_parameters
+        )
     )
     args.router_only_training = router_only_training
-    if router_only_training:
+    if architecture_type == RELIABILITY_AWARE_ROUTER_ARCHITECTURE_TYPE:
+        model.set_reliability_router_trainable_only()
+    elif router_only_training:
         model.set_router_trainable_only()
     elif args.frozen_encoder_epochs > 0:
         _set_encoder_trainable(model, False)
@@ -1833,6 +1989,17 @@ def main(
             "ranking_max_pairs_per_batch": args.ranking_max_pairs_per_batch,
             "diversity_loss_weight": args.diversity_loss_weight,
             "gate_balance_loss_weight": args.gate_balance_loss_weight,
+            "oracle_temperature": getattr(args, "oracle_temperature", None),
+            "routing_distillation_weight": getattr(
+                args,
+                "routing_distillation_weight",
+                0.0,
+            ),
+            "reliability_loss_weight": getattr(
+                args,
+                "reliability_loss_weight",
+                0.0,
+            ),
             "training_mix_mode": training_mix_mode,
             "training_pair_mix_requested": args.training_pair_mix,
         },
