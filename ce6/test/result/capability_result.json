@@ -1,0 +1,148 @@
+{
+  "device": "mps",
+  "n": 77,
+  "overall": {
+    "sts_handled": 0.338,
+    "nli_handled": 0.468
+  },
+  "by_subtype": [
+    {
+      "subtype": "acronym-ambiguity",
+      "n": 3,
+      "sts": 0.67,
+      "nli": 0.67
+    },
+    {
+      "subtype": "antonym",
+      "n": 3,
+      "sts": 0.0,
+      "nli": 0.33
+    },
+    {
+      "subtype": "causal",
+      "n": 3,
+      "sts": 0.0,
+      "nli": 0.0
+    },
+    {
+      "subtype": "condition",
+      "n": 4,
+      "sts": 0.75,
+      "nli": 0.25
+    },
+    {
+      "subtype": "constraint-addition",
+      "n": 3,
+      "sts": 0.33,
+      "nli": 0.0
+    },
+    {
+      "subtype": "constraint-conflict",
+      "n": 3,
+      "sts": 1.0,
+      "nli": 0.33
+    },
+    {
+      "subtype": "cross-domain-analogy",
+      "n": 3,
+      "sts": 0.67,
+      "nli": 0.0
+    },
+    {
+      "subtype": "disjoint-but-similar-vocabulary",
+      "n": 3,
+      "sts": 0.0,
+      "nli": 0.67
+    },
+    {
+      "subtype": "evidence-asymmetry",
+      "n": 3,
+      "sts": 0.33,
+      "nli": 0.0
+    },
+    {
+      "subtype": "granularity",
+      "n": 4,
+      "sts": 0.0,
+      "nli": 0.5
+    },
+    {
+      "subtype": "hardneg",
+      "n": 5,
+      "sts": 0.0,
+      "nli": 1.0
+    },
+    {
+      "subtype": "hypernym",
+      "n": 3,
+      "sts": 0.0,
+      "nli": 0.33
+    },
+    {
+      "subtype": "implicit-entailment",
+      "n": 4,
+      "sts": 0.25,
+      "nli": 0.5
+    },
+    {
+      "subtype": "method-vs-application",
+      "n": 3,
+      "sts": 0.33,
+      "nli": 0.67
+    },
+    {
+      "subtype": "modality",
+      "n": 3,
+      "sts": 0.33,
+      "nli": 0.33
+    },
+    {
+      "subtype": "negated-subordinate",
+      "n": 3,
+      "sts": 0.33,
+      "nli": 0.67
+    },
+    {
+      "subtype": "negation",
+      "n": 4,
+      "sts": 0.0,
+      "nli": 1.0
+    },
+    {
+      "subtype": "role-reversal",
+      "n": 4,
+      "sts": 0.25,
+      "nli": 0.0
+    },
+    {
+      "subtype": "same-topic-different-object",
+      "n": 4,
+      "sts": 1.0,
+      "nli": 1.0
+    },
+    {
+      "subtype": "scope",
+      "n": 3,
+      "sts": 0.67,
+      "nli": 0.33
+    },
+    {
+      "subtype": "shared-method-different-goal",
+      "n": 3,
+      "sts": 0.67,
+      "nli": 0.33
+    },
+    {
+      "subtype": "subset",
+      "n": 3,
+      "sts": 0.0,
+      "nli": 0.33
+    },
+    {
+      "subtype": "temporal",
+      "n": 3,
+      "sts": 0.33,
+      "nli": 1.0
+    }
+  ]
+}
