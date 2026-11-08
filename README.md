@@ -1,8 +1,27 @@
-# GrantFetcher
+# GrantMatchMaking Agent
 
-GrantFetcher is a backend pipeline for collecting grant opportunities and faculty profiles, extracting supporting content, generating research keywords, and matching faculty with relevant funding opportunities.
+**A LangGraph multi-agent system for matching researchers with funding opportunities.**
 
-The system combines structured PostgreSQL data, pgvector embeddings, extracted document/web content stored in S3, and AWS Bedrock models for keyword generation, reranking, and recommendation explanations.
+GrantMatchMaking Agent coordinates specialized agents for faculty context, grant opportunity context, matching execution, and general conversation. An intent router and LangGraph orchestrator select the workflow, pass requests and intermediate results through shared state, recover missing information, and stream node-level progress to the client.
+
+The supporting data pipeline collects grant opportunities and faculty profiles, extracts documents and web content, generates research keywords, and prepares matching data. Structured metadata and embeddings live in PostgreSQL with pgvector; extracted content is stored in S3. AWS Bedrock supplies model calls for keyword generation, reranking, and recommendation explanations.
+
+[Multi-agent architecture](#multi-agent-architecture) · [Installation](#installation) · [Configuration](#configuration) · [Data preparation](#data-preparation-pipeline) · [Run the API](#running-the-api)
+
+## Multi-Agent Architecture
+
+| Component | Responsibility |
+| :--- | :--- |
+| [IntentRouter](./services/agent_v2/router.py) | Extracts the request scenario, researcher identifiers, grant references, topical constraints, and requested team size or result count. |
+| [GrantMatchOrchestrator](./services/agent_v2/orchestrator.py) | Builds the LangGraph state graph and selects individual, group, specific-grant, or general-conversation paths through conditional edges. |
+| [FacultyContextAgent](./services/agent_v2/agents/faculty_context_agent.py) | Resolves researcher context and requests additional user reference data when needed. |
+| [OpportunityContextAgent](./services/agent_v2/agents/opportunity_context_agent.py) | Resolves grant references from existing data or retrieves the opportunity from its source. |
+| [MatchingExecutionAgent](./services/agent_v2/agents/matching_execution_agent.py) | Prepares keywords, invokes individual or team matching, and connects matching results with recommendation justifications. |
+| [GeneralConversationAgent](./services/agent_v2/agents/general_conversation_agent.py) | Handles requests routed to general conversation. |
+
+The agents exchange information through a common workflow state. Conditional branches handle missing faculty or grant information before matching; unsuccessful resolution can return a request for more input. The orchestrator supports individual researcher matching, team matching, and evaluation against a specific grant.
+
+Progress updates are emitted as LangGraph nodes complete and exposed through the Flask streaming API. Retrieval, keyword generation, cross-encoder scoring, and explanation generation support the agents' decisions; they are implementation stages within the wider multi-agent system.
 
 ## System Overview
 
